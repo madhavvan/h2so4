@@ -39,8 +39,8 @@ export default function App() {
     apiKey: localStorage.getItem("GEMINI_API_KEY") || "",
     autoSend: false, 
     contextFiles: [
-      { id: '1', name: 'Resume - Venu Madhav', content: INITIAL_RESUME_TEXT, type: 'resume' },
-      { id: '2', name: 'Job Description - Goldman Sachs', content: INITIAL_JD_TEXT, type: 'jd' }
+      { id: '1', name: 'Placeholder Resume', content: INITIAL_RESUME_TEXT, type: 'resume' },
+      { id: '2', name: 'Placeholder JD', content: INITIAL_JD_TEXT, type: 'jd' }
     ]
   });
 
@@ -474,7 +474,7 @@ export default function App() {
          <div className="space-y-4 text-gray-300">
             <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
                 <h4 className="font-bold text-white mb-2">Goal: Record Interviewer ONLY</h4>
-                <p className="text-sm">To prevent the AI from hearing YOU (Venu), you should route the meeting audio directly to this app.</p>
+                <p className="text-sm">To prevent the AI from hearing YOU (the candidate), you should route the meeting audio directly to this app.</p>
             </div>
             
             <div className="space-y-2 text-sm">
@@ -513,11 +513,10 @@ export default function App() {
                                 <p className="text-xs text-gray-500 mt-0.5 uppercase tracking-wider">{file.type}</p>
                             </div>
                         </div>
-                        {file.type === 'custom' && (
-                             <button onClick={() => removeFile(file.id)} className="text-gray-500 hover:text-red-400 p-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                <Trash2 size={16} />
-                             </button>
-                        )}
+                        {/* Modified: Allow deletion for ALL file types */}
+                         <button onClick={() => removeFile(file.id)} className="text-gray-500 hover:text-red-400 p-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <Trash2 size={16} />
+                         </button>
                     </div>
                 ))}
             </div>
