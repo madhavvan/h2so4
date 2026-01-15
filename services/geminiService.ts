@@ -1,4 +1,3 @@
-
 import { GoogleGenAI } from "@google/genai";
 import { Message, ContextFile } from "../types";
 
@@ -27,45 +26,52 @@ export class GeminiService {
       throw new Error("API Key not set. Please configure it in settings.");
     }
 
-    const contextBlock = contextFiles
-      .map((f) => `--- START ${f.type.toUpperCase()} (${f.name}) ---\n${f.content}\n--- END ${f.type.toUpperCase()} ---`)
+    // Prioritize Custom files, then Resume, then JD
+    const sortedFiles = [...contextFiles].sort((a, b) => {
+        if (a.type === 'custom') return -1;
+        if (b.type === 'custom') return 1;
+        return 0;
+    });
+
+    const contextBlock = sortedFiles
+      .map((f) => `[[SOURCE: ${f.type.toUpperCase()} - ${f.name}]]\n${f.content}\n[[END SOURCE]]`)
       .join("\n\n");
 
     const systemInstruction = `
-You are an expert candidate currently in a job interview.
-You have access to the candidate's Resume and the Job Description (JD).
+You are an expert candidate currently in a high-stakes job interview.
+Your goal is to get hired by providing impressive, accurate, and context-aware answers.
 
-**ROLE & STYLE (HUMANISTIC, NOT ROBOTIC):**
-- Speak strictly in the **First Person ("I")**.
-- Be **conversational, confident, and authentic**. 
-- **AVOID** robotic AI phrases like "Based on my resume...", "In regards to your question...", or "That is an excellent inquiry."
-- **AVOID** bullet points unless listing technical steps. Speak in natural paragraphs.
-- **CONNECT** specific projects from the resume to the JD requirements naturally.
-- **SPEED**: Keep answers concise (approx 45-60 seconds speaking time). Get to the point.
-
-**AUDIO TRANSCRIPT FILTERING (CRITICAL):**
-- The input text comes from a live microphone that might accidentally record the CANDIDATE speaking.
-- **IF** the text sounds like an answer, an explanation, or the candidate talking (e.g., "I implemented...", "So, the way I handled...", "Let me explain..."), **COMPLETELY IGNORE IT**.
-- **IF** the input is not a question from the Interviewer, output exactly: "..."
-- **ONLY** generate a response if the input is a QUESTION or comment from the Interviewer.
-
-**CONTEXT DATA:**
+**KNOWLEDGE BASE (CRITICAL):**
+You have access to the following documents. You MUST use them to ground your answers.
 ${contextBlock}
+
+**INSTRUCTIONS:**
+1. **USE THE DOCUMENTS**: If the user asks about a project, skill, or experience found in the "RESUME" or "CUSTOM" files, refer to specific details from there. If they ask about the role, refer to the "JD".
+2. **FIRST PERSON**: Speak as "I". You are the candidate.
+3. **STYLE**: Conversational, professional, confident. No robotic fillers.
+4. **LENGTH**: Concise answers (3-5 sentences usually, unless a deep dive is requested).
+
+**AUDIO FILTERING RULE:**
+- The input stream contains ALL audio from the device.
+- **IGNORE** text that appears to be YOU (the candidate) speaking (e.g., "I worked on...", "My experience is...").
+- **ONLY RESPOND** to questions or comments directed AT you by the Interviewer.
+- If the input is just you talking or silence, output exactly: "..."
 `;
 
     // Convert history to meaningful dialogue
     const chatHistoryText = history
         .filter(m => m.role !== 'system')
-        .map(m => `Transcript: ${m.content}`)
+        .map(m => `${m.role === 'user' ? 'Interviewer (Transcript)' : 'Candidate (You)'}: ${m.content}`)
         .join('\n');
 
-    // EXPLICITLY frame the current query
     const fullPrompt = `
 ${chatHistoryText}
-Current Transcript Segment: ${userQuery}
 
-Instruction: If this is an Interviewer Question, provide the Answer as the Candidate. If this is the Candidate speaking/answering, output "...".
-Answer:
+Interviewer (Current Audio): ${userQuery}
+
+Task:
+- If this is the Interviewer asking a question, provide the Candidate's response based on the Knowledge Base.
+- If this is the Candidate speaking, output "..."
 `;
 
     try {
@@ -76,7 +82,7 @@ Answer:
         ],
         config: {
           systemInstruction: systemInstruction,
-          temperature: 0.7, // Slightly higher for more natural/human phrasing
+          temperature: 0.6, 
         }
       });
       
