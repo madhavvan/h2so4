@@ -35,10 +35,14 @@ export const useSpeechRecognition = ({
 
     try {
       // 1. Request System Audio via Screen Share
-      // Note: Video is required to get the prompt, but we will ignore the video track.
+      // We explicitly request audio options for high fidelity
       const stream = await navigator.mediaDevices.getDisplayMedia({ 
           video: true, 
-          audio: true 
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          }
       });
 
       // 2. Validate Audio Track
@@ -55,8 +59,9 @@ export const useSpeechRecognition = ({
       streamRef.current = stream;
 
       // 3. Connect to Deepgram WebSocket
-      // Using Nova-2 model for speed and accuracy
-      const socket = new WebSocket('wss://api.deepgram.com/v1/listen?tier=nova-2&smart_format=true&interim_results=true&encoding=linear16&sample_rate=48000', [
+      // REMOVED encoding=linear16&sample_rate=48000 because MediaRecorder sends WebM/MP4 containers.
+      // Deepgram will auto-detect the container format from the stream.
+      const socket = new WebSocket('wss://api.deepgram.com/v1/listen?tier=nova-2&smart_format=true&interim_results=true', [
          'token',
          apiKey
       ]);
@@ -66,15 +71,11 @@ export const useSpeechRecognition = ({
          setIsListening(true);
          
          // 4. Start Recording & Streaming
-         // We use MediaRecorder to get chunks. Deepgram supports raw or containerized audio.
-         // Simpler to just send the MediaRecorder blob chunks.
-         // Note: For lowest latency, we'd use AudioContext and ScriptProcessor/AudioWorklet to send raw PCM,
-         // but MediaRecorder with small timeslice is robust and compatible.
-         
-         // However, Deepgram WebSocket with 'encoding=webm' (default if not specified) works well with MediaRecorder.
-         // Let's rely on browser default mime type or force webm.
+         // Detect supported mimeType
          let mimeType = 'audio/webm';
-         if (!MediaRecorder.isTypeSupported(mimeType)) {
+         if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+             mimeType = 'audio/webm;codecs=opus';
+         } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
              mimeType = 'audio/mp4'; // Safari fallback
          }
          
@@ -104,14 +105,15 @@ export const useSpeechRecognition = ({
           }
       };
 
-      socket.onclose = () => {
-         console.log('Deepgram Closed');
-         stopListening(); // Ensure cleanup
+      socket.onclose = (event) => {
+         console.log('Deepgram Closed', event.code, event.reason);
+         setIsListening(false);
       };
 
       socket.onerror = (e) => {
           console.error("Deepgram Error", e);
           setError("Transcription Connection Error");
+          stopListening();
       };
       
       socketRef.current = socket;
@@ -125,7 +127,7 @@ export const useSpeechRecognition = ({
       console.error("Capture Error:", err);
       // 'NotAllowedError' means user cancelled the dialog
       if (err.name !== 'NotAllowedError') {
-          const msg = `Error: ${err.message || 'Could not start audio capture'}`;
+          const msg = `Capture Error: ${err.message || 'Could not start audio capture'}`;
           setError(msg);
           onError?.(msg);
       }
@@ -141,9 +143,10 @@ export const useSpeechRecognition = ({
     }
     
     // Close Socket
-    if (socketRef.current && socketRef.current.readyState === 1) {
-        // Send generic close frame
-        socketRef.current.close();
+    if (socketRef.current) {
+        if (socketRef.current.readyState === 1) {
+             socketRef.current.close();
+        }
     }
 
     // Stop all tracks (Video and Audio) to release the "Sharing" indicator

@@ -2,6 +2,7 @@
   "name": "Interview Copilot AI",
   "description": "A real-time AI interview assistant that listens to incoming questions, uses your resume and JD context, and drafts accurate responses using Gemini 3 Flash.",
   "requestFramePermissions": [
-    "microphone"
+    "microphone",
+    "display-capture"
   ]
 }
