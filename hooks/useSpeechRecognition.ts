@@ -26,7 +26,8 @@ export const useSpeechRecognition = ({
   const startListening = useCallback(async () => {
     setError(null);
 
-    if (!apiKey) {
+    const cleanKey = apiKey?.trim();
+    if (!cleanKey) {
         const msg = "Deepgram API Key missing. Check Settings.";
         setError(msg);
         onError?.(msg);
@@ -59,11 +60,10 @@ export const useSpeechRecognition = ({
       streamRef.current = stream;
 
       // 3. Connect to Deepgram WebSocket
-      // REMOVED encoding=linear16&sample_rate=48000 because MediaRecorder sends WebM/MP4 containers.
-      // Deepgram will auto-detect the container format from the stream.
-      const socket = new WebSocket('wss://api.deepgram.com/v1/listen?tier=nova-2&smart_format=true&interim_results=true', [
+      // Fixed: 'tier' param is deprecated/incorrect for model selection. Used 'model=nova-2'.
+      const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&punctuate=true', [
          'token',
-         apiKey
+         cleanKey
       ]);
 
       socket.onopen = () => {
@@ -79,6 +79,8 @@ export const useSpeechRecognition = ({
              mimeType = 'audio/mp4'; // Safari fallback
          }
          
+         console.log('Using MimeType:', mimeType);
+
          const mediaRecorder = new MediaRecorder(stream, { mimeType });
          mediaRecorderRef.current = mediaRecorder;
 
@@ -108,12 +110,25 @@ export const useSpeechRecognition = ({
       socket.onclose = (event) => {
          console.log('Deepgram Closed', event.code, event.reason);
          setIsListening(false);
+         if (event.code === 1006) {
+             // Abnormal closure often implies auth error or 400 Bad Request during handshake
+             // But usually on handshake fail we get onerror first.
+         }
       };
 
       socket.onerror = (e) => {
           console.error("Deepgram Error", e);
-          setError("Transcription Connection Error");
-          stopListening();
+          // If the socket isn't open yet, it's likely a connection/handshake error (Auth or Params)
+          if (socket.readyState !== 1) {
+               setError("Connection Error: Check API Key & Network.");
+          } else {
+               setError("Transcription Stream Error");
+          }
+          // We don't automatically stopListening here to allow potential recovery or manual stop, 
+          // but for handshake errors, we should probably cleanup.
+          if (socket.readyState === 3) { // CLOSED
+             stopListening();
+          }
       };
       
       socketRef.current = socket;
@@ -144,7 +159,7 @@ export const useSpeechRecognition = ({
     
     // Close Socket
     if (socketRef.current) {
-        if (socketRef.current.readyState === 1) {
+        if (socketRef.current.readyState === 1 || socketRef.current.readyState === 0) {
              socketRef.current.close();
         }
     }
