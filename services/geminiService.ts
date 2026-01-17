@@ -3,7 +3,8 @@ import { Message, ContextFile } from "../types";
 
 export class GeminiService {
   private ai: GoogleGenAI | null = null;
-  private modelName = "gemini-2.0-flash"; // Upgraded to 2.0 Flash for better multimodal (PDF/Image) support
+  // Updated to Gemini 3 Flash Preview as requested and per guidelines
+  private modelName = "gemini-3-flash-preview"; 
   private currentKey: string | null = null;
 
   constructor(apiKey?: string) {
@@ -76,7 +77,8 @@ ${modeInstruction}
 - The input stream contains ALL audio from the device.
 - **IGNORE** text that appears to be YOU (the candidate) speaking (e.g., "I worked on...", "My experience is...").
 - **ONLY RESPOND** to questions or comments directed AT you by the Interviewer.
-- If the input is just you talking or silence, output exactly: "..."
+- If the input is clearly just you talking to yourself or silence, output exactly: "..."
+- **WHEN IN DOUBT, ANSWER.** If it looks like a question or a topic starter, provide a response.
 `;
 
     // Convert history to meaningful dialogue

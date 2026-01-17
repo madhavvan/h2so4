@@ -21,7 +21,8 @@ export const useSpeechRecognition = ({
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const streamRef = useRef<MediaStream | null>(null); // Keeps the original Display Media stream (Video+Audio)
+  const audioStreamRef = useRef<MediaStream | null>(null); // Keeps the Audio-only stream
   
   const startListening = useCallback(async () => {
     setError(null);
@@ -36,7 +37,6 @@ export const useSpeechRecognition = ({
 
     try {
       // 1. Request System Audio via Screen Share
-      // We explicitly request audio options for high fidelity
       const stream = await navigator.mediaDevices.getDisplayMedia({ 
           video: true, 
           audio: {
@@ -49,7 +49,6 @@ export const useSpeechRecognition = ({
       // 2. Validate Audio Track
       const audioTracks = stream.getAudioTracks();
       if (audioTracks.length === 0) {
-          // User didn't check "Share Audio"
           stream.getTracks().forEach(t => t.stop());
           const msg = "No audio shared. Please check 'Share tab audio' in the popup.";
           setError(msg);
@@ -59,8 +58,12 @@ export const useSpeechRecognition = ({
 
       streamRef.current = stream;
 
+      // CRITICAL FIX: Create a new MediaStream with ONLY the audio track.
+      // Passing a stream with Video+Audio to a MediaRecorder set to 'audio/webm' causes NotSupportedError in Chrome.
+      const audioStream = new MediaStream(audioTracks);
+      audioStreamRef.current = audioStream;
+
       // 3. Connect to Deepgram WebSocket
-      // Fixed: 'tier' param is deprecated/incorrect for model selection. Used 'model=nova-2'.
       const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&punctuate=true', [
          'token',
          cleanKey
@@ -76,21 +79,28 @@ export const useSpeechRecognition = ({
          if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
              mimeType = 'audio/webm;codecs=opus';
          } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-             mimeType = 'audio/mp4'; // Safari fallback
+             mimeType = 'audio/mp4';
          }
          
          console.log('Using MimeType:', mimeType);
 
-         const mediaRecorder = new MediaRecorder(stream, { mimeType });
-         mediaRecorderRef.current = mediaRecorder;
+         try {
+             // Use the AUDIO-ONLY stream here
+             const mediaRecorder = new MediaRecorder(audioStream, { mimeType });
+             mediaRecorderRef.current = mediaRecorder;
 
-         mediaRecorder.addEventListener('dataavailable', (event) => {
-             if (event.data.size > 0 && socket.readyState === 1) {
-                 socket.send(event.data);
-             }
-         });
+             mediaRecorder.addEventListener('dataavailable', (event) => {
+                 if (event.data.size > 0 && socket.readyState === 1) {
+                     socket.send(event.data);
+                 }
+             });
 
-         mediaRecorder.start(250); // Send chunks every 250ms
+             mediaRecorder.start(250); // Send chunks every 250ms
+         } catch (recErr: any) {
+             console.error("MediaRecorder Start Error:", recErr);
+             setError(`Recorder Error: ${recErr.message}`);
+             stopListening();
+         }
       };
 
       socket.onmessage = (message) => {
@@ -110,30 +120,21 @@ export const useSpeechRecognition = ({
       socket.onclose = (event) => {
          console.log('Deepgram Closed', event.code, event.reason);
          setIsListening(false);
-         if (event.code === 1006) {
-             // Abnormal closure often implies auth error or 400 Bad Request during handshake
-             // But usually on handshake fail we get onerror first.
-         }
       };
 
       socket.onerror = (e) => {
           console.error("Deepgram Error", e);
-          // If the socket isn't open yet, it's likely a connection/handshake error (Auth or Params)
           if (socket.readyState !== 1) {
                setError("Connection Error: Check API Key & Network.");
           } else {
                setError("Transcription Stream Error");
-          }
-          // We don't automatically stopListening here to allow potential recovery or manual stop, 
-          // but for handshake errors, we should probably cleanup.
-          if (socket.readyState === 3) { // CLOSED
-             stopListening();
           }
       };
       
       socketRef.current = socket;
 
       // Handle user clicking "Stop Sharing" on the browser UI
+      // We listen to the video track ending because that's what controls the UI indicator
       stream.getVideoTracks()[0].onended = () => {
           stopListening();
       };
@@ -164,7 +165,13 @@ export const useSpeechRecognition = ({
         }
     }
 
-    // Stop all tracks (Video and Audio) to release the "Sharing" indicator
+    // Stop Audio-Only Stream Tracks
+    if (audioStreamRef.current) {
+        audioStreamRef.current.getTracks().forEach(track => track.stop());
+        audioStreamRef.current = null;
+    }
+
+    // Stop Original Display Stream Tracks (Video+Audio)
     if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
         streamRef.current = null;
