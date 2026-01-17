@@ -1,18 +1,22 @@
-
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Interview Copilot AI</title>
+    <!-- Favicon (CPU Icon Blue) -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%233b82f6%22 stroke-width=%222%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22><rect x=%224%22 y=%224%22 width=%2216%22 height=%2216%22 rx=%222%22/><rect x=%229%22 y=%229%22 width=%226%22 height=%226%22/><path d=%22M9 1v3%22/><path d=%22M15 1v3%22/><path d=%22M9 20v3%22/><path d=%22M15 20v3%22/><path d=%22M20 9h3%22/><path d=%22M20 14h3%22/><path d=%22M1 9h3%22/><path d=%22M1 14h3%22/></svg>">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
+        darkMode: 'class',
         theme: {
           extend: {
             colors: {
-              background: '#09090b',
-              surface: '#18181b',
+              background: 'var(--bg-color)',
+              surface: 'var(--surface-color)',
+              border: 'var(--border-color)',
+              text: 'var(--text-color)',
               primary: '#3b82f6',
               accent: '#f59e0b',
             },
@@ -24,23 +28,41 @@
       }
     </script>
     <style>
+      :root {
+        /* Light Mode Defaults */
+        --bg-color: #f8fafc; /* Slate 50 */
+        --surface-color: #ffffff; /* White */
+        --border-color: #e2e8f0; /* Slate 200 */
+        --text-color: #0f172a; /* Slate 900 */
+      }
+
+      .dark {
+        /* Dark Mode Defaults */
+        --bg-color: #09090b; /* Zinc 950 */
+        --surface-color: #18181b; /* Zinc 900 */
+        --border-color: #27272a; /* Zinc 800 */
+        --text-color: #e4e4e7; /* Zinc 200 */
+      }
+
       /* Custom Scrollbar */
       ::-webkit-scrollbar {
         width: 8px;
+        height: 8px;
       }
       ::-webkit-scrollbar-track {
-        background: #18181b; 
+        background: var(--surface-color); 
       }
       ::-webkit-scrollbar-thumb {
-        background: #3f3f46; 
+        background: var(--border-color); 
         border-radius: 4px;
       }
       ::-webkit-scrollbar-thumb:hover {
-        background: #52525b; 
+        background: #71717a; 
       }
       body {
-        background-color: #09090b;
-        color: #e4e4e7;
+        background-color: var(--bg-color);
+        color: var(--text-color);
+        transition: background-color 0.3s, color 0.3s;
       }
     </style>
   <script type="importmap">

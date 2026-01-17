@@ -1,12 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-
-// Extend Window interface for Web Speech API support
-declare global {
-  interface Window {
-    SpeechRecognition: any;
-    webkitSpeechRecognition: any;
-  }
-}
+import { useState, useCallback, useRef } from 'react';
 
 interface SpeechResult {
   final: string;
@@ -16,128 +8,148 @@ interface SpeechResult {
 interface UseSpeechRecognitionProps {
   onResult: (result: SpeechResult) => void;
   onError?: (error: string) => void;
+  apiKey: string; // Deepgram API Key
 }
 
 export const useSpeechRecognition = ({ 
   onResult,
-  onError
+  onError,
+  apiKey
 }: UseSpeechRecognitionProps) => {
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   
-  const recognitionRef = useRef<any>(null);
-  const shouldBeListeningRef = useRef(false);
-
-  // Store callback in ref
-  const onResultRef = useRef(onResult);
-  const onErrorRef = useRef(onError);
-
-  useEffect(() => {
-    onResultRef.current = onResult;
-  }, [onResult]);
-
-  useEffect(() => {
-    onErrorRef.current = onError;
-  }, [onError]);
-
-  useEffect(() => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    
-    if (!SpeechRecognition) {
-      const msg = "Browser does not support Speech Recognition.";
-      setError(msg);
-      onErrorRef.current?.(msg);
-      return;
-    }
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1; // Limit alternatives to stabilize result
-    recognition.lang = 'en-US';
-
-    recognition.onstart = () => {
-      setIsListening(true);
-      setError(null);
-    };
-
-    recognition.onerror = (event: any) => {
-      // Ignore 'no-speech' as it just means silence
-      if (event.error === 'no-speech') return;
-
-      console.warn("Speech recognition error:", event.error);
-
-      // If it's a network error or aborted, we might want to restart if we should be listening
-      if (event.error === 'network' || event.error === 'aborted') {
-          if (shouldBeListeningRef.current) {
-             // Restart logic handled in onend
-          }
-      } else {
-         const msg = `Error: ${event.error}`;
-         setError(msg);
-         onErrorRef.current?.(msg);
-      }
-    };
-
-    recognition.onend = () => {
-      // Vital: If we expect to be listening, restart immediately.
-      // This creates the "Always On" effect.
-      if (shouldBeListeningRef.current) {
-        try {
-          recognition.start();
-        } catch (e) {
-            // Already started or busy
-        }
-      } else {
-        setIsListening(false);
-      }
-    };
-
-    recognition.onresult = (event: any) => {
-      let finalChunk = '';
-      let interimChunk = '';
-
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        if (event.results[i].isFinal) {
-          finalChunk += event.results[i][0].transcript;
-        } else {
-          interimChunk += event.results[i][0].transcript;
-        }
-      }
-
-      onResultRef.current({
-          final: finalChunk,
-          interim: interimChunk
-      });
-    };
-
-    recognitionRef.current = recognition;
-
-    return () => {
-      if (recognitionRef.current) {
-          recognitionRef.current.onend = null; // Prevent auto-restart on unmount
-          recognitionRef.current.stop();
-      }
-    };
-  }, []);
-
-  const startListening = useCallback(() => {
-    shouldBeListeningRef.current = true;
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  
+  const startListening = useCallback(async () => {
     setError(null);
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.start();
-      } catch (e) {
-        console.warn("Recognition already started");
+
+    if (!apiKey) {
+        const msg = "Deepgram API Key missing. Check Settings.";
+        setError(msg);
+        onError?.(msg);
+        return;
+    }
+
+    try {
+      // 1. Request System Audio via Screen Share
+      // Note: Video is required to get the prompt, but we will ignore the video track.
+      const stream = await navigator.mediaDevices.getDisplayMedia({ 
+          video: true, 
+          audio: true 
+      });
+
+      // 2. Validate Audio Track
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length === 0) {
+          // User didn't check "Share Audio"
+          stream.getTracks().forEach(t => t.stop());
+          const msg = "No audio shared. Please check 'Share tab audio' in the popup.";
+          setError(msg);
+          onError?.(msg);
+          return;
+      }
+
+      streamRef.current = stream;
+
+      // 3. Connect to Deepgram WebSocket
+      // Using Nova-2 model for speed and accuracy
+      const socket = new WebSocket('wss://api.deepgram.com/v1/listen?tier=nova-2&smart_format=true&interim_results=true&encoding=linear16&sample_rate=48000', [
+         'token',
+         apiKey
+      ]);
+
+      socket.onopen = () => {
+         console.log('Deepgram Connected');
+         setIsListening(true);
+         
+         // 4. Start Recording & Streaming
+         // We use MediaRecorder to get chunks. Deepgram supports raw or containerized audio.
+         // Simpler to just send the MediaRecorder blob chunks.
+         // Note: For lowest latency, we'd use AudioContext and ScriptProcessor/AudioWorklet to send raw PCM,
+         // but MediaRecorder with small timeslice is robust and compatible.
+         
+         // However, Deepgram WebSocket with 'encoding=webm' (default if not specified) works well with MediaRecorder.
+         // Let's rely on browser default mime type or force webm.
+         let mimeType = 'audio/webm';
+         if (!MediaRecorder.isTypeSupported(mimeType)) {
+             mimeType = 'audio/mp4'; // Safari fallback
+         }
+         
+         const mediaRecorder = new MediaRecorder(stream, { mimeType });
+         mediaRecorderRef.current = mediaRecorder;
+
+         mediaRecorder.addEventListener('dataavailable', (event) => {
+             if (event.data.size > 0 && socket.readyState === 1) {
+                 socket.send(event.data);
+             }
+         });
+
+         mediaRecorder.start(250); // Send chunks every 250ms
+      };
+
+      socket.onmessage = (message) => {
+          try {
+              const received = JSON.parse(message.data);
+              const transcript = received.channel?.alternatives?.[0]?.transcript;
+              if (transcript && received.is_final) {
+                 onResult({ final: transcript, interim: '' });
+              } else if (transcript) {
+                 onResult({ final: '', interim: transcript });
+              }
+          } catch (e) {
+              console.error("Deepgram Parse Error", e);
+          }
+      };
+
+      socket.onclose = () => {
+         console.log('Deepgram Closed');
+         stopListening(); // Ensure cleanup
+      };
+
+      socket.onerror = (e) => {
+          console.error("Deepgram Error", e);
+          setError("Transcription Connection Error");
+      };
+      
+      socketRef.current = socket;
+
+      // Handle user clicking "Stop Sharing" on the browser UI
+      stream.getVideoTracks()[0].onended = () => {
+          stopListening();
+      };
+
+    } catch (err: any) {
+      console.error("Capture Error:", err);
+      // 'NotAllowedError' means user cancelled the dialog
+      if (err.name !== 'NotAllowedError') {
+          const msg = `Error: ${err.message || 'Could not start audio capture'}`;
+          setError(msg);
+          onError?.(msg);
       }
     }
-  }, []);
+  }, [apiKey, onResult, onError]);
 
   const stopListening = useCallback(() => {
-    shouldBeListeningRef.current = false;
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-      // isListening will be set to false in onend
+    setIsListening(false);
+    
+    // Stop Recorder
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+    }
+    
+    // Close Socket
+    if (socketRef.current && socketRef.current.readyState === 1) {
+        // Send generic close frame
+        socketRef.current.close();
+    }
+
+    // Stop all tracks (Video and Audio) to release the "Sharing" indicator
+    if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
     }
   }, []);
 
