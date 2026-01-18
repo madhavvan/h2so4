@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Eye, EyeOff, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Eye, EyeOff, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus } from 'lucide-react';
 import { geminiService } from './services/geminiService';
+import { groqService } from './services/groqService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
-import { INITIAL_JD_TEXT, INITIAL_RESUME_TEXT } from './constants';
 import { Message, AppSettings, ContextFile } from './types';
 
 // Extend Window interface for PiP support
@@ -199,7 +199,7 @@ const ChatInterface = ({
                     {isProcessing && (
                     <div className="flex justify-start">
                         <div className="bg-surface border border-border rounded-2xl px-4 py-3 rounded-tl-sm flex items-center gap-2 text-gray-500 text-xs shadow-lg">
-                            <span className="font-semibold text-primary tracking-wider">THINKING</span>
+                            <span className="font-semibold text-primary tracking-wider">THINKING ({settings.selectedModel === 'groq' ? 'GROQ' : 'GEMINI'})</span>
                             <div className="flex gap-1">
                                 <div className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0ms'}}></div>
                                 <div className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '150ms'}}></div>
@@ -423,6 +423,9 @@ export default function App() {
   const [showContext, setShowContext] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   
+  // Local state for Quick Paste in Context Modal
+  const [pasteContent, setPasteContent] = useState("");
+  
   // PiP State
   const [isPipMode, setIsPipMode] = useState(false);
 
@@ -430,11 +433,11 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>({
     apiKey: localStorage.getItem("GEMINI_API_KEY") || "",
     deepgramApiKey: localStorage.getItem("DEEPGRAM_API_KEY") || "",
+    groqApiKey: localStorage.getItem("GROQ_API_KEY") || "",
+    selectedModel: (localStorage.getItem("SELECTED_MODEL") as 'gemini'|'groq') || 'gemini',
     autoSend: false, 
-    contextFiles: [
-      { id: '1', name: 'Placeholder Resume', content: INITIAL_RESUME_TEXT, type: 'resume' },
-      { id: '2', name: 'Placeholder JD', content: INITIAL_JD_TEXT, type: 'jd' }
-    ],
+    // Start with empty array - no placeholders
+    contextFiles: [],
     theme: (localStorage.getItem("THEME") as 'light'|'dark') || 'dark',
     fontSize: (localStorage.getItem("FONT_SIZE") as 'small'|'medium'|'large') || 'medium',
     generalMode: localStorage.getItem("GENERAL_MODE") === 'true' // Default false (Context Mode)
@@ -443,6 +446,8 @@ export default function App() {
   // Settings Modal Local State
   const [tempApiKey, setTempApiKey] = useState("");
   const [tempDeepgramKey, setTempDeepgramKey] = useState("");
+  const [tempGroqKey, setTempGroqKey] = useState("");
+  const [tempModel, setTempModel] = useState<'gemini'|'groq'>('gemini');
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved'>('idle');
 
   // Apply Theme to HTML root
@@ -466,9 +471,11 @@ export default function App() {
       if (showSettings) {
           setTempApiKey(settings.apiKey);
           setTempDeepgramKey(settings.deepgramApiKey);
+          setTempGroqKey(settings.groqApiKey);
+          setTempModel(settings.selectedModel);
           setSaveStatus('idle');
       }
-  }, [showSettings, settings.apiKey, settings.deepgramApiKey]);
+  }, [showSettings, settings.apiKey, settings.deepgramApiKey, settings.groqApiKey, settings.selectedModel]);
 
 
   // Scroll State
@@ -497,7 +504,10 @@ export default function App() {
     if (settings.apiKey) {
       geminiService.init(settings.apiKey);
     }
-  }, [settings.apiKey]);
+    if (settings.groqApiKey) {
+      groqService.init(settings.groqApiKey);
+    }
+  }, [settings.apiKey, settings.groqApiKey]);
 
   // Handle Auto-Scrolling
   useEffect(() => {
@@ -535,13 +545,25 @@ export default function App() {
   
       try {
         const currentSettings = settingsRef.current;
-        // Pass generalMode to service
-        const responseText = await geminiService.generateResponse(
-          userMsg.content,
-          messages, 
-          currentSettings.contextFiles,
-          currentSettings.generalMode
-        );
+        let responseText = "";
+
+        // Route request based on selected model
+        if (currentSettings.selectedModel === 'groq') {
+             responseText = await groqService.generateResponse(
+                userMsg.content,
+                messages,
+                currentSettings.contextFiles,
+                currentSettings.generalMode
+             );
+        } else {
+             // Default to Gemini
+             responseText = await geminiService.generateResponse(
+                userMsg.content,
+                messages, 
+                currentSettings.contextFiles,
+                currentSettings.generalMode
+             );
+        }
         
         if (responseText !== "Listening...") {
             const aiMsg: Message = {
@@ -621,12 +643,24 @@ export default function App() {
     try {
         const historyForService = messages.filter(m => m.id !== lastUserMsg.id && m.role !== 'system');
         const currentSettings = settingsRef.current;
-        const responseText = await geminiService.generateResponse(
-            lastUserMsg.content,
-            historyForService,
-            currentSettings.contextFiles,
-            currentSettings.generalMode
-        );
+        let responseText = "";
+
+        if (currentSettings.selectedModel === 'groq') {
+            responseText = await groqService.generateResponse(
+                lastUserMsg.content,
+                historyForService,
+                currentSettings.contextFiles,
+                currentSettings.generalMode
+            );
+        } else {
+            responseText = await geminiService.generateResponse(
+                lastUserMsg.content,
+                historyForService,
+                currentSettings.contextFiles,
+                currentSettings.generalMode
+            );
+        }
+
         if (responseText !== "Listening...") {
             const aiMsg: Message = {
                 id: Date.now().toString(),
@@ -661,6 +695,18 @@ export default function App() {
     };
     reader.readAsDataURL(file);
   };
+  
+  const handleAddPasteText = () => {
+      if (!pasteContent.trim()) return;
+      const newFile: ContextFile = {
+          id: Date.now().toString(),
+          name: `Pasted Context ${settings.contextFiles.length + 1}`,
+          content: pasteContent,
+          type: 'custom'
+      };
+      setSettings(prev => ({ ...prev, contextFiles: [...prev.contextFiles, newFile] }));
+      setPasteContent("");
+  };
 
   const removeFile = (id: string) => {
     setSettings(prev => ({ ...prev, contextFiles: prev.contextFiles.filter(f => f.id !== id) }));
@@ -677,10 +723,18 @@ export default function App() {
   const saveSettings = () => {
       localStorage.setItem("GEMINI_API_KEY", tempApiKey);
       localStorage.setItem("DEEPGRAM_API_KEY", tempDeepgramKey);
+      localStorage.setItem("GROQ_API_KEY", tempGroqKey);
+      localStorage.setItem("SELECTED_MODEL", tempModel);
       localStorage.setItem("THEME", settings.theme);
       localStorage.setItem("FONT_SIZE", settings.fontSize);
       
-      setSettings(prev => ({ ...prev, apiKey: tempApiKey, deepgramApiKey: tempDeepgramKey }));
+      setSettings(prev => ({ 
+          ...prev, 
+          apiKey: tempApiKey, 
+          deepgramApiKey: tempDeepgramKey,
+          groqApiKey: tempGroqKey,
+          selectedModel: tempModel
+      }));
       setSaveStatus('saved');
       setTimeout(() => setSaveStatus('idle'), 2000);
   };
@@ -744,21 +798,95 @@ export default function App() {
       <Modal isOpen={showSettings} onClose={() => setShowSettings(false)} title="Settings">
          <div className="space-y-6">
             
+            {/* Model Selection */}
+            <div className="bg-surface/50 border border-border p-3 rounded-lg space-y-3">
+                <label className="text-sm font-bold text-text flex items-center gap-2">
+                    <Cpu size={16} /> AI Model Selection
+                </label>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <button
+                        onClick={() => setTempModel('gemini')}
+                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                            tempModel === 'gemini' 
+                            ? 'bg-blue-500/10 border-blue-500 shadow-sm' 
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+                        }`}
+                    >
+                        <div className="flex items-center justify-between w-full">
+                            <span className={`font-bold text-sm flex items-center gap-2 ${tempModel === 'gemini' ? 'text-blue-500' : 'text-text'}`}>
+                                <div className={`w-2 h-2 rounded-full ${tempModel === 'gemini' ? 'bg-blue-500' : 'bg-gray-400'}`}></div>
+                                Gemini 3 Flash
+                            </span>
+                            {tempModel === 'gemini' && <Check size={16} className="text-blue-500" />}
+                        </div>
+                        <p className="text-[11px] text-gray-500 leading-relaxed">
+                            Best for <strong>Multimodal</strong> tasks (PDFs, Images) and long context windows. Reliable all-rounder.
+                        </p>
+                    </button>
+
+                    <button
+                        onClick={() => setTempModel('groq')}
+                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                            tempModel === 'groq' 
+                            ? 'bg-orange-500/10 border-orange-500 shadow-sm' 
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+                        }`}
+                    >
+                        <div className="flex items-center justify-between w-full">
+                            <span className={`font-bold text-sm flex items-center gap-2 ${tempModel === 'groq' ? 'text-orange-500' : 'text-text'}`}>
+                                <div className={`w-2 h-2 rounded-full ${tempModel === 'groq' ? 'bg-orange-500' : 'bg-gray-400'}`}></div>
+                                Groq (Llama 4)
+                            </span>
+                            {tempModel === 'groq' && <Check size={16} className="text-orange-500" />}
+                        </div>
+                        <p className="text-[11px] text-gray-500 leading-relaxed">
+                            Best for <strong>Extreme Speed</strong> & Reasoning. Supports Text & Images (No PDFs).
+                        </p>
+                    </button>
+                </div>
+            </div>
+
             {/* API Key Section */}
             <div className="space-y-4">
                 <div className="space-y-1">
-                    <label className="text-sm font-medium text-text">Gemini API Key (Required)</label>
+                    <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-text">Gemini API Key {tempModel === 'gemini' && <span className="text-red-500">*</span>}</label>
+                        <a href="https://ai.google.dev/gemini-api/docs/api-key" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+                             Get Gemini API Key <ExternalLink size={10} />
+                        </a>
+                    </div>
                     <input 
                         type="password"
                         value={tempApiKey}
                         onChange={(e) => setTempApiKey(e.target.value)}
                         placeholder="Enter Gemini API Key"
-                        className="w-full bg-background border border-border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm"
+                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'gemini' && !tempApiKey ? 'border-red-500/50' : 'border-border'}`}
+                    />
+                </div>
+
+                <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-text">Groq API Key {tempModel === 'groq' && <span className="text-red-500">*</span>}</label>
+                        <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+                             Get Groq API Key <ExternalLink size={10} />
+                        </a>
+                    </div>
+                    <input 
+                        type="password"
+                        value={tempGroqKey}
+                        onChange={(e) => setTempGroqKey(e.target.value)}
+                        placeholder="Enter Groq API Key (gsk_...)"
+                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'groq' && !tempGroqKey ? 'border-red-500/50' : 'border-border'}`}
                     />
                 </div>
                 
-                <div className="space-y-1">
-                    <label className="text-sm font-medium text-text">Deepgram API Key (System Audio)</label>
+                <div className="space-y-1 pt-2 border-t border-border">
+                    <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-text">Deepgram API Key (System Audio)</label>
+                        <a href="https://console.deepgram.com/signup" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+                             Get Deepgram API Key <ExternalLink size={10} />
+                        </a>
+                    </div>
                     <input 
                         type="password"
                         value={tempDeepgramKey}
@@ -766,7 +894,6 @@ export default function App() {
                         placeholder="Enter Deepgram API Key"
                         className="w-full bg-background border border-border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm"
                     />
-                    <p className="text-xs text-gray-500">Used for transcribing system audio via Screen Share.</p>
                 </div>
 
                 <button 
@@ -859,7 +986,8 @@ export default function App() {
                     <div>
                          <h3 className="text-sm font-semibold text-text">How Context Works</h3>
                          <p className="text-xs text-gray-500 leading-relaxed mt-1">
-                             Upload your Resume and Job Description (JD) below. The Copilot uses these files to personalize answers.
+                             Upload your Resume and Job Description (JD). 
+                             Groq supports <strong>Text</strong> and <strong>Images</strong>. Gemini supports PDFs.
                          </p>
                     </div>
                 </div>
@@ -883,6 +1011,30 @@ export default function App() {
                  </button>
              </div>
 
+            {/* NEW: Paste Text Area */}
+            <div className="bg-background p-3 rounded-lg border border-border space-y-2">
+                <p className="text-sm font-medium text-text flex items-center gap-2">
+                    <Edit3 size={14} /> Quick Paste Context
+                </p>
+                <textarea 
+                    value={pasteContent}
+                    onChange={(e) => setPasteContent(e.target.value)}
+                    placeholder="Paste Resume or JD text here for Groq/Gemini..."
+                    className="w-full bg-surface border border-border rounded-lg p-2 text-sm text-text focus:outline-none focus:ring-1 focus:ring-primary h-24 max-h-48 custom-scrollbar resize-y"
+                />
+                <button 
+                    onClick={handleAddPasteText}
+                    disabled={!pasteContent.trim()}
+                    className={`w-full py-1.5 rounded-lg text-xs font-bold uppercase tracking-wider transition-all border ${
+                        pasteContent.trim() 
+                        ? 'bg-primary/10 text-primary border-primary/30 hover:bg-primary/20' 
+                        : 'bg-gray-500/5 text-gray-500 border-transparent cursor-not-allowed'
+                    }`}
+                >
+                    Add as Text Context
+                </button>
+            </div>
+
             {/* Upload Area */}
             <div className="flex justify-between items-center bg-background p-3 rounded-lg border border-border mt-2">
                 <div>
@@ -896,7 +1048,7 @@ export default function App() {
             </div>
 
             {/* File List */}
-            <div className="space-y-2 max-h-[50vh] overflow-y-auto pr-1 custom-scrollbar">
+            <div className="space-y-2 max-h-[40vh] overflow-y-auto pr-1 custom-scrollbar">
                 {settings.contextFiles.map((file) => (
                     <div key={file.id} className="bg-surface border border-border rounded-lg p-3 flex items-center justify-between group">
                         <div className="flex items-center gap-3 overflow-hidden">

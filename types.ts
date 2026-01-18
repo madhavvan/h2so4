@@ -7,7 +7,9 @@ export interface Message {
 
 export interface AppSettings {
   apiKey: string; // Gemini Key
-  deepgramApiKey: string; // New Deepgram Key
+  deepgramApiKey: string; // Deepgram Key
+  groqApiKey: string; // Groq Key
+  selectedModel: 'gemini' | 'groq'; // Model Selection
   autoSend: boolean;
   contextFiles: ContextFile[];
   theme: 'light' | 'dark';
