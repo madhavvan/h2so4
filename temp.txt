@@ -1,0 +1,251 @@
+1251:      <Modal isOpen={showSettings} onClose={() => setShowSettings(false)} title="Settings">
+1252-         <div className="space-y-6">
+1253-            
+1254-            {/* Model Selection */}
+1255-            <div className="bg-surface/50 border border-border p-3 rounded-lg space-y-3">
+1256-                <div className="flex items-center justify-between">
+1257-                    <label className="text-sm font-bold text-text flex items-center gap-2">
+1258-                        <Cpu size={16} /> AI Model Selection
+1259-                    </label>
+1260-                    <span className="text-[10px] text-green-400 font-medium bg-green-400/10 px-2 py-0.5 rounded-full border border-green-400/20">
+1261-                        For better experience choose GPT-5.4 Mini
+1262-                    </span>
+1263-                </div>
+1264-                <div className="flex flex-wrap gap-2">
+1265-                    <button
+1266-                        onClick={() => setTempModel('gemini')}
+1267-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
+1268-                            tempModel === 'gemini' 
+1269-                            ? 'bg-blue-500/10 border-blue-500 shadow-sm' 
+1270-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+1271-                        }`}
+1272-                    >
+1273-                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'gemini' ? 'bg-blue-500' : 'bg-gray-400'}`}></div>
+1274-                        <span className={`font-bold text-xs ${tempModel === 'gemini' ? 'text-blue-500' : 'text-text'}`}>
+1275-                            Gemini 3.1 Flash
+1276-                        </span>
+1277-                    </button>
+1278-
+1279-                    <button
+1280-                        onClick={() => setTempModel('groq')}
+1281-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
+1282-                            tempModel === 'groq' 
+1283-                            ? 'bg-orange-500/10 border-orange-500 shadow-sm' 
+1284-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+1285-                        }`}
+1286-                    >
+1287-                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'groq' ? 'bg-orange-500' : 'bg-gray-400'}`}></div>
+1288-                        <span className={`font-bold text-xs ${tempModel === 'groq' ? 'text-orange-500' : 'text-text'}`}>
+1289-                            Groq
+1290-                        </span>
+1291-                    </button>
+1292-
+1293-                    <button
+1294-                        onClick={() => setTempModel('openai')}
+1295-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
+1296-                            tempModel === 'openai' 
+1297-                            ? 'bg-green-500/10 border-green-500 shadow-sm' 
+1298-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+1299-                        }`}
+1300-                    >
+1301-                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'openai' ? 'bg-green-500' : 'bg-gray-400'}`}></div>
+1302-                        <span className={`font-bold text-xs ${tempModel === 'openai' ? 'text-green-500' : 'text-text'}`}>
+1303-                            GPT-5.4 Mini <span className="ml-1 text-[9px] bg-green-500 text-white px-1.5 py-0.5 rounded-full">Recommended</span>
+1304-                        </span>
+1305-                    </button>
+1306-
+1307-                    <button
+1308-                        onClick={() => setTempModel('xai')}
+1309-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
+1310-                            tempModel === 'xai' 
+1311-                            ? 'bg-gray-500/10 border-gray-500 shadow-sm' 
+1312-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+1313-                        }`}
+1314-                    >
+1315-                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'xai' ? 'bg-white' : 'bg-gray-400'}`}></div>
+1316-                        <span className={`font-bold text-xs ${tempModel === 'xai' ? 'text-text' : 'text-text'}`}>
+1317-                            Grok (xAI)
+1318-                        </span>
+1319-                    </button>
+1320-                </div>
+1321-            </div>
+1322-
+1323-            {/* API Key Section */}
+1324-            <div className="space-y-4">
+1325-                <div className="space-y-1">
+1326-                    <div className="flex items-center justify-between">
+1327-                        <label className="text-sm font-medium text-text">Gemini API Key {tempModel === 'gemini' && <span className="text-red-500">*</span>}</label>
+1328-                        <a href="https://ai.google.dev/gemini-api/docs/api-key" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+1329-                             Get Key <ExternalLink size={10} />
+1330-                        </a>
+1331-                    </div>
+1332-                    <input 
+1333-                        type="password"
+1334-                        value={tempApiKey}
+1335-                        onChange={(e) => setTempApiKey(e.target.value)}
+1336-                        placeholder="Enter Gemini API Key"
+1337-                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'gemini' && !tempApiKey ? 'border-red-500/50' : 'border-border'}`}
+1338-                    />
+1339-                </div>
+1340-
+1341-                <div className="space-y-1">
+1342-                    <div className="flex items-center justify-between">
+1343-                        <label className="text-sm font-medium text-text">Groq API Key {tempModel === 'groq' && <span className="text-red-500">*</span>}</label>
+1344-                        <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+1345-                             Get Key <ExternalLink size={10} />
+1346-                        </a>
+1347-                    </div>
+1348-                    <input 
+1349-                        type="password"
+1350-                        value={tempGroqKey}
+1351-                        onChange={(e) => setTempGroqKey(e.target.value)}
+1352-                        placeholder="Enter Groq API Key (gsk_...)"
+1353-                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'groq' && !tempGroqKey ? 'border-red-500/50' : 'border-border'}`}
+1354-                    />
+1355-                </div>
+1356-
+1357-                <div className="space-y-1">
+1358-                    <div className="flex items-center justify-between">
+1359-                        <label className="text-sm font-medium text-text">OpenAI API Key {tempModel === 'openai' && <span className="text-red-500">*</span>}</label>
+1360-                        <a href="https://platform.openai.com/settings/organization/api-keys" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+1361-                             Get Key <ExternalLink size={10} />
+1362-                        </a>
+1363-                    </div>
+1364-                    <input 
+1365-                        type="password"
+1366-                        value={tempOpenAIKey}
+1367-                        onChange={(e) => setTempOpenAIKey(e.target.value)}
+1368-                        placeholder="Enter OpenAI API Key (sk-...)"
+1369-                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'openai' && !tempOpenAIKey ? 'border-red-500/50' : 'border-border'}`}
+1370-                    />
+1371-                </div>
+1372-
+1373-                <div className="space-y-1">
+1374-                    <div className="flex items-center justify-between">
+1375-                        <label className="text-sm font-medium text-text">xAI (Grok) API Key {tempModel === 'xai' && <span className="text-red-500">*</span>}</label>
+1376-                        <a href="https://console.x.ai/home" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+1377-                             Get Key <ExternalLink size={10} />
+1378-                        </a>
+1379-                    </div>
+1380-                    <input 
+1381-                        type="password"
+1382-                        value={tempXaiKey}
+1383-                        onChange={(e) => setTempXaiKey(e.target.value)}
+1384-                        placeholder="Enter xAI API Key (xai-...)"
+1385-                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'xai' && !tempXaiKey ? 'border-red-500/50' : 'border-border'}`}
+1386-                    />
+1387-                </div>
+1388-                
+1389-                <div className="space-y-1 pt-2 border-t border-border">
+1390-                    <div className="flex items-center justify-between">
+1391-                        <label className="text-sm font-medium text-text">Deepgram API Key (System Audio)</label>
+1392-                        <a href="https://console.deepgram.com/signup" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+1393-                             Get Key <ExternalLink size={10} />
+1394-                        </a>
+1395-                    </div>
+1396-                    <input 
+1397-                        type="password"
+1398-                        value={tempDeepgramKey}
+1399-                        onChange={(e) => setTempDeepgramKey(e.target.value)}
+1400-                        placeholder="Enter Deepgram API Key"
+1401-                        className="w-full bg-background border border-border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm"
+1402-                    />
+1403-                </div>
+1404-
+1405-                <button 
+1406-                    onClick={saveSettings}
+1407-                    className={`w-full px-4 py-2 rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-all ${
+1408-                        saveStatus === 'saved' 
+1409-                        ? 'bg-green-500 text-white' 
+1410-                        : 'bg-primary text-white hover:bg-blue-600'
+1411-                    }`}
+1412-                >
+1413-                    {saveStatus === 'saved' ? <Check size={16} /> : <Save size={16} />}
+1414-                    {saveStatus === 'saved' ? 'Settings Saved' : 'Save Settings'}
+1415-                </button>
+1416-            </div>
+1417-
+1418-            <div className="border-t border-border pt-4 space-y-4">
+1419-                {/* Theme Toggle */}
+1420-                <div className="flex items-center justify-between">
+1421-                    <span className="text-sm font-medium text-text">App Theme</span>
+1422-                    <div className="flex items-center bg-background border border-border rounded-lg p-1">
+1423-                        <button 
+1424-                            onClick={() => setSettings(s => ({...s, theme: 'light'}))}
+1425-                            className={`p-2 rounded-md transition-all ${settings.theme === 'light' ? 'bg-white shadow text-black' : 'text-gray-400 hover:text-gray-200'}`}
+1426-                        >
+1427-                            <Sun size={16} />
+1428-                        </button>
+1429-                        <button 
+1430-                            onClick={() => setSettings(s => ({...s, theme: 'dark'}))}
+1431-                            className={`p-2 rounded-md transition-all ${settings.theme === 'dark' ? 'bg-gray-700 shadow text-white' : 'text-gray-400 hover:text-gray-600'}`}
+1432-                        >
+1433-                            <Moon size={16} />
+1434-                        </button>
+1435-                    </div>
+1436-                </div>
+1437-
+1438-                {/* Font Size Toggle */}
+1439-                <div className="flex items-center justify-between">
+1440-                    <span className="text-sm font-medium text-text">Text Size</span>
+1441-                    <div className="flex items-center gap-2">
+1442-                        {(['small', 'medium', 'large'] as const).map((size) => (
+1443-                            <button
+1444-                                key={size}
+1445-                                onClick={() => setSettings(s => ({...s, fontSize: size}))}
+1446-                                className={`px-3 py-1.5 rounded-md text-xs font-medium border transition-all ${
+1447-                                    settings.fontSize === size 
+1448-                                    ? 'bg-primary text-white border-primary' 
+1449-                                    : 'bg-transparent text-gray-500 border-border hover:border-gray-400'
+1450-                                }`}
+1451-                            >
+1452-                                {size.charAt(0).toUpperCase() + size.slice(1)}
+1453-                            </button>
+1454-                        ))}
+1455-                    </div>
+1456-                </div>
+1457-            </div>
+1458-
+1459-         </div>
+1460-      </Modal>
+1461-
+1462-      {/* --- Context Files Modal --- */}
+1463-      <Modal isOpen={showContext} onClose={() => setShowContext(false)} title="Knowledge Base">
+1464-        <div className="space-y-6">
+1465-           {/* Info Banner */}
+1466-           <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-3">
+1467-               <div className="flex items-start gap-3">
+1468-                   <Info size={18} className="text-blue-500 mt-0.5" />
+1469-                   <div className="text-xs text-blue-200/80 leading-relaxed">
+1470-                       <strong className="text-blue-400 block mb-1">How Context Works</strong>
+1471-                       Files uploaded here are sent to the AI with every message. 
+1472-                       Use "Context Mode" to force the AI to rely on these files.
+1473-                   </div>
+1474-               </div>
+1475-           </div>
+1476-
+1477-           {/* File List */}
+1478-           <div className="space-y-3">
+1479-               <div className="flex items-center justify-between">
+1480-                   <h3 className="text-sm font-bold text-text">Attached Files ({settings.contextFiles.length})</h3>
+1481-                   <button onClick={triggerFileUpload} className="text-xs flex items-center gap-1 text-primary hover:underline">
+1482-                       <Plus size={12} /> Add File
+1483-                   </button>
+1484-                   {/* HIDDEN INPUT */}
+1485-                   <input 
+1486-                       type="file" 
+1487-                       ref={fileInputRef} 
+1488-                       className="hidden"
+1489-                       onChange={handleFileUpload}
+1490-                       accept=".pdf,.txt,.md,.json,.js,.ts,.py,.html,.css,.csv,.png,.jpg,.jpeg"
+1491-                   />
+1492-               </div>
+1493-               
+1494-               <div className="space-y-2 max-h-[200px] overflow-y-auto custom-scrollbar pr-1">
+1495-                   {settings.contextFiles.length === 0 && (
+1496-                       <div className="text-center py-6 border border-dashed border-border rounded-xl text-gray-500">
+1497-                           <FilePlus size={24} className="mx-auto mb-2 opacity-50" />
+1498-                           <p className="text-xs">No files added.</p>
+1499-                       </div>
+1500-                   )}
+1501-                   {settings.contextFiles.map(file => (

@@ -158,8 +158,27 @@ const ChatInterface = ({
                 <div className="popup-header" id="dragHandle">
                     <div className="avatar">✦</div>
                     <div className="header-info">
-                        <h4>Aura AI</h4>
+                        <h4>minico</h4>
                         <span><span className="dot"></span> Online — ready to help</span>
+                    </div>
+                    <div className="ml-auto flex items-center gap-2">
+                        <select 
+                            value={settings.selectedModel}
+                            onChange={handleModelChange}
+                            className="bg-white/10 border border-white/20 text-white text-xs rounded-md px-2 py-1 outline-none focus:border-blue-400 appearance-none cursor-pointer"
+                        >
+                            <option value="gemini" className="text-black">Gemini 3.1</option>
+                            <option value="groq" className="text-black">Groq</option>
+                            <option value="openai" className="text-black">GPT-5.4 Mini</option>
+                            <option value="xai" className="text-black">Grok</option>
+                        </select>
+                        <button 
+                            onClick={onOpenSettings}
+                            className="p-1.5 rounded-md bg-white/10 border border-white/20 text-white hover:bg-white/20 transition-colors"
+                            title="Settings"
+                        >
+                            <Settings size={14} />
+                        </button>
                     </div>
                 </div>
 
@@ -186,7 +205,7 @@ const ChatInterface = ({
 
                     {messages.map((msg: Message) => (
                         <div key={msg.id} className={`msg ${msg.role === 'user' ? 'user' : 'ai'}`}>
-                            <span className="msg-name">{msg.role === 'user' ? 'You' : 'Aura'}</span>
+                            <span className="msg-name">{msg.role === 'user' ? 'You' : 'minico'}</span>
                             <div className="bubble">
                                 <MessageRenderer content={msg.content} fontSize={settings.fontSize} />
                             </div>
@@ -196,7 +215,7 @@ const ChatInterface = ({
 
                     {isProcessing && (
                         <div className="msg ai" id="typing">
-                            <span className="msg-name">Aura</span>
+                            <span className="msg-name">minico</span>
                             <div className="bubble typing-bubble">
                                 <span className="typing-dot"></span>
                                 <span className="typing-dot"></span>
@@ -1234,76 +1253,69 @@ export default function App() {
             
             {/* Model Selection */}
             <div className="bg-surface/50 border border-border p-3 rounded-lg space-y-3">
-                <label className="text-sm font-bold text-text flex items-center gap-2">
-                    <Cpu size={16} /> AI Model Selection
-                </label>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="flex items-center justify-between">
+                    <label className="text-sm font-bold text-text flex items-center gap-2">
+                        <Cpu size={16} /> AI Model Selection
+                    </label>
+                    <span className="text-[10px] text-green-400 font-medium bg-green-400/10 px-2 py-0.5 rounded-full border border-green-400/20">
+                        For better experience choose GPT-5.4 Mini
+                    </span>
+                </div>
+                <div className="flex flex-wrap gap-2">
                     <button
                         onClick={() => setTempModel('gemini')}
-                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
                             tempModel === 'gemini' 
                             ? 'bg-blue-500/10 border-blue-500 shadow-sm' 
                             : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
                         }`}
                     >
-                        <div className="flex items-center justify-between w-full">
-                            <span className={`font-bold text-xs flex items-center gap-2 ${tempModel === 'gemini' ? 'text-blue-500' : 'text-text'}`}>
-                                <div className={`w-2 h-2 rounded-full ${tempModel === 'gemini' ? 'bg-blue-500' : 'bg-gray-400'}`}></div>
-                                Gemini 3.1 Flash
-                            </span>
-                            {tempModel === 'gemini' && <Check size={14} className="text-blue-500" />}
-                        </div>
+                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'gemini' ? 'bg-blue-500' : 'bg-gray-400'}`}></div>
+                        <span className={`font-bold text-xs ${tempModel === 'gemini' ? 'text-blue-500' : 'text-text'}`}>
+                            Gemini 3.1 Flash
+                        </span>
                     </button>
 
                     <button
                         onClick={() => setTempModel('groq')}
-                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
                             tempModel === 'groq' 
                             ? 'bg-orange-500/10 border-orange-500 shadow-sm' 
                             : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
                         }`}
                     >
-                        <div className="flex items-center justify-between w-full">
-                            <span className={`font-bold text-xs flex items-center gap-2 ${tempModel === 'groq' ? 'text-orange-500' : 'text-text'}`}>
-                                <div className={`w-2 h-2 rounded-full ${tempModel === 'groq' ? 'bg-orange-500' : 'bg-gray-400'}`}></div>
-                                Groq
-                            </span>
-                            {tempModel === 'groq' && <Check size={14} className="text-orange-500" />}
-                        </div>
+                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'groq' ? 'bg-orange-500' : 'bg-gray-400'}`}></div>
+                        <span className={`font-bold text-xs ${tempModel === 'groq' ? 'text-orange-500' : 'text-text'}`}>
+                            Groq
+                        </span>
                     </button>
 
                     <button
                         onClick={() => setTempModel('openai')}
-                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
                             tempModel === 'openai' 
                             ? 'bg-green-500/10 border-green-500 shadow-sm' 
                             : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
                         }`}
                     >
-                        <div className="flex items-center justify-between w-full">
-                            <span className={`font-bold text-xs flex items-center gap-2 ${tempModel === 'openai' ? 'text-green-500' : 'text-text'}`}>
-                                <div className={`w-2 h-2 rounded-full ${tempModel === 'openai' ? 'bg-green-500' : 'bg-gray-400'}`}></div>
-                                GPT-5.4 Mini
-                            </span>
-                            {tempModel === 'openai' && <Check size={14} className="text-green-500" />}
-                        </div>
+                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'openai' ? 'bg-green-500' : 'bg-gray-400'}`}></div>
+                        <span className={`font-bold text-xs ${tempModel === 'openai' ? 'text-green-500' : 'text-text'}`}>
+                            GPT-5.4 Mini <span className="ml-1 text-[9px] bg-green-500 text-white px-1.5 py-0.5 rounded-full">Recommended</span>
+                        </span>
                     </button>
 
                     <button
                         onClick={() => setTempModel('xai')}
-                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
                             tempModel === 'xai' 
                             ? 'bg-gray-500/10 border-gray-500 shadow-sm' 
                             : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
                         }`}
                     >
-                        <div className="flex items-center justify-between w-full">
-                            <span className={`font-bold text-xs flex items-center gap-2 ${tempModel === 'xai' ? 'text-text' : 'text-text'}`}>
-                                <div className={`w-2 h-2 rounded-full ${tempModel === 'xai' ? 'bg-white' : 'bg-gray-400'}`}></div>
-                                Grok (xAI)
-                            </span>
-                            {tempModel === 'xai' && <Check size={14} className="text-gray-500" />}
-                        </div>
+                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'xai' ? 'bg-white' : 'bg-gray-400'}`}></div>
+                        <span className={`font-bold text-xs ${tempModel === 'xai' ? 'text-text' : 'text-text'}`}>
+                            Grok (xAI)
+                        </span>
                     </button>
                 </div>
             </div>
