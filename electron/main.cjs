@@ -1,29 +1,53 @@
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 
+let mainWindow = null;
+
 function createWindow() {
-  const win = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 450,
     height: 700,
-    alwaysOnTop: true, // Keeps it above other windows
+    alwaysOnTop: true,
+    // --- TRANSPARENCY ---
+    transparent: true,
+    frame: false,               
+    hasShadow: false,           
+    backgroundColor: '#00000000', 
+    // --- END TRANSPARENCY ---
     webPreferences: {
       nodeIntegration: true,
-      contextIsolation: false
+      contextIsolation: false,
+    },
+    roundedCorners: true,
+    resizable: true,
+    minWidth: 380,
+    minHeight: 500,
+  });
+
+  
+  mainWindow.setContentProtection(true);
+
+  // IPC: Allow renderer to toggle click-through on transparent areas
+  ipcMain.on('set-ignore-mouse', (_event, ignore) => {
+    if (mainWindow) {
+      mainWindow.setIgnoreMouseEvents(ignore, { forward: true });
     }
   });
 
-  // THIS IS THE MAGIC LINE TO HIDE FROM SCREEN SHARE
-  // It prevents the window content from being captured by screen recording apps
-  // like Zoom, Google Meet, Teams, etc.
-  win.setContentProtection(true);
+  // IPC: Allow renderer to set always-on-top level
+  ipcMain.on('set-always-on-top', (_event, flag) => {
+    if (mainWindow) {
+      mainWindow.setAlwaysOnTop(flag, 'floating');
+    }
+  });
 
   // Load the app
   const isDev = !app.isPackaged;
-  
+
   if (isDev) {
-    win.loadURL('http://localhost:3000');
+    mainWindow.loadURL('http://localhost:3000');
   } else {
-    win.loadFile(path.join(__dirname, '../dist/index.html'));
+    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 }
 

@@ -147,17 +147,24 @@ const ChatInterface = ({
     };
 
     if (isPipMode) {
+        // Detect Electron for window controls
+        const inElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+
         return (
-            <div className="popup open">
+            <div className="popup open" style={inElectron ? { background: 'transparent' } : undefined}>
                 <div className="bg-layer"></div>
                 
-                <div className="popup-header" id="dragHandle">
+                <div 
+                    className="popup-header" 
+                    id="dragHandle"
+                    style={inElectron ? { WebkitAppRegion: 'drag' } as any : undefined}
+                >
                     <div className="avatar">✦</div>
                     <div className="header-info">
                         <h4>minico</h4>
                         <span><span className="dot"></span> Online — ready to help</span>
                     </div>
-                    <div className="ml-auto flex items-center gap-2">
+                    <div className="ml-auto flex items-center gap-2" style={inElectron ? { WebkitAppRegion: 'no-drag' } as any : undefined}>
                         <select 
                             value={settings.selectedModel}
                             onChange={handleModelChange}
@@ -185,6 +192,33 @@ const ChatInterface = ({
                         >
                             <Settings size={14} strokeWidth={1.5} />
                         </button>
+                        {/* Electron window controls — minimize & close */}
+                        {inElectron && (
+                            <>
+                                <button
+                                    onClick={() => {
+                                        const { remote } = require('electron') as any;
+                                        remote?.getCurrentWindow?.()?.minimize?.();
+                                    }}
+                                    className="p-1.5 rounded-md transition-colors hover:bg-white/10"
+                                    title="Minimize"
+                                    style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
+                                >
+                                    <span style={{ fontSize: '14px', lineHeight: 1 }}>—</span>
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        const w = window as any;
+                                        w.close?.();
+                                    }}
+                                    className="p-1.5 rounded-md transition-colors hover:bg-red-500/20"
+                                    title="Close"
+                                    style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
+                                >
+                                    <X size={14} strokeWidth={1.5} />
+                                </button>
+                            </>
+                        )}
                     </div>
                 </div>
 
@@ -578,14 +612,13 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
                 };
                 pipWindow.document.head.appendChild(twScript);
 
-                // Inject CSS Vars — fully transparent PiP window
+                // Inject CSS Vars
                  const style = pipWindow.document.createElement('style');
                 style.textContent = `
-                 :root { --bg-color: transparent; --surface-color: transparent; --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
-                 .dark { --bg-color: transparent; --surface-color: transparent; --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
-                 body { background-color: transparent !important; color: var(--text-color); }
-                 .pip-body { background: transparent !important; }
-                 html { background: transparent !important; }
+                 :root { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
+                 .dark { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
+                 body { background-color: var(--bg-color); color: var(--text-color); }
+                 .pip-body { background: #000000; }
                 `;
                 pipWindow.document.head.appendChild(style);
 
@@ -642,6 +675,21 @@ export default function App() {
   
   // PiP State
   const [isPipMode, setIsPipMode] = useState(false);
+
+  // Detect Electron environment
+  const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+
+  // In Electron: auto-enter PiP mode + set transparent background on html
+  useEffect(() => {
+    if (isElectron) {
+      setIsPipMode(true);
+      document.documentElement.classList.add('electron-transparent');
+      document.body.style.background = 'transparent';
+    }
+    return () => {
+      document.documentElement.classList.remove('electron-transparent');
+    };
+  }, [isElectron]);
 
   // Settings State
   const [settings, setSettings] = useState<AppSettings>({
@@ -1209,13 +1257,23 @@ export default function App() {
     onOpenHelp: () => setShowHelp(true),
     onOpenDownload: () => setShowDownloadModal(true),
     isPipMode,
-    togglePip: () => setIsPipMode(true)
+    togglePip: () => setIsPipMode(true),
+    isElectron
   };
 
   return (
-    <div className={`h-[100dvh] flex flex-col font-sans overflow-hidden transition-colors duration-300 ${settings.theme === 'dark' ? 'dark bg-[#09090b]' : 'bg-slate-50'}`}>
+    <div className={`h-[100dvh] flex flex-col font-sans overflow-hidden transition-colors duration-300 ${
+      isElectron 
+        ? '' /* Fully transparent in Electron — no background at all */
+        : settings.theme === 'dark' ? 'dark bg-[#09090b]' : 'bg-slate-50'
+    }`}
+    style={isElectron ? { background: 'transparent' } : undefined}
+    >
         {/* Main Content Area */}
         {!isPipMode ? (
+            <ChatInterface {...sharedProps} />
+        ) : isElectron ? (
+            /* ELECTRON: Render PiP UI directly in the transparent window — no portal needed */
             <ChatInterface {...sharedProps} />
         ) : (
             <div className="flex-1 flex flex-col items-center justify-center p-8 bg-surface/50 text-center space-y-6 animate-in fade-in">
@@ -1246,8 +1304,8 @@ export default function App() {
             </div>
         )}
 
-        {/* PiP Portal */}
-        {isPipMode && (
+        {/* PiP Portal — only used in web browser, NOT in Electron */}
+        {isPipMode && !isElectron && (
             <PiPWindow onClose={() => setIsPipMode(false)}>
                 <ChatInterface {...sharedProps} />
             </PiPWindow>
