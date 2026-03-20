@@ -150,10 +150,6 @@ const ChatInterface = ({
         return (
             <div className="popup open">
                 <div className="bg-layer"></div>
-                <div className="orb orb1"></div>
-                <div className="orb orb2"></div>
-                <div className="orb orb3"></div>
-                <div className="grid-overlay"></div>
                 
                 <div className="popup-header" id="dragHandle">
                     <div className="avatar">✦</div>
@@ -165,7 +161,12 @@ const ChatInterface = ({
                         <select 
                             value={settings.selectedModel}
                             onChange={handleModelChange}
-                            className="bg-white/10 border border-white/20 text-white text-xs rounded-md px-2 py-1 outline-none focus:border-blue-400 appearance-none cursor-pointer"
+                            className="text-xs rounded-md px-2 py-1 outline-none cursor-pointer"
+                            style={{ 
+                                background: 'var(--bubble-user)', 
+                                border: '1px solid var(--glass-border)',
+                                color: 'var(--text-main)' 
+                            }}
                         >
                             <option value="gemini" className="text-black">Gemini 3.1</option>
                             <option value="groq" className="text-black">Groq</option>
@@ -174,10 +175,15 @@ const ChatInterface = ({
                         </select>
                         <button 
                             onClick={onOpenSettings}
-                            className="p-1.5 rounded-md bg-white/10 border border-white/20 text-white hover:bg-white/20 transition-colors"
+                            className="p-1.5 rounded-md transition-colors"
                             title="Settings"
+                            style={{ 
+                                background: 'var(--bubble-user)', 
+                                border: '1px solid var(--glass-border)',
+                                color: 'var(--text-main)' 
+                            }}
                         >
-                            <Settings size={14} />
+                            <Settings size={14} strokeWidth={1.5} />
                         </button>
                     </div>
                 </div>
@@ -189,14 +195,14 @@ const ChatInterface = ({
                     onScroll={handleScroll}
                 >
                     {messages.length === 0 && (
-                        <div className="flex flex-col items-center justify-center h-full text-white/60 space-y-4 opacity-80 mt-10">
-                            <div className="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center relative ring-1 ring-white/20">
-                                {isListening ? <ScreenShare size={24} className="text-red-400 animate-pulse" /> : <ScreenShareOff size={24} className="text-white/50" />}
-                                {settings.autoSend && <div className="absolute top-0 right-0 w-3 h-3 bg-green-400 rounded-full border-2 border-[#060b1a] shadow-[0_0_10px_rgba(74,222,128,0.5)]"></div>}
+                        <div className="flex flex-col items-center justify-center h-full space-y-4 opacity-80 mt-10" style={{ color: 'var(--text-muted)' }}>
+                            <div className="w-16 h-16 rounded-full flex items-center justify-center relative border border-current" style={{ background: 'var(--bubble-user)' }}>
+                                {isListening ? <ScreenShare size={24} strokeWidth={1.5} className="animate-pulse" style={{ color: 'var(--text-main)' }} /> : <ScreenShareOff size={24} strokeWidth={1.5} />}
+                                {settings.autoSend && <div className="absolute top-0 right-0 w-3 h-3 rounded-full border-2" style={{ background: 'var(--text-main)', borderColor: 'var(--glass-bg)' }}></div>}
                             </div>
                             <div className="text-center px-4">
-                                <p className="font-medium text-white mb-1 text-sm">System Audio Copilot</p>
-                                <p className="text-xs leading-relaxed max-w-xs mx-auto text-white/50">
+                                <p className="font-medium mb-1 text-sm" style={{ color: 'var(--text-main)' }}>System Audio Copilot</p>
+                                <p className="text-xs leading-relaxed max-w-xs mx-auto">
                                     Click the Mic button to share your screen tab.
                                 </p>
                             </div>
@@ -255,7 +261,7 @@ const ChatInterface = ({
                         disabled={!inputText.trim() || isProcessing}
                         style={{ opacity: (!inputText.trim() || isProcessing) ? 0.5 : 1 }}
                     >
-                        <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+                        <Send size={18} strokeWidth={1.5} />
                     </button>
                     
                     <button 
@@ -264,9 +270,9 @@ const ChatInterface = ({
                         onClick={handleAutoSolve}
                         disabled={isProcessing}
                         title="Auto-Solve Screen"
-                        style={{ opacity: isProcessing ? 0.5 : 1, background: 'linear-gradient(135deg, #f7c56e, #f76e6e)' }}
+                        style={{ opacity: isProcessing ? 0.5 : 1 }}
                     >
-                        <Wand2 size={18} className="text-[#060b1a]" />
+                        <Wand2 size={18} strokeWidth={1.5} />
                     </button>
 
                     <button 
@@ -274,9 +280,9 @@ const ChatInterface = ({
                         aria-label="Toggle Mic"
                         onClick={isListening ? stopListening : startListening}
                         title={isListening ? "Stop Listening" : "Start Listening"}
-                        style={{ opacity: 1, background: isListening ? 'linear-gradient(135deg, #f76e6e, #f76e6e)' : 'linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05))', border: '1px solid rgba(255,255,255,0.2)' }}
+                        style={{ opacity: 1, background: isListening ? 'var(--text-main)' : 'var(--bubble-user)' }}
                     >
-                        {isListening ? <MicOff size={18} className="text-[#060b1a]" /> : <Mic size={18} className="text-white" />}
+                        {isListening ? <MicOff size={18} strokeWidth={1.5} style={{ color: 'var(--glass-bg)', stroke: 'var(--glass-bg)' }} /> : <Mic size={18} strokeWidth={1.5} />}
                     </button>
                 </div>
             </div>
