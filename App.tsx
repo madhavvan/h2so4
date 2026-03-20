@@ -1,0 +1,1635 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { geminiService } from './services/geminiService';
+import { groqService } from './services/groqService';
+import { openaiService } from './services/openaiService';
+import { xaiService } from './services/xaiService';
+import { useSpeechRecognition } from './hooks/useSpeechRecognition';
+import { extractTextFromPdf } from './services/pdfService';
+import { Message, AppSettings, ContextFile } from './types';
+import './pip-styles.css';
+
+// Extend Window interface for PiP support
+// Moved to types.ts
+
+// --- Helper: Code Block Renderer ---
+
+const CodeBlock: React.FC<{ code: string; language: string }> = ({ code, language }) => {
+    const [copied, setCopied] = useState(false);
+
+    const handleCopy = () => {
+        navigator.clipboard.writeText(code);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    };
+
+    return (
+        <div className="my-3 rounded-lg overflow-hidden border border-gray-700/50 bg-black/20 backdrop-blur-sm shadow-lg">
+            <div className="flex items-center justify-between px-4 py-2 bg-black/40 border-b border-gray-700/50">
+                <span className="text-xs font-mono text-gray-400 lowercase">{language || 'code'}</span>
+                <button 
+                    onClick={handleCopy} 
+                    className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white transition-colors"
+                >
+                    {copied ? <Check size={12} className="text-green-400"/> : <Copy size={12} />}
+                    {copied ? "Copied" : "Copy"}
+                </button>
+            </div>
+            <div className="p-4 overflow-x-auto bg-transparent">
+                <SyntaxHighlighter
+                    language={language || 'text'}
+                    style={vscDarkPlus}
+                    customStyle={{ margin: 0, padding: 0, background: 'transparent' }}
+                    wrapLines={true}
+                >
+                    {code.trim()}
+                </SyntaxHighlighter>
+            </div>
+        </div>
+    );
+};
+
+const MessageRenderer = ({ content, fontSize }: { content: string, fontSize: string }) => {
+    // Font size mapping
+    const sizeClass = 
+        fontSize === 'small' ? 'prose-sm' : 
+        fontSize === 'large' ? 'prose-lg' : 
+        'prose-base';
+
+    return (
+        <div className={`markdown-body prose dark:prose-invert max-w-none ${sizeClass} prose-pre:bg-transparent prose-pre:p-0 prose-pre:m-0`}>
+            <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                    code({ node, inline, className, children, ...props }: any) {
+                        const match = /language-(\w+)/.exec(className || '');
+                        return !inline && match ? (
+                            <CodeBlock code={String(children).replace(/\n$/, '')} language={match[1]} />
+                        ) : (
+                            <code className="bg-gray-200 dark:bg-gray-800 rounded px-1 py-0.5 font-mono text-sm" {...props}>
+                                {children}
+                            </code>
+                        );
+                    }
+                }}
+            >
+                {content}
+            </ReactMarkdown>
+        </div>
+    );
+};
+
+// --- Components ---
+
+const Modal = ({ isOpen, onClose, title, children }: any) => {
+  if (!isOpen) return null;
+  return (
+    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
+      <div className="bg-surface border border-border rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col shadow-2xl overflow-hidden text-text">
+        <div className="p-4 border-b border-border flex justify-between items-center bg-gray-500/5">
+          <h2 className="text-lg font-bold flex items-center gap-2">{title}</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-primary transition-colors p-1 rounded-full hover:bg-gray-500/10">
+             <X size={20} />
+          </button>
+        </div>
+        <div className="p-4 overflow-y-auto custom-scrollbar flex-1">
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Extracted for re-use between Main Window and PiP Window
+const ChatInterface = ({ 
+    messages, 
+    settings, 
+    setSettings, // Added to allow model switching from main UI
+    isListening, 
+    isProcessing, 
+    inputText, 
+    setInputText, 
+    interimText, 
+    speechError, 
+    toggleAutoSend, 
+    startListening, 
+    stopListening, 
+    handleManualSend, 
+    handleAutoSolve,
+    handleClear, 
+    handleRegenerate,
+    chatContainerRef,
+    textareaRef,
+    handleScroll,
+    onOpenSettings,
+    onOpenContext,
+    onOpenHelp,
+    onOpenDownload,
+    isPipMode,
+    togglePip
+}: any) => {
+
+    const handleModelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+        const newModel = e.target.value as 'gemini' | 'groq' | 'openai' | 'xai';
+        // Immediate state update
+        const newSettings = {
+            ...settings,
+            selectedModel: newModel
+        };
+        setSettings(newSettings);
+        // Persist immediately
+        localStorage.setItem("SELECTED_MODEL", newModel);
+    };
+
+    if (isPipMode) {
+        return (
+            <div className="popup open">
+                <div className="bg-layer"></div>
+                <div className="orb orb1"></div>
+                <div className="orb orb2"></div>
+                <div className="orb orb3"></div>
+                <div className="grid-overlay"></div>
+                
+                <div className="popup-header" id="dragHandle">
+                    <div className="avatar">✦</div>
+                    <div className="header-info">
+                        <h4>Aura AI</h4>
+                        <span><span className="dot"></span> Online — ready to help</span>
+                    </div>
+                </div>
+
+                <div 
+                    className="messages" 
+                    id="messages"
+                    ref={chatContainerRef} 
+                    onScroll={handleScroll}
+                >
+                    {messages.length === 0 && (
+                        <div className="flex flex-col items-center justify-center h-full text-white/60 space-y-4 opacity-80 mt-10">
+                            <div className="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center relative ring-1 ring-white/20">
+                                {isListening ? <ScreenShare size={24} className="text-red-400 animate-pulse" /> : <ScreenShareOff size={24} className="text-white/50" />}
+                                {settings.autoSend && <div className="absolute top-0 right-0 w-3 h-3 bg-green-400 rounded-full border-2 border-[#060b1a] shadow-[0_0_10px_rgba(74,222,128,0.5)]"></div>}
+                            </div>
+                            <div className="text-center px-4">
+                                <p className="font-medium text-white mb-1 text-sm">System Audio Copilot</p>
+                                <p className="text-xs leading-relaxed max-w-xs mx-auto text-white/50">
+                                    Click the Mic button to share your screen tab.
+                                </p>
+                            </div>
+                        </div>
+                    )}
+
+                    {messages.map((msg: Message) => (
+                        <div key={msg.id} className={`msg ${msg.role === 'user' ? 'user' : 'ai'}`}>
+                            <span className="msg-name">{msg.role === 'user' ? 'You' : 'Aura'}</span>
+                            <div className="bubble">
+                                <MessageRenderer content={msg.content} fontSize={settings.fontSize} />
+                            </div>
+                            <span className="msg-time">{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        </div>
+                    ))}
+
+                    {isProcessing && (
+                        <div className="msg ai" id="typing">
+                            <span className="msg-name">Aura</span>
+                            <div className="bubble typing-bubble">
+                                <span className="typing-dot"></span>
+                                <span className="typing-dot"></span>
+                                <span className="typing-dot"></span>
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                <div className="input-area">
+                    <div className="input-wrap">
+                        <textarea 
+                            id="inputBox" 
+                            className="pip-textarea"
+                            placeholder={settings.autoSend ? "Listening for interviewer..." : "Type a message…"}
+                            rows={1}
+                            value={inputText}
+                            onChange={(e) => {
+                                setInputText(e.target.value);
+                                e.target.style.height = 'auto';
+                                e.target.style.height = Math.min(e.target.scrollHeight, 110) + 'px';
+                            }}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter' && !e.shiftKey) {
+                                    e.preventDefault();
+                                    handleManualSend();
+                                }
+                            }}
+                        />
+                    </div>
+                    
+                    <button 
+                        className="send-btn" 
+                        id="sendBtn" 
+                        aria-label="Send message"
+                        onClick={handleManualSend}
+                        disabled={!inputText.trim() || isProcessing}
+                        style={{ opacity: (!inputText.trim() || isProcessing) ? 0.5 : 1 }}
+                    >
+                        <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+                    </button>
+                    
+                    <button 
+                        className="send-btn ml-2" 
+                        aria-label="Auto-Solve"
+                        onClick={handleAutoSolve}
+                        disabled={isProcessing}
+                        title="Auto-Solve Screen"
+                        style={{ opacity: isProcessing ? 0.5 : 1, background: 'linear-gradient(135deg, #f7c56e, #f76e6e)' }}
+                    >
+                        <Wand2 size={18} className="text-[#060b1a]" />
+                    </button>
+
+                    <button 
+                        className="send-btn ml-2" 
+                        aria-label="Toggle Mic"
+                        onClick={isListening ? stopListening : startListening}
+                        title={isListening ? "Stop Listening" : "Start Listening"}
+                        style={{ opacity: 1, background: isListening ? 'linear-gradient(135deg, #f76e6e, #f76e6e)' : 'linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05))', border: '1px solid rgba(255,255,255,0.2)' }}
+                    >
+                        {isListening ? <MicOff size={18} className="text-[#060b1a]" /> : <Mic size={18} className="text-white" />}
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className={`flex-1 flex flex-col h-full overflow-hidden relative ${isPipMode ? 'bg-transparent' : 'bg-background'} text-text transition-colors duration-300 ${settings.theme === 'dark' ? 'dark' : ''}`}>
+             {/* --- RESPONSIVE HEADER --- */}
+            <header className={`h-14 md:h-16 border-b border-border ${isPipMode ? 'bg-surface/50' : 'bg-surface/80'} backdrop-blur-md flex items-center justify-between px-4 shrink-0 z-20 sticky top-0`}>
+                <div className="flex items-center gap-2 md:gap-3">
+                <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
+                    <Cpu size={18} className="text-white" />
+                </div>
+                <h1 className="font-bold text-base md:text-lg tracking-tight hidden xs:block">Interview<span className="text-blue-500">Copilot</span></h1>
+                </div>
+
+                <div className="flex items-center gap-2 md:gap-3">
+                    <div className={`hidden md:flex px-3 py-1 rounded-full text-xs font-medium items-center gap-2 border transition-all duration-300 ${isListening ? 'bg-red-500/10 border-red-500/50 text-red-500' : 'bg-surface border-border text-gray-500'}`}>
+                        <div className={`w-2 h-2 rounded-full ${isListening ? 'bg-red-500 animate-pulse' : 'bg-gray-500'}`}></div>
+                        {isListening ? 'LIVE' : 'OFF'}
+                    </div>
+                    
+                    <button onClick={onOpenDownload} className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white rounded-lg text-xs font-bold transition-all shadow-lg shadow-blue-500/20" title="Download Desktop App">
+                        <Download size={14} />
+                        Get Desktop App
+                    </button>
+                    
+                    {!isPipMode && (
+                        <button 
+                            onClick={togglePip} 
+                            className="p-2 text-primary hover:bg-blue-500/10 rounded-lg transition-all border border-blue-500/20" 
+                            title="Pop Out (Hide from Screen Share)"
+                        >
+                            <ExternalLink size={20} />
+                        </button>
+                    )}
+
+                    <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Audio Help"><HelpCircle size={20} /></button>
+                    <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Files (Knowledge Base)"><FileText size={20} /></button>
+                    <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border ${!settings.apiKey ? 'text-red-400 animate-pulse' : 'text-gray-400 hover:text-text hover:bg-surface'}`} title="Settings"><Settings size={20} /></button>
+                </div>
+            </header>
+
+            <main className="flex-1 flex overflow-hidden relative w-full">
+                <div className="flex-1 flex flex-col max-w-4xl mx-auto w-full relative">
+                
+                <div 
+                    ref={chatContainerRef} 
+                    onScroll={handleScroll}
+                    className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 md:space-y-6 pb-40 md:pb-48 scroll-smooth custom-scrollbar"
+                >
+                    {messages.length === 0 && (
+                        <div className="flex flex-col items-center justify-center h-[60%] text-gray-400 space-y-6 opacity-60 mt-10">
+                            <div className="w-24 h-24 rounded-full bg-surface flex items-center justify-center relative ring-1 ring-border">
+                                {isListening ? <ScreenShare size={40} className="text-red-500 animate-pulse" /> : <ScreenShareOff size={40} className="text-gray-500" />}
+                                {settings.autoSend && <div className="absolute top-1 right-1 w-4 h-4 bg-green-500 rounded-full border-2 border-background shadow-[0_0_10px_rgba(34,197,94,0.5)]"></div>}
+                            </div>
+                            <div className="text-center px-6">
+                                <p className="font-medium text-text mb-2 text-lg">System Audio Copilot</p>
+                                <p className="text-sm leading-relaxed max-w-xs mx-auto text-gray-500">
+                                    Click the Mic button to share your screen tab.<br/>
+                                    <strong>Remember to check "Share tab audio"</strong>.
+                                </p>
+                            </div>
+                        </div>
+                    )}
+                    
+                    {messages.map((msg: Message) => (
+                    <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-in slide-in-from-bottom-2 duration-300`}>
+                        <div className={`max-w-[95%] md:max-w-[85%] rounded-2xl p-3 md:p-5 shadow-lg ${
+                        msg.role === 'user' 
+                            ? 'bg-surface text-text border border-border rounded-tr-sm' 
+                            : msg.role === 'system'
+                            ? 'bg-red-500/10 border border-red-500/50 text-red-500'
+                            : 'bg-primary/5 border border-primary/20 text-text rounded-tl-sm backdrop-blur-sm'
+                        }`}>
+                        <div className="text-[10px] font-bold mb-2 opacity-60 uppercase tracking-wider flex items-center gap-1">
+                            {msg.role === 'user' ? <MessageSquare size={10} /> : <Zap size={10} />}
+                            {msg.role === 'user' ? 'Transcript' : msg.role === 'system' ? 'System' : 'Answer'}
+                        </div>
+                        {/* Use Custom Message Renderer */}
+                        <MessageRenderer content={msg.content} fontSize={settings.fontSize} />
+                        </div>
+                    </div>
+                    ))}
+
+                    {isProcessing && (
+                    <div className="flex justify-start">
+                        <div className="bg-surface border border-border rounded-2xl px-4 py-3 rounded-tl-sm flex items-center gap-2 text-gray-500 text-xs shadow-lg">
+                            <span className="font-semibold text-primary tracking-wider">THINKING ({settings.selectedModel.toUpperCase()})</span>
+                            <div className="flex gap-1">
+                                <div className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0ms'}}></div>
+                                <div className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '150ms'}}></div>
+                                <div className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '300ms'}}></div>
+                            </div>
+                        </div>
+                    </div>
+                    )}
+                </div>
+
+                {/* --- INPUT BAR --- */}
+                <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-background via-background to-transparent pt-4 pb-4 px-2 md:px-6 z-20">
+                    <div className="max-w-3xl mx-auto flex flex-col gap-2">
+                        
+                        {speechError && (
+                            <div className="mx-auto bg-red-500/90 text-white px-3 py-1 rounded-full text-xs border border-red-400 flex items-center gap-2 shadow-lg backdrop-blur">
+                                <AlertTriangle size={10} /> {speechError}
+                            </div>
+                        )}
+
+                        <div className={`bg-surface/90 backdrop-blur-xl border rounded-2xl shadow-2xl transition-all duration-300 flex flex-col ${isListening ? 'border-primary/50 shadow-[0_0_20px_rgba(59,130,246,0.15)]' : 'border-border'}`}>
+                            
+                            <div className="flex items-center justify-between px-3 py-1.5 border-b border-gray-500/10">
+                                <div className="flex items-center gap-2">
+                                    <button
+                                        onClick={toggleAutoSend}
+                                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] md:text-xs font-bold transition-all border ${
+                                            settings.autoSend 
+                                            ? 'bg-blue-500/20 text-blue-500 border-blue-500/30' 
+                                            : 'bg-gray-500/10 text-gray-500 border-transparent'
+                                        }`}
+                                    >
+                                        <Zap size={12} className={settings.autoSend ? "fill-blue-500" : ""} />
+                                        {settings.autoSend ? 'AUTO' : 'MANUAL'}
+                                    </button>
+
+                                    <button
+                                        onClick={isListening ? stopListening : startListening}
+                                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] md:text-xs font-bold transition-all border ${
+                                            isListening 
+                                            ? 'bg-red-500/20 text-red-500 border-red-500/30' 
+                                            : 'bg-gray-500/10 text-gray-500 border-transparent'
+                                        }`}
+                                    >
+                                        {isListening ? <Mic size={12} /> : <MicOff size={12} />}
+                                        {isListening ? 'ON' : 'OFF'}
+                                    </button>
+
+                                    {/* --- QUICK MODEL SWITCHER --- */}
+                                    <div className="h-5 w-[1px] bg-gray-500/20 mx-1"></div>
+                                    <div className="relative group">
+                                        <select
+                                            value={settings.selectedModel}
+                                            onChange={handleModelChange}
+                                            className="appearance-none bg-surface text-text text-[10px] md:text-xs font-bold px-2.5 py-1 pr-6 rounded-md border border-border hover:border-primary focus:outline-none focus:ring-1 focus:ring-primary transition-all cursor-pointer"
+                                        >
+                                            <option value="gemini" className="bg-white dark:bg-gray-800 text-black dark:text-white">Gemini 3.1 Flash</option>
+                                            <option value="groq" className="bg-white dark:bg-gray-800 text-black dark:text-white">Groq</option>
+                                            <option value="openai" className="bg-white dark:bg-gray-800 text-black dark:text-white">GPT-5.4 Mini</option>
+                                            <option value="xai" className="bg-white dark:bg-gray-800 text-black dark:text-white">Grok (xAI)</option>
+                                        </select>
+                                        <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500">
+                                            <ChevronDown size={10} />
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                {!isProcessing && messages.length > 0 && (
+                                    <button onClick={handleRegenerate} className="text-gray-500 hover:text-primary transition-colors p-1" title="Regenerate last answer">
+                                        <RefreshCw size={14} />
+                                    </button>
+                                )}
+                            </div>
+
+                            <div className="relative p-2 flex items-end gap-2">
+                                <div className="relative flex-1 min-w-0">
+                                    {interimText && (
+                                        <div className="absolute top-2.5 left-3 text-gray-400 pointer-events-none text-sm md:text-base whitespace-pre-wrap truncate w-full opacity-60 italic z-0">
+                                            {inputText}{interimText}
+                                        </div>
+                                    )}
+                                    <textarea
+                                        ref={textareaRef}
+                                        value={inputText}
+                                        onChange={(e) => setInputText(e.target.value)}
+                                        placeholder={settings.autoSend ? "Listening for interviewer..." : "Type or speak context..."}
+                                        className="w-full bg-transparent text-text placeholder-gray-500 px-3 py-2.5 focus:outline-none rounded-xl text-sm md:text-base leading-relaxed resize-none z-10 relative custom-scrollbar max-h-[150px] overflow-y-auto"
+                                        rows={1}
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter' && !e.shiftKey) {
+                                                e.preventDefault();
+                                                handleManualSend();
+                                            }
+                                        }}
+                                    />
+                                </div>
+
+                                <div className="flex flex-col gap-1 pb-1">
+                                    {inputText && (
+                                        <button onClick={handleClear} className="p-2 text-gray-400 hover:text-red-400 rounded-lg hover:bg-gray-500/10 transition-colors">
+                                            <X size={18} />
+                                        </button>
+                                    )}
+                                    <div className="flex gap-1">
+                                        <button 
+                                            onClick={handleAutoSolve}
+                                            disabled={isProcessing}
+                                            title="Auto-Solve Screen"
+                                            className={`p-2 rounded-xl transition-all shadow-lg ${
+                                                !isProcessing
+                                                ? 'bg-purple-600 text-white hover:bg-purple-700' 
+                                                : 'bg-surface text-gray-500 cursor-not-allowed border border-border'
+                                            }`}
+                                        >
+                                            <Wand2 size={18} />
+                                        </button>
+                                        <button 
+                                            onClick={handleManualSend}
+                                            disabled={!inputText.trim() || isProcessing}
+                                            className={`p-2 rounded-xl transition-all shadow-lg ${
+                                                inputText.trim() && !isProcessing
+                                                ? 'bg-primary text-white hover:bg-blue-600' 
+                                                : 'bg-surface text-gray-500 cursor-not-allowed border border-border'
+                                            }`}
+                                        >
+                                            <Send size={18} />
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                </div>
+            </main>
+        </div>
+    );
+};
+
+// PiP Window Logic
+const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = ({ children, onClose }) => {
+    const [container, setContainer] = useState<HTMLElement | null>(null);
+
+    useEffect(() => {
+        if (!window.documentPictureInPicture) {
+            alert("Your browser does not support Document Picture-in-Picture (Pop-out). Please use Chrome 111+ or Edge.");
+            onClose();
+            return;
+        }
+
+        async function initPip() {
+            try {
+                // Request a vertical phone-like window
+                const pipWindow = await window.documentPictureInPicture.requestWindow({
+                    width: 450,
+                    height: 700,
+                });
+
+                // Copy styles from main document to PiP
+                [...document.styleSheets].forEach((styleSheet) => {
+                    try {
+                        const cssRules = [...styleSheet.cssRules]
+                        .map((rule) => rule.cssText)
+                        .join("");
+                        const style = document.createElement("style");
+                        style.textContent = cssRules;
+                        pipWindow.document.head.appendChild(style);
+                    } catch (e) {
+                    const link = document.createElement("link");
+                    link.rel = "stylesheet";
+                    link.type = styleSheet.type;
+                    link.media = styleSheet.media.mediaText;
+                    link.href = styleSheet.href;
+                    pipWindow.document.head.appendChild(link);
+                    }
+                });
+                
+                // Add Tailwind CDN directly to be sure
+                const twScript = pipWindow.document.createElement('script');
+                twScript.src = "https://cdn.tailwindcss.com";
+                twScript.onload = () => {
+                     // Re-inject config
+                     const configScript = pipWindow.document.createElement('script');
+                     configScript.innerHTML = `
+                      tailwind.config = {
+                        darkMode: 'class',
+                        theme: {
+                          extend: {
+                            colors: {
+                              background: 'var(--bg-color)',
+                              surface: 'var(--surface-color)',
+                              border: 'var(--border-color)',
+                              text: 'var(--text-color)',
+                              primary: '#3b82f6',
+                              accent: '#f59e0b',
+                            },
+                          },
+                        },
+                      }
+                   `;
+                   pipWindow.document.head.appendChild(configScript);
+                };
+                pipWindow.document.head.appendChild(twScript);
+
+                // Inject CSS Vars
+                 const style = pipWindow.document.createElement('style');
+                style.textContent = `
+                 :root { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
+                 .dark { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
+                 body { background-color: var(--bg-color); color: var(--text-color); }
+                 .pip-body { background: #000000; }
+                `;
+                pipWindow.document.head.appendChild(style);
+
+                pipWindow.document.body.className = 'pip-body';
+
+                const div = pipWindow.document.createElement('div');
+                div.style.height = '100%';
+                div.style.display = 'flex';
+                div.style.flexDirection = 'column';
+                // Force dark mode if main app is dark, else light
+                if (document.documentElement.classList.contains('dark')) {
+                    div.classList.add('dark');
+                }
+                pipWindow.document.body.appendChild(div);
+                setContainer(div);
+
+                pipWindow.addEventListener("pagehide", () => {
+                    onClose();
+                });
+            } catch (err) {
+                console.error("PiP Error:", err);
+                onClose();
+            }
+        }
+        initPip();
+    }, []);
+
+    if (!container) return null;
+    return createPortal(children, container);
+};
+
+
+export default function App() {
+  // --- State ---
+  const [messages, setMessages] = useState<Message[]>([]);
+  const messagesRef = useRef<Message[]>([]);
+
+  // Keep messagesRef in sync with messages
+  useEffect(() => {
+      messagesRef.current = messages;
+  }, [messages]);
+  const [inputText, setInputText] = useState("");
+  const [interimText, setInterimText] = useState("");
+  
+  const [isProcessing, setIsProcessing] = useState(false);
+  const streamRef = useRef<MediaStream | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showContext, setShowContext] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [showDownloadModal, setShowDownloadModal] = useState(false);
+  
+  // Local state for Quick Paste in Context Modal
+  const [pasteContent, setPasteContent] = useState("");
+  
+  // PiP State
+  const [isPipMode, setIsPipMode] = useState(false);
+
+  // Settings State
+  const [settings, setSettings] = useState<AppSettings>({
+    apiKey: localStorage.getItem("GEMINI_API_KEY") || "",
+    deepgramApiKey: localStorage.getItem("DEEPGRAM_API_KEY") || "",
+    groqApiKey: localStorage.getItem("GROQ_API_KEY") || "",
+    openaiApiKey: localStorage.getItem("OPENAI_API_KEY") || "",
+    xaiApiKey: localStorage.getItem("XAI_API_KEY") || "",
+    selectedModel: (localStorage.getItem("SELECTED_MODEL") as 'gemini'|'groq'|'openai'|'xai') || 'gemini',
+    autoSend: false, 
+    // Start with empty array - no placeholders
+    contextFiles: [],
+    theme: (localStorage.getItem("THEME") as 'light'|'dark') || 'dark',
+    fontSize: (localStorage.getItem("FONT_SIZE") as 'small'|'medium'|'large') || 'medium',
+    generalMode: localStorage.getItem("GENERAL_MODE") === 'true' // Default false (Context Mode)
+  });
+
+  // Settings Modal Local State
+  const [tempApiKey, setTempApiKey] = useState("");
+  const [tempDeepgramKey, setTempDeepgramKey] = useState("");
+  const [tempGroqKey, setTempGroqKey] = useState("");
+  const [tempOpenAIKey, setTempOpenAIKey] = useState("");
+  const [tempXaiKey, setTempXaiKey] = useState("");
+  const [tempModel, setTempModel] = useState<'gemini'|'groq'|'openai'|'xai'>('gemini');
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saved'>('idle');
+
+  // Ref for file input to ensure reliable click
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Ref pattern to fix closure staleness in callbacks
+  const settingsRef = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  // Apply Theme to HTML root
+  useEffect(() => {
+      const root = document.documentElement;
+      if (settings.theme === 'dark') {
+          root.classList.add('dark');
+      } else {
+          root.classList.remove('dark');
+      }
+      localStorage.setItem("THEME", settings.theme);
+  }, [settings.theme]);
+
+  // Apply General Mode persistence
+  useEffect(() => {
+      localStorage.setItem("GENERAL_MODE", String(settings.generalMode));
+  }, [settings.generalMode]);
+
+  // Sync temp key when settings open
+  useEffect(() => {
+      if (showSettings) {
+          setTempApiKey(settings.apiKey);
+          setTempDeepgramKey(settings.deepgramApiKey);
+          setTempGroqKey(settings.groqApiKey);
+          setTempOpenAIKey(settings.openaiApiKey);
+          setTempXaiKey(settings.xaiApiKey);
+          setTempModel(settings.selectedModel);
+          setSaveStatus('idle');
+      }
+  }, [showSettings, settings.apiKey, settings.deepgramApiKey, settings.groqApiKey, settings.openaiApiKey, settings.xaiApiKey, settings.selectedModel]);
+
+
+  // Scroll State
+  const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
+
+  const chatContainerRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const silenceTimerRef = useRef<any>(null);
+  const inputTextRef = useRef(inputText);
+
+  useEffect(() => {
+    inputTextRef.current = inputText;
+    if (textareaRef.current) {
+        textareaRef.current.style.height = 'auto';
+        const newHeight = Math.min(textareaRef.current.scrollHeight, 150);
+        textareaRef.current.style.height = newHeight + 'px';
+    }
+  }, [inputText]);
+
+  // --- Initialization ---
+  useEffect(() => {
+    if (settings.apiKey) {
+      geminiService.init(settings.apiKey);
+    }
+    if (settings.groqApiKey) {
+      groqService.init(settings.groqApiKey);
+    }
+    if (settings.openaiApiKey) {
+      openaiService.init(settings.openaiApiKey);
+    }
+    if (settings.xaiApiKey) {
+      xaiService.init(settings.xaiApiKey);
+    }
+  }, [settings.apiKey, settings.groqApiKey, settings.openaiApiKey, settings.xaiApiKey]);
+
+  // Handle Auto-Scrolling
+  useEffect(() => {
+    if (shouldAutoScroll && chatContainerRef.current) {
+      chatContainerRef.current.scrollTo({
+          top: chatContainerRef.current.scrollHeight,
+          behavior: 'smooth'
+      });
+    }
+  }, [messages, interimText, shouldAutoScroll]);
+
+  const handleScroll = () => {
+      if (!chatContainerRef.current) return;
+      const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
+      const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
+      setShouldAutoScroll(isAtBottom);
+  };
+
+  // --- Core Logic ---
+  const executeSend = useCallback(async (textToSend: string, imageBase64?: string) => {
+      if (!textToSend.trim()) return;
+      
+      const userMsg: Message = {
+        id: Date.now().toString(),
+        role: 'user',
+        content: textToSend,
+        timestamp: Date.now()
+      };
+  
+      setMessages(prev => [...prev, userMsg]);
+      setIsProcessing(true);
+      setInterimText("");
+      setInputText(""); 
+      setShouldAutoScroll(true); 
+  
+      try {
+        const currentSettings = settingsRef.current;
+        let contextFiles = currentSettings.contextFiles;
+        let finalImageBase64 = imageBase64;
+
+        // Auto-capture screen if stream is available and no image provided
+        if (!finalImageBase64 && streamRef.current) {
+            const videoTrack = streamRef.current.getVideoTracks()[0];
+            if (videoTrack) {
+                try {
+                    const video = document.createElement('video');
+                    video.srcObject = new MediaStream([videoTrack]);
+                    await video.play();
+
+                    let width = video.videoWidth;
+                    let height = video.videoHeight;
+                    const MAX_WIDTH = 1920;
+                    
+                    if (width > MAX_WIDTH) {
+                        height = Math.round((height * MAX_WIDTH) / width);
+                        width = MAX_WIDTH;
+                    }
+
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    ctx?.drawImage(video, 0, 0, width, height);
+                    
+                    finalImageBase64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+                    
+                    video.pause();
+                    video.srcObject = null;
+                } catch (err) {
+                    console.error("Auto screen capture failed:", err);
+                }
+            }
+        }
+
+        if (finalImageBase64) {
+            contextFiles = [...contextFiles, {
+                id: 'temp-screen-capture',
+                name: 'Screen Capture',
+                content: '[Binary File]',
+                type: 'custom',
+                mimeType: 'image/jpeg',
+                base64: finalImageBase64
+            }];
+        }
+        let responseText = "";
+
+        // Route request based on selected model
+        if (currentSettings.selectedModel === 'groq') {
+             responseText = await groqService.generateResponse(
+                userMsg.content,
+                messagesRef.current,
+                contextFiles,
+                currentSettings.generalMode
+             );
+        } else if (currentSettings.selectedModel === 'openai') {
+            responseText = await openaiService.generateResponse(
+                userMsg.content,
+                messagesRef.current,
+                contextFiles,
+                currentSettings.generalMode
+            );
+        } else if (currentSettings.selectedModel === 'xai') {
+             responseText = await xaiService.generateResponse(
+                userMsg.content,
+                messagesRef.current,
+                contextFiles,
+                currentSettings.generalMode
+             );
+        } else {
+             // Default to Gemini
+             responseText = await geminiService.generateResponse(
+                userMsg.content,
+                messagesRef.current, 
+                contextFiles,
+                currentSettings.generalMode
+             );
+        }
+        
+        if (responseText !== "Listening...") {
+            const aiMsg: Message = {
+              id: (Date.now() + 1).toString(),
+              role: 'model',
+              content: responseText,
+              timestamp: Date.now()
+            };
+            setMessages(prev => [...prev, aiMsg]);
+        }
+      } catch (err) {
+        console.error(err);
+        const errorMsg: Message = {
+          id: Date.now().toString(),
+          role: 'system',
+          content: "Error generating response. Check API Key.",
+          timestamp: Date.now()
+        };
+        setMessages(prev => [...prev, errorMsg]);
+      } finally {
+        setIsProcessing(false);
+      }
+  }, []); 
+
+  // --- Speech Handling ---
+  const handleSpeechResult = useCallback(({ final, interim }: { final: string, interim: string }) => {
+    setInterimText(interim);
+    if (interim && silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+    }
+    if (final) {
+        // --- NOISE GATE / FILLER FILTER ---
+        // 1. Clean punctuation for matching
+        const raw = final.trim().toLowerCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g,"");
+        
+        // 2. Extended Filler Dictionary
+        const IGNORED_PHRASES = new Set([
+            "ok", "okay", "k", "kk", "alright", "right", "sure", "yeah", "yep", "yup", "yes",
+            "cool", "nice", "great", "awesome", "perfect", "fine", "good",
+            "hmm", "hm", "mm", "mmm", "uh", "um", "huh", "ah", "er", "oh",
+            "got it", "i see", "makes sense", "understood", "no problem", "no worries",
+            "thank you", "thanks", "thanks a lot",
+            "hello", "hi", "hey", "guys", "everyone",
+            "bye", "goodbye", "see ya",
+            "so", "and", "but", "or", "actually", "basically", "literally",
+            "wait", "hold on", "one sec", "one second",
+            "what", "really", "wow", "oh wow",
+            "ok cool", "okay cool", "sounds good", "sounds great", "fair enough",
+            "ok bye", "okay bye", "all good"
+        ]);
+
+        // 3. Regex for repeated characters (e.g. "hmmm", "ooookay", "umm")
+        // Catches h+m+, u+m+, u+h+, o+k+, a+h+, e+r+
+        const isRepeatedFiller = /^(h+m+|u+m+|u+h+|o+k+|a+h+|e+r+)$/.test(raw);
+
+        // 4. Logic: Ignore if exact match, repeated filler pattern, or very short noise (<2 chars)
+        const isIgnored = IGNORED_PHRASES.has(raw) || isRepeatedFiller || raw.length < 2;
+
+        if (isIgnored) {
+            console.log("Ignored filler/noise:", final);
+            setInterimText(""); 
+            return; // EXIT: Do not add to input text, do not send to AI.
+        }
+        // ----------------------------------
+
+        setInputText(prev => {
+            const separator = prev.length > 0 && !prev.endsWith(' ') ? " " : "";
+            return prev + separator + final;
+        });
+        if (settingsRef.current.autoSend) {
+            if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = setTimeout(() => {
+                const currentBuffer = inputTextRef.current;
+                if (currentBuffer && currentBuffer.trim().length > 0) {
+                     executeSend(currentBuffer);
+                }
+            }, 1200); 
+        }
+    }
+  }, [executeSend]);
+
+  const { isListening, error: speechError, startListening, stopListening, stream } = useSpeechRecognition({
+    onResult: handleSpeechResult,
+    onError: (err) => console.error("Speech Error:", err),
+    apiKey: settings.deepgramApiKey // Pass Deepgram Key
+  });
+
+  useEffect(() => {
+      streamRef.current = stream;
+  }, [stream]);
+
+  // Auto-start listening if autoSend is on is slightly dangerous with Screen Share 
+  // because it prompts every time. Disabling auto-start for System Audio.
+  // We only start if the user clicks the button.
+
+  // --- UI Actions ---
+  const handleManualSend = () => {
+    if (!inputText.trim() || isProcessing) return;
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    executeSend(inputText);
+  };
+
+  const handleAutoSolve = () => {
+    if (isProcessing) return;
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    executeSend("Please analyze the code or problem visible on the screen and provide the solution.");
+  };
+
+  const handleClear = () => {
+      setInputText("");
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+  };
+
+  const handleRegenerate = async () => {
+    if (isProcessing) return;
+    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+    if (!lastUserMsg) return;
+
+    setIsProcessing(true);
+    try {
+        const historyForService = messages.filter(m => m.id !== lastUserMsg.id && m.role !== 'system');
+        const currentSettings = settingsRef.current;
+        let contextFiles = currentSettings.contextFiles;
+        let responseText = "";
+
+        // Auto-capture screen if stream is available
+        if (streamRef.current) {
+            const videoTrack = streamRef.current.getVideoTracks()[0];
+            if (videoTrack) {
+                try {
+                    const video = document.createElement('video');
+                    video.srcObject = new MediaStream([videoTrack]);
+                    await video.play();
+
+                    let width = video.videoWidth;
+                    let height = video.videoHeight;
+                    const MAX_WIDTH = 1920;
+                    
+                    if (width > MAX_WIDTH) {
+                        height = Math.round((height * MAX_WIDTH) / width);
+                        width = MAX_WIDTH;
+                    }
+
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    ctx?.drawImage(video, 0, 0, width, height);
+                    
+                    const finalImageBase64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+                    
+                    video.pause();
+                    video.srcObject = null;
+
+                    contextFiles = [...contextFiles, {
+                        id: 'temp-screen-capture',
+                        name: 'Screen Capture',
+                        content: '[Binary File]',
+                        type: 'custom',
+                        mimeType: 'image/jpeg',
+                        base64: finalImageBase64
+                    }];
+                } catch (err) {
+                    console.error("Auto screen capture failed during regenerate:", err);
+                }
+            }
+        }
+
+        if (currentSettings.selectedModel === 'groq') {
+            responseText = await groqService.generateResponse(
+                lastUserMsg.content,
+                historyForService,
+                contextFiles,
+                currentSettings.generalMode
+            );
+        } else if (currentSettings.selectedModel === 'openai') {
+            responseText = await openaiService.generateResponse(
+                lastUserMsg.content,
+                historyForService,
+                contextFiles,
+                currentSettings.generalMode
+            );
+        } else if (currentSettings.selectedModel === 'xai') {
+            responseText = await xaiService.generateResponse(
+                lastUserMsg.content,
+                historyForService,
+                contextFiles,
+                currentSettings.generalMode
+            );
+        } else {
+            responseText = await geminiService.generateResponse(
+                lastUserMsg.content,
+                historyForService,
+                contextFiles,
+                currentSettings.generalMode
+            );
+        }
+
+        if (responseText !== "Listening...") {
+            const aiMsg: Message = {
+                id: Date.now().toString(),
+                role: 'model',
+                content: responseText,
+                timestamp: Date.now()
+            };
+            setMessages(prev => [...prev, aiMsg]);
+        }
+    } catch (err) { console.error(err); } finally { setIsProcessing(false); }
+  };
+
+  const triggerFileUpload = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Reset input so same file can be selected again
+    e.target.value = '';
+
+    // Check if it's likely a text file to allow text-based models (like OpenAI) to read it.
+    const isText = file.type.startsWith('text/') ||
+                   file.name.endsWith('.txt') ||
+                   file.name.endsWith('.md') ||
+                   file.name.endsWith('.js') ||
+                   file.name.endsWith('.ts') ||
+                   file.name.endsWith('.py') ||
+                   file.name.endsWith('.json') ||
+                   file.name.endsWith('.html') ||
+                   file.name.endsWith('.css') ||
+                   file.name.endsWith('.csv');
+
+    const isPdf = file.type === 'application/pdf' || file.name.endsWith('.pdf');
+
+    const reader = new FileReader();
+
+    if (isPdf) {
+        setIsProcessing(true);
+        extractTextFromPdf(file).then(text => {
+            const newFile: ContextFile = {
+                id: Date.now().toString(),
+                name: file.name,
+                content: text,
+                type: 'custom',
+                mimeType: 'text/plain',
+                base64: undefined
+            };
+            setSettings(prev => ({ ...prev, contextFiles: [...prev.contextFiles, newFile] }));
+        }).catch(err => {
+            console.error(err);
+            alert("Failed to extract text from PDF");
+        }).finally(() => {
+            setIsProcessing(false);
+        });
+    } else if (isText) {
+        reader.onload = (event) => {
+            const text = event.target?.result as string;
+            const newFile: ContextFile = {
+                id: Date.now().toString(),
+                name: file.name,
+                content: text, // Store exact text for models
+                type: 'custom',
+                mimeType: file.type || 'text/plain',
+                base64: undefined // Explicitly undefined so text filters pick it up
+            };
+            setSettings(prev => ({ ...prev, contextFiles: [...prev.contextFiles, newFile] }));
+        };
+        reader.readAsText(file);
+    } else {
+        // Binary (Image/PDF)
+        reader.onload = (event) => {
+          const result = event.target?.result as string;
+          const base64Data = result.split(',')[1];
+          const mimeType = result.split(':')[1].split(';')[0];
+    
+          const newFile: ContextFile = {
+            id: Date.now().toString(),
+            name: file.name,
+            content: "[Binary File]", 
+            type: 'custom',
+            mimeType: mimeType,
+            base64: base64Data
+          };
+          setSettings(prev => ({ ...prev, contextFiles: [...prev.contextFiles, newFile] }));
+        };
+        reader.readAsDataURL(file);
+    }
+  };
+  
+  const handleAddPasteText = () => {
+      if (!pasteContent.trim()) return;
+      const newFile: ContextFile = {
+          id: Date.now().toString(),
+          name: `Pasted Context ${settings.contextFiles.length + 1}`,
+          content: pasteContent,
+          type: 'custom'
+      };
+      setSettings(prev => ({ ...prev, contextFiles: [...prev.contextFiles, newFile] }));
+      setPasteContent("");
+  };
+
+  const removeFile = (id: string) => {
+    setSettings(prev => ({ ...prev, contextFiles: prev.contextFiles.filter(f => f.id !== id) }));
+  };
+
+  const toggleAutoSend = () => {
+    setSettings(prev => ({ ...prev, autoSend: !prev.autoSend }));
+  };
+  
+  const toggleGeneralMode = () => {
+      setSettings(prev => ({ ...prev, generalMode: !prev.generalMode }));
+  };
+
+  const saveSettings = () => {
+      localStorage.setItem("GEMINI_API_KEY", tempApiKey);
+      localStorage.setItem("DEEPGRAM_API_KEY", tempDeepgramKey);
+      localStorage.setItem("GROQ_API_KEY", tempGroqKey);
+      localStorage.setItem("OPENAI_API_KEY", tempOpenAIKey);
+      localStorage.setItem("XAI_API_KEY", tempXaiKey);
+      localStorage.setItem("SELECTED_MODEL", tempModel);
+      localStorage.setItem("THEME", settings.theme);
+      localStorage.setItem("FONT_SIZE", settings.fontSize);
+      
+      const newSettings: AppSettings = { 
+          ...settings, 
+          apiKey: tempApiKey, 
+          deepgramApiKey: tempDeepgramKey,
+          groqApiKey: tempGroqKey,
+          openaiApiKey: tempOpenAIKey,
+          xaiApiKey: tempXaiKey,
+          selectedModel: tempModel
+      };
+
+      setSettings(newSettings);
+      
+      // Update ref immediately to prevent race conditions before next render
+      settingsRef.current = newSettings;
+
+      setSaveStatus('saved');
+      setTimeout(() => setSaveStatus('idle'), 2000);
+  };
+
+  // --- RENDER HELPERS ---
+
+  const sharedProps = {
+    messages, settings, setSettings, isListening, isProcessing, inputText, setInputText, interimText,
+    speechError, toggleAutoSend, startListening, stopListening, handleManualSend, handleAutoSolve,
+    handleClear, handleRegenerate, chatContainerRef, textareaRef, handleScroll,
+    onOpenSettings: () => setShowSettings(true),
+    onOpenContext: () => { console.log('Opening Context'); setShowContext(true); },
+    onOpenHelp: () => setShowHelp(true),
+    onOpenDownload: () => setShowDownloadModal(true),
+    isPipMode,
+    togglePip: () => setIsPipMode(true)
+  };
+
+  return (
+    <div className={`h-[100dvh] flex flex-col font-sans overflow-hidden transition-colors duration-300 ${settings.theme === 'dark' ? 'dark bg-[#09090b]' : 'bg-slate-50'}`}>
+        {/* Main Content Area */}
+        {!isPipMode ? (
+            <ChatInterface {...sharedProps} />
+        ) : (
+            <div className="flex-1 flex flex-col items-center justify-center p-8 bg-surface/50 text-center space-y-6 animate-in fade-in">
+                <div className="w-24 h-24 rounded-full bg-blue-500/10 flex items-center justify-center animate-pulse-slow">
+                    <ExternalLink size={40} className="text-blue-500" />
+                </div>
+                <div>
+                    <h2 className="text-2xl font-bold text-text mb-2">Copilot Active in Pop-out Window</h2>
+                    <p className="text-gray-500 max-w-md mx-auto">
+                        This tab is now "Safe to Share".<br/>
+                        The AI interface has moved to a separate window that is hidden from screen share.
+                    </p>
+                </div>
+                <div className="p-4 bg-surface rounded-lg border border-border text-left w-full max-w-lg shadow-sm">
+                    <p className="text-xs text-gray-400 uppercase tracking-wider font-bold mb-2">Safe View Placeholder</p>
+                    <div className="space-y-2 opacity-50">
+                         <div className="h-4 bg-gray-500 rounded w-3/4"></div>
+                         <div className="h-4 bg-gray-500 rounded w-1/2"></div>
+                         <div className="h-4 bg-gray-500 rounded w-5/6"></div>
+                    </div>
+                </div>
+                <button 
+                    onClick={() => setIsPipMode(false)}
+                    className="px-6 py-3 bg-primary hover:bg-blue-600 text-white rounded-lg font-medium transition-colors flex items-center gap-2"
+                >
+                    <ExternalLink size={18} className="rotate-180" /> Bring Back to Tab
+                </button>
+            </div>
+        )}
+
+        {/* PiP Portal */}
+        {isPipMode && (
+            <PiPWindow onClose={() => setIsPipMode(false)}>
+                <ChatInterface {...sharedProps} />
+            </PiPWindow>
+        )}
+
+      {/* --- MODALS --- */}
+      
+      <Modal isOpen={showSettings} onClose={() => setShowSettings(false)} title="Settings">
+         <div className="space-y-6">
+            
+            {/* Model Selection */}
+            <div className="bg-surface/50 border border-border p-3 rounded-lg space-y-3">
+                <label className="text-sm font-bold text-text flex items-center gap-2">
+                    <Cpu size={16} /> AI Model Selection
+                </label>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <button
+                        onClick={() => setTempModel('gemini')}
+                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                            tempModel === 'gemini' 
+                            ? 'bg-blue-500/10 border-blue-500 shadow-sm' 
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+                        }`}
+                    >
+                        <div className="flex items-center justify-between w-full">
+                            <span className={`font-bold text-xs flex items-center gap-2 ${tempModel === 'gemini' ? 'text-blue-500' : 'text-text'}`}>
+                                <div className={`w-2 h-2 rounded-full ${tempModel === 'gemini' ? 'bg-blue-500' : 'bg-gray-400'}`}></div>
+                                Gemini 3.1 Flash
+                            </span>
+                            {tempModel === 'gemini' && <Check size={14} className="text-blue-500" />}
+                        </div>
+                    </button>
+
+                    <button
+                        onClick={() => setTempModel('groq')}
+                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                            tempModel === 'groq' 
+                            ? 'bg-orange-500/10 border-orange-500 shadow-sm' 
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+                        }`}
+                    >
+                        <div className="flex items-center justify-between w-full">
+                            <span className={`font-bold text-xs flex items-center gap-2 ${tempModel === 'groq' ? 'text-orange-500' : 'text-text'}`}>
+                                <div className={`w-2 h-2 rounded-full ${tempModel === 'groq' ? 'bg-orange-500' : 'bg-gray-400'}`}></div>
+                                Groq
+                            </span>
+                            {tempModel === 'groq' && <Check size={14} className="text-orange-500" />}
+                        </div>
+                    </button>
+
+                    <button
+                        onClick={() => setTempModel('openai')}
+                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                            tempModel === 'openai' 
+                            ? 'bg-green-500/10 border-green-500 shadow-sm' 
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+                        }`}
+                    >
+                        <div className="flex items-center justify-between w-full">
+                            <span className={`font-bold text-xs flex items-center gap-2 ${tempModel === 'openai' ? 'text-green-500' : 'text-text'}`}>
+                                <div className={`w-2 h-2 rounded-full ${tempModel === 'openai' ? 'bg-green-500' : 'bg-gray-400'}`}></div>
+                                GPT-5.4 Mini
+                            </span>
+                            {tempModel === 'openai' && <Check size={14} className="text-green-500" />}
+                        </div>
+                    </button>
+
+                    <button
+                        onClick={() => setTempModel('xai')}
+                        className={`relative p-3 rounded-xl border text-left transition-all hover:shadow-md flex flex-col gap-2 h-full ${
+                            tempModel === 'xai' 
+                            ? 'bg-gray-500/10 border-gray-500 shadow-sm' 
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+                        }`}
+                    >
+                        <div className="flex items-center justify-between w-full">
+                            <span className={`font-bold text-xs flex items-center gap-2 ${tempModel === 'xai' ? 'text-text' : 'text-text'}`}>
+                                <div className={`w-2 h-2 rounded-full ${tempModel === 'xai' ? 'bg-white' : 'bg-gray-400'}`}></div>
+                                Grok (xAI)
+                            </span>
+                            {tempModel === 'xai' && <Check size={14} className="text-gray-500" />}
+                        </div>
+                    </button>
+                </div>
+            </div>
+
+            {/* API Key Section */}
+            <div className="space-y-4">
+                <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-text">Gemini API Key {tempModel === 'gemini' && <span className="text-red-500">*</span>}</label>
+                        <a href="https://ai.google.dev/gemini-api/docs/api-key" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+                             Get Key <ExternalLink size={10} />
+                        </a>
+                    </div>
+                    <input 
+                        type="password"
+                        value={tempApiKey}
+                        onChange={(e) => setTempApiKey(e.target.value)}
+                        placeholder="Enter Gemini API Key"
+                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'gemini' && !tempApiKey ? 'border-red-500/50' : 'border-border'}`}
+                    />
+                </div>
+
+                <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-text">Groq API Key {tempModel === 'groq' && <span className="text-red-500">*</span>}</label>
+                        <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+                             Get Key <ExternalLink size={10} />
+                        </a>
+                    </div>
+                    <input 
+                        type="password"
+                        value={tempGroqKey}
+                        onChange={(e) => setTempGroqKey(e.target.value)}
+                        placeholder="Enter Groq API Key (gsk_...)"
+                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'groq' && !tempGroqKey ? 'border-red-500/50' : 'border-border'}`}
+                    />
+                </div>
+
+                <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-text">OpenAI API Key {tempModel === 'openai' && <span className="text-red-500">*</span>}</label>
+                        <a href="https://platform.openai.com/settings/organization/api-keys" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+                             Get Key <ExternalLink size={10} />
+                        </a>
+                    </div>
+                    <input 
+                        type="password"
+                        value={tempOpenAIKey}
+                        onChange={(e) => setTempOpenAIKey(e.target.value)}
+                        placeholder="Enter OpenAI API Key (sk-...)"
+                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'openai' && !tempOpenAIKey ? 'border-red-500/50' : 'border-border'}`}
+                    />
+                </div>
+
+                <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-text">xAI (Grok) API Key {tempModel === 'xai' && <span className="text-red-500">*</span>}</label>
+                        <a href="https://console.x.ai/home" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+                             Get Key <ExternalLink size={10} />
+                        </a>
+                    </div>
+                    <input 
+                        type="password"
+                        value={tempXaiKey}
+                        onChange={(e) => setTempXaiKey(e.target.value)}
+                        placeholder="Enter xAI API Key (xai-...)"
+                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'xai' && !tempXaiKey ? 'border-red-500/50' : 'border-border'}`}
+                    />
+                </div>
+                
+                <div className="space-y-1 pt-2 border-t border-border">
+                    <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-text">Deepgram API Key (System Audio)</label>
+                        <a href="https://console.deepgram.com/signup" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
+                             Get Key <ExternalLink size={10} />
+                        </a>
+                    </div>
+                    <input 
+                        type="password"
+                        value={tempDeepgramKey}
+                        onChange={(e) => setTempDeepgramKey(e.target.value)}
+                        placeholder="Enter Deepgram API Key"
+                        className="w-full bg-background border border-border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm"
+                    />
+                </div>
+
+                <button 
+                    onClick={saveSettings}
+                    className={`w-full px-4 py-2 rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-all ${
+                        saveStatus === 'saved' 
+                        ? 'bg-green-500 text-white' 
+                        : 'bg-primary text-white hover:bg-blue-600'
+                    }`}
+                >
+                    {saveStatus === 'saved' ? <Check size={16} /> : <Save size={16} />}
+                    {saveStatus === 'saved' ? 'Settings Saved' : 'Save Settings'}
+                </button>
+            </div>
+
+            <div className="border-t border-border pt-4 space-y-4">
+                {/* Theme Toggle */}
+                <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-text">App Theme</span>
+                    <div className="flex items-center bg-background border border-border rounded-lg p-1">
+                        <button 
+                            onClick={() => setSettings(s => ({...s, theme: 'light'}))}
+                            className={`p-2 rounded-md transition-all ${settings.theme === 'light' ? 'bg-white shadow text-black' : 'text-gray-400 hover:text-gray-200'}`}
+                        >
+                            <Sun size={16} />
+                        </button>
+                        <button 
+                            onClick={() => setSettings(s => ({...s, theme: 'dark'}))}
+                            className={`p-2 rounded-md transition-all ${settings.theme === 'dark' ? 'bg-gray-700 shadow text-white' : 'text-gray-400 hover:text-gray-600'}`}
+                        >
+                            <Moon size={16} />
+                        </button>
+                    </div>
+                </div>
+
+                {/* Font Size Toggle */}
+                <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-text">Text Size</span>
+                    <div className="flex items-center gap-2">
+                        {(['small', 'medium', 'large'] as const).map((size) => (
+                            <button
+                                key={size}
+                                onClick={() => setSettings(s => ({...s, fontSize: size}))}
+                                className={`px-3 py-1.5 rounded-md text-xs font-medium border transition-all ${
+                                    settings.fontSize === size 
+                                    ? 'bg-primary text-white border-primary' 
+                                    : 'bg-transparent text-gray-500 border-border hover:border-gray-400'
+                                }`}
+                            >
+                                {size.charAt(0).toUpperCase() + size.slice(1)}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            </div>
+
+         </div>
+      </Modal>
+
+      {/* --- Context Files Modal --- */}
+      <Modal isOpen={showContext} onClose={() => setShowContext(false)} title="Knowledge Base">
+        <div className="space-y-6">
+           {/* Info Banner */}
+           <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-3">
+               <div className="flex items-start gap-3">
+                   <Info size={18} className="text-blue-500 mt-0.5" />
+                   <div className="text-xs text-blue-200/80 leading-relaxed">
+                       <strong className="text-blue-400 block mb-1">How Context Works</strong>
+                       Files uploaded here are sent to the AI with every message. 
+                       Use "Context Mode" to force the AI to rely on these files.
+                   </div>
+               </div>
+           </div>
+
+           {/* File List */}
+           <div className="space-y-3">
+               <div className="flex items-center justify-between">
+                   <h3 className="text-sm font-bold text-text">Attached Files ({settings.contextFiles.length})</h3>
+                   <button onClick={triggerFileUpload} className="text-xs flex items-center gap-1 text-primary hover:underline">
+                       <Plus size={12} /> Add File
+                   </button>
+                   {/* HIDDEN INPUT */}
+                   <input 
+                       type="file" 
+                       ref={fileInputRef} 
+                       className="hidden"
+                       onChange={handleFileUpload}
+                       accept=".pdf,.txt,.md,.json,.js,.ts,.py,.html,.css,.csv,.png,.jpg,.jpeg"
+                   />
+               </div>
+               
+               <div className="space-y-2 max-h-[200px] overflow-y-auto custom-scrollbar pr-1">
+                   {settings.contextFiles.length === 0 && (
+                       <div className="text-center py-6 border border-dashed border-border rounded-xl text-gray-500">
+                           <FilePlus size={24} className="mx-auto mb-2 opacity-50" />
+                           <p className="text-xs">No files added.</p>
+                       </div>
+                   )}
+                   {settings.contextFiles.map(file => (
+                       <div key={file.id} className="flex items-center justify-between p-2.5 bg-background border border-border rounded-lg group hover:border-primary/30 transition-colors">
+                           <div className="flex items-center gap-3 overflow-hidden">
+                               <div className="w-8 h-8 rounded bg-gray-500/10 flex items-center justify-center shrink-0">
+                                   <FileText size={14} className="text-gray-400" />
+                               </div>
+                               <div className="min-w-0">
+                                   <p className="text-xs font-medium text-text truncate max-w-[180px]">{file.name}</p>
+                                   <p className="text-[10px] text-gray-500 uppercase">{file.type}</p>
+                               </div>
+                           </div>
+                           <button onClick={() => removeFile(file.id)} className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors opacity-0 group-hover:opacity-100">
+                               <Trash2 size={14} />
+                           </button>
+                       </div>
+                   ))}
+               </div>
+           </div>
+
+           {/* Paste Text Section */}
+           <div className="space-y-3 pt-4 border-t border-border">
+               <h3 className="text-sm font-bold text-text">Quick Paste</h3>
+               <div className="relative">
+                   <textarea
+                        value={pasteContent}
+                        onChange={(e) => setPasteContent(e.target.value)}
+                        placeholder="Paste Resume text, Job Description, or Notes here..."
+                        className="w-full h-32 bg-background border border-border rounded-xl p-3 text-xs focus:ring-1 focus:ring-primary outline-none resize-none custom-scrollbar"
+                   />
+                   <div className="absolute bottom-2 right-2">
+                       <button 
+                            onClick={handleAddPasteText}
+                            disabled={!pasteContent.trim()}
+                            className={`p-2 rounded-lg transition-all ${pasteContent.trim() ? 'bg-primary text-white shadow-lg hover:bg-blue-600' : 'bg-surface text-gray-500 cursor-not-allowed border border-border'}`}
+                            title="Add as Context"
+                       >
+                           <Plus size={16} />
+                       </button>
+                   </div>
+               </div>
+           </div>
+
+           {/* General Mode Toggle within Context */}
+           <div className="flex items-center justify-between pt-2">
+               <div className="flex flex-col">
+                   <span className="text-sm font-medium text-text">General Knowledge Mode</span>
+                   <span className="text-[10px] text-gray-500">
+                       {settings.generalMode ? "AI uses broad knowledge (Wikipedia-style)." : "AI relies strictly on your files."}
+                   </span>
+               </div>
+               <button 
+                   onClick={toggleGeneralMode}
+                   className={`text-2xl transition-colors ${settings.generalMode ? 'text-green-500' : 'text-gray-500'}`}
+               >
+                   {settings.generalMode ? <ToggleRight size={32} /> : <ToggleLeft size={32} />}
+               </button>
+           </div>
+        </div>
+      </Modal>
+
+      {/* --- Help Modal --- */}
+      <Modal isOpen={showHelp} onClose={() => setShowHelp(false)} title="Audio Setup Help">
+          <div className="space-y-4 text-sm text-text">
+              <div className="p-4 bg-surface border border-border rounded-xl space-y-3">
+                  <h3 className="font-bold flex items-center gap-2"><Mic size={16} className="text-red-500" /> How to Capture Audio</h3>
+                  <ol className="list-decimal list-inside space-y-2 text-gray-400 ml-1">
+                      <li>Click the <span className="text-text font-bold">MIC (OFF)</span> button in the bottom bar.</li>
+                      <li>A browser popup will ask to share your screen.</li>
+                      <li>Select the <span className="text-text font-bold">Chrome Tab</span> where your meeting is running (e.g., Google Meet, Zoom Web).</li>
+                      <li><span className="text-red-400 font-bold underline decoration-wavy">CRITICAL:</span> Check the box <strong>"Also share tab audio"</strong> in the bottom left of the popup.</li>
+                      <li>Click <strong>Share</strong>. The status will turn to <span className="text-red-500 font-bold">LIVE</span>.</li>
+                  </ol>
+              </div>
+              <div className="p-4 bg-surface border border-border rounded-xl space-y-2">
+                  <h3 className="font-bold flex items-center gap-2"><ExternalLink size={16} className="text-blue-500" /> Pop-out Mode</h3>
+                  <p className="text-gray-400 leading-relaxed">
+                      If you are sharing your <strong>Entire Screen</strong>, the interviewer will see this AI overlay. 
+                      To hide it, click the <span className="text-blue-500 font-bold">Pop-out Icon</span> in the top right. 
+                      This moves the AI to a separate window that is <em>not</em> visible in screen share.
+                  </p>
+              </div>
+          </div>
+      </Modal>
+
+      <Modal isOpen={showDownloadModal} onClose={() => setShowDownloadModal(false)} title="Download Interview Copilot">
+          <div className="space-y-6 text-center">
+              <div className="w-16 h-16 bg-gradient-to-br from-blue-500/20 to-purple-600/20 rounded-2xl flex items-center justify-center mx-auto mb-4 border border-blue-500/30">
+                  <Download size={32} className="text-blue-500" />
+              </div>
+              <h3 className="text-xl font-bold text-text">Experience Stealth Mode</h3>
+              <p className="text-sm text-gray-400 max-w-sm mx-auto leading-relaxed">
+                  The desktop app runs natively on your system and is <strong className="text-white">completely invisible to screen sharing apps</strong> like Zoom, Google Meet, and MS Teams.
+              </p>
+              
+              <div className="grid grid-cols-1 gap-3 pt-4">
+                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-blue-500 hover:bg-blue-500/5 transition-all group">
+                      <div className="flex items-center gap-4">
+                          <div className="p-2 bg-blue-500/10 rounded-lg group-hover:bg-blue-500/20 transition-colors">
+                              <Monitor size={24} className="text-blue-400 group-hover:text-blue-500" />
+                          </div>
+                          <div className="text-left">
+                              <div className="font-bold text-text group-hover:text-blue-400 transition-colors">Download for Windows</div>
+                              <div className="text-xs text-gray-500">Windows 10/11 (.exe)</div>
+                          </div>
+                      </div>
+                      <Download size={18} className="text-gray-500 group-hover:text-blue-500 transition-colors" />
+                  </a>
+                  
+                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac.dmg" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-purple-500 hover:bg-purple-500/5 transition-all group">
+                      <div className="flex items-center gap-4">
+                          <div className="p-2 bg-purple-500/10 rounded-lg group-hover:bg-purple-500/20 transition-colors">
+                              <Laptop size={24} className="text-purple-400 group-hover:text-purple-500" />
+                          </div>
+                          <div className="text-left">
+                              <div className="font-bold text-text group-hover:text-purple-400 transition-colors">Download for Mac</div>
+                              <div className="text-xs text-gray-500">macOS 10.15+ (.dmg)</div>
+                          </div>
+                      </div>
+                      <Download size={18} className="text-gray-500 group-hover:text-purple-500 transition-colors" />
+                  </a>
+                  
+                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-orange-500 hover:bg-orange-500/5 transition-all group">
+                      <div className="flex items-center gap-4">
+                          <div className="p-2 bg-orange-500/10 rounded-lg group-hover:bg-orange-500/20 transition-colors">
+                              <Terminal size={24} className="text-orange-400 group-hover:text-orange-500" />
+                          </div>
+                          <div className="text-left">
+                              <div className="font-bold text-text group-hover:text-orange-400 transition-colors">Download for Linux</div>
+                              <div className="text-xs text-gray-500">Any distro (.AppImage)</div>
+                          </div>
+                      </div>
+                      <Download size={18} className="text-gray-500 group-hover:text-orange-500 transition-colors" />
+                  </a>
+              </div>
+              
+              <div className="text-xs text-gray-400 mt-4 bg-surface border border-border p-3 rounded-lg text-left flex items-start gap-2">
+                  <Info size={16} className="text-blue-400 shrink-0 mt-0.5" />
+                  <p>
+                      <strong>Note for Deployment:</strong> Once you push this code to GitHub, the automated Actions workflow will build these files. You'll need to update these links in <code>App.tsx</code> to point to your actual GitHub Releases page.
+                  </p>
+              </div>
+          </div>
+      </Modal>
+
+    </div>
+  );
+}
