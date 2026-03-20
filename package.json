@@ -1,7 +1,7 @@
 {
   "name": "interview-copilot-ai",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -23,13 +23,20 @@
       "electron/**/*"
     ],
     "mac": {
-      "category": "public.app-category.productivity"
+      "category": "public.app-category.productivity",
+      "artifactName": "InterviewCopilot-Mac.${ext}"
     },
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "artifactName": "InterviewCopilot-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "allowToChangeInstallationDirectory": false
     },
     "linux": {
-      "target": "AppImage"
+      "target": "AppImage",
+      "artifactName": "InterviewCopilot-Linux.${ext}"
     }
   },
   "dependencies": {
