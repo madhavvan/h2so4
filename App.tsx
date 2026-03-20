@@ -578,13 +578,14 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
                 };
                 pipWindow.document.head.appendChild(twScript);
 
-                // Inject CSS Vars
+                // Inject CSS Vars — fully transparent PiP window
                  const style = pipWindow.document.createElement('style');
                 style.textContent = `
-                 :root { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
-                 .dark { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
-                 body { background-color: var(--bg-color); color: var(--text-color); }
-                 .pip-body { background: #000000; }
+                 :root { --bg-color: transparent; --surface-color: transparent; --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
+                 .dark { --bg-color: transparent; --surface-color: transparent; --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
+                 body { background-color: transparent !important; color: var(--text-color); }
+                 .pip-body { background: transparent !important; }
+                 html { background: transparent !important; }
                 `;
                 pipWindow.document.head.appendChild(style);
 
