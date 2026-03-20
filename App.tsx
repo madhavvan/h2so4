@@ -163,7 +163,7 @@ const ChatInterface = ({
                             onChange={handleModelChange}
                             className="text-xs rounded-md px-2 py-1 outline-none cursor-pointer"
                             style={{ 
-                                background: 'var(--bubble-user)', 
+                                background: 'transparent', 
                                 border: '1px solid var(--glass-border)',
                                 color: 'var(--text-main)' 
                             }}
@@ -178,7 +178,7 @@ const ChatInterface = ({
                             className="p-1.5 rounded-md transition-colors"
                             title="Settings"
                             style={{ 
-                                background: 'var(--bubble-user)', 
+                                background: 'transparent', 
                                 border: '1px solid var(--glass-border)',
                                 color: 'var(--text-main)' 
                             }}
@@ -280,7 +280,7 @@ const ChatInterface = ({
                         aria-label="Toggle Mic"
                         onClick={isListening ? stopListening : startListening}
                         title={isListening ? "Stop Listening" : "Start Listening"}
-                        style={{ opacity: 1, background: isListening ? 'var(--text-main)' : 'var(--bubble-user)' }}
+                        style={{ opacity: 1, background: isListening ? 'rgba(255,255,255,0.9)' : 'transparent' }}
                     >
                         {isListening ? <MicOff size={18} strokeWidth={1.5} style={{ color: 'var(--glass-bg)', stroke: 'var(--glass-bg)' }} /> : <Mic size={18} strokeWidth={1.5} />}
                     </button>
@@ -290,9 +290,9 @@ const ChatInterface = ({
     }
 
     return (
-        <div className={`flex-1 flex flex-col h-full overflow-hidden relative ${isPipMode ? 'bg-transparent' : 'bg-background'} text-text transition-colors duration-300 ${settings.theme === 'dark' ? 'dark' : ''}`}>
+        <div className={`flex-1 flex flex-col h-full overflow-hidden relative bg-transparent text-text transition-colors duration-300 ${settings.theme === 'dark' ? 'dark' : ''}`}>
              {/* --- RESPONSIVE HEADER --- */}
-            <header className={`h-14 md:h-16 border-b border-border ${isPipMode ? 'bg-surface/50' : 'bg-surface/80'} backdrop-blur-md flex items-center justify-between px-4 shrink-0 z-20 sticky top-0`}>
+            <header className={`h-14 md:h-16 border-b border-white/15 bg-transparent flex items-center justify-between px-4 shrink-0 z-20 sticky top-0`}>
                 <div className="flex items-center gap-2 md:gap-3">
                 <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
                     <Cpu size={18} className="text-white" />
@@ -355,10 +355,10 @@ const ChatInterface = ({
                     <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-in slide-in-from-bottom-2 duration-300`}>
                         <div className={`max-w-[95%] md:max-w-[85%] rounded-2xl p-3 md:p-5 shadow-lg ${
                         msg.role === 'user' 
-                            ? 'bg-surface text-text border border-border rounded-tr-sm' 
+                            ? 'bg-transparent text-text border border-white/20 rounded-tr-sm' 
                             : msg.role === 'system'
-                            ? 'bg-red-500/10 border border-red-500/50 text-red-500'
-                            : 'bg-primary/5 border border-primary/20 text-text rounded-tl-sm backdrop-blur-sm'
+                            ? 'bg-transparent border border-red-500/50 text-red-500'
+                            : 'bg-transparent border border-white/15 text-text rounded-tl-sm'
                         }`}>
                         <div className="text-[10px] font-bold mb-2 opacity-60 uppercase tracking-wider flex items-center gap-1">
                             {msg.role === 'user' ? <MessageSquare size={10} /> : <Zap size={10} />}
@@ -372,7 +372,7 @@ const ChatInterface = ({
 
                     {isProcessing && (
                     <div className="flex justify-start">
-                        <div className="bg-surface border border-border rounded-2xl px-4 py-3 rounded-tl-sm flex items-center gap-2 text-gray-500 text-xs shadow-lg">
+                        <div className="bg-transparent border border-white/15 rounded-2xl px-4 py-3 rounded-tl-sm flex items-center gap-2 text-gray-500 text-xs shadow-lg">
                             <span className="font-semibold text-primary tracking-wider">THINKING ({settings.selectedModel.toUpperCase()})</span>
                             <div className="flex gap-1">
                                 <div className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0ms'}}></div>
@@ -385,7 +385,7 @@ const ChatInterface = ({
                 </div>
 
                 {/* --- INPUT BAR --- */}
-                <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-background via-background to-transparent pt-4 pb-4 px-2 md:px-6 z-20">
+                <div className="absolute bottom-0 left-0 right-0 bg-transparent pt-4 pb-4 px-2 md:px-6 z-20">
                     <div className="max-w-3xl mx-auto flex flex-col gap-2">
                         
                         {speechError && (
@@ -394,7 +394,7 @@ const ChatInterface = ({
                             </div>
                         )}
 
-                        <div className={`bg-surface/90 backdrop-blur-xl border rounded-2xl shadow-2xl transition-all duration-300 flex flex-col ${isListening ? 'border-primary/50 shadow-[0_0_20px_rgba(59,130,246,0.15)]' : 'border-border'}`}>
+                        <div className={`bg-transparent border rounded-2xl shadow-lg transition-all duration-300 flex flex-col ${isListening ? 'border-white/30' : 'border-white/15'}`}>
                             
                             <div className="flex items-center justify-between px-3 py-1.5 border-b border-gray-500/10">
                                 <div className="flex items-center gap-2">
