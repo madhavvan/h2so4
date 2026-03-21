@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, screen, session } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer } = require('electron');
 const path = require('path');
 
 let mainWindow = null;
@@ -148,6 +148,16 @@ function createPopoutWindow(options = {}) {
 // ───────────────────────────────────────────────
 //  IPC HANDLERS
 // ───────────────────────────────────────────────
+
+// Desktop capturer — renderer can't access this directly in Electron 17+
+ipcMain.handle('get-desktop-sources', async () => {
+  const sources = await desktopCapturer.getSources({
+    types: ['window', 'screen'],
+    thumbnailSize: { width: 150, height: 150 }
+  });
+  // Return serializable data (thumbnails are NativeImage, can't be sent directly)
+  return sources.map(s => ({ id: s.id, name: s.name }));
+});
 
 // Pop-out window management
 ipcMain.on('open-popout', (_event, options) => {

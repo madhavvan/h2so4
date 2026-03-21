@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, Minus, Maximize2 } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -172,86 +172,105 @@ const ChatInterface = ({
         localStorage.setItem("SELECTED_MODEL", newModel);
     };
 
+    // Pop-out size presets: S → M → L cycle
+    const sizePresets = [
+        { label: 'S', w: 340, h: 480 },
+        { label: 'M', w: 450, h: 700 },
+        { label: 'L', w: 580, h: 850 },
+    ];
+    const [sizeIndex, setSizeIndex] = useState(1); // Start at M
+
     if (isPipMode) {
         // Detect Electron for window controls
         const inElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+
+        const cycleSize = () => {
+            const next = (sizeIndex + 1) % sizePresets.length;
+            setSizeIndex(next);
+            electronIPC.send('resize-popout', { width: sizePresets[next].w, height: sizePresets[next].h });
+        };
+
+        // Shared button style for glass look
+        const glassBtn = {
+            background: 'transparent',
+            border: '1px solid var(--glass-border)',
+            color: 'var(--text-main)',
+        };
 
         return (
             <div className="popup open" style={inElectron ? { background: 'transparent' } : undefined}>
                 <div className="bg-layer"></div>
                 
+                {/* ── HEADER ── */}
                 <div 
                     className="popup-header" 
                     id="dragHandle"
-                    style={inElectron ? { WebkitAppRegion: 'drag' } as any : undefined}
+                    style={inElectron ? { WebkitAppRegion: 'drag', padding: '10px 12px' } as any : undefined}
                 >
+                    {/* Left: Avatar + Name */}
                     <div className="avatar">✦</div>
-                    <div className="header-info">
+                    <div className="header-info" style={{ minWidth: 0 }}>
                         <h4>minico</h4>
-                        <span><span className="dot"></span> Online — ready to help</span>
+                        <span><span className="dot"></span> Online</span>
                     </div>
-                    <div className="ml-auto flex items-center gap-2" style={inElectron ? { WebkitAppRegion: 'no-drag' } as any : undefined}>
+
+                    {/* Right: Controls row */}
+                    <div 
+                        className="ml-auto flex items-center" 
+                        style={inElectron ? { WebkitAppRegion: 'no-drag', gap: '6px' } as any : { gap: '6px' }}
+                    >
+                        {/* Model selector — compact */}
                         <select 
                             value={settings.selectedModel}
                             onChange={handleModelChange}
-                            className="text-xs rounded-md px-2 py-1 outline-none cursor-pointer"
-                            style={{ 
-                                background: 'transparent', 
-                                border: '1px solid var(--glass-border)',
-                                color: 'var(--text-main)' 
-                            }}
+                            className="text-[10px] rounded px-1.5 py-0.5 outline-none cursor-pointer"
+                            style={glassBtn}
                         >
-                            <option value="gemini" className="text-black">Gemini 3.1</option>
+                            <option value="gemini" className="text-black">Gemini</option>
                             <option value="groq" className="text-black">Groq</option>
-                            <option value="openai" className="text-black">GPT-5.4 Mini</option>
+                            <option value="openai" className="text-black">GPT</option>
                             <option value="xai" className="text-black">Grok</option>
                         </select>
-                        <button 
-                            onClick={onOpenSettings}
-                            className="p-1.5 rounded-md transition-colors"
-                            title="Settings"
-                            style={{ 
-                                background: 'transparent', 
-                                border: '1px solid var(--glass-border)',
-                                color: 'var(--text-main)' 
-                            }}
-                        >
-                            <Settings size={14} strokeWidth={1.5} />
+
+                        {/* Settings */}
+                        <button onClick={onOpenSettings} className="p-1 rounded transition-colors hover:bg-white/10" title="Settings" style={glassBtn}>
+                            <Settings size={13} strokeWidth={1.5} />
                         </button>
-                        {/* Electron window controls — resize, minimize & close */}
+
+                        {/* ── Electron-only controls ── */}
                         {inElectron && (
                             <>
-                                <button
-                                    onClick={() => electronIPC.send('resize-popout', { width: 320, height: 450 })}
-                                    className="p-1.5 rounded-md transition-colors hover:bg-white/10"
-                                    title="Smaller"
-                                    style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
+                                {/* Divider */}
+                                <div style={{ width: 1, height: 16, background: 'var(--glass-border)', margin: '0 2px' }} />
+
+                                {/* Size cycle: S → M → L */}
+                                <button 
+                                    onClick={cycleSize} 
+                                    className="rounded transition-colors hover:bg-white/10"
+                                    title={`Resize (now ${sizePresets[sizeIndex].label})`}
+                                    style={{ ...glassBtn, padding: '2px 6px', fontSize: '10px', fontWeight: 700, letterSpacing: '0.5px' }}
                                 >
-                                    <Minus size={12} strokeWidth={2} />
+                                    {sizePresets[sizeIndex].label}
                                 </button>
-                                <button
-                                    onClick={() => electronIPC.send('resize-popout', { width: 550, height: 800 })}
-                                    className="p-1.5 rounded-md transition-colors hover:bg-white/10"
-                                    title="Larger"
-                                    style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
-                                >
-                                    <Maximize2 size={12} strokeWidth={2} />
-                                </button>
-                                <button
-                                    onClick={() => electronIPC.send('minimize-window')}
-                                    className="p-1.5 rounded-md transition-colors hover:bg-white/10"
+
+                                {/* Minimize */}
+                                <button 
+                                    onClick={() => electronIPC.send('minimize-window')} 
+                                    className="p-1 rounded transition-colors hover:bg-white/10" 
                                     title="Minimize"
-                                    style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
+                                    style={glassBtn}
                                 >
-                                    <span style={{ fontSize: '14px', lineHeight: 1 }}>—</span>
+                                    <svg width="12" height="12" viewBox="0 0 12 12"><line x1="2" y1="6" x2="10" y2="6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
                                 </button>
-                                <button
-                                    onClick={() => electronIPC.send('close-window')}
-                                    className="p-1.5 rounded-md transition-colors hover:bg-red-500/20"
+
+                                {/* Close */}
+                                <button 
+                                    onClick={() => electronIPC.send('close-window')} 
+                                    className="p-1 rounded transition-colors hover:bg-red-500/30" 
                                     title="Close"
-                                    style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
+                                    style={glassBtn}
                                 >
-                                    <X size={14} strokeWidth={1.5} />
+                                    <X size={13} strokeWidth={1.5} />
                                 </button>
                             </>
                         )}

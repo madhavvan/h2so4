@@ -20,13 +20,11 @@ const isElectron = typeof window !== 'undefined' && !!(window as any).process?.v
 async function getAudioStream(): Promise<{ stream: MediaStream; audioStream: MediaStream }> {
   if (isElectron) {
     // ── ELECTRON PATH ──
-    // Use Electron's desktopCapturer to pick a source, then getUserMedia with chrome constraints
-    const { desktopCapturer } = (window as any).require('electron');
+    // desktopCapturer is only available in main process (Electron 17+)
+    // Use IPC to get sources from main process
+    const { ipcRenderer } = (window as any).require('electron');
 
-    const sources = await desktopCapturer.getSources({
-      types: ['window', 'screen'],
-      thumbnailSize: { width: 150, height: 150 }
-    });
+    const sources = await ipcRenderer.invoke('get-desktop-sources');
 
     if (!sources || sources.length === 0) {
       throw new Error('No capture sources found');
