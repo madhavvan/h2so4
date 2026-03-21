@@ -11,175 +11,226 @@ interface UseSpeechRecognitionProps {
   apiKey: string; // Deepgram API Key
 }
 
-export const useSpeechRecognition = ({ 
+// Detect Electron
+const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+
+/**
+ * Get audio stream — handles both Browser (getDisplayMedia) and Electron (desktopCapturer)
+ */
+async function getAudioStream(): Promise<{ stream: MediaStream; audioStream: MediaStream }> {
+  if (isElectron) {
+    // ── ELECTRON PATH ──
+    // Use Electron's desktopCapturer to pick a source, then getUserMedia with chrome constraints
+    const { desktopCapturer } = (window as any).require('electron');
+
+    const sources = await desktopCapturer.getSources({
+      types: ['window', 'screen'],
+      thumbnailSize: { width: 150, height: 150 }
+    });
+
+    if (!sources || sources.length === 0) {
+      throw new Error('No capture sources found');
+    }
+
+    // Try to find "Entire Screen" first, fall back to first source
+    const screenSource = sources.find((s: any) =>
+      s.name === 'Entire Screen' || s.name === 'Screen 1' || s.name.toLowerCase().includes('screen')
+    ) || sources[0];
+
+    // In Electron, we use getUserMedia with chromeMediaSource constraints
+    // This captures system audio on Windows. macOS has limitations (see notes below).
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: screenSource.id,
+        }
+      } as any,
+      video: {
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: screenSource.id,
+          maxWidth: 1920,
+          maxHeight: 1080,
+          maxFrameRate: 5, // Low FPS since we only need occasional screenshots
+        }
+      } as any,
+    });
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      stream.getTracks().forEach(t => t.stop());
+      throw new Error('No system audio detected. On macOS you may need a virtual audio driver (e.g. BlackHole).');
+    }
+
+    const audioStream = new MediaStream(audioTracks);
+    return { stream, audioStream };
+
+  } else {
+    // ── BROWSER PATH ──
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      }
+    });
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      stream.getTracks().forEach(t => t.stop());
+      throw new Error("No audio shared. Please check 'Share tab audio' in the popup.");
+    }
+
+    const audioStream = new MediaStream(audioTracks);
+    return { stream, audioStream };
+  }
+}
+
+export const useSpeechRecognition = ({
   onResult,
   onError,
   apiKey
 }: UseSpeechRecognitionProps) => {
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  
+
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
-  const streamRef = useRef<MediaStream | null>(null); // Keeps the original Display Media stream (Video+Audio)
+  const streamRef = useRef<MediaStream | null>(null);
   const [currentStream, setCurrentStream] = useState<MediaStream | null>(null);
-  const audioStreamRef = useRef<MediaStream | null>(null); // Keeps the Audio-only stream
-  
+  const audioStreamRef = useRef<MediaStream | null>(null);
+
+  const stopListening = useCallback(() => {
+    setIsListening(false);
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+
+    if (socketRef.current) {
+      if (socketRef.current.readyState === 1 || socketRef.current.readyState === 0) {
+        socketRef.current.close();
+      }
+    }
+
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(track => track.stop());
+      audioStreamRef.current = null;
+    }
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+      setCurrentStream(null);
+    }
+  }, []);
+
   const startListening = useCallback(async () => {
     setError(null);
 
     const cleanKey = apiKey?.trim();
     if (!cleanKey) {
-        const msg = "Deepgram API Key missing. Check Settings.";
-        setError(msg);
-        onError?.(msg);
-        return;
+      const msg = "Deepgram API Key missing. Check Settings.";
+      setError(msg);
+      onError?.(msg);
+      return;
     }
 
     try {
-      // 1. Request System Audio via Screen Share
-      const stream = await navigator.mediaDevices.getDisplayMedia({ 
-          video: true, 
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-          }
-      });
-
-      // 2. Validate Audio Track
-      const audioTracks = stream.getAudioTracks();
-      if (audioTracks.length === 0) {
-          stream.getTracks().forEach(t => t.stop());
-          const msg = "No audio shared. Please check 'Share tab audio' in the popup.";
-          setError(msg);
-          onError?.(msg);
-          return;
-      }
+      // 1. Get audio stream (handles both Browser and Electron)
+      const { stream, audioStream } = await getAudioStream();
 
       streamRef.current = stream;
       setCurrentStream(stream);
-
-      // CRITICAL FIX: Create a new MediaStream with ONLY the audio track.
-      // Passing a stream with Video+Audio to a MediaRecorder set to 'audio/webm' causes NotSupportedError in Chrome.
-      const audioStream = new MediaStream(audioTracks);
       audioStreamRef.current = audioStream;
 
-      // 3. Connect to Deepgram WebSocket
-      const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&punctuate=true', [
-         'token',
-         cleanKey
-      ]);
+      // 2. Connect to Deepgram WebSocket
+      const socket = new WebSocket(
+        'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&punctuate=true',
+        ['token', cleanKey]
+      );
 
       socket.onopen = () => {
-         console.log('Deepgram Connected');
-         setIsListening(true);
-         
-         // 4. Start Recording & Streaming
-         // Detect supported mimeType
-         let mimeType = 'audio/webm';
-         if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-             mimeType = 'audio/webm;codecs=opus';
-         } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-             mimeType = 'audio/mp4';
-         }
-         
-         console.log('Using MimeType:', mimeType);
+        console.log('Deepgram Connected');
+        setIsListening(true);
 
-         try {
-             // Use the AUDIO-ONLY stream here
-             const mediaRecorder = new MediaRecorder(audioStream, { mimeType });
-             mediaRecorderRef.current = mediaRecorder;
+        // 3. Start Recording & Streaming
+        let mimeType = 'audio/webm';
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+          mimeType = 'audio/webm;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+          mimeType = 'audio/mp4';
+        }
 
-             mediaRecorder.addEventListener('dataavailable', (event) => {
-                 if (event.data.size > 0 && socket.readyState === 1) {
-                     socket.send(event.data);
-                 }
-             });
+        console.log('Using MimeType:', mimeType);
 
-             mediaRecorder.start(250); // Send chunks every 250ms
-         } catch (recErr: any) {
-             console.error("MediaRecorder Start Error:", recErr);
-             setError(`Recorder Error: ${recErr.message}`);
-             stopListening();
-         }
+        try {
+          const mediaRecorder = new MediaRecorder(audioStream, { mimeType });
+          mediaRecorderRef.current = mediaRecorder;
+
+          mediaRecorder.addEventListener('dataavailable', (event) => {
+            if (event.data.size > 0 && socket.readyState === 1) {
+              socket.send(event.data);
+            }
+          });
+
+          mediaRecorder.start(250);
+        } catch (recErr: any) {
+          console.error("MediaRecorder Start Error:", recErr);
+          setError(`Recorder Error: ${recErr.message}`);
+          stopListening();
+        }
       };
 
       socket.onmessage = (message) => {
-          try {
-              const received = JSON.parse(message.data);
-              const transcript = received.channel?.alternatives?.[0]?.transcript;
-              if (transcript && received.is_final) {
-                 onResult({ final: transcript, interim: '' });
-              } else if (transcript) {
-                 onResult({ final: '', interim: transcript });
-              }
-          } catch (e) {
-              console.error("Deepgram Parse Error", e);
+        try {
+          const received = JSON.parse(message.data);
+          const transcript = received.channel?.alternatives?.[0]?.transcript;
+          if (transcript && received.is_final) {
+            onResult({ final: transcript, interim: '' });
+          } else if (transcript) {
+            onResult({ final: '', interim: transcript });
           }
+        } catch (e) {
+          console.error("Deepgram Parse Error", e);
+        }
       };
 
       socket.onclose = (event) => {
-         console.log('Deepgram Closed', event.code, event.reason);
-         setIsListening(false);
+        console.log('Deepgram Closed', event.code, event.reason);
+        setIsListening(false);
       };
 
       socket.onerror = (e) => {
-          console.error("Deepgram Error", e);
-          if (socket.readyState !== 1) {
-               setError("Connection Error: Check API Key & Network.");
-          } else {
-               setError("Transcription Stream Error");
-          }
+        console.error("Deepgram Error", e);
+        if (socket.readyState !== 1) {
+          setError("Connection Error: Check API Key & Network.");
+        } else {
+          setError("Transcription Stream Error");
+        }
       };
-      
+
       socketRef.current = socket;
 
-      // Handle user clicking "Stop Sharing" on the browser UI
-      // We listen to the video track ending because that's what controls the UI indicator
-      stream.getVideoTracks()[0].onended = () => {
+      // Handle stream ending
+      const videoTracks = stream.getVideoTracks();
+      if (videoTracks.length > 0) {
+        videoTracks[0].onended = () => {
           stopListening();
-      };
+        };
+      }
 
     } catch (err: any) {
       console.error("Capture Error:", err);
-      // 'NotAllowedError' means user cancelled the dialog
       if (err.name !== 'NotAllowedError') {
-          const msg = `Capture Error: ${err.message || 'Could not start audio capture'}`;
-          setError(msg);
-          onError?.(msg);
+        const msg = `Capture Error: ${err.message || 'Could not start audio capture'}`;
+        setError(msg);
+        onError?.(msg);
       }
     }
-  }, [apiKey, onResult, onError]);
-
-  const stopListening = useCallback(() => {
-    setIsListening(false);
-    
-    // Stop Recorder
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
-    }
-    
-    // Close Socket
-    if (socketRef.current) {
-        if (socketRef.current.readyState === 1 || socketRef.current.readyState === 0) {
-             socketRef.current.close();
-        }
-    }
-
-    // Stop Audio-Only Stream Tracks
-    if (audioStreamRef.current) {
-        audioStreamRef.current.getTracks().forEach(track => track.stop());
-        audioStreamRef.current = null;
-    }
-
-    // Stop Original Display Stream Tracks (Video+Audio)
-    if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-        streamRef.current = null;
-        setCurrentStream(null);
-    }
-  }, []);
+  }, [apiKey, onResult, onError, stopListening]);
 
   return { isListening, error, startListening, stopListening, stream: currentStream };
 };

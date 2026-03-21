@@ -1,10 +1,28 @@
-const { app, BrowserWindow, ipcMain, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session } = require('electron');
 const path = require('path');
 
 let mainWindow = null;
 let popoutWindow = null;
 
 const isDev = !app.isPackaged;
+
+// Grant all media permissions (screen capture, audio, etc.)
+app.whenReady().then(() => {
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    // Allow all media-related permissions
+    const allowedPermissions = ['media', 'mediaKeySystem', 'display-capture', 'audioCapture', 'videoCapture'];
+    if (allowedPermissions.includes(permission)) {
+      callback(true);
+    } else {
+      callback(true); // Allow everything for simplicity in a desktop app
+    }
+  });
+
+  // Also handle permission checks
+  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
+    return true;
+  });
+});
 
 function getAppURL(params = '') {
   if (isDev) {
@@ -157,15 +175,25 @@ ipcMain.on('close-window', (event) => {
   if (win) win.close();
 });
 
-// Resize pop-out
+// Resize pop-out — keeps window on-screen and animates
 ipcMain.on('resize-popout', (_event, { width, height }) => {
   if (popoutWindow && !popoutWindow.isDestroyed()) {
-    const [currentW, currentH] = popoutWindow.getSize();
-    popoutWindow.setSize(
-      width || currentW,
-      height || currentH,
-      true // animate
-    );
+    const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
+    const [currentX, currentY] = popoutWindow.getPosition();
+    
+    // Calculate new position so window doesn't go off-screen
+    const newW = Math.min(width, screenW - 20);
+    const newH = Math.min(height, screenH - 20);
+    let newX = currentX;
+    let newY = currentY;
+
+    // Push back on-screen if needed
+    if (newX + newW > screenW) newX = screenW - newW - 10;
+    if (newY + newH > screenH) newY = screenH - newH - 10;
+    if (newX < 0) newX = 10;
+    if (newY < 0) newY = 10;
+
+    popoutWindow.setBounds({ x: newX, y: newY, width: newW, height: newH }, true);
   }
 });
 
