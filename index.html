@@ -30,30 +30,18 @@
     <style>
       :root {
         /* Light Mode Defaults */
-        --bg-color: #f8fafc;
-        --surface-color: #ffffff;
-        --border-color: #e2e8f0;
-        --text-color: #0f172a;
+        --bg-color: #f8fafc; /* Slate 50 */
+        --surface-color: #ffffff; /* White */
+        --border-color: #e2e8f0; /* Slate 200 */
+        --text-color: #0f172a; /* Slate 900 */
       }
 
       .dark {
         /* Dark Mode Defaults */
-        --bg-color: #09090b;
-        --surface-color: #18181b;
-        --border-color: #27272a;
-        --text-color: #e4e4e7;
-      }
-
-      /*
-       * ELECTRON TRANSPARENCY:
-       * When running in Electron with transparent:true,
-       * html + body must be transparent so the OS desktop shows through.
-       * We detect Electron via a class added by the React app on mount.
-       */
-      html.electron-transparent,
-      html.electron-transparent body {
-        background: transparent !important;
-        background-color: transparent !important;
+        --bg-color: #09090b; /* Zinc 950 */
+        --surface-color: #18181b; /* Zinc 900 */
+        --border-color: #27272a; /* Zinc 800 */
+        --text-color: #e4e4e7; /* Zinc 200 */
       }
 
       /* Custom Scrollbar */
@@ -76,9 +64,16 @@
         color: var(--text-color);
         transition: background-color 0.3s, color 0.3s;
       }
+
+      /* Electron pop-out window transparency */
+      html.electron-transparent,
+      html.electron-transparent body {
+        background: transparent !important;
+        background-color: transparent !important;
+      }
     </style>
-    <link rel="stylesheet" href="/index.css">
-  </head>
+<link rel="stylesheet" href="/index.css">
+</head>
   <body>
     <div id="root"></div>
     <script type="module" src="/index.tsx"></script>

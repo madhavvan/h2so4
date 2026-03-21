@@ -1,62 +1,203 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, screen } = require('electron');
 const path = require('path');
 
 let mainWindow = null;
+let popoutWindow = null;
 
-function createWindow() {
+const isDev = !app.isPackaged;
+
+function getAppURL(params = '') {
+  if (isDev) {
+    return `http://localhost:3000${params ? '?' + params : ''}`;
+  }
+  // For production, load file and append hash params
+  const filePath = path.join(__dirname, '../dist/index.html');
+  return params ? `file://${filePath}?${params}` : filePath;
+}
+
+// ───────────────────────────────────────────────
+//  MAIN WINDOW — Full app, opaque, normal frame
+// ───────────────────────────────────────────────
+function createMainWindow() {
+  const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
+
   mainWindow = new BrowserWindow({
-    width: 450,
-    height: 700,
-    alwaysOnTop: true,
-    // --- TRANSPARENCY ---
-    transparent: true,
-    frame: false,               
-    hasShadow: false,           
-    backgroundColor: '#00000000', 
-    // --- END TRANSPARENCY ---
+    width: Math.min(1100, screenW - 100),
+    height: Math.min(750, screenH - 100),
+    minWidth: 800,
+    minHeight: 600,
+    // Normal opaque window with frame
+    frame: true,
+    transparent: false,
+    backgroundColor: '#09090b', // Dark zinc background
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
     },
-    roundedCorners: true,
-    resizable: true,
-    minWidth: 380,
-    minHeight: 500,
+    icon: path.join(__dirname, '../dist/favicon.ico'),
+    title: 'Interview Copilot',
+    show: false, // Show after ready-to-show for smooth startup
   });
 
-  
+  // INVISIBLE TO SCREEN SHARE
   mainWindow.setContentProtection(true);
 
-  // IPC: Allow renderer to toggle click-through on transparent areas
-  ipcMain.on('set-ignore-mouse', (_event, ignore) => {
-    if (mainWindow) {
-      mainWindow.setIgnoreMouseEvents(ignore, { forward: true });
-    }
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
   });
 
-  // IPC: Allow renderer to set always-on-top level
-  ipcMain.on('set-always-on-top', (_event, flag) => {
-    if (mainWindow) {
-      mainWindow.setAlwaysOnTop(flag, 'floating');
-    }
-  });
-
-  // Load the app
-  const isDev = !app.isPackaged;
-
+  // Load the full app
   if (isDev) {
     mainWindow.loadURL('http://localhost:3000');
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+    // Close popout if main closes
+    if (popoutWindow && !popoutWindow.isDestroyed()) {
+      popoutWindow.close();
+    }
+  });
 }
 
+// ───────────────────────────────────────────────
+//  POP-OUT WINDOW — Transparent, frameless, compact
+// ───────────────────────────────────────────────
+function createPopoutWindow(options = {}) {
+  if (popoutWindow && !popoutWindow.isDestroyed()) {
+    popoutWindow.focus();
+    return;
+  }
+
+  const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
+  const popW = options.width || 450;
+  const popH = options.height || 700;
+
+  popoutWindow = new BrowserWindow({
+    width: popW,
+    height: popH,
+    x: screenW - popW - 30,   // Bottom-right corner
+    y: screenH - popH - 30,
+    minWidth: 320,
+    minHeight: 400,
+    maxWidth: 800,
+    maxHeight: 1000,
+    // --- TRANSPARENCY ---
+    transparent: true,
+    frame: false,
+    hasShadow: false,
+    // --- END TRANSPARENCY ---
+    alwaysOnTop: true,
+    resizable: true,
+    skipTaskbar: false,
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false,
+    },
+    title: 'Interview Copilot — Pop-out',
+    show: false,
+  });
+
+  // INVISIBLE TO SCREEN SHARE
+  popoutWindow.setContentProtection(true);
+
+  // Keep floating above all windows
+  popoutWindow.setAlwaysOnTop(true, 'floating');
+
+  popoutWindow.once('ready-to-show', () => {
+    popoutWindow.show();
+  });
+
+  // Load the app in popout mode
+  if (isDev) {
+    popoutWindow.loadURL('http://localhost:3000?mode=popout');
+  } else {
+    // For file:// URLs with query params
+    popoutWindow.loadURL(`file://${path.join(__dirname, '../dist/index.html')}?mode=popout`);
+  }
+
+  popoutWindow.on('closed', () => {
+    popoutWindow = null;
+    // Notify main window that popout closed
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('popout-closed');
+    }
+  });
+}
+
+// ───────────────────────────────────────────────
+//  IPC HANDLERS
+// ───────────────────────────────────────────────
+
+// Pop-out window management
+ipcMain.on('open-popout', (_event, options) => {
+  createPopoutWindow(options);
+  // Notify main window
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('popout-opened');
+  }
+});
+
+ipcMain.on('close-popout', () => {
+  if (popoutWindow && !popoutWindow.isDestroyed()) {
+    popoutWindow.close();
+  }
+});
+
+// Window controls (for frameless pop-out)
+ipcMain.on('minimize-window', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) win.minimize();
+});
+
+ipcMain.on('close-window', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) win.close();
+});
+
+// Resize pop-out
+ipcMain.on('resize-popout', (_event, { width, height }) => {
+  if (popoutWindow && !popoutWindow.isDestroyed()) {
+    const [currentW, currentH] = popoutWindow.getSize();
+    popoutWindow.setSize(
+      width || currentW,
+      height || currentH,
+      true // animate
+    );
+  }
+});
+
+// Toggle always-on-top for pop-out
+ipcMain.on('set-always-on-top', (_event, flag) => {
+  if (popoutWindow && !popoutWindow.isDestroyed()) {
+    popoutWindow.setAlwaysOnTop(flag, 'floating');
+  }
+});
+
+// Relay messages between windows (main <-> popout)
+ipcMain.on('relay-to-popout', (_event, data) => {
+  if (popoutWindow && !popoutWindow.isDestroyed()) {
+    popoutWindow.webContents.send('from-main', data);
+  }
+});
+
+ipcMain.on('relay-to-main', (_event, data) => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('from-popout', data);
+  }
+});
+
+// ───────────────────────────────────────────────
+//  APP LIFECYCLE
+// ───────────────────────────────────────────────
 app.whenReady().then(() => {
-  createWindow();
+  createMainWindow();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+      createMainWindow();
     }
   });
 });

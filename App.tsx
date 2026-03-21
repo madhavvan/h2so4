@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, Minus, Maximize2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -14,8 +14,28 @@ import { extractTextFromPdf } from './services/pdfService';
 import { Message, AppSettings, ContextFile } from './types';
 import './pip-styles.css';
 
-// Extend Window interface for PiP support
-// Moved to types.ts
+// --- Electron Helpers ---
+const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+const isPopoutMode = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('mode') === 'popout';
+
+const electronIPC = {
+  send: (channel: string, data?: any) => {
+    if (isElectron) {
+      try {
+        const ipc = (window as any).require?.('electron')?.ipcRenderer;
+        ipc?.send(channel, data);
+      } catch (e) { console.warn('IPC send failed:', e); }
+    }
+  },
+  on: (channel: string, callback: (data: any) => void) => {
+    if (isElectron) {
+      try {
+        const ipc = (window as any).require?.('electron')?.ipcRenderer;
+        ipc?.on(channel, (_event: any, data: any) => callback(data));
+      } catch (e) { console.warn('IPC on failed:', e); }
+    }
+  }
+};
 
 // --- Helper: Code Block Renderer ---
 
@@ -88,9 +108,15 @@ const MessageRenderer = ({ content, fontSize }: { content: string, fontSize: str
 
 const Modal = ({ isOpen, onClose, title, children }: any) => {
   if (!isOpen) return null;
+  const inElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
   return (
-    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
-      <div className="bg-surface border border-border rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col shadow-2xl overflow-hidden text-text">
+    <div 
+      className="fixed inset-0 flex items-center justify-center z-50 p-4 animate-in fade-in duration-200"
+      style={{ background: inElectron ? 'rgba(0,0,0,0.85)' : 'rgba(0,0,0,0.5)' }}
+    >
+      <div className="border border-border rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col shadow-2xl overflow-hidden text-text"
+        style={{ background: inElectron ? '#1a1a2e' : 'var(--surface-color)' }}
+      >
         <div className="p-4 border-b border-border flex justify-between items-center bg-gray-500/5">
           <h2 className="text-lg font-bold flex items-center gap-2">{title}</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-primary transition-colors p-1 rounded-full hover:bg-gray-500/10">
@@ -192,14 +218,27 @@ const ChatInterface = ({
                         >
                             <Settings size={14} strokeWidth={1.5} />
                         </button>
-                        {/* Electron window controls — minimize & close */}
+                        {/* Electron window controls — resize, minimize & close */}
                         {inElectron && (
                             <>
                                 <button
-                                    onClick={() => {
-                                        const { remote } = require('electron') as any;
-                                        remote?.getCurrentWindow?.()?.minimize?.();
-                                    }}
+                                    onClick={() => electronIPC.send('resize-popout', { width: 320, height: 450 })}
+                                    className="p-1.5 rounded-md transition-colors hover:bg-white/10"
+                                    title="Smaller"
+                                    style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
+                                >
+                                    <Minus size={12} strokeWidth={2} />
+                                </button>
+                                <button
+                                    onClick={() => electronIPC.send('resize-popout', { width: 550, height: 800 })}
+                                    className="p-1.5 rounded-md transition-colors hover:bg-white/10"
+                                    title="Larger"
+                                    style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
+                                >
+                                    <Maximize2 size={12} strokeWidth={2} />
+                                </button>
+                                <button
+                                    onClick={() => electronIPC.send('minimize-window')}
                                     className="p-1.5 rounded-md transition-colors hover:bg-white/10"
                                     title="Minimize"
                                     style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
@@ -207,10 +246,7 @@ const ChatInterface = ({
                                     <span style={{ fontSize: '14px', lineHeight: 1 }}>—</span>
                                 </button>
                                 <button
-                                    onClick={() => {
-                                        const w = window as any;
-                                        w.close?.();
-                                    }}
+                                    onClick={() => electronIPC.send('close-window')}
                                     className="p-1.5 rounded-md transition-colors hover:bg-red-500/20"
                                     title="Close"
                                     style={{ color: 'var(--text-main)', border: '1px solid var(--glass-border)' }}
@@ -673,23 +709,28 @@ export default function App() {
   // Local state for Quick Paste in Context Modal
   const [pasteContent, setPasteContent] = useState("");
   
-  // PiP State
-  const [isPipMode, setIsPipMode] = useState(false);
+  // PiP State — auto-enter if this is the Electron pop-out window
+  const [isPipMode, setIsPipMode] = useState(isPopoutMode);
 
-  // Detect Electron environment
-  const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
-
-  // In Electron: auto-enter PiP mode + set transparent background on html
+  // Electron pop-out window: make transparent + set up cross-window sync
   useEffect(() => {
-    if (isElectron) {
-      setIsPipMode(true);
+    if (isElectron && isPopoutMode) {
       document.documentElement.classList.add('electron-transparent');
       document.body.style.background = 'transparent';
+    }
+    // Listen for popout closed (main window gets notified)
+    if (isElectron && !isPopoutMode) {
+      electronIPC.on('popout-closed', () => {
+        setIsPipMode(false);
+      });
+      electronIPC.on('popout-opened', () => {
+        setIsPipMode(true);
+      });
     }
     return () => {
       document.documentElement.classList.remove('electron-transparent');
     };
-  }, [isElectron]);
+  }, []);
 
   // Settings State
   const [settings, setSettings] = useState<AppSettings>({
@@ -1257,23 +1298,39 @@ export default function App() {
     onOpenHelp: () => setShowHelp(true),
     onOpenDownload: () => setShowDownloadModal(true),
     isPipMode,
-    togglePip: () => setIsPipMode(true),
+    togglePip: () => {
+      if (isElectron) {
+        // In Electron: open a real transparent pop-out window
+        electronIPC.send('open-popout', { width: 450, height: 700 });
+      } else {
+        setIsPipMode(true);
+      }
+    },
     isElectron
   };
 
+  // If this IS the Electron pop-out window, render ONLY the compact PiP chat
+  if (isElectron && isPopoutMode) {
+    return (
+      <div className="h-[100dvh] flex flex-col font-sans overflow-hidden" style={{ background: 'transparent' }}>
+        <ChatInterface {...sharedProps} />
+        {/* Modals need to work in pop-out too */}
+        <Modal isOpen={showSettings} onClose={() => setShowSettings(false)} title="Settings">
+          <div className="text-center text-sm text-gray-400 py-8">
+            <Settings size={32} className="mx-auto mb-3 text-gray-500" />
+            <p>Open Settings in the main app window.</p>
+          </div>
+        </Modal>
+      </div>
+    );
+  }
+
   return (
     <div className={`h-[100dvh] flex flex-col font-sans overflow-hidden transition-colors duration-300 ${
-      isElectron 
-        ? '' /* Fully transparent in Electron — no background at all */
-        : settings.theme === 'dark' ? 'dark bg-[#09090b]' : 'bg-slate-50'
-    }`}
-    style={isElectron ? { background: 'transparent' } : undefined}
-    >
+      settings.theme === 'dark' ? 'dark bg-[#09090b]' : 'bg-slate-50'
+    }`}>
         {/* Main Content Area */}
         {!isPipMode ? (
-            <ChatInterface {...sharedProps} />
-        ) : isElectron ? (
-            /* ELECTRON: Render PiP UI directly in the transparent window — no portal needed */
             <ChatInterface {...sharedProps} />
         ) : (
             <div className="flex-1 flex flex-col items-center justify-center p-8 bg-surface/50 text-center space-y-6 animate-in fade-in">
@@ -1283,8 +1340,10 @@ export default function App() {
                 <div>
                     <h2 className="text-2xl font-bold text-text mb-2">Copilot Active in Pop-out Window</h2>
                     <p className="text-gray-500 max-w-md mx-auto">
-                        This tab is now "Safe to Share".<br/>
-                        The AI interface has moved to a separate window that is hidden from screen share.
+                        {isElectron 
+                          ? <>The AI copilot is running in a transparent overlay.<br/>It is <strong className="text-green-400">invisible to screen share</strong>.</>
+                          : <>This tab is now "Safe to Share".<br/>The AI interface has moved to a separate window that is hidden from screen share.</>
+                        }
                     </p>
                 </div>
                 <div className="p-4 bg-surface rounded-lg border border-border text-left w-full max-w-lg shadow-sm">
@@ -1296,7 +1355,12 @@ export default function App() {
                     </div>
                 </div>
                 <button 
-                    onClick={() => setIsPipMode(false)}
+                    onClick={() => {
+                      if (isElectron) {
+                        electronIPC.send('close-popout');
+                      }
+                      setIsPipMode(false);
+                    }}
                     className="px-6 py-3 bg-primary hover:bg-blue-600 text-white rounded-lg font-medium transition-colors flex items-center gap-2"
                 >
                     <ExternalLink size={18} className="rotate-180" /> Bring Back to Tab

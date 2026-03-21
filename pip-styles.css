@@ -167,9 +167,10 @@
 
 /* ═══════════════════════════════════════════════════
    ELECTRON TRANSPARENCY OVERRIDES
-   When running in Electron with transparent:true,
-   everything must be truly see-through so the 
-   desktop / YouTube / anything behind is visible.
+   When running in Electron pop-out with transparent:true,
+   everything must be truly see-through.
+   
+   NO backdrop-filter allowed — it crashes transparent windows.
    ═══════════════════════════════════════════════════ */
 
 html.electron-transparent,
@@ -179,6 +180,14 @@ html.electron-transparent .pip-body {
   background-color: transparent !important;
 }
 
+/* Kill ALL backdrop-filter globally in Electron pop-out */
+html.electron-transparent *,
+html.electron-transparent *::before,
+html.electron-transparent *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
 html.electron-transparent .popup {
   background: transparent !important;
   border-radius: 16px;
@@ -186,14 +195,10 @@ html.electron-transparent .popup {
 
 html.electron-transparent .bg-layer {
   background: transparent !important;
-  backdrop-filter: none !important;
-  -webkit-backdrop-filter: none !important;
 }
 
 html.electron-transparent .popup-header {
-  background: rgba(0, 0, 0, 0.25) !important;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: rgba(10, 10, 30, 0.75) !important;
   -webkit-app-region: drag;
   border-bottom: 1px solid rgba(255, 255, 255, 0.15);
 }
@@ -203,20 +208,16 @@ html.electron-transparent .messages {
 }
 
 html.electron-transparent .bubble {
-  background: rgba(0, 0, 0, 0.3) !important;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: rgba(10, 10, 30, 0.65) !important;
   border: 1px solid rgba(255, 255, 255, 0.15) !important;
 }
 
 html.electron-transparent .msg.user .bubble {
-  background: rgba(255, 255, 255, 0.08) !important;
+  background: rgba(255, 255, 255, 0.1) !important;
 }
 
 html.electron-transparent .input-area {
-  background: rgba(0, 0, 0, 0.25) !important;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: rgba(10, 10, 30, 0.75) !important;
   border-top: 1px solid rgba(255, 255, 255, 0.15);
 }
 
@@ -226,4 +227,18 @@ html.electron-transparent .pip-textarea {
 
 html.electron-transparent .send-btn {
   background: rgba(255, 255, 255, 0.08) !important;
+}
+
+/* Resize grip indicator in bottom-right corner */
+html.electron-transparent .popup::after {
+  content: '';
+  position: fixed;
+  bottom: 4px;
+  right: 4px;
+  width: 12px;
+  height: 12px;
+  border-right: 2px solid rgba(255, 255, 255, 0.3);
+  border-bottom: 2px solid rgba(255, 255, 255, 0.3);
+  pointer-events: none;
+  z-index: 9999;
 }
