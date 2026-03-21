@@ -320,7 +320,45 @@ const ChatInterface = ({
                     )}
                 </div>
 
-                <div className="input-area">
+                <div className="input-area" style={{ flexDirection: 'column', gap: '0' }}>
+                    {/* ── Control strip: AUTO, MIC, LIVE status ── */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 8px', borderBottom: '1px solid var(--glass-border)' }}>
+                        <button
+                            onClick={toggleAutoSend}
+                            style={{
+                                background: settings.autoSend ? 'rgba(59,130,246,0.2)' : 'transparent',
+                                border: `1px solid ${settings.autoSend ? 'rgba(59,130,246,0.4)' : 'var(--glass-border)'}`,
+                                color: settings.autoSend ? '#3b82f6' : 'var(--text-muted)',
+                                padding: '3px 8px', borderRadius: '6px', fontSize: '10px', fontWeight: 700,
+                                cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px'
+                            }}
+                        >
+                            <Zap size={10} /> {settings.autoSend ? 'AUTO' : 'MANUAL'}
+                        </button>
+
+                        <button
+                            onClick={isListening ? stopListening : startListening}
+                            style={{
+                                background: isListening ? 'rgba(239,68,68,0.2)' : 'transparent',
+                                border: `1px solid ${isListening ? 'rgba(239,68,68,0.4)' : 'var(--glass-border)'}`,
+                                color: isListening ? '#ef4444' : 'var(--text-muted)',
+                                padding: '3px 8px', borderRadius: '6px', fontSize: '10px', fontWeight: 700,
+                                cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px'
+                            }}
+                        >
+                            {isListening ? <Mic size={10} /> : <MicOff size={10} />}
+                            {isListening ? 'LIVE' : 'MIC OFF'}
+                        </button>
+
+                        {speechError && (
+                            <span style={{ fontSize: '9px', color: '#ef4444', marginLeft: 'auto', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {speechError}
+                            </span>
+                        )}
+                    </div>
+
+                    {/* ── Input row ── */}
+                    <div style={{ display: 'flex', alignItems: 'flex-end', gap: '8px', padding: '8px' }}>
                     <div className="input-wrap">
                         <textarea 
                             id="inputBox" 
@@ -363,16 +401,7 @@ const ChatInterface = ({
                     >
                         <Wand2 size={18} strokeWidth={1.5} />
                     </button>
-
-                    <button 
-                        className="send-btn ml-2" 
-                        aria-label="Toggle Mic"
-                        onClick={isListening ? stopListening : startListening}
-                        title={isListening ? "Stop Listening" : "Start Listening"}
-                        style={{ opacity: 1, background: isListening ? 'rgba(255,255,255,0.9)' : 'transparent' }}
-                    >
-                        {isListening ? <MicOff size={18} strokeWidth={1.5} style={{ color: 'var(--glass-bg)', stroke: 'var(--glass-bg)' }} /> : <Mic size={18} strokeWidth={1.5} />}
-                    </button>
+                    </div>
                 </div>
             </div>
         );
@@ -1328,30 +1357,67 @@ export default function App() {
     isElectron
   };
 
-  // If this IS the Electron pop-out window, render ONLY the compact PiP chat
-  if (isElectron && isPopoutMode) {
-    return (
-      <div className="h-[100dvh] flex flex-col font-sans overflow-hidden" style={{ background: 'transparent' }}>
-        <ChatInterface {...sharedProps} />
-        {/* Modals need to work in pop-out too */}
-        <Modal isOpen={showSettings} onClose={() => setShowSettings(false)} title="Settings">
-          <div className="text-center text-sm text-gray-400 py-8">
-            <Settings size={32} className="mx-auto mb-3 text-gray-500" />
-            <p>Open Settings in the main app window.</p>
-          </div>
-        </Modal>
-      </div>
-    );
-  }
+  // ── CONVERSATION SYNC (Electron: main ↔ pop-out via localStorage) ──
+  const syncKeyRef = useRef('copilot_messages_v1');
+  const isSyncingRef = useRef(false);
+
+  // Save messages to localStorage whenever they change
+  useEffect(() => {
+    if (isSyncingRef.current) { isSyncingRef.current = false; return; }
+    try {
+      localStorage.setItem(syncKeyRef.current, JSON.stringify(messages));
+    } catch (e) { /* quota exceeded — ignore */ }
+  }, [messages]);
+
+  // Load messages from localStorage on mount (pop-out gets main's history)
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(syncKeyRef.current);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setMessages(parsed);
+        }
+      }
+    } catch (e) { /* ignore parse errors */ }
+  }, []);
+
+  // Listen for storage events from the other window
+  useEffect(() => {
+    const handler = (e: StorageEvent) => {
+      if (e.key === syncKeyRef.current && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          if (Array.isArray(parsed)) {
+            isSyncingRef.current = true;
+            setMessages(parsed);
+          }
+        } catch (err) { /* ignore */ }
+      }
+    };
+    window.addEventListener('storage', handler);
+    return () => window.removeEventListener('storage', handler);
+  }, []);
+
+  // ── RENDER ──
+  const isPopoutElectron = isElectron && isPopoutMode;
 
   return (
-    <div className={`h-[100dvh] flex flex-col font-sans overflow-hidden transition-colors duration-300 ${
-      settings.theme === 'dark' ? 'dark bg-[#09090b]' : 'bg-slate-50'
-    }`}>
-        {/* Main Content Area */}
-        {!isPipMode ? (
+    <div 
+      className={`h-[100dvh] flex flex-col font-sans overflow-hidden transition-colors duration-300 ${
+        isPopoutElectron ? '' : settings.theme === 'dark' ? 'dark bg-[#09090b]' : 'bg-slate-50'
+      }`}
+      style={isPopoutElectron ? { background: 'transparent' } : undefined}
+    >
+        {/* ── CONTENT AREA ── */}
+        {isPopoutElectron ? (
+            /* Electron pop-out: always show compact chat */
+            <ChatInterface {...sharedProps} />
+        ) : !isPipMode ? (
+            /* Main window: full app */
             <ChatInterface {...sharedProps} />
         ) : (
+            /* Main window when pop-out is active: safe placeholder */
             <div className="flex-1 flex flex-col items-center justify-center p-8 bg-surface/50 text-center space-y-6 animate-in fade-in">
                 <div className="w-24 h-24 rounded-full bg-blue-500/10 flex items-center justify-center animate-pulse-slow">
                     <ExternalLink size={40} className="text-blue-500" />
