@@ -111,11 +111,18 @@ const Modal = ({ isOpen, onClose, title, children }: any) => {
   const inElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
   return (
     <div 
-      className="fixed inset-0 flex items-center justify-center z-50 p-4 animate-in fade-in duration-200"
-      style={{ background: inElectron ? 'rgba(0,0,0,0.85)' : 'rgba(0,0,0,0.5)' }}
+      className="fixed inset-0 flex items-center justify-center p-4"
+      style={{ 
+        background: inElectron ? 'rgba(0,0,0,0.92)' : 'rgba(0,0,0,0.5)',
+        zIndex: 99999,  // Above everything including screen-saver level content
+        WebkitAppRegion: 'no-drag' as any,  // Ensure clicks work in frameless window
+      }}
+      onClick={onClose}
     >
-      <div className="border border-border rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col shadow-2xl overflow-hidden text-text"
+      <div 
+        className="border border-border rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col shadow-2xl overflow-hidden text-text"
         style={{ background: inElectron ? '#1a1a2e' : 'var(--surface-color)' }}
+        onClick={(e) => e.stopPropagation()}
       >
         <div className="p-4 border-b border-border flex justify-between items-center bg-gray-500/5">
           <h2 className="text-lg font-bold flex items-center gap-2">{title}</h2>

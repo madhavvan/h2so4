@@ -1,8 +1,9 @@
-const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 
 let mainWindow = null;
 let popoutWindow = null;
+let tray = null;
 
 const isDev = !app.isPackaged;
 
@@ -32,7 +33,7 @@ function createMainWindow() {
     frame: true,
     transparent: false,
     backgroundColor: '#09090b', // Dark zinc background
-    skipTaskbar: true,  // Hide from taskbar (invisible during screen share)
+    skipTaskbar: true,  // Hidden from taskbar — access via system tray
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
@@ -44,6 +45,14 @@ function createMainWindow() {
 
   // INVISIBLE TO SCREEN SHARE
   mainWindow.setContentProtection(true);
+
+  // Hide instead of close — app stays in tray
+  mainWindow.on('close', (e) => {
+    if (!app.isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
 
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
@@ -272,33 +281,133 @@ ipcMain.on('relay-to-main', (_event, data) => {
 });
 
 // ───────────────────────────────────────────────
+//  SYSTEM TRAY
+// ───────────────────────────────────────────────
+function createTray() {
+  // Create a simple 16x16 blue square icon for the tray
+  // On Windows: .ico works best. On Mac/Linux: PNG.
+  // nativeImage can create from a data URL
+  const size = 16;
+  const icon = nativeImage.createEmpty();
+  
+  // Try to load from app resources first, fall back to generated icon
+  let trayIcon;
+  try {
+    const iconPath = isDev 
+      ? path.join(__dirname, '../public/tray-icon.png')
+      : path.join(__dirname, '../dist/tray-icon.png');
+    trayIcon = nativeImage.createFromPath(iconPath);
+    if (trayIcon.isEmpty()) throw new Error('Icon file not found');
+  } catch (e) {
+    // Generate a simple 16x16 blue square as fallback
+    // This is a minimal 16x16 blue PNG as base64
+    const bluePng = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAMklEQVQ4T2P8z8BQz0BHwMgwasCoAQyjYcAwGgYMo2HAMKINAIZ/DAz1dAyDUQNGwwAALNYIEdLptSAAAAAASUVORK5CYII=';
+    trayIcon = nativeImage.createFromBuffer(Buffer.from(bluePng, 'base64'));
+  }
+  
+  // Resize for tray
+  trayIcon = trayIcon.resize({ width: 16, height: 16 });
+
+  tray = new Tray(trayIcon);
+  tray.setToolTip('Interview Copilot');
+
+  function updateTrayMenu() {
+    const isMainVisible = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible();
+    const isPopoutOpen = popoutWindow && !popoutWindow.isDestroyed();
+
+    const contextMenu = Menu.buildFromTemplate([
+      {
+        label: 'Interview Copilot',
+        enabled: false,
+      },
+      { type: 'separator' },
+      {
+        label: isMainVisible ? 'Hide Main Window' : 'Show Main Window',
+        click: () => {
+          if (!mainWindow || mainWindow.isDestroyed()) {
+            createMainWindow();
+          } else if (mainWindow.isVisible()) {
+            mainWindow.hide();
+          } else {
+            mainWindow.show();
+            mainWindow.focus();
+          }
+          updateTrayMenu();
+        }
+      },
+      {
+        label: isPopoutOpen ? 'Close Pop-out' : 'Open Pop-out',
+        click: () => {
+          if (isPopoutOpen) {
+            popoutWindow.close();
+          } else {
+            createPopoutWindow();
+          }
+          setTimeout(updateTrayMenu, 200);
+        }
+      },
+      { type: 'separator' },
+      {
+        label: 'Quit',
+        click: () => {
+          app.isQuitting = true;
+          app.quit();
+        }
+      }
+    ]);
+
+    tray.setContextMenu(contextMenu);
+  }
+
+  // Left-click on tray: toggle main window
+  tray.on('click', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createMainWindow();
+    } else if (mainWindow.isVisible()) {
+      mainWindow.hide();
+    } else {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+    updateTrayMenu();
+  });
+
+  // Update menu whenever windows change
+  updateTrayMenu();
+  
+  // Re-build menu periodically to reflect window state changes
+  setInterval(updateTrayMenu, 3000);
+}
+
+// ───────────────────────────────────────────────
 //  APP LIFECYCLE
 // ───────────────────────────────────────────────
+app.isQuitting = false;
+
 app.whenReady().then(() => {
   // Grant all media permissions (screen capture, audio, etc.)
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    callback(true); // Allow everything for a desktop app
+    callback(true);
   });
   session.defaultSession.setPermissionCheckHandler(() => true);
 
-  // macOS: Hide from Dock to be invisible during screen share
-  if (process.platform === 'darwin' && app.dock) {
-    app.dock.hide();
-  }
-
   createMainWindow();
+  createTray();
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
+    if (!mainWindow || mainWindow.isDestroyed()) {
       createMainWindow();
-    } else if (mainWindow) {
+    } else {
       mainWindow.show();
     }
   });
 });
 
+// Don't quit when all windows closed — tray keeps app alive
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  // Do nothing — app stays in tray
+});
+
+app.on('before-quit', () => {
+  app.isQuitting = true;
 });
