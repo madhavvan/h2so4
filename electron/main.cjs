@@ -6,23 +6,7 @@ let popoutWindow = null;
 
 const isDev = !app.isPackaged;
 
-// Grant all media permissions (screen capture, audio, etc.)
-app.whenReady().then(() => {
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    // Allow all media-related permissions
-    const allowedPermissions = ['media', 'mediaKeySystem', 'display-capture', 'audioCapture', 'videoCapture'];
-    if (allowedPermissions.includes(permission)) {
-      callback(true);
-    } else {
-      callback(true); // Allow everything for simplicity in a desktop app
-    }
-  });
-
-  // Also handle permission checks
-  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
-    return true;
-  });
-});
+// Permissions and lifecycle are set up in the APP LIFECYCLE section below
 
 function getAppURL(params = '') {
   if (isDev) {
@@ -48,13 +32,14 @@ function createMainWindow() {
     frame: true,
     transparent: false,
     backgroundColor: '#09090b', // Dark zinc background
+    skipTaskbar: true,  // Hide from taskbar (invisible during screen share)
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
     },
     icon: path.join(__dirname, '../dist/favicon.ico'),
     title: 'Interview Copilot',
-    show: false, // Show after ready-to-show for smooth startup
+    show: false,
   });
 
   // INVISIBLE TO SCREEN SHARE
@@ -82,10 +67,21 @@ function createMainWindow() {
 
 // ───────────────────────────────────────────────
 //  POP-OUT WINDOW — Transparent, frameless, compact
+//  ALWAYS on top. Hidden from taskbar + screen share.
 // ───────────────────────────────────────────────
+let alwaysOnTopInterval = null;
+
+function enforceAlwaysOnTop() {
+  if (popoutWindow && !popoutWindow.isDestroyed()) {
+    // 'screen-saver' is the HIGHEST level — above all apps, even fullscreen
+    popoutWindow.setAlwaysOnTop(true, 'screen-saver');
+  }
+}
+
 function createPopoutWindow(options = {}) {
   if (popoutWindow && !popoutWindow.isDestroyed()) {
     popoutWindow.focus();
+    enforceAlwaysOnTop();
     return;
   }
 
@@ -96,7 +92,7 @@ function createPopoutWindow(options = {}) {
   popoutWindow = new BrowserWindow({
     width: popW,
     height: popH,
-    x: screenW - popW - 30,   // Bottom-right corner
+    x: screenW - popW - 30,
     y: screenH - popH - 30,
     minWidth: 320,
     minHeight: 400,
@@ -109,7 +105,8 @@ function createPopoutWindow(options = {}) {
     // --- END TRANSPARENCY ---
     alwaysOnTop: true,
     resizable: true,
-    skipTaskbar: false,
+    skipTaskbar: true,     // ← HIDDEN from taskbar
+    focusable: true,
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
@@ -121,24 +118,65 @@ function createPopoutWindow(options = {}) {
   // INVISIBLE TO SCREEN SHARE
   popoutWindow.setContentProtection(true);
 
-  // Keep floating above all windows
-  popoutWindow.setAlwaysOnTop(true, 'floating');
+  // Set highest always-on-top level immediately
+  enforceAlwaysOnTop();
+
+  // ── ROBUST ALWAYS-ON-TOP ──
+  // Re-enforce after ANY event that might drop it
+
+  // After losing and regaining focus
+  popoutWindow.on('blur', () => {
+    setTimeout(enforceAlwaysOnTop, 50);
+  });
+
+  popoutWindow.on('focus', () => {
+    enforceAlwaysOnTop();
+  });
+
+  // After window is moved (dragging can reset z-order)
+  popoutWindow.on('moved', () => {
+    enforceAlwaysOnTop();
+  });
+
+  // After resize
+  popoutWindow.on('resize', () => {
+    enforceAlwaysOnTop();
+  });
+
+  // After minimize/restore
+  popoutWindow.on('restore', () => {
+    enforceAlwaysOnTop();
+  });
+
+  popoutWindow.on('show', () => {
+    enforceAlwaysOnTop();
+  });
+
+  // Periodic enforcement every 2 seconds as a safety net
+  if (alwaysOnTopInterval) clearInterval(alwaysOnTopInterval);
+  alwaysOnTopInterval = setInterval(() => {
+    enforceAlwaysOnTop();
+  }, 2000);
 
   popoutWindow.once('ready-to-show', () => {
     popoutWindow.show();
+    enforceAlwaysOnTop();
   });
 
   // Load the app in popout mode
   if (isDev) {
     popoutWindow.loadURL('http://localhost:3000?mode=popout');
   } else {
-    // For file:// URLs with query params
     popoutWindow.loadURL(`file://${path.join(__dirname, '../dist/index.html')}?mode=popout`);
   }
 
   popoutWindow.on('closed', () => {
+    // Stop the periodic enforcement
+    if (alwaysOnTopInterval) {
+      clearInterval(alwaysOnTopInterval);
+      alwaysOnTopInterval = null;
+    }
     popoutWindow = null;
-    // Notify main window that popout closed
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('popout-closed');
     }
@@ -204,13 +242,19 @@ ipcMain.on('resize-popout', (_event, { width, height }) => {
     if (newY < 0) newY = 10;
 
     popoutWindow.setBounds({ x: newX, y: newY, width: newW, height: newH }, true);
+    // Re-enforce after resize
+    setTimeout(enforceAlwaysOnTop, 100);
   }
 });
 
 // Toggle always-on-top for pop-out
 ipcMain.on('set-always-on-top', (_event, flag) => {
   if (popoutWindow && !popoutWindow.isDestroyed()) {
-    popoutWindow.setAlwaysOnTop(flag, 'floating');
+    if (flag) {
+      enforceAlwaysOnTop();
+    } else {
+      popoutWindow.setAlwaysOnTop(false);
+    }
   }
 });
 
@@ -231,11 +275,24 @@ ipcMain.on('relay-to-main', (_event, data) => {
 //  APP LIFECYCLE
 // ───────────────────────────────────────────────
 app.whenReady().then(() => {
+  // Grant all media permissions (screen capture, audio, etc.)
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    callback(true); // Allow everything for a desktop app
+  });
+  session.defaultSession.setPermissionCheckHandler(() => true);
+
+  // macOS: Hide from Dock to be invisible during screen share
+  if (process.platform === 'darwin' && app.dock) {
+    app.dock.hide();
+  }
+
   createMainWindow();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createMainWindow();
+    } else if (mainWindow) {
+      mainWindow.show();
     }
   });
 });
