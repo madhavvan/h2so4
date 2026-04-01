@@ -280,6 +280,35 @@ ipcMain.on('relay-to-main', (_event, data) => {
   }
 });
 
+// ── Cross-window state sync (messages + context files) ──
+// Forwards full state between main ↔ pop-out so uploaded files,
+// chat history, and context stay in sync without localStorage.
+
+function relayToOtherWindows(event, channel, data) {
+  BrowserWindow.getAllWindows().forEach(win => {
+    if (win.webContents.id !== event.sender.id && !win.isDestroyed()) {
+      win.webContents.send(channel, data);
+    }
+  });
+}
+
+ipcMain.on('sync-messages', (event, data) => {
+  relayToOtherWindows(event, 'sync-messages', data);
+});
+
+ipcMain.on('sync-context-files', (event, data) => {
+  relayToOtherWindows(event, 'sync-context-files', data);
+});
+
+// Pop-out requests full state on mount → tell the main window to push everything
+ipcMain.on('request-full-state', (event) => {
+  BrowserWindow.getAllWindows().forEach(win => {
+    if (win.webContents.id !== event.sender.id && !win.isDestroyed()) {
+      win.webContents.send('popout-requests-state');
+    }
+  });
+});
+
 // ───────────────────────────────────────────────
 //  SYSTEM TRAY
 // ───────────────────────────────────────────────

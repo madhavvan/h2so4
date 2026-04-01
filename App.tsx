@@ -1371,13 +1371,13 @@ export default function App() {
     isElectron
   };
 
-  // ── CONVERSATION SYNC (Electron: main ↔ pop-out via localStorage + IPC) ──
+  // ── CONVERSATION SYNC (Electron: main ↔ pop-out via IPC primary, localStorage fallback) ──
   const syncKeyRef = useRef('copilot_messages_v1');
   const contextFilesSyncKey = 'copilot_context_files_v1';
   const isSyncingRef = useRef(false);
   const isSyncingFilesRef = useRef(false);
 
-  // Strip base64 from context files before localStorage to avoid quota overflow
+  // Strip base64 from context files — only used as last-resort fallback
   const stripBase64ForSync = (files: ContextFile[]): ContextFile[] =>
     files.map(f => f.base64 ? { ...f, base64: undefined, content: f.content || `[Binary: ${f.name}]` } : f);
 
@@ -1385,17 +1385,13 @@ export default function App() {
   useEffect(() => {
     if (isSyncingRef.current) { isSyncingRef.current = false; return; }
     try {
-      const payload = JSON.stringify(messages);
-      localStorage.setItem(syncKeyRef.current, payload);
-    } catch (e: any) {
-      // Quota exceeded — trim old messages and retry once
-      console.warn('localStorage quota exceeded for messages, trimming history');
+      localStorage.setItem(syncKeyRef.current, JSON.stringify(messages));
+    } catch (e) {
+      // Quota exceeded — trim old messages and retry
       try {
-        const trimmed = messages.slice(-50); // keep last 50 messages
-        localStorage.setItem(syncKeyRef.current, JSON.stringify(trimmed));
+        localStorage.setItem(syncKeyRef.current, JSON.stringify(messages.slice(-50)));
       } catch (_) { /* truly full — skip */ }
     }
-    // Also push via IPC so the Electron pop-out gets it even if localStorage is full
     if (isElectron) {
       electronIPC.send('sync-messages', messages);
     }
@@ -1405,11 +1401,14 @@ export default function App() {
   useEffect(() => {
     if (isSyncingFilesRef.current) { isSyncingFilesRef.current = false; return; }
     try {
-      // Strip base64 blobs to stay under localStorage quota
-      const lightweight = stripBase64ForSync(settings.contextFiles);
-      localStorage.setItem(contextFilesSyncKey, JSON.stringify(lightweight));
-    } catch (e: any) {
-      console.warn('localStorage quota exceeded for context files');
+      // Try full files first (including base64) so browser PiP works
+      localStorage.setItem(contextFilesSyncKey, JSON.stringify(settings.contextFiles));
+    } catch (e) {
+      // Quota exceeded — fallback: strip base64 so at least text files sync
+      console.warn('localStorage quota exceeded for context files, stripping binary data');
+      try {
+        localStorage.setItem(contextFilesSyncKey, JSON.stringify(stripBase64ForSync(settings.contextFiles)));
+      } catch (_) { /* truly full — skip */ }
     }
     // IPC sync sends full context files (including base64) — no quota limits
     if (isElectron) {
@@ -1417,8 +1416,15 @@ export default function App() {
     }
   }, [settings.contextFiles]);
 
-  // Load messages from localStorage on mount (pop-out gets main's history)
+  // Load state on mount
   useEffect(() => {
+    // In Electron pop-out: request full state from the main window via IPC
+    // This is the primary sync path — more reliable than localStorage
+    if (isElectron && isPopoutMode) {
+      electronIPC.send('request-full-state');
+    }
+
+    // Also load from localStorage as fallback / for browser PiP
     try {
       const saved = localStorage.getItem(syncKeyRef.current);
       if (saved) {
@@ -1427,9 +1433,8 @@ export default function App() {
           setMessages(parsed);
         }
       }
-    } catch (e) { /* ignore parse errors */ }
+    } catch (e) { /* ignore */ }
 
-    // Load context files from localStorage on mount (pop-out gets main's files)
     try {
       const savedFiles = localStorage.getItem(contextFilesSyncKey);
       if (savedFiles) {
@@ -1438,11 +1443,12 @@ export default function App() {
           setSettings(prev => ({ ...prev, contextFiles: parsedFiles }));
         }
       }
-    } catch (e) { /* ignore parse errors */ }
+    } catch (e) { /* ignore */ }
   }, []);
 
-  // Listen for storage events from the other window (browser path)
+  // Listen for sync events from the other window
   useEffect(() => {
+    // Browser path: StorageEvent (works for PiP, unreliable for Electron)
     const handler = (e: StorageEvent) => {
       if (e.key === syncKeyRef.current && e.newValue) {
         try {
@@ -1465,8 +1471,9 @@ export default function App() {
     };
     window.addEventListener('storage', handler);
 
-    // Electron IPC sync — receives full payloads (including base64) without quota limits
+    // Electron IPC sync — primary path for Electron windows
     if (isElectron) {
+      // Receive pushed updates from the other window
       electronIPC.on('sync-messages', (data: any) => {
         if (Array.isArray(data)) {
           isSyncingRef.current = true;
@@ -1479,6 +1486,14 @@ export default function App() {
           setSettings(prev => ({ ...prev, contextFiles: data }));
         }
       });
+
+      // Main window: respond to pop-out's state request by pushing current state
+      if (!isPopoutMode) {
+        electronIPC.on('popout-requests-state', () => {
+          electronIPC.send('sync-messages', messages);
+          electronIPC.send('sync-context-files', settingsRef.current.contextFiles);
+        });
+      }
     }
 
     return () => window.removeEventListener('storage', handler);
