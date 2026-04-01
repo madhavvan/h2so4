@@ -100,8 +100,22 @@ export const useSpeechRecognition = ({
   const [currentStream, setCurrentStream] = useState<MediaStream | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
 
+  // Auto-reconnect state
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const intentionalStopRef = useRef(false); // true when user clicks stop
+  const MAX_RECONNECT_ATTEMPTS = 5;
+
   const stopListening = useCallback(() => {
+    intentionalStopRef.current = true;
     setIsListening(false);
+
+    // Clear any pending reconnect
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    reconnectAttemptsRef.current = 0;
 
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
@@ -125,8 +139,109 @@ export const useSpeechRecognition = ({
     }
   }, []);
 
+  // Connect (or reconnect) the Deepgram WebSocket using the existing audio stream
+  const connectDeepgram = useCallback((audioStream: MediaStream, cleanKey: string) => {
+    // Tear down previous socket/recorder without touching the media streams
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try { mediaRecorderRef.current.stop(); } catch (_) {}
+    }
+    if (socketRef.current) {
+      try { socketRef.current.close(); } catch (_) {}
+    }
+
+    const socket = new WebSocket(
+      'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&punctuate=true',
+      ['token', cleanKey]
+    );
+
+    socket.onopen = () => {
+      console.log('Deepgram Connected', reconnectAttemptsRef.current > 0 ? `(reconnect #${reconnectAttemptsRef.current})` : '');
+      reconnectAttemptsRef.current = 0; // reset on successful connect
+      setIsListening(true);
+      setError(null);
+
+      let mimeType = 'audio/webm';
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        mimeType = 'audio/webm;codecs=opus';
+      } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+        mimeType = 'audio/mp4';
+      }
+
+      console.log('Using MimeType:', mimeType);
+
+      try {
+        const mediaRecorder = new MediaRecorder(audioStream, { mimeType });
+        mediaRecorderRef.current = mediaRecorder;
+
+        mediaRecorder.addEventListener('dataavailable', (event) => {
+          if (event.data.size > 0 && socket.readyState === 1) {
+            socket.send(event.data);
+          }
+        });
+
+        mediaRecorder.start(250);
+      } catch (recErr: any) {
+        console.error("MediaRecorder Start Error:", recErr);
+        setError(`Recorder Error: ${recErr.message}`);
+        stopListening();
+      }
+    };
+
+    socket.onmessage = (message) => {
+      try {
+        const received = JSON.parse(message.data);
+        const transcript = received.channel?.alternatives?.[0]?.transcript;
+        if (transcript && received.is_final) {
+          onResult({ final: transcript, interim: '' });
+        } else if (transcript) {
+          onResult({ final: '', interim: transcript });
+        }
+      } catch (e) {
+        console.error("Deepgram Parse Error", e);
+      }
+    };
+
+    socket.onclose = (event) => {
+      console.log('Deepgram Closed', event.code, event.reason);
+      setIsListening(false);
+
+      // Auto-reconnect if not intentionally stopped and audio stream is still alive
+      if (
+        !intentionalStopRef.current &&
+        audioStreamRef.current &&
+        audioStreamRef.current.getAudioTracks().some(t => t.readyState === 'live') &&
+        reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS
+      ) {
+        reconnectAttemptsRef.current += 1;
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current - 1), 16000); // 1s, 2s, 4s, 8s, 16s
+        console.log(`Deepgram auto-reconnect #${reconnectAttemptsRef.current} in ${delay}ms`);
+        setError(`Reconnecting... (${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
+
+        reconnectTimerRef.current = setTimeout(() => {
+          if (!intentionalStopRef.current && audioStreamRef.current) {
+            connectDeepgram(audioStreamRef.current, cleanKey);
+          }
+        }, delay);
+      } else if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+        setError("Connection lost. Please restart listening.");
+      }
+    };
+
+    socket.onerror = (e) => {
+      console.error("Deepgram Error", e);
+      // Don't set a permanent error here — onclose will handle reconnect
+      if (socket.readyState !== 1 && reconnectAttemptsRef.current === 0) {
+        setError("Connection Error: Check API Key & Network.");
+      }
+    };
+
+    socketRef.current = socket;
+  }, [onResult, stopListening]);
+
   const startListening = useCallback(async () => {
     setError(null);
+    intentionalStopRef.current = false;
+    reconnectAttemptsRef.current = 0;
 
     const cleanKey = apiKey?.trim();
     if (!cleanKey) {
@@ -145,72 +260,7 @@ export const useSpeechRecognition = ({
       audioStreamRef.current = audioStream;
 
       // 2. Connect to Deepgram WebSocket
-      const socket = new WebSocket(
-        'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&punctuate=true',
-        ['token', cleanKey]
-      );
-
-      socket.onopen = () => {
-        console.log('Deepgram Connected');
-        setIsListening(true);
-
-        // 3. Start Recording & Streaming
-        let mimeType = 'audio/webm';
-        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-          mimeType = 'audio/webm;codecs=opus';
-        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-          mimeType = 'audio/mp4';
-        }
-
-        console.log('Using MimeType:', mimeType);
-
-        try {
-          const mediaRecorder = new MediaRecorder(audioStream, { mimeType });
-          mediaRecorderRef.current = mediaRecorder;
-
-          mediaRecorder.addEventListener('dataavailable', (event) => {
-            if (event.data.size > 0 && socket.readyState === 1) {
-              socket.send(event.data);
-            }
-          });
-
-          mediaRecorder.start(250);
-        } catch (recErr: any) {
-          console.error("MediaRecorder Start Error:", recErr);
-          setError(`Recorder Error: ${recErr.message}`);
-          stopListening();
-        }
-      };
-
-      socket.onmessage = (message) => {
-        try {
-          const received = JSON.parse(message.data);
-          const transcript = received.channel?.alternatives?.[0]?.transcript;
-          if (transcript && received.is_final) {
-            onResult({ final: transcript, interim: '' });
-          } else if (transcript) {
-            onResult({ final: '', interim: transcript });
-          }
-        } catch (e) {
-          console.error("Deepgram Parse Error", e);
-        }
-      };
-
-      socket.onclose = (event) => {
-        console.log('Deepgram Closed', event.code, event.reason);
-        setIsListening(false);
-      };
-
-      socket.onerror = (e) => {
-        console.error("Deepgram Error", e);
-        if (socket.readyState !== 1) {
-          setError("Connection Error: Check API Key & Network.");
-        } else {
-          setError("Transcription Stream Error");
-        }
-      };
-
-      socketRef.current = socket;
+      connectDeepgram(audioStream, cleanKey);
 
       // Handle stream ending
       const videoTracks = stream.getVideoTracks();
@@ -228,7 +278,7 @@ export const useSpeechRecognition = ({
         onError?.(msg);
       }
     }
-  }, [apiKey, onResult, onError, stopListening]);
+  }, [apiKey, onResult, onError, stopListening, connectDeepgram]);
 
   return { isListening, error, startListening, stopListening, stream: currentStream };
 };

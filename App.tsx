@@ -919,50 +919,16 @@ export default function App() {
       try {
         const currentSettings = settingsRef.current;
         let contextFiles = currentSettings.contextFiles;
-        let finalImageBase64 = imageBase64;
 
-        // Auto-capture screen if stream is available and no image provided
-        if (!finalImageBase64 && streamRef.current) {
-            const videoTrack = streamRef.current.getVideoTracks()[0];
-            if (videoTrack) {
-                try {
-                    const video = document.createElement('video');
-                    video.srcObject = new MediaStream([videoTrack]);
-                    await video.play();
-
-                    let width = video.videoWidth;
-                    let height = video.videoHeight;
-                    const MAX_WIDTH = 1920;
-                    
-                    if (width > MAX_WIDTH) {
-                        height = Math.round((height * MAX_WIDTH) / width);
-                        width = MAX_WIDTH;
-                    }
-
-                    const canvas = document.createElement('canvas');
-                    canvas.width = width;
-                    canvas.height = height;
-                    const ctx = canvas.getContext('2d');
-                    ctx?.drawImage(video, 0, 0, width, height);
-                    
-                    finalImageBase64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
-                    
-                    video.pause();
-                    video.srcObject = null;
-                } catch (err) {
-                    console.error("Auto screen capture failed:", err);
-                }
-            }
-        }
-
-        if (finalImageBase64) {
+        // Only include a screen capture if one was explicitly passed (e.g. from Auto-Solve)
+        if (imageBase64) {
             contextFiles = [...contextFiles, {
                 id: 'temp-screen-capture',
                 name: 'Screen Capture',
                 content: '[Binary File]',
                 type: 'custom',
                 mimeType: 'image/jpeg',
-                base64: finalImageBase64
+                base64: imageBase64
             }];
         }
         let responseText = "";
@@ -1101,10 +1067,94 @@ export default function App() {
     executeSend(inputText);
   };
 
-  const handleAutoSolve = () => {
+  /**
+   * One-shot screen capture — grabs a single frame and immediately releases resources.
+   * Electron: fresh getUserMedia (video only), screenshot, stop tracks.
+   * Browser: uses the existing display stream if video track is still alive.
+   */
+  const captureScreenshot = useCallback(async (): Promise<string | null> => {
+    let tempStream: MediaStream | null = null;
+    try {
+      let videoTrack: MediaStreamTrack | null = null;
+
+      if (isElectron) {
+        // Fresh one-shot capture in Electron
+        const { ipcRenderer } = (window as any).require('electron');
+        const sources = await ipcRenderer.invoke('get-desktop-sources');
+        if (!sources || sources.length === 0) return null;
+
+        const screenSource = sources.find((s: any) =>
+          s.name === 'Entire Screen' || s.name === 'Screen 1' || s.name.toLowerCase().includes('screen')
+        ) || sources[0];
+
+        tempStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            mandatory: {
+              chromeMediaSource: 'desktop',
+              chromeMediaSourceId: screenSource.id,
+              maxWidth: 1920,
+              maxHeight: 1080,
+              maxFrameRate: 5,
+            }
+          } as any,
+        });
+        videoTrack = tempStream.getVideoTracks()[0] || null;
+      } else {
+        // Browser: reuse existing stream's video track
+        videoTrack = streamRef.current?.getVideoTracks()[0] || null;
+      }
+
+      if (!videoTrack || videoTrack.readyState !== 'live') return null;
+
+      const video = document.createElement('video');
+      video.srcObject = new MediaStream([videoTrack]);
+      await video.play();
+
+      let width = video.videoWidth;
+      let height = video.videoHeight;
+      const MAX_WIDTH = 1920;
+      if (width > MAX_WIDTH) {
+        height = Math.round((height * MAX_WIDTH) / width);
+        width = MAX_WIDTH;
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx?.drawImage(video, 0, 0, width, height);
+
+      const base64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+
+      // Cleanup DOM elements to prevent memory leaks
+      video.pause();
+      video.srcObject = null;
+      video.remove();
+      canvas.remove();
+
+      return base64;
+    } catch (err) {
+      console.error("Screen capture failed:", err);
+      return null;
+    } finally {
+      // Release the one-shot stream in Electron (don't touch the browser's ongoing stream)
+      if (tempStream) {
+        tempStream.getTracks().forEach(t => t.stop());
+      }
+    }
+  }, []);
+
+  const handleAutoSolve = async () => {
     if (isProcessing) return;
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    executeSend("Please analyze the code or problem visible on the screen and provide the solution.");
+
+    // One-shot screen capture, then send with the image
+    const screenshot = await captureScreenshot();
+    executeSend(
+      "Please analyze the code or problem visible on the screen and provide the solution.",
+      screenshot || undefined
+    );
   };
 
   const handleClear = () => {
@@ -1121,51 +1171,8 @@ export default function App() {
     try {
         const historyForService = messages.filter(m => m.id !== lastUserMsg.id && m.role !== 'system');
         const currentSettings = settingsRef.current;
-        let contextFiles = currentSettings.contextFiles;
+        const contextFiles = currentSettings.contextFiles;
         let responseText = "";
-
-        // Auto-capture screen if stream is available
-        if (streamRef.current) {
-            const videoTrack = streamRef.current.getVideoTracks()[0];
-            if (videoTrack) {
-                try {
-                    const video = document.createElement('video');
-                    video.srcObject = new MediaStream([videoTrack]);
-                    await video.play();
-
-                    let width = video.videoWidth;
-                    let height = video.videoHeight;
-                    const MAX_WIDTH = 1920;
-                    
-                    if (width > MAX_WIDTH) {
-                        height = Math.round((height * MAX_WIDTH) / width);
-                        width = MAX_WIDTH;
-                    }
-
-                    const canvas = document.createElement('canvas');
-                    canvas.width = width;
-                    canvas.height = height;
-                    const ctx = canvas.getContext('2d');
-                    ctx?.drawImage(video, 0, 0, width, height);
-                    
-                    const finalImageBase64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
-                    
-                    video.pause();
-                    video.srcObject = null;
-
-                    contextFiles = [...contextFiles, {
-                        id: 'temp-screen-capture',
-                        name: 'Screen Capture',
-                        content: '[Binary File]',
-                        type: 'custom',
-                        mimeType: 'image/jpeg',
-                        base64: finalImageBase64
-                    }];
-                } catch (err) {
-                    console.error("Auto screen capture failed during regenerate:", err);
-                }
-            }
-        }
 
         if (currentSettings.selectedModel === 'groq') {
             responseText = await groqService.generateResponse(
@@ -1364,17 +1371,51 @@ export default function App() {
     isElectron
   };
 
-  // ── CONVERSATION SYNC (Electron: main ↔ pop-out via localStorage) ──
+  // ── CONVERSATION SYNC (Electron: main ↔ pop-out via localStorage + IPC) ──
   const syncKeyRef = useRef('copilot_messages_v1');
+  const contextFilesSyncKey = 'copilot_context_files_v1';
   const isSyncingRef = useRef(false);
+  const isSyncingFilesRef = useRef(false);
+
+  // Strip base64 from context files before localStorage to avoid quota overflow
+  const stripBase64ForSync = (files: ContextFile[]): ContextFile[] =>
+    files.map(f => f.base64 ? { ...f, base64: undefined, content: f.content || `[Binary: ${f.name}]` } : f);
 
   // Save messages to localStorage whenever they change
   useEffect(() => {
     if (isSyncingRef.current) { isSyncingRef.current = false; return; }
     try {
-      localStorage.setItem(syncKeyRef.current, JSON.stringify(messages));
-    } catch (e) { /* quota exceeded — ignore */ }
+      const payload = JSON.stringify(messages);
+      localStorage.setItem(syncKeyRef.current, payload);
+    } catch (e: any) {
+      // Quota exceeded — trim old messages and retry once
+      console.warn('localStorage quota exceeded for messages, trimming history');
+      try {
+        const trimmed = messages.slice(-50); // keep last 50 messages
+        localStorage.setItem(syncKeyRef.current, JSON.stringify(trimmed));
+      } catch (_) { /* truly full — skip */ }
+    }
+    // Also push via IPC so the Electron pop-out gets it even if localStorage is full
+    if (isElectron) {
+      electronIPC.send('sync-messages', messages);
+    }
   }, [messages]);
+
+  // Save context files to localStorage whenever they change
+  useEffect(() => {
+    if (isSyncingFilesRef.current) { isSyncingFilesRef.current = false; return; }
+    try {
+      // Strip base64 blobs to stay under localStorage quota
+      const lightweight = stripBase64ForSync(settings.contextFiles);
+      localStorage.setItem(contextFilesSyncKey, JSON.stringify(lightweight));
+    } catch (e: any) {
+      console.warn('localStorage quota exceeded for context files');
+    }
+    // IPC sync sends full context files (including base64) — no quota limits
+    if (isElectron) {
+      electronIPC.send('sync-context-files', settings.contextFiles);
+    }
+  }, [settings.contextFiles]);
 
   // Load messages from localStorage on mount (pop-out gets main's history)
   useEffect(() => {
@@ -1387,9 +1428,20 @@ export default function App() {
         }
       }
     } catch (e) { /* ignore parse errors */ }
+
+    // Load context files from localStorage on mount (pop-out gets main's files)
+    try {
+      const savedFiles = localStorage.getItem(contextFilesSyncKey);
+      if (savedFiles) {
+        const parsedFiles = JSON.parse(savedFiles);
+        if (Array.isArray(parsedFiles) && parsedFiles.length > 0) {
+          setSettings(prev => ({ ...prev, contextFiles: parsedFiles }));
+        }
+      }
+    } catch (e) { /* ignore parse errors */ }
   }, []);
 
-  // Listen for storage events from the other window
+  // Listen for storage events from the other window (browser path)
   useEffect(() => {
     const handler = (e: StorageEvent) => {
       if (e.key === syncKeyRef.current && e.newValue) {
@@ -1401,8 +1453,34 @@ export default function App() {
           }
         } catch (err) { /* ignore */ }
       }
+      if (e.key === contextFilesSyncKey && e.newValue) {
+        try {
+          const parsedFiles = JSON.parse(e.newValue);
+          if (Array.isArray(parsedFiles)) {
+            isSyncingFilesRef.current = true;
+            setSettings(prev => ({ ...prev, contextFiles: parsedFiles }));
+          }
+        } catch (err) { /* ignore */ }
+      }
     };
     window.addEventListener('storage', handler);
+
+    // Electron IPC sync — receives full payloads (including base64) without quota limits
+    if (isElectron) {
+      electronIPC.on('sync-messages', (data: any) => {
+        if (Array.isArray(data)) {
+          isSyncingRef.current = true;
+          setMessages(data);
+        }
+      });
+      electronIPC.on('sync-context-files', (data: any) => {
+        if (Array.isArray(data)) {
+          isSyncingFilesRef.current = true;
+          setSettings(prev => ({ ...prev, contextFiles: data }));
+        }
+      });
+    }
+
     return () => window.removeEventListener('storage', handler);
   }, []);
 
@@ -1852,13 +1930,6 @@ export default function App() {
                       </div>
                       <Download size={18} className="text-gray-500 group-hover:text-orange-500 transition-colors" />
                   </a>
-              </div>
-              
-              <div className="text-xs text-gray-400 mt-4 bg-surface border border-border p-3 rounded-lg text-left flex items-start gap-2">
-                  <Info size={16} className="text-blue-400 shrink-0 mt-0.5" />
-                  <p>
-                      <strong>Note for Deployment:</strong> Once you push this code to GitHub, the automated Actions workflow will build these files. You'll need to update these links in <code>App.tsx</code> to point to your actual GitHub Releases page.
-                  </p>
               </div>
           </div>
       </Modal>
