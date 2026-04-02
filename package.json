@@ -41,6 +41,7 @@
   },
   "dependencies": {
     "@google/genai": "^1.36.0",
+    "better-sqlite3": "^12.8.0",
     "groq-sdk": "0.9.1",
     "lucide-react": "^0.562.0",
     "openai": "4.24.1",
@@ -53,6 +54,7 @@
     "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.0.3",
     "@types/node": "^22.14.0",
     "@types/react-syntax-highlighter": "^15.5.13",
     "@vitejs/plugin-react": "^5.0.0",

@@ -11,6 +11,7 @@ import { openaiService } from './services/openaiService';
 import { xaiService } from './services/xaiService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
+import { useDatabase } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
 import './pip-styles.css';
 
@@ -164,7 +165,8 @@ const ChatInterface = ({
     onOpenHelp,
     onOpenDownload,
     isPipMode,
-    togglePip
+    togglePip,
+    onNewSession
 }: any) => {
 
     const handleModelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -446,6 +448,9 @@ const ChatInterface = ({
                         </button>
                     )}
 
+                    {onNewSession && (
+                        <button onClick={onNewSession} className="p-2 text-gray-400 hover:text-green-400 hover:bg-green-500/10 border border-transparent hover:border-green-500/20 rounded-lg transition-all" title="New Interview Session"><Plus size={20} /></button>
+                    )}
                     <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Audio Help"><HelpCircle size={20} /></button>
                     <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Files (Knowledge Base)"><FileText size={20} /></button>
                     <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border ${!settings.apiKey ? 'text-red-400 animate-pulse' : 'text-gray-400 hover:text-text hover:bg-surface'}`} title="Settings"><Settings size={20} /></button>
@@ -743,14 +748,22 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
 
 
 export default function App() {
-  // --- State ---
-  const [messages, setMessages] = useState<Message[]>([]);
+  // --- Database-backed state (Electron) / local fallback (browser) ---
+  const db = useDatabase();
+  const messages = db.messages;
+  const setMessages = db.setMessages;
   const messagesRef = useRef<Message[]>([]);
+  const contextFilesRef = useRef<ContextFile[]>([]);
 
   // Keep messagesRef in sync with messages
   useEffect(() => {
       messagesRef.current = messages;
   }, [messages]);
+
+  // Keep contextFilesRef in sync with db.contextFiles
+  useEffect(() => {
+      contextFilesRef.current = db.contextFiles;
+  }, [db.contextFiles]);
   const [inputText, setInputText] = useState("");
   const [interimText, setInterimText] = useState("");
   
@@ -795,9 +808,8 @@ export default function App() {
     openaiApiKey: localStorage.getItem("OPENAI_API_KEY") || "",
     xaiApiKey: localStorage.getItem("XAI_API_KEY") || "",
     selectedModel: (localStorage.getItem("SELECTED_MODEL") as 'gemini'|'groq'|'openai'|'xai') || 'gemini',
-    autoSend: false, 
-    // Start with empty array - no placeholders
-    contextFiles: [],
+    autoSend: false,
+    contextFiles: [], // Legacy — db.contextFiles is the source of truth in Electron
     theme: (localStorage.getItem("THEME") as 'light'|'dark') || 'dark',
     fontSize: (localStorage.getItem("FONT_SIZE") as 'small'|'medium'|'large') || 'medium',
     generalMode: localStorage.getItem("GENERAL_MODE") === 'true' // Default false (Context Mode)
@@ -892,6 +904,13 @@ export default function App() {
     }
   }, [messages, interimText, shouldAutoScroll]);
 
+  // Pop-out: re-enable auto-scroll when new messages arrive (since executeSend doesn't run here)
+  useEffect(() => {
+    if (isPopoutMode && messages.length > 0) {
+      setShouldAutoScroll(true);
+    }
+  }, [messages.length]);
+
   const handleScroll = () => {
       if (!chatContainerRef.current) return;
       const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
@@ -909,16 +928,20 @@ export default function App() {
         content: textToSend,
         timestamp: Date.now()
       };
-  
-      setMessages(prev => [...prev, userMsg]);
+
+      if (db.isElectron) {
+        db.addMessage(userMsg);
+      } else {
+        setMessages(prev => [...prev, userMsg]);
+      }
       setIsProcessing(true);
       setInterimText("");
-      setInputText(""); 
-      setShouldAutoScroll(true); 
-  
+      setInputText("");
+      setShouldAutoScroll(true);
+
       try {
         const currentSettings = settingsRef.current;
-        let contextFiles = currentSettings.contextFiles;
+        let contextFiles = contextFilesRef.current;
 
         // Only include a screen capture if one was explicitly passed (e.g. from Auto-Solve)
         if (imageBase64) {
@@ -972,7 +995,11 @@ export default function App() {
               content: responseText,
               timestamp: Date.now()
             };
-            setMessages(prev => [...prev, aiMsg]);
+            if (db.isElectron) {
+              db.addMessage(aiMsg);
+            } else {
+              setMessages(prev => [...prev, aiMsg]);
+            }
         }
       } catch (err) {
         console.error(err);
@@ -982,7 +1009,11 @@ export default function App() {
           content: "Error generating response. Check API Key.",
           timestamp: Date.now()
         };
-        setMessages(prev => [...prev, errorMsg]);
+        if (db.isElectron) {
+          db.addMessage(errorMsg);
+        } else {
+          setMessages(prev => [...prev, errorMsg]);
+        }
       } finally {
         setIsProcessing(false);
       }
@@ -1046,22 +1077,82 @@ export default function App() {
     }
   }, [executeSend]);
 
-  const { isListening, error: speechError, startListening, stopListening, stream } = useSpeechRecognition({
-    onResult: handleSpeechResult,
+  // ── Speech recognition — only runs in the main window, NOT the pop-out ──
+  // Pop-out is a thin UI client: it relays actions to main and receives state via IPC.
+  const isPopoutThinClient = isElectron && isPopoutMode;
+
+  const { isListening: _rawIsListening, error: _rawSpeechError, startListening: _rawStartListening, stopListening: _rawStopListening, stream } = useSpeechRecognition({
+    onResult: isPopoutThinClient ? () => {} : handleSpeechResult,
     onError: (err) => console.error("Speech Error:", err),
-    apiKey: settings.deepgramApiKey // Pass Deepgram Key
+    apiKey: isPopoutThinClient ? '' : settings.deepgramApiKey
   });
+
+  // Pop-out: shadow state received from main window via IPC
+  const [remoteIsListening, setRemoteIsListening] = useState(false);
+  const [remoteIsProcessing, setRemoteIsProcessing] = useState(false);
+  const [remoteSpeechError, setRemoteSpeechError] = useState<string | null>(null);
+
+  // Expose unified state — pop-out reads from remote, main reads from local
+  const isListening = isPopoutThinClient ? remoteIsListening : _rawIsListening;
+  const speechError = isPopoutThinClient ? remoteSpeechError : _rawSpeechError;
 
   useEffect(() => {
       streamRef.current = stream;
   }, [stream]);
 
-  // Auto-start listening if autoSend is on is slightly dangerous with Screen Share 
-  // because it prompts every time. Disabling auto-start for System Audio.
-  // We only start if the user clicks the button.
+  // ── Cross-window state sync (Electron only) ──
+  // Main window → pop-out: relay state whenever it changes
+  useEffect(() => {
+    if (!isElectron || isPopoutMode) return;
+    electronIPC.send('relay-to-popout', {
+      type: 'state-sync',
+      isListening: _rawIsListening,
+      isProcessing,
+      interimText,
+      inputText,
+      autoSend: settings.autoSend,
+      speechError: _rawSpeechError,
+    });
+  }, [_rawIsListening, isProcessing, interimText, inputText, settings.autoSend, _rawSpeechError]);
 
-  // --- UI Actions ---
+  // Pop-out: receive state from main window
+  useEffect(() => {
+    if (!isPopoutThinClient) return;
+    const ipc = (window as any).require?.('electron')?.ipcRenderer;
+    if (!ipc) return;
+
+    const handler = (_e: any, data: any) => {
+      if (data?.type === 'state-sync') {
+        setRemoteIsListening(data.isListening);
+        setRemoteIsProcessing(data.isProcessing);
+        setInterimText(data.interimText ?? '');
+        setInputText(data.inputText ?? '');
+        setRemoteSpeechError(data.speechError ?? null);
+        setIsProcessing(data.isProcessing);
+        setSettings(prev => prev.autoSend !== data.autoSend ? { ...prev, autoSend: data.autoSend } : prev);
+      }
+    };
+    ipc.on('from-main', handler);
+    electronIPC.send('relay-to-main', { type: 'request-state' });
+    return () => ipc.removeListener('from-main', handler);
+  }, []);
+
+  // --- UI Actions (pop-out relays to main, main executes locally) ---
+  const startListening = isPopoutThinClient
+    ? () => electronIPC.send('relay-to-main', { type: 'cmd-start-listening' })
+    : _rawStartListening;
+
+  const stopListening = isPopoutThinClient
+    ? () => electronIPC.send('relay-to-main', { type: 'cmd-stop-listening' })
+    : _rawStopListening;
+
   const handleManualSend = () => {
+    if (isPopoutThinClient) {
+      if (!inputText.trim()) return;
+      electronIPC.send('relay-to-main', { type: 'cmd-manual-send', text: inputText });
+      setInputText('');
+      return;
+    }
     if (!inputText.trim() || isProcessing) return;
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     executeSend(inputText);
@@ -1145,7 +1236,64 @@ export default function App() {
     }
   }, []);
 
+  // Main window: listen for commands from pop-out
+  useEffect(() => {
+    if (!isElectron || isPopoutMode) return;
+    const ipc = (window as any).require?.('electron')?.ipcRenderer;
+    if (!ipc) return;
+
+    const handler = (_e: any, data: any) => {
+      if (!data?.type) return;
+      switch (data.type) {
+        case 'cmd-start-listening':
+          _rawStartListening();
+          break;
+        case 'cmd-stop-listening':
+          _rawStopListening();
+          break;
+        case 'cmd-toggle-auto-send':
+          setSettings(prev => ({ ...prev, autoSend: !prev.autoSend }));
+          break;
+        case 'cmd-manual-send':
+          if (data.text?.trim()) executeSend(data.text);
+          break;
+        case 'cmd-auto-solve':
+          captureScreenshot().then(screenshot => {
+            executeSend(
+              "Please analyze the code or problem visible on the screen and provide the solution.",
+              screenshot || undefined
+            );
+          });
+          break;
+        case 'cmd-clear':
+          setInputText('');
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          break;
+        case 'cmd-set-input':
+          setInputText(data.text ?? '');
+          break;
+        case 'request-state':
+          electronIPC.send('relay-to-popout', {
+            type: 'state-sync',
+            isListening: _rawIsListening,
+            isProcessing,
+            interimText,
+            inputText,
+            autoSend: settings.autoSend,
+            speechError: _rawSpeechError,
+          });
+          break;
+      }
+    };
+    ipc.on('from-popout', handler);
+    return () => ipc.removeListener('from-popout', handler);
+  }, [executeSend, captureScreenshot, _rawStartListening, _rawStopListening]);
+
   const handleAutoSolve = async () => {
+    if (isPopoutThinClient) {
+      electronIPC.send('relay-to-main', { type: 'cmd-auto-solve' });
+      return;
+    }
     if (isProcessing) return;
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
 
@@ -1158,6 +1306,10 @@ export default function App() {
   };
 
   const handleClear = () => {
+      if (isPopoutThinClient) {
+        electronIPC.send('relay-to-main', { type: 'cmd-clear' });
+        return;
+      }
       setInputText("");
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
   };
@@ -1171,7 +1323,7 @@ export default function App() {
     try {
         const historyForService = messages.filter(m => m.id !== lastUserMsg.id && m.role !== 'system');
         const currentSettings = settingsRef.current;
-        const contextFiles = currentSettings.contextFiles;
+        const contextFiles = contextFilesRef.current;
         let responseText = "";
 
         if (currentSettings.selectedModel === 'groq') {
@@ -1254,7 +1406,7 @@ export default function App() {
                 mimeType: 'text/plain',
                 base64: undefined
             };
-            setSettings(prev => ({ ...prev, contextFiles: [...prev.contextFiles, newFile] }));
+            db.addContextFile(newFile);
         }).catch(err => {
             console.error(err);
             alert("Failed to extract text from PDF");
@@ -1267,12 +1419,12 @@ export default function App() {
             const newFile: ContextFile = {
                 id: Date.now().toString(),
                 name: file.name,
-                content: text, // Store exact text for models
+                content: text,
                 type: 'custom',
                 mimeType: file.type || 'text/plain',
-                base64: undefined // Explicitly undefined so text filters pick it up
+                base64: undefined
             };
-            setSettings(prev => ({ ...prev, contextFiles: [...prev.contextFiles, newFile] }));
+            db.addContextFile(newFile);
         };
         reader.readAsText(file);
     } else {
@@ -1281,16 +1433,16 @@ export default function App() {
           const result = event.target?.result as string;
           const base64Data = result.split(',')[1];
           const mimeType = result.split(':')[1].split(';')[0];
-    
+
           const newFile: ContextFile = {
             id: Date.now().toString(),
             name: file.name,
-            content: "[Binary File]", 
+            content: "[Binary File]",
             type: 'custom',
             mimeType: mimeType,
             base64: base64Data
           };
-          setSettings(prev => ({ ...prev, contextFiles: [...prev.contextFiles, newFile] }));
+          db.addContextFile(newFile);
         };
         reader.readAsDataURL(file);
     }
@@ -1300,19 +1452,23 @@ export default function App() {
       if (!pasteContent.trim()) return;
       const newFile: ContextFile = {
           id: Date.now().toString(),
-          name: `Pasted Context ${settings.contextFiles.length + 1}`,
+          name: `Pasted Context ${db.contextFiles.length + 1}`,
           content: pasteContent,
           type: 'custom'
       };
-      setSettings(prev => ({ ...prev, contextFiles: [...prev.contextFiles, newFile] }));
+      db.addContextFile(newFile);
       setPasteContent("");
   };
 
   const removeFile = (id: string) => {
-    setSettings(prev => ({ ...prev, contextFiles: prev.contextFiles.filter(f => f.id !== id) }));
+    db.removeContextFile(id);
   };
 
   const toggleAutoSend = () => {
+    if (isPopoutThinClient) {
+      electronIPC.send('relay-to-main', { type: 'cmd-toggle-auto-send' });
+      return;
+    }
     setSettings(prev => ({ ...prev, autoSend: !prev.autoSend }));
   };
   
@@ -1368,136 +1524,11 @@ export default function App() {
         setIsPipMode(true);
       }
     },
-    isElectron
+    isElectron,
+    onNewSession: db.isElectron ? () => db.newSession() : null
   };
 
-  // ── CONVERSATION SYNC (Electron: main ↔ pop-out via IPC primary, localStorage fallback) ──
-  const syncKeyRef = useRef('copilot_messages_v1');
-  const contextFilesSyncKey = 'copilot_context_files_v1';
-  const isSyncingRef = useRef(false);
-  const isSyncingFilesRef = useRef(false);
-
-  // Strip base64 from context files — only used as last-resort fallback
-  const stripBase64ForSync = (files: ContextFile[]): ContextFile[] =>
-    files.map(f => f.base64 ? { ...f, base64: undefined, content: f.content || `[Binary: ${f.name}]` } : f);
-
-  // Save messages to localStorage whenever they change
-  useEffect(() => {
-    if (isSyncingRef.current) { isSyncingRef.current = false; return; }
-    try {
-      localStorage.setItem(syncKeyRef.current, JSON.stringify(messages));
-    } catch (e) {
-      // Quota exceeded — trim old messages and retry
-      try {
-        localStorage.setItem(syncKeyRef.current, JSON.stringify(messages.slice(-50)));
-      } catch (_) { /* truly full — skip */ }
-    }
-    if (isElectron) {
-      electronIPC.send('sync-messages', messages);
-    }
-  }, [messages]);
-
-  // Save context files to localStorage whenever they change
-  useEffect(() => {
-    if (isSyncingFilesRef.current) { isSyncingFilesRef.current = false; return; }
-    try {
-      // Try full files first (including base64) so browser PiP works
-      localStorage.setItem(contextFilesSyncKey, JSON.stringify(settings.contextFiles));
-    } catch (e) {
-      // Quota exceeded — fallback: strip base64 so at least text files sync
-      console.warn('localStorage quota exceeded for context files, stripping binary data');
-      try {
-        localStorage.setItem(contextFilesSyncKey, JSON.stringify(stripBase64ForSync(settings.contextFiles)));
-      } catch (_) { /* truly full — skip */ }
-    }
-    // IPC sync sends full context files (including base64) — no quota limits
-    if (isElectron) {
-      electronIPC.send('sync-context-files', settings.contextFiles);
-    }
-  }, [settings.contextFiles]);
-
-  // Load state on mount
-  useEffect(() => {
-    // In Electron pop-out: request full state from the main window via IPC
-    // This is the primary sync path — more reliable than localStorage
-    if (isElectron && isPopoutMode) {
-      electronIPC.send('request-full-state');
-    }
-
-    // Also load from localStorage as fallback / for browser PiP
-    try {
-      const saved = localStorage.getItem(syncKeyRef.current);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setMessages(parsed);
-        }
-      }
-    } catch (e) { /* ignore */ }
-
-    try {
-      const savedFiles = localStorage.getItem(contextFilesSyncKey);
-      if (savedFiles) {
-        const parsedFiles = JSON.parse(savedFiles);
-        if (Array.isArray(parsedFiles) && parsedFiles.length > 0) {
-          setSettings(prev => ({ ...prev, contextFiles: parsedFiles }));
-        }
-      }
-    } catch (e) { /* ignore */ }
-  }, []);
-
-  // Listen for sync events from the other window
-  useEffect(() => {
-    // Browser path: StorageEvent (works for PiP, unreliable for Electron)
-    const handler = (e: StorageEvent) => {
-      if (e.key === syncKeyRef.current && e.newValue) {
-        try {
-          const parsed = JSON.parse(e.newValue);
-          if (Array.isArray(parsed)) {
-            isSyncingRef.current = true;
-            setMessages(parsed);
-          }
-        } catch (err) { /* ignore */ }
-      }
-      if (e.key === contextFilesSyncKey && e.newValue) {
-        try {
-          const parsedFiles = JSON.parse(e.newValue);
-          if (Array.isArray(parsedFiles)) {
-            isSyncingFilesRef.current = true;
-            setSettings(prev => ({ ...prev, contextFiles: parsedFiles }));
-          }
-        } catch (err) { /* ignore */ }
-      }
-    };
-    window.addEventListener('storage', handler);
-
-    // Electron IPC sync — primary path for Electron windows
-    if (isElectron) {
-      // Receive pushed updates from the other window
-      electronIPC.on('sync-messages', (data: any) => {
-        if (Array.isArray(data)) {
-          isSyncingRef.current = true;
-          setMessages(data);
-        }
-      });
-      electronIPC.on('sync-context-files', (data: any) => {
-        if (Array.isArray(data)) {
-          isSyncingFilesRef.current = true;
-          setSettings(prev => ({ ...prev, contextFiles: data }));
-        }
-      });
-
-      // Main window: respond to pop-out's state request by pushing current state
-      if (!isPopoutMode) {
-        electronIPC.on('popout-requests-state', () => {
-          electronIPC.send('sync-messages', messages);
-          electronIPC.send('sync-context-files', settingsRef.current.contextFiles);
-        });
-      }
-    }
-
-    return () => window.removeEventListener('storage', handler);
-  }, []);
+  // Sync is now handled by useDatabase hook (Electron) — no localStorage sync needed
 
   // ── RENDER ──
   const isPopoutElectron = isElectron && isPopoutMode;
@@ -1791,7 +1822,7 @@ export default function App() {
            {/* File List */}
            <div className="space-y-3">
                <div className="flex items-center justify-between">
-                   <h3 className="text-sm font-bold text-text">Attached Files ({settings.contextFiles.length})</h3>
+                   <h3 className="text-sm font-bold text-text">Attached Files ({db.contextFiles.length})</h3>
                    <button onClick={triggerFileUpload} className="text-xs flex items-center gap-1 text-primary hover:underline">
                        <Plus size={12} /> Add File
                    </button>
@@ -1806,13 +1837,13 @@ export default function App() {
                </div>
                
                <div className="space-y-2 max-h-[200px] overflow-y-auto custom-scrollbar pr-1">
-                   {settings.contextFiles.length === 0 && (
+                   {db.contextFiles.length === 0 && (
                        <div className="text-center py-6 border border-dashed border-border rounded-xl text-gray-500">
                            <FilePlus size={24} className="mx-auto mb-2 opacity-50" />
                            <p className="text-xs">No files added.</p>
                        </div>
                    )}
-                   {settings.contextFiles.map(file => (
+                   {db.contextFiles.map(file => (
                        <div key={file.id} className="flex items-center justify-between p-2.5 bg-background border border-border rounded-lg group hover:border-primary/30 transition-colors">
                            <div className="flex items-center gap-3 overflow-hidden">
                                <div className="w-8 h-8 rounded bg-gray-500/10 flex items-center justify-center shrink-0">

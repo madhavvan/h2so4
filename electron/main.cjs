@@ -1,5 +1,6 @@
 const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
+const database = require('./database.cjs');
 
 let mainWindow = null;
 let popoutWindow = null;
@@ -280,32 +281,57 @@ ipcMain.on('relay-to-main', (_event, data) => {
   }
 });
 
-// ── Cross-window state sync (messages + context files) ──
-// Forwards full state between main ↔ pop-out so uploaded files,
-// chat history, and context stay in sync without localStorage.
+// ── Database IPC handlers ──
 
-function relayToOtherWindows(event, channel, data) {
+ipcMain.handle('db:get-active-session', () => {
+  return database.getOrCreateActiveSession();
+});
+
+ipcMain.handle('db:new-session', (_event, name) => {
+  return database.startNewSession(name);
+});
+
+ipcMain.handle('db:get-messages', (_event, sessionId) => {
+  return database.getMessages(sessionId);
+});
+
+ipcMain.handle('db:add-message', (_event, sessionId, message) => {
+  database.addMessage(sessionId, message);
+  // Notify the OTHER window so it updates in real time
   BrowserWindow.getAllWindows().forEach(win => {
-    if (win.webContents.id !== event.sender.id && !win.isDestroyed()) {
-      win.webContents.send(channel, data);
+    if (win.webContents.id !== _event.sender.id && !win.isDestroyed()) {
+      win.webContents.send('db:messages-updated', sessionId);
     }
   });
-}
-
-ipcMain.on('sync-messages', (event, data) => {
-  relayToOtherWindows(event, 'sync-messages', data);
 });
 
-ipcMain.on('sync-context-files', (event, data) => {
-  relayToOtherWindows(event, 'sync-context-files', data);
+ipcMain.handle('db:get-context-files', (_event, sessionId) => {
+  return database.getContextFiles(sessionId);
 });
 
-// Pop-out requests full state on mount → tell the main window to push everything
-ipcMain.on('request-full-state', (event) => {
+ipcMain.handle('db:add-context-file', (_event, sessionId, file) => {
+  database.addContextFile(sessionId, file);
   BrowserWindow.getAllWindows().forEach(win => {
-    if (win.webContents.id !== event.sender.id && !win.isDestroyed()) {
-      win.webContents.send('popout-requests-state');
+    if (win.webContents.id !== _event.sender.id && !win.isDestroyed()) {
+      win.webContents.send('db:files-updated', sessionId);
     }
+  });
+});
+
+ipcMain.handle('db:remove-context-file', (_event, fileId) => {
+  database.removeContextFile(fileId);
+  BrowserWindow.getAllWindows().forEach(win => {
+    if (win.webContents.id !== _event.sender.id && !win.isDestroyed()) {
+      win.webContents.send('db:files-updated');
+    }
+  });
+});
+
+ipcMain.handle('db:clear-session', (_event, sessionId) => {
+  database.clearMessages(sessionId);
+  database.clearContextFiles(sessionId);
+  BrowserWindow.getAllWindows().forEach(win => {
+    win.webContents.send('db:session-cleared', sessionId);
   });
 });
 
@@ -439,4 +465,5 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   app.isQuitting = true;
+  database.closeDB();
 });
