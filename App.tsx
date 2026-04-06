@@ -1653,7 +1653,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     onOpenSettings: () => setShowSettings(true),
     onOpenContext: () => { console.log('Opening Context'); setShowContext(true); },
     onOpenHelp: () => setShowHelp(true),
-    onOpenDownload: () => setShowDownloadModal(true),
+    onOpenDownload: () => { if (!isElectron) setShowDownloadModal(true); },
     isPipMode,
     togglePip: () => {
       // ── Feature Gate: Popout is Pro only ──
