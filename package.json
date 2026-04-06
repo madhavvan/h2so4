@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
-    "electron:start": "concurrently -k \"npm run dev\" \"wait-on tcp:3000 && electron .\"",
+    "electron:start": "concurrently -k \"npm run dev\" \"wait-on tcp:3005 && electron .\"",
     "electron:build": "npm run build && electron-builder"
   },
   "build": {
@@ -41,6 +41,7 @@
   },
   "dependencies": {
     "@google/genai": "^1.36.0",
+    "@react-oauth/google": "^0.13.4",
     "better-sqlite3": "^12.8.0",
     "groq-sdk": "0.9.1",
     "lucide-react": "^0.562.0",

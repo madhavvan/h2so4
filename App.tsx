@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, LogOut, Lock, Crown } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -13,6 +13,8 @@ import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
 import { useDatabase } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
+import { SubscriptionGate } from './SubscriptionGate';
+import { licenseService, UserProfile, LicenseData } from './services/licenseService';
 import './pip-styles.css';
 
 // --- Electron Helpers ---
@@ -166,11 +168,17 @@ const ChatInterface = ({
     onOpenDownload,
     isPipMode,
     togglePip,
-    onNewSession
+    onNewSession,
+    userProfile,
+    userLicense,
+    onLogout,
+    gate
 }: any) => {
 
     const handleModelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
         const newModel = e.target.value as 'gemini' | 'groq' | 'openai' | 'xai';
+        // ── Feature Gate: Block model switch for free users ──
+        if (!gate.canUseModel(newModel)) return;
         // Immediate state update
         const newSettings = {
             ...settings,
@@ -219,7 +227,7 @@ const ChatInterface = ({
                     {/* Left: Avatar + Name */}
                     <div className="avatar">✦</div>
                     <div className="header-info" style={{ minWidth: 0 }}>
-                        <h4>minico</h4>
+                        <h4>minicaai</h4>
                         <span><span className="dot"></span> Online</span>
                     </div>
 
@@ -229,16 +237,16 @@ const ChatInterface = ({
                         style={inElectron ? { WebkitAppRegion: 'no-drag', gap: '6px' } as any : { gap: '6px' }}
                     >
                         {/* Model selector — compact */}
-                        <select 
+                        <select
                             value={settings.selectedModel}
                             onChange={handleModelChange}
                             className="text-[10px] rounded px-1.5 py-0.5 outline-none cursor-pointer"
                             style={glassBtn}
                         >
                             <option value="gemini" className="text-black">Gemini</option>
-                            <option value="groq" className="text-black">Groq</option>
-                            <option value="openai" className="text-black">GPT</option>
-                            <option value="xai" className="text-black">Grok</option>
+                            <option value="groq" disabled={!gate.canUseModel('groq')} className="text-black">Groq{!gate.canUseModel('groq') ? ' 🔒' : ''}</option>
+                            <option value="openai" disabled={!gate.canUseModel('openai')} className="text-black">GPT{!gate.canUseModel('openai') ? ' 🔒' : ''}</option>
+                            <option value="xai" disabled={!gate.canUseModel('xai')} className="text-black">Grok{!gate.canUseModel('xai') ? ' 🔒' : ''}</option>
                         </select>
 
                         {/* Settings */}
@@ -309,7 +317,7 @@ const ChatInterface = ({
 
                     {messages.map((msg: Message) => (
                         <div key={msg.id} className={`msg ${msg.role === 'user' ? 'user' : 'ai'}`}>
-                            <span className="msg-name">{msg.role === 'user' ? 'You' : 'minico'}</span>
+                            <span className="msg-name">{msg.role === 'user' ? 'You' : 'minicaai'}</span>
                             <div className="bubble">
                                 <MessageRenderer content={msg.content} fontSize={settings.fontSize} />
                             </div>
@@ -319,7 +327,7 @@ const ChatInterface = ({
 
                     {isProcessing && (
                         <div className="msg ai" id="typing">
-                            <span className="msg-name">minico</span>
+                            <span className="msg-name">minicaai</span>
                             <div className="bubble typing-bubble">
                                 <span className="typing-dot"></span>
                                 <span className="typing-dot"></span>
@@ -400,13 +408,13 @@ const ChatInterface = ({
                         <Send size={18} strokeWidth={1.5} />
                     </button>
                     
-                    <button 
-                        className="send-btn ml-2" 
-                        aria-label="Auto-Solve"
+                    <button
+                        className="send-btn ml-2"
+                        aria-label={gate.canAutoSolve ? "Auto-Solve" : "Auto-Solve — Pro only"}
                         onClick={handleAutoSolve}
-                        disabled={isProcessing}
-                        title="Auto-Solve Screen"
-                        style={{ opacity: isProcessing ? 0.5 : 1 }}
+                        disabled={isProcessing || !gate.canAutoSolve}
+                        title={gate.canAutoSolve ? "Auto-Solve Screen" : "Auto-Solve — Pro only 🔒"}
+                        style={{ opacity: (isProcessing || !gate.canAutoSolve) ? 0.4 : 1, position: 'relative' }}
                     >
                         <Wand2 size={18} strokeWidth={1.5} />
                     </button>
@@ -424,27 +432,36 @@ const ChatInterface = ({
                 <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
                     <Cpu size={18} className="text-white" />
                 </div>
-                <h1 className="font-bold text-base md:text-lg tracking-tight hidden xs:block">Interview<span className="text-blue-500">Copilot</span></h1>
+                <h1 className="font-bold text-base md:text-lg tracking-tight hidden xs:block">minica<span className="text-blue-500">ai</span></h1>
                 </div>
 
                 <div className="flex items-center gap-2 md:gap-3">
+                    {/* User tier badge */}
+                    {userLicense && (
+                      <div className={`hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border ${
+                        userLicense.tier === 'pro' ? 'bg-blue-500/10 border-blue-500/30 text-blue-400' : 'bg-gray-500/10 border-gray-500/30 text-gray-400'
+                      }`}>
+                        {userLicense.tier === 'pro' ? <Crown size={10} /> : <Zap size={10} />}
+                        {userLicense.tier.toUpperCase()}
+                      </div>
+                    )}
                     <div className={`hidden md:flex px-3 py-1 rounded-full text-xs font-medium items-center gap-2 border transition-all duration-300 ${isListening ? 'bg-red-500/10 border-red-500/50 text-red-500' : 'bg-surface border-border text-gray-500'}`}>
                         <div className={`w-2 h-2 rounded-full ${isListening ? 'bg-red-500 animate-pulse' : 'bg-gray-500'}`}></div>
                         {isListening ? 'LIVE' : 'OFF'}
                     </div>
                     
-                    <button onClick={onOpenDownload} className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white rounded-lg text-xs font-bold transition-all shadow-lg shadow-blue-500/20" title="Download Desktop App">
-                        <Download size={14} />
-                        Get Desktop App
-                    </button>
-                    
                     {!isPipMode && (
-                        <button 
-                            onClick={togglePip} 
-                            className="p-2 text-primary hover:bg-blue-500/10 rounded-lg transition-all border border-blue-500/20" 
-                            title="Pop Out (Hide from Screen Share)"
+                        <button
+                            onClick={togglePip}
+                            className={`p-2 rounded-lg transition-all border relative ${
+                              gate.canPopout
+                                ? 'text-primary hover:bg-blue-500/10 border-blue-500/20'
+                                : 'text-gray-500 border-gray-500/20 cursor-not-allowed opacity-60'
+                            }`}
+                            title={gate.canPopout ? "Pop Out (Hide from Screen Share)" : "Pop-out Mode — Pro only 🔒"}
                         >
                             <ExternalLink size={20} />
+                            {!gate.canPopout && <Lock size={8} className="absolute top-1 right-1 text-amber-400" />}
                         </button>
                     )}
 
@@ -454,6 +471,7 @@ const ChatInterface = ({
                     <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Audio Help"><HelpCircle size={20} /></button>
                     <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Files (Knowledge Base)"><FileText size={20} /></button>
                     <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border ${!settings.apiKey ? 'text-red-400 animate-pulse' : 'text-gray-400 hover:text-text hover:bg-surface'}`} title="Settings"><Settings size={20} /></button>
+                    <button onClick={onLogout} className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 rounded-lg transition-all" title="Logout"><LogOut size={20} /></button>
                 </div>
             </header>
 
@@ -561,9 +579,9 @@ const ChatInterface = ({
                                             className="appearance-none bg-surface text-text text-[10px] md:text-xs font-bold px-2.5 py-1 pr-6 rounded-md border border-border hover:border-primary focus:outline-none focus:ring-1 focus:ring-primary transition-all cursor-pointer"
                                         >
                                             <option value="gemini" className="bg-white dark:bg-gray-800 text-black dark:text-white">Gemini 3.1 Flash</option>
-                                            <option value="groq" className="bg-white dark:bg-gray-800 text-black dark:text-white">Groq</option>
-                                            <option value="openai" className="bg-white dark:bg-gray-800 text-black dark:text-white">GPT-5.4 Mini</option>
-                                            <option value="xai" className="bg-white dark:bg-gray-800 text-black dark:text-white">Grok (xAI)</option>
+                                            <option value="groq" disabled={!gate.canUseModel('groq')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Groq{!gate.canUseModel('groq') ? ' 🔒' : ''}</option>
+                                            <option value="openai" disabled={!gate.canUseModel('openai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">GPT-5.4 Mini{!gate.canUseModel('openai') ? ' 🔒' : ''}</option>
+                                            <option value="xai" disabled={!gate.canUseModel('xai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Grok (xAI){!gate.canUseModel('xai') ? ' 🔒' : ''}</option>
                                         </select>
                                         <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500">
                                             <ChevronDown size={10} />
@@ -608,17 +626,20 @@ const ChatInterface = ({
                                         </button>
                                     )}
                                     <div className="flex gap-1">
-                                        <button 
+                                        <button
                                             onClick={handleAutoSolve}
-                                            disabled={isProcessing}
-                                            title="Auto-Solve Screen"
-                                            className={`p-2 rounded-xl transition-all shadow-lg ${
-                                                !isProcessing
-                                                ? 'bg-purple-600 text-white hover:bg-purple-700' 
+                                            disabled={isProcessing || !gate.canAutoSolve}
+                                            title={gate.canAutoSolve ? "Auto-Solve Screen" : "Auto-Solve — Pro only"}
+                                            className={`p-2 rounded-xl transition-all shadow-lg relative ${
+                                                !gate.canAutoSolve
+                                                ? 'bg-gray-600/30 text-gray-500 cursor-not-allowed border border-gray-500/20'
+                                                : !isProcessing
+                                                ? 'bg-purple-600 text-white hover:bg-purple-700'
                                                 : 'bg-surface text-gray-500 cursor-not-allowed border border-border'
                                             }`}
                                         >
                                             <Wand2 size={18} />
+                                            {!gate.canAutoSolve && <Lock size={8} className="absolute top-1 right-1 text-amber-400" />}
                                         </button>
                                         <button 
                                             onClick={handleManualSend}
@@ -747,7 +768,41 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
 };
 
 
-export default function App() {
+import { FEATURE_GATES } from './services/licenseService';
+
+// ── Feature Gate Helper ──
+function useFeatureGate(license: LicenseData | null) {
+  const tier = license?.tier === 'pro' ? 'pro' : 'free';
+  const gates = FEATURE_GATES[tier];
+
+  return {
+    tier,
+    isPro: tier === 'pro',
+    isFree: tier === 'free',
+    allowedModels: gates.models,
+    canScreenCapture: gates.screenCapture,
+    canAutoSolve: gates.autoSolve,
+    canPopout: gates.popout,
+    maxContextFiles: gates.contextFiles,
+    maxSessions: gates.sessionsPerMonth,
+    canExportHistory: gates.exportHistory,
+    canUseModel: (model: string) => gates.models.includes(model),
+    getDefaultModel: () => gates.models[0] || 'gemini',
+  };
+}
+
+// ── Pro Feature Locked Overlay ──
+const ProFeatureLocked = ({ feature, compact }: { feature: string; compact?: boolean }) => (
+  <div className={`flex items-center gap-1.5 ${compact ? 'text-[10px]' : 'text-xs'} text-amber-400/80`}>
+    <Lock size={compact ? 10 : 12} />
+    <span>Pro only{!compact && ` — ${feature}`}</span>
+  </div>
+);
+
+function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProfile | null; userLicense: LicenseData | null; onLogout: () => void }) {
+  // --- Feature Gates ---
+  const gate = useFeatureGate(userLicense);
+
   // --- Database-backed state (Electron) / local fallback (browser) ---
   const db = useDatabase();
   const messages = db.messages;
@@ -807,7 +862,12 @@ export default function App() {
     groqApiKey: localStorage.getItem("GROQ_API_KEY") || "",
     openaiApiKey: localStorage.getItem("OPENAI_API_KEY") || "",
     xaiApiKey: localStorage.getItem("XAI_API_KEY") || "",
-    selectedModel: (localStorage.getItem("SELECTED_MODEL") as 'gemini'|'groq'|'openai'|'xai') || 'gemini',
+    selectedModel: (() => {
+      const saved = (localStorage.getItem("SELECTED_MODEL") as 'gemini'|'groq'|'openai'|'xai') || 'gemini';
+      // Force free users back to allowed model
+      if (!gate.canUseModel(saved)) return gate.getDefaultModel() as 'gemini'|'groq'|'openai'|'xai';
+      return saved;
+    })(),
     autoSend: false,
     contextFiles: [], // Legacy — db.contextFiles is the source of truth in Electron
     theme: (localStorage.getItem("THEME") as 'light'|'dark') || 'dark',
@@ -921,7 +981,24 @@ export default function App() {
   // --- Core Logic ---
   const executeSend = useCallback(async (textToSend: string, imageBase64?: string) => {
       if (!textToSend.trim()) return;
-      
+
+      // ── Feature Gate: Block disallowed models ──
+      const currentModel = settingsRef.current.selectedModel;
+      if (!gate.canUseModel(currentModel)) {
+        const fallback = gate.getDefaultModel();
+        setSettings(prev => ({ ...prev, selectedModel: fallback as any }));
+        localStorage.setItem("SELECTED_MODEL", fallback);
+        // Notify user
+        const gateMsg: Message = {
+          id: Date.now().toString(),
+          role: 'model',
+          content: `⚠️ **${currentModel.charAt(0).toUpperCase() + currentModel.slice(1)}** is a Pro-only model. Switched to **${fallback.charAt(0).toUpperCase() + fallback.slice(1)}**. Upgrade to Pro to unlock all AI models.`,
+          timestamp: Date.now()
+        };
+        if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
+        return;
+      }
+
       const userMsg: Message = {
         id: Date.now().toString(),
         role: 'user',
@@ -1164,6 +1241,12 @@ export default function App() {
    * Browser: uses the existing display stream if video track is still alive.
    */
   const captureScreenshot = useCallback(async (): Promise<string | null> => {
+    // ── Feature Gate: Screen capture is Pro only ──
+    if (!gate.canScreenCapture) {
+      console.warn('[FeatureGate] Screen capture blocked — free tier');
+      return null;
+    }
+
     let tempStream: MediaStream | null = null;
     try {
       let videoTrack: MediaStreamTrack | null = null;
@@ -1290,6 +1373,18 @@ export default function App() {
   }, [executeSend, captureScreenshot, _rawStartListening, _rawStopListening]);
 
   const handleAutoSolve = async () => {
+    // ── Feature Gate: Auto-Solve is Pro only ──
+    if (!gate.canAutoSolve) {
+      const gateMsg: Message = {
+        id: Date.now().toString(),
+        role: 'model',
+        content: '🔒 **Auto-Solve** is a Pro feature. Upgrade to Pro to capture your screen and get instant AI solutions.',
+        timestamp: Date.now()
+      };
+      if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
+      return;
+    }
+
     if (isPopoutThinClient) {
       electronIPC.send('relay-to-main', { type: 'cmd-auto-solve' });
       return;
@@ -1379,6 +1474,12 @@ export default function App() {
     // Reset input so same file can be selected again
     e.target.value = '';
 
+    // ── Feature Gate: Context file limit ──
+    if (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) {
+      alert(`Free plan allows up to ${gate.maxContextFiles} context file${gate.maxContextFiles === 1 ? '' : 's'}. Upgrade to Pro for unlimited files.`);
+      return;
+    }
+
     // Check if it's likely a text file to allow text-based models (like OpenAI) to read it.
     const isText = file.type.startsWith('text/') ||
                    file.name.endsWith('.txt') ||
@@ -1450,6 +1551,11 @@ export default function App() {
   
   const handleAddPasteText = () => {
       if (!pasteContent.trim()) return;
+      // ── Feature Gate: Context file limit ──
+      if (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) {
+        alert(`Free plan allows up to ${gate.maxContextFiles} context file${gate.maxContextFiles === 1 ? '' : 's'}. Upgrade to Pro for unlimited files.`);
+        return;
+      }
       const newFile: ContextFile = {
           id: Date.now().toString(),
           name: `Pasted Context ${db.contextFiles.length + 1}`,
@@ -1477,12 +1583,15 @@ export default function App() {
   };
 
   const saveSettings = () => {
+      // ── Feature Gate: Ensure model is allowed before saving ──
+      const safeModel = gate.canUseModel(tempModel) ? tempModel : gate.getDefaultModel() as any;
+
       localStorage.setItem("GEMINI_API_KEY", tempApiKey);
       localStorage.setItem("DEEPGRAM_API_KEY", tempDeepgramKey);
       localStorage.setItem("GROQ_API_KEY", tempGroqKey);
       localStorage.setItem("OPENAI_API_KEY", tempOpenAIKey);
       localStorage.setItem("XAI_API_KEY", tempXaiKey);
-      localStorage.setItem("SELECTED_MODEL", tempModel);
+      localStorage.setItem("SELECTED_MODEL", safeModel);
       localStorage.setItem("THEME", settings.theme);
       localStorage.setItem("FONT_SIZE", settings.fontSize);
       
@@ -1493,11 +1602,11 @@ export default function App() {
           groqApiKey: tempGroqKey,
           openaiApiKey: tempOpenAIKey,
           xaiApiKey: tempXaiKey,
-          selectedModel: tempModel
+          selectedModel: safeModel
       };
 
       setSettings(newSettings);
-      
+
       // Update ref immediately to prevent race conditions before next render
       settingsRef.current = newSettings;
 
@@ -1517,6 +1626,17 @@ export default function App() {
     onOpenDownload: () => setShowDownloadModal(true),
     isPipMode,
     togglePip: () => {
+      // ── Feature Gate: Popout is Pro only ──
+      if (!gate.canPopout) {
+        const gateMsg: Message = {
+          id: Date.now().toString(),
+          role: 'model',
+          content: '🔒 **Pop-out Mode** is a Pro feature. Upgrade to Pro to use the invisible overlay during interviews.',
+          timestamp: Date.now()
+        };
+        if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
+        return;
+      }
       if (isElectron) {
         // In Electron: open a real transparent pop-out window
         electronIPC.send('open-popout', { width: 450, height: 700 });
@@ -1525,7 +1645,11 @@ export default function App() {
       }
     },
     isElectron,
-    onNewSession: db.isElectron ? () => db.newSession() : null
+    onNewSession: db.isElectron ? () => db.newSession() : null,
+    userProfile,
+    userLicense,
+    onLogout,
+    gate
   };
 
   // Sync is now handled by useDatabase hook (Electron) — no localStorage sync needed
@@ -1602,9 +1726,15 @@ export default function App() {
                     <label className="text-sm font-bold text-text flex items-center gap-2">
                         <Cpu size={16} /> AI Model Selection
                     </label>
-                    <span className="text-[10px] text-green-400 font-medium bg-green-400/10 px-2 py-0.5 rounded-full border border-green-400/20">
+                    {gate.isPro ? (
+                      <span className="text-[10px] text-green-400 font-medium bg-green-400/10 px-2 py-0.5 rounded-full border border-green-400/20">
                         For better experience choose GPT-5.4 Mini
-                    </span>
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-amber-400 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/20 flex items-center gap-1">
+                        <Lock size={8} /> Upgrade to Pro for all models
+                      </span>
+                    )}
                 </div>
                 <div className="flex flex-wrap gap-2">
                     <button
@@ -1622,45 +1752,57 @@ export default function App() {
                     </button>
 
                     <button
-                        onClick={() => setTempModel('groq')}
-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
-                            tempModel === 'groq' 
-                            ? 'bg-orange-500/10 border-orange-500 shadow-sm' 
-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+                        onClick={() => gate.canUseModel('groq') && setTempModel('groq')}
+                        disabled={!gate.canUseModel('groq')}
+                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all flex items-center gap-2 ${
+                            !gate.canUseModel('groq')
+                            ? 'bg-background border-border opacity-40 cursor-not-allowed'
+                            : tempModel === 'groq'
+                            ? 'bg-orange-500/10 border-orange-500 shadow-sm'
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100 hover:shadow-md'
                         }`}
                     >
                         <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'groq' ? 'bg-orange-500' : 'bg-gray-400'}`}></div>
                         <span className={`font-bold text-xs ${tempModel === 'groq' ? 'text-orange-500' : 'text-text'}`}>
                             Groq
                         </span>
+                        {!gate.canUseModel('groq') && <Lock size={10} className="text-amber-400 ml-1" />}
                     </button>
 
                     <button
-                        onClick={() => setTempModel('openai')}
-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
-                            tempModel === 'openai' 
-                            ? 'bg-green-500/10 border-green-500 shadow-sm' 
-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+                        onClick={() => gate.canUseModel('openai') && setTempModel('openai')}
+                        disabled={!gate.canUseModel('openai')}
+                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all flex items-center gap-2 ${
+                            !gate.canUseModel('openai')
+                            ? 'bg-background border-border opacity-40 cursor-not-allowed'
+                            : tempModel === 'openai'
+                            ? 'bg-green-500/10 border-green-500 shadow-sm'
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100 hover:shadow-md'
                         }`}
                     >
                         <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'openai' ? 'bg-green-500' : 'bg-gray-400'}`}></div>
                         <span className={`font-bold text-xs ${tempModel === 'openai' ? 'text-green-500' : 'text-text'}`}>
-                            GPT-5.4 Mini <span className="ml-1 text-[9px] bg-green-500 text-white px-1.5 py-0.5 rounded-full">Recommended</span>
+                            GPT-5.4 Mini {gate.canUseModel('openai') && <span className="ml-1 text-[9px] bg-green-500 text-white px-1.5 py-0.5 rounded-full">Recommended</span>}
                         </span>
+                        {!gate.canUseModel('openai') && <Lock size={10} className="text-amber-400 ml-1" />}
                     </button>
 
                     <button
-                        onClick={() => setTempModel('xai')}
-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
-                            tempModel === 'xai' 
-                            ? 'bg-gray-500/10 border-gray-500 shadow-sm' 
-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
+                        onClick={() => gate.canUseModel('xai') && setTempModel('xai')}
+                        disabled={!gate.canUseModel('xai')}
+                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all flex items-center gap-2 ${
+                            !gate.canUseModel('xai')
+                            ? 'bg-background border-border opacity-40 cursor-not-allowed'
+                            : tempModel === 'xai'
+                            ? 'bg-gray-500/10 border-gray-500 shadow-sm'
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100 hover:shadow-md'
                         }`}
                     >
                         <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'xai' ? 'bg-white' : 'bg-gray-400'}`}></div>
                         <span className={`font-bold text-xs ${tempModel === 'xai' ? 'text-text' : 'text-text'}`}>
                             Grok (xAI)
                         </span>
+                        {!gate.canUseModel('xai') && <Lock size={10} className="text-amber-400 ml-1" />}
                     </button>
                 </div>
             </div>
@@ -1822,9 +1964,11 @@ export default function App() {
            {/* File List */}
            <div className="space-y-3">
                <div className="flex items-center justify-between">
-                   <h3 className="text-sm font-bold text-text">Attached Files ({db.contextFiles.length})</h3>
-                   <button onClick={triggerFileUpload} className="text-xs flex items-center gap-1 text-primary hover:underline">
-                       <Plus size={12} /> Add File
+                   <h3 className="text-sm font-bold text-text">
+                     Attached Files ({db.contextFiles.length}{gate.maxContextFiles !== -1 ? `/${gate.maxContextFiles}` : ''})
+                   </h3>
+                   <button onClick={triggerFileUpload} disabled={gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles} className={`text-xs flex items-center gap-1 ${gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles ? 'text-gray-500 cursor-not-allowed' : 'text-primary hover:underline'}`}>
+                       <Plus size={12} /> {gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles ? 'Limit reached' : 'Add File'}
                    </button>
                    {/* HIDDEN INPUT */}
                    <input 
@@ -1938,7 +2082,7 @@ export default function App() {
               </p>
               
               <div className="grid grid-cols-1 gap-3 pt-4">
-                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-blue-500 hover:bg-blue-500/5 transition-all group">
+                  <a href="http://localhost:4000/download/InterviewCopilot-Setup.exe" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-blue-500 hover:bg-blue-500/5 transition-all group">
                       <div className="flex items-center gap-4">
                           <div className="p-2 bg-blue-500/10 rounded-lg group-hover:bg-blue-500/20 transition-colors">
                               <Monitor size={24} className="text-blue-400 group-hover:text-blue-500" />
@@ -1951,7 +2095,7 @@ export default function App() {
                       <Download size={18} className="text-gray-500 group-hover:text-blue-500 transition-colors" />
                   </a>
                   
-                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac.dmg" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-purple-500 hover:bg-purple-500/5 transition-all group">
+                  <a href="http://localhost:4000/download/InterviewCopilot-Mac.dmg" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-purple-500 hover:bg-purple-500/5 transition-all group">
                       <div className="flex items-center gap-4">
                           <div className="p-2 bg-purple-500/10 rounded-lg group-hover:bg-purple-500/20 transition-colors">
                               <Laptop size={24} className="text-purple-400 group-hover:text-purple-500" />
@@ -1964,7 +2108,7 @@ export default function App() {
                       <Download size={18} className="text-gray-500 group-hover:text-purple-500 transition-colors" />
                   </a>
                   
-                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-orange-500 hover:bg-orange-500/5 transition-all group">
+                  <a href="http://localhost:4000/download/InterviewCopilot-Linux.AppImage" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-orange-500 hover:bg-orange-500/5 transition-all group">
                       <div className="flex items-center gap-4">
                           <div className="p-2 bg-orange-500/10 rounded-lg group-hover:bg-orange-500/20 transition-colors">
                               <Terminal size={24} className="text-orange-400 group-hover:text-orange-500" />
@@ -1982,4 +2126,59 @@ export default function App() {
 
     </div>
   );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  APP WRAPPER — Subscription gate + feature enforcement
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+export default function App() {
+  const [authenticated, setAuthenticated] = useState(false);
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [license, setLicense] = useState<LicenseData | null>(null);
+
+  useEffect(() => {
+    const saved = licenseService.loadAuth();
+    if (saved.user && saved.license && licenseService.isLicenseValid(saved.license)) {
+      setUser(saved.user);
+      setLicense(saved.license);
+      setAuthenticated(true);
+      licenseService.startRevalidation();
+    }
+    return () => licenseService.stopRevalidation();
+  }, []);
+
+  const handleLogout = () => {
+    licenseService.logout();
+    setAuthenticated(false);
+    setUser(null);
+    setLicense(null);
+  };
+
+  if (!authenticated) {
+    return (
+      <SubscriptionGate
+        onAuthenticated={(u, l) => {
+          setUser(u);
+          setLicense(l);
+          setAuthenticated(true);
+          licenseService.startRevalidation();
+        }}
+      />
+    );
+  }
+
+  // In browser (not Electron) — block access, force download
+  if (!isElectron && !isPopoutMode) {
+    return (
+      <SubscriptionGate
+        onAuthenticated={(u, l) => {
+          setUser(u);
+          setLicense(l);
+          setAuthenticated(true);
+        }}
+      />
+    );
+  }
+
+  return <MainApp userProfile={user} userLicense={license} onLogout={handleLogout} />;
 }

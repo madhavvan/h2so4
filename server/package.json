@@ -1,0 +1,26 @@
+{
+  "name": "minicaai-api",
+  "version": "1.0.0",
+  "description": "minicaai.com backend — Stripe payments, license validation, geo-enforcement",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "google-auth-library": "^10.6.2",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "rate-limiter-flexible": "^5.0.3",
+    "razorpay": "^2.9.6",
+    "stripe": "^14.21.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}

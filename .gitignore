@@ -12,6 +12,31 @@ dist
 dist-ssr
 *.local
 
+# ── Secrets — NEVER commit these ──
+.env
+.env.*
+!.env.example
+server/.env
+server/.env.*
+!server/.env.example
+
+# ── Database files ──
+server/data/
+*.db
+*.db-shm
+*.db-wal
+
+# ── Electron build artifacts ──
+out/
+release/
+build/
+*.exe
+*.dmg
+*.AppImage
+*.snap
+*.deb
+*.rpm
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -22,3 +47,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# OS files
+Thumbs.db
+Desktop.ini

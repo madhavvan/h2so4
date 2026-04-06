@@ -12,7 +12,7 @@ const isDev = !app.isPackaged;
 
 function getAppURL(params = '') {
   if (isDev) {
-    return `http://localhost:3000${params ? '?' + params : ''}`;
+    return `http://localhost:3005${params ? '?' + params : ''}`;
   }
   // For production, load file and append hash params
   const filePath = path.join(__dirname, '../dist/index.html');
@@ -61,7 +61,7 @@ function createMainWindow() {
 
   // Load the full app
   if (isDev) {
-    mainWindow.loadURL('http://localhost:3000');
+    mainWindow.loadURL('http://localhost:3005');
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
@@ -175,7 +175,7 @@ function createPopoutWindow(options = {}) {
 
   // Load the app in popout mode
   if (isDev) {
-    popoutWindow.loadURL('http://localhost:3000?mode=popout');
+    popoutWindow.loadURL('http://localhost:3005?mode=popout');
   } else {
     popoutWindow.loadURL(`file://${path.join(__dirname, '../dist/index.html')}?mode=popout`);
   }
