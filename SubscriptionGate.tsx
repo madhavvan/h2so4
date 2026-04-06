@@ -5,7 +5,7 @@ import { geoService, GeoData } from './services/geoService';
 import { pricingService, RegionPricing, PricingTier } from './services/pricingService';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
 
-const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '179380214544-5r338sqpqr6ke6tnsf165ic7qi9th0ht.apps.googleusercontent.com';
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  SUBSCRIPTION GATE — Landing → Auth → Download funnel
@@ -679,17 +679,10 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setAuthError(null);
 
     try {
-      // Try server first, fall back to local
       let user: UserProfile, license: LicenseData;
-      try {
-        const result = await licenseService.signup(email.trim(), password, name.trim(), geo?.country_code || 'US');
-        user = result.user;
-        license = result.license;
-      } catch {
-        const result = await licenseService.localSignup(email.trim(), password, name.trim(), geo?.country_code || 'US');
-        user = result.user;
-        license = result.license;
-      }
+      const result = await licenseService.signup(email.trim(), password, name.trim(), geo?.country_code || 'US');
+      user = result.user;
+      license = result.license;
 
       setCurrentUser(user);
       setCurrentLicense(license);
@@ -722,21 +715,9 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setAuthError(null);
 
     try {
-      let user: UserProfile, license: LicenseData;
-      try {
-        const result = await licenseService.login(email.trim(), password);
-        user = result.user;
-        license = result.license;
-      } catch {
-        // Fallback: check local
-        const saved = licenseService.loadAuth();
-        if (saved.user && saved.user.email === email.trim()) {
-          user = saved.user;
-          license = saved.license!;
-        } else {
-          throw new Error('Invalid credentials. Please check your email and password.');
-        }
-      }
+      const result = await licenseService.login(email.trim(), password);
+      const user = result.user;
+      const license = result.license;
 
       setCurrentUser(user);
       setCurrentLicense(license);

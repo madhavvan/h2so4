@@ -42,7 +42,7 @@ router.get('/users', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// ── Search user by email ──
+// ── Search user by email (full A-Z data) ──
 router.get('/users/search', authMiddleware, adminOnly, (req, res) => {
   try {
     const { email } = req.query;
@@ -53,15 +53,91 @@ router.get('/users/search', authMiddleware, adminOnly, (req, res) => {
 
     const license = db.getLicenseByUserId(user.id);
     const devices = db.getUserDevices(user.id);
+    const payments = db.getPaymentsByUser(user.id);
+    const conversations = db.getConversationsByUser(user.id);
+
+    // Get login history for this user
+    const loginLogs = db.getDB()
+      .prepare('SELECT * FROM login_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50')
+      .all(user.id);
 
     res.json({
-      user: { id: user.id, email: user.email, name: user.name, tier: user.tier, country_code: user.country_code, created_at: user.created_at, last_login_at: user.last_login_at, is_banned: user.is_banned },
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        tier: user.tier,
+        country_code: user.country_code,
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+        last_login_at: user.last_login_at,
+        is_banned: user.is_banned,
+        avatar_url: user.avatar_url,
+        oauth_provider: user.oauth_provider,
+        stripe_customer_id: user.stripe_customer_id,
+      },
       license,
       devices,
+      payments,
+      conversations: conversations.map(c => ({
+        id: c.id,
+        name: c.name,
+        created_at: c.created_at,
+        updated_at: c.updated_at,
+        message_count: db.getConversationMessages(c.id).length,
+      })),
+      login_history: loginLogs,
     });
   } catch (err) {
     console.error('Search user error:', err);
     res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// ── Get full user detail by ID (A-Z view) ──
+router.get('/users/:id', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const license = db.getLicenseByUserId(user.id);
+    const devices = db.getUserDevices(user.id);
+    const payments = db.getPaymentsByUser(user.id);
+    const conversations = db.getConversationsByUser(user.id);
+    const loginLogs = db.getDB()
+      .prepare('SELECT * FROM login_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50')
+      .all(user.id);
+
+    // Include conversation messages for full detail
+    const conversationsWithMessages = conversations.map(c => ({
+      ...c,
+      messages: db.getConversationMessages(c.id),
+    }));
+
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        tier: user.tier,
+        country_code: user.country_code,
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+        last_login_at: user.last_login_at,
+        is_banned: user.is_banned,
+        avatar_url: user.avatar_url,
+        oauth_provider: user.oauth_provider,
+        stripe_customer_id: user.stripe_customer_id,
+      },
+      license,
+      devices,
+      payments,
+      conversations: conversationsWithMessages,
+      login_history: loginLogs,
+    });
+  } catch (err) {
+    console.error('Get user detail error:', err);
+    res.status(500).json({ error: 'Failed to fetch user details' });
   }
 });
 
@@ -125,6 +201,56 @@ router.get('/revoked', authMiddleware, adminOnly, (req, res) => {
   } catch (err) {
     console.error('Revoked keys error:', err);
     res.status(500).json({ error: 'Failed to fetch revoked keys' });
+  }
+});
+
+// ── Payment history (all users) ──
+router.get('/payments', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 100;
+    const payments = db.getAllPayments(Math.min(limit, 500));
+    const stats = db.getPaymentStats();
+    res.json({ payments, stats });
+  } catch (err) {
+    console.error('Payments error:', err);
+    res.status(500).json({ error: 'Failed to fetch payments' });
+  }
+});
+
+// ── Unban a user ──
+router.post('/users/unban', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const { email } = req.body;
+    const user = db.getUserByEmail(email);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    db.getDB().prepare('UPDATE users SET is_banned = 0, updated_at = ? WHERE id = ?').run(Date.now(), user.id);
+    res.json({ success: true, message: `${email} has been unbanned` });
+  } catch (err) {
+    console.error('Unban error:', err);
+    res.status(500).json({ error: 'Failed to unban user' });
+  }
+});
+
+// ── Downgrade user to free ──
+router.post('/users/downgrade', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const { email } = req.body;
+    const user = db.getUserByEmail(email);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    db.updateUserTier(user.id, 'free');
+    db.updateLicenseOnPayment(user.id, {
+      tier: 'free',
+      status: 'active',
+      expires_at: Date.now() + (30 * 24 * 60 * 60 * 1000),
+      sessions_limit: 5,
+    });
+
+    res.json({ success: true, message: `${email} downgraded to free` });
+  } catch (err) {
+    console.error('Downgrade error:', err);
+    res.status(500).json({ error: 'Failed to downgrade user' });
   }
 });
 

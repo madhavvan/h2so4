@@ -295,7 +295,7 @@ router.post('/google', async (req, res) => {
   }
 });
 
-// ── Get current user ──
+// ── Get current user (full profile) ──
 router.get('/me', authMiddleware, (req, res) => {
   try {
     const user = db.getUserById(req.user.id);
@@ -303,15 +303,110 @@ router.get('/me', authMiddleware, (req, res) => {
 
     const license = db.getLicenseByUserId(user.id);
     const devices = db.getUserDevices(user.id);
+    const payments = db.getPaymentsByUser(user.id);
+    const conversations = db.getConversationsByUser(user.id);
 
     res.json({
-      user: { id: user.id, email: user.email, name: user.name, tier: user.tier, country_code: user.country_code, created_at: user.created_at },
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        tier: user.tier,
+        country_code: user.country_code,
+        created_at: user.created_at,
+        last_login_at: user.last_login_at,
+        avatar_url: user.avatar_url,
+        oauth_provider: user.oauth_provider,
+        is_admin: DEVELOPER_EMAILS.includes(user.email),
+      },
       license,
       devices,
+      payments,
+      conversations: conversations.map(c => ({ id: c.id, name: c.name, created_at: c.created_at, updated_at: c.updated_at })),
     });
   } catch (err) {
     console.error('Get user error:', err);
     res.status(500).json({ error: 'Failed to fetch user data' });
+  }
+});
+
+// ── Update user profile ──
+router.put('/profile', authMiddleware, (req, res) => {
+  try {
+    const user = db.getUserById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const { name, country_code } = req.body;
+    const d = db.getDB();
+    const updates = [];
+    const values = [];
+
+    if (name && name.trim().length > 0 && name.trim().length <= 100) {
+      updates.push('name = ?');
+      values.push(name.trim());
+    }
+    if (country_code && /^[A-Z]{2}$/.test(country_code)) {
+      updates.push('country_code = ?');
+      values.push(country_code);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    updates.push('updated_at = ?');
+    values.push(Date.now());
+    values.push(user.id);
+
+    d.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+
+    const updated = db.getUserById(user.id);
+    res.json({
+      user: {
+        id: updated.id,
+        email: updated.email,
+        name: updated.name,
+        tier: updated.tier,
+        country_code: updated.country_code,
+        avatar_url: updated.avatar_url,
+      },
+    });
+  } catch (err) {
+    console.error('Profile update error:', err);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// ── Change password ──
+router.put('/password', authMiddleware, (req, res) => {
+  try {
+    const user = db.getUserById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.password_hash) {
+      return res.status(400).json({ error: 'Account uses Google sign-in. Password cannot be changed.' });
+    }
+
+    const { current_password, new_password } = req.body;
+    if (!current_password || !new_password) {
+      return res.status(400).json({ error: 'Current and new password required' });
+    }
+    if (!isStrongPassword(new_password)) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+
+    if (!db.verifyPassword(current_password, user.password_hash)) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    const d = db.getDB();
+    const newHash = db.hashPassword(new_password);
+    d.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')
+      .run(newHash, Date.now(), user.id);
+
+    res.json({ success: true, message: 'Password updated' });
+  } catch (err) {
+    console.error('Password change error:', err);
+    res.status(500).json({ error: 'Failed to change password' });
   }
 });
 

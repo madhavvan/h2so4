@@ -12,17 +12,12 @@ declare global {
 }
 
 export interface AppSettings {
-  apiKey: string; // Gemini Key
-  deepgramApiKey: string; // Deepgram Key
-  groqApiKey: string; // Groq Key
-  openaiApiKey: string; // OpenAI Key
-  xaiApiKey: string; // xAI (Grok) Key
-  selectedModel: 'gemini' | 'groq' | 'openai' | 'xai'; // Model Selection
+  selectedModel: 'gemini' | 'groq' | 'openai' | 'xai';
   autoSend: boolean;
   contextFiles: ContextFile[];
   theme: 'light' | 'dark';
   fontSize: 'small' | 'medium' | 'large';
-  generalMode: boolean; // Smart General Mode toggle
+  generalMode: boolean;
 }
 
 export interface ContextFile {

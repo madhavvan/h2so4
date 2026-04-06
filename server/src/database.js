@@ -96,6 +96,43 @@ function getDB() {
       updated_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS conversations (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      is_active INTEGER DEFAULT 1,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS payments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      provider_payment_id TEXT,
+      provider_subscription_id TEXT,
+      amount INTEGER NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'USD',
+      status TEXT NOT NULL,
+      tier_granted TEXT,
+      metadata TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
     -- Index for fast lookups
     CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
     CREATE INDEX IF NOT EXISTS idx_licenses_user ON licenses(user_id);
@@ -103,6 +140,10 @@ function getDB() {
     CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
     CREATE INDEX IF NOT EXISTS idx_login_logs_user ON login_logs(user_id);
     CREATE INDEX IF NOT EXISTS idx_login_logs_created ON login_logs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
+    CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv ON conversation_messages(conversation_id);
+    CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
+    CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at);
   `);
 
   // Set default app config
@@ -333,6 +374,110 @@ function setConfig(key, value) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
+//  CONVERSATION OPERATIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function createConversation({ id, user_id, name }) {
+  const d = getDB();
+  const now = Date.now();
+  d.prepare('INSERT INTO conversations (id, user_id, name, created_at, updated_at, is_active) VALUES (?, ?, ?, ?, ?, 1)')
+    .run(id, user_id, name, now, now);
+  return d.prepare('SELECT * FROM conversations WHERE id = ?').get(id);
+}
+
+function getConversationsByUser(userId) {
+  return getDB().prepare('SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC').all(userId);
+}
+
+function getConversationById(id) {
+  return getDB().prepare('SELECT * FROM conversations WHERE id = ?').get(id) || null;
+}
+
+function updateConversation(id, { name, is_active }) {
+  const d = getDB();
+  const updates = [];
+  const values = [];
+  if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+  if (is_active !== undefined) { updates.push('is_active = ?'); values.push(is_active ? 1 : 0); }
+  updates.push('updated_at = ?');
+  values.push(Date.now());
+  values.push(id);
+  d.prepare(`UPDATE conversations SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+  return getConversationById(id);
+}
+
+function deleteConversation(id) {
+  const d = getDB();
+  d.prepare('DELETE FROM conversation_messages WHERE conversation_id = ?').run(id);
+  d.prepare('DELETE FROM conversations WHERE id = ?').run(id);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+//  CONVERSATION MESSAGE OPS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function addConversationMessage({ id, conversation_id, user_id, role, content, timestamp }) {
+  const d = getDB();
+  d.prepare('INSERT OR REPLACE INTO conversation_messages (id, conversation_id, user_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(id, conversation_id, user_id, role, content, timestamp);
+  // Touch conversation updated_at
+  d.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?').run(Date.now(), conversation_id);
+}
+
+function addConversationMessages(messages) {
+  const d = getDB();
+  const insert = d.prepare('INSERT OR REPLACE INTO conversation_messages (id, conversation_id, user_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)');
+  const insertMany = d.transaction((msgs) => {
+    for (const m of msgs) {
+      insert.run(m.id, m.conversation_id, m.user_id, m.role, m.content, m.timestamp);
+    }
+    // Touch conversation updated_at for the first message's conversation
+    if (msgs.length > 0) {
+      d.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?').run(Date.now(), msgs[0].conversation_id);
+    }
+  });
+  insertMany(messages);
+}
+
+function getConversationMessages(conversationId) {
+  return getDB().prepare('SELECT * FROM conversation_messages WHERE conversation_id = ? ORDER BY timestamp ASC').all(conversationId);
+}
+
+function clearConversationMessages(conversationId) {
+  getDB().prepare('DELETE FROM conversation_messages WHERE conversation_id = ?').run(conversationId);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PAYMENT OPERATIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function recordPayment({ user_id, email, provider, provider_payment_id, provider_subscription_id, amount, currency, status, tier_granted, metadata }) {
+  const d = getDB();
+  d.prepare(`
+    INSERT INTO payments (user_id, email, provider, provider_payment_id, provider_subscription_id, amount, currency, status, tier_granted, metadata, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(user_id, email, provider, provider_payment_id || null, provider_subscription_id || null, amount, currency || 'USD', status, tier_granted || null, metadata ? JSON.stringify(metadata) : null, Date.now());
+}
+
+function getPaymentsByUser(userId) {
+  return getDB().prepare('SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC').all(userId);
+}
+
+function getAllPayments(limit = 100) {
+  return getDB().prepare('SELECT * FROM payments ORDER BY created_at DESC LIMIT ?').all(limit);
+}
+
+function getPaymentStats() {
+  const d = getDB();
+  const monthAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+  return {
+    total_payments: d.prepare('SELECT COUNT(*) as c FROM payments WHERE status = ?').get('completed').c,
+    revenue_this_month: d.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'completed' AND created_at > ?").get(monthAgo).total,
+    total_revenue: d.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'completed'").get().total,
+  };
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
 //  ADMIN STATS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -352,6 +497,9 @@ function getStats() {
     banned_users: d.prepare('SELECT COUNT(*) as c FROM users WHERE is_banned = 1').get().c,
     logins_today: d.prepare('SELECT COUNT(*) as c FROM login_logs WHERE created_at > ? AND success = 1').get(dayAgo).c,
     failed_logins_today: d.prepare('SELECT COUNT(*) as c FROM login_logs WHERE created_at > ? AND success = 0').get(dayAgo).c,
+    total_conversations: d.prepare('SELECT COUNT(*) as c FROM conversations').get().c,
+    total_messages: d.prepare('SELECT COUNT(*) as c FROM conversation_messages').get().c,
+    ...getPaymentStats(),
   };
 }
 
@@ -373,6 +521,11 @@ module.exports = {
   incrementSessionCount, updateLicenseStatus, updateLicenseOnPayment,
   // Devices
   registerDevice, getUserDevices, deactivateDevice, isDeviceAuthorized,
+  // Conversations
+  createConversation, getConversationsByUser, getConversationById, updateConversation, deleteConversation,
+  addConversationMessage, addConversationMessages, getConversationMessages, clearConversationMessages,
+  // Payments
+  recordPayment, getPaymentsByUser, getAllPayments, getPaymentStats,
   // Login logs
   logLogin, getRecentLogins,
   // Revoked keys

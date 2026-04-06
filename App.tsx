@@ -468,7 +468,7 @@ const ChatInterface = ({
                     )}
                     <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Audio Help"><HelpCircle size={20} /></button>
                     <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Files (Knowledge Base)"><FileText size={20} /></button>
-                    <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border ${!settings.apiKey ? 'text-red-400 animate-pulse' : 'text-gray-400 hover:text-text hover:bg-surface'}`} title="Settings"><Settings size={20} /></button>
+                    <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border text-gray-400 hover:text-text hover:bg-surface`} title="Settings"><Settings size={20} /></button>
                     <button onClick={onLogout} className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 rounded-lg transition-all" title="Logout"><LogOut size={20} /></button>
                 </div>
             </header>
@@ -798,10 +798,14 @@ async function openProUpgrade() {
     return;
   }
   try {
+    // Use the user's actual country code for geo-routed payments (Stripe vs Razorpay)
+    const saved = licenseService.loadAuth();
+    const countryCode = saved.user?.country_code || 'US';
+
     const response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-checkout', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-      body: JSON.stringify({ country_code: 'US' }),
+      body: JSON.stringify({ country_code: countryCode }),
     });
     if (!response.ok) throw new Error('Failed to start checkout');
     const data = await response.json();
@@ -884,30 +888,19 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
   // Settings State
   const [settings, setSettings] = useState<AppSettings>({
-    apiKey: localStorage.getItem("GEMINI_API_KEY") || "",
-    deepgramApiKey: localStorage.getItem("DEEPGRAM_API_KEY") || "",
-    groqApiKey: localStorage.getItem("GROQ_API_KEY") || "",
-    openaiApiKey: localStorage.getItem("OPENAI_API_KEY") || "",
-    xaiApiKey: localStorage.getItem("XAI_API_KEY") || "",
     selectedModel: (() => {
       const saved = (localStorage.getItem("SELECTED_MODEL") as 'gemini'|'groq'|'openai'|'xai') || 'gemini';
-      // Force free users back to allowed model
       if (!gate.canUseModel(saved)) return gate.getDefaultModel() as 'gemini'|'groq'|'openai'|'xai';
       return saved;
     })(),
     autoSend: false,
-    contextFiles: [], // Legacy — db.contextFiles is the source of truth in Electron
+    contextFiles: [],
     theme: (localStorage.getItem("THEME") as 'light'|'dark') || 'dark',
     fontSize: (localStorage.getItem("FONT_SIZE") as 'small'|'medium'|'large') || 'medium',
-    generalMode: localStorage.getItem("GENERAL_MODE") === 'true' // Default false (Context Mode)
+    generalMode: localStorage.getItem("GENERAL_MODE") === 'true',
   });
 
   // Settings Modal Local State
-  const [tempApiKey, setTempApiKey] = useState("");
-  const [tempDeepgramKey, setTempDeepgramKey] = useState("");
-  const [tempGroqKey, setTempGroqKey] = useState("");
-  const [tempOpenAIKey, setTempOpenAIKey] = useState("");
-  const [tempXaiKey, setTempXaiKey] = useState("");
   const [tempModel, setTempModel] = useState<'gemini'|'groq'|'openai'|'xai'>('gemini');
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved'>('idle');
 
@@ -934,18 +927,13 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       localStorage.setItem("GENERAL_MODE", String(settings.generalMode));
   }, [settings.generalMode]);
 
-  // Sync temp key when settings open
+  // Sync temp state when settings open
   useEffect(() => {
       if (showSettings) {
-          setTempApiKey(settings.apiKey);
-          setTempDeepgramKey(settings.deepgramApiKey);
-          setTempGroqKey(settings.groqApiKey);
-          setTempOpenAIKey(settings.openaiApiKey);
-          setTempXaiKey(settings.xaiApiKey);
           setTempModel(settings.selectedModel);
           setSaveStatus('idle');
       }
-  }, [showSettings, settings.apiKey, settings.deepgramApiKey, settings.groqApiKey, settings.openaiApiKey, settings.xaiApiKey, settings.selectedModel]);
+  }, [showSettings, settings.selectedModel]);
 
 
   // Scroll State
@@ -1147,7 +1135,6 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   const { isListening: _rawIsListening, error: _rawSpeechError, startListening: _rawStartListening, stopListening: _rawStopListening, stream } = useSpeechRecognition({
     onResult: isPopoutThinClient ? () => {} : handleSpeechResult,
     onError: (err) => console.error("Speech Error:", err),
-    apiKey: isPopoutThinClient ? '' : settings.deepgramApiKey
   });
 
   // Pop-out: shadow state received from main window via IPC
@@ -1543,31 +1530,18 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   };
 
   const saveSettings = () => {
-      // ── Feature Gate: Ensure model is allowed before saving ──
       const safeModel = gate.canUseModel(tempModel) ? tempModel : gate.getDefaultModel() as any;
 
-      localStorage.setItem("GEMINI_API_KEY", tempApiKey);
-      localStorage.setItem("DEEPGRAM_API_KEY", tempDeepgramKey);
-      localStorage.setItem("GROQ_API_KEY", tempGroqKey);
-      localStorage.setItem("OPENAI_API_KEY", tempOpenAIKey);
-      localStorage.setItem("XAI_API_KEY", tempXaiKey);
       localStorage.setItem("SELECTED_MODEL", safeModel);
       localStorage.setItem("THEME", settings.theme);
       localStorage.setItem("FONT_SIZE", settings.fontSize);
-      
-      const newSettings: AppSettings = { 
-          ...settings, 
-          apiKey: tempApiKey, 
-          deepgramApiKey: tempDeepgramKey,
-          groqApiKey: tempGroqKey,
-          openaiApiKey: tempOpenAIKey,
-          xaiApiKey: tempXaiKey,
-          selectedModel: safeModel
+
+      const newSettings: AppSettings = {
+          ...settings,
+          selectedModel: safeModel,
       };
 
       setSettings(newSettings);
-
-      // Update ref immediately to prevent race conditions before next render
       settingsRef.current = newSettings;
 
       setSaveStatus('saved');
@@ -2033,6 +2007,27 @@ export default function App() {
     }
     return () => licenseService.stopRevalidation();
   }, []);
+
+  // Revalidate license when app regains focus (e.g. after paying in browser)
+  useEffect(() => {
+    const handleFocus = async () => {
+      const saved = licenseService.loadAuth();
+      if (saved.user && saved.token) {
+        const updated = await licenseService.validateWithServer();
+        if (updated) {
+          const refreshedUser = { ...saved.user, tier: updated.tier };
+          setUser(refreshedUser);
+          setLicense(updated);
+          licenseService.saveAuth(refreshedUser, updated, saved.token);
+          if (!authenticated && licenseService.isLicenseValid(updated)) {
+            setAuthenticated(true);
+          }
+        }
+      }
+    };
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [authenticated]);
 
   const handleLogout = () => {
     licenseService.logout();

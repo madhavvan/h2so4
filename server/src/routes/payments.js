@@ -202,6 +202,20 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
       const d = db.getDB();
       d.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
         .run(`rzp_${razorpay_payment_id}`, Date.now(), user.id);
+
+      // Record payment in history
+      db.recordPayment({
+        user_id: user.id,
+        email: user.email,
+        provider: 'razorpay',
+        provider_payment_id: razorpay_payment_id,
+        provider_subscription_id: razorpay_subscription_id || null,
+        amount: 399900,
+        currency: 'INR',
+        status: 'completed',
+        tier_granted: 'pro',
+        metadata: { order_id: razorpay_order_id, verified_client_side: true },
+      });
     }
 
     const license = db.getLicenseByUserId(req.user.id);

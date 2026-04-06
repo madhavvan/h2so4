@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
+import { getDeepgramKey } from '../services/aiProxyService';
 
 interface SpeechResult {
   final: string;
@@ -8,7 +9,6 @@ interface SpeechResult {
 interface UseSpeechRecognitionProps {
   onResult: (result: SpeechResult) => void;
   onError?: (error: string) => void;
-  apiKey: string; // Deepgram API Key
 }
 
 // Detect Electron
@@ -89,7 +89,6 @@ async function getAudioStream(): Promise<{ stream: MediaStream; audioStream: Med
 export const useSpeechRecognition = ({
   onResult,
   onError,
-  apiKey
 }: UseSpeechRecognitionProps) => {
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -243,23 +242,24 @@ export const useSpeechRecognition = ({
     intentionalStopRef.current = false;
     reconnectAttemptsRef.current = 0;
 
-    const cleanKey = apiKey?.trim();
-    if (!cleanKey) {
-      const msg = "Deepgram API Key missing. Check Settings.";
-      setError(msg);
-      onError?.(msg);
-      return;
-    }
-
     try {
-      // 1. Get audio stream (handles both Browser and Electron)
+      // 1. Fetch Deepgram key from server
+      const cleanKey = await getDeepgramKey();
+      if (!cleanKey) {
+        const msg = "Could not get Deepgram key. Please try again.";
+        setError(msg);
+        onError?.(msg);
+        return;
+      }
+
+      // 2. Get audio stream (handles both Browser and Electron)
       const { stream, audioStream } = await getAudioStream();
 
       streamRef.current = stream;
       setCurrentStream(stream);
       audioStreamRef.current = audioStream;
 
-      // 2. Connect to Deepgram WebSocket
+      // 3. Connect to Deepgram WebSocket
       connectDeepgram(audioStream, cleanKey);
 
       // Handle stream ending
@@ -278,7 +278,7 @@ export const useSpeechRecognition = ({
         onError?.(msg);
       }
     }
-  }, [apiKey, onResult, onError, stopListening, connectDeepgram]);
+  }, [onResult, onError, stopListening, connectDeepgram]);
 
   return { isListening, error, startListening, stopListening, stream: currentStream };
 };
