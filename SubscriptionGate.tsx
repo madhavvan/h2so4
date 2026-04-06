@@ -1343,7 +1343,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               <Bot size={14} /><span>minicaai.com</span>
             </div>
             <div className="flex items-center gap-6 text-xs text-gray-600">
-              <span>Privacy</span><span>Terms</span><span>Support</span>
+              <span>Privacy</span><span>Terms</span><a href="mailto:madhavvan@minicaai.com" className="hover:text-white transition-colors">Support</a>
             </div>
           </div>
         </footer>
@@ -1584,7 +1584,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 { q: 'Can I share the app with others?', a: 'No. Each license is bound to a specific device. Shared copies will not be able to authenticate and will be locked.' },
                 { q: 'What happens if I use a VPN?', a: 'VPN and proxy connections are detected and blocked. You must use a direct connection from your registered country.' },
                 { q: 'Can I cancel anytime?', a: 'Yes. Cancel from your account settings. Access continues until the end of your billing period.' },
-                { q: 'What if I change devices?', a: 'Contact support to transfer your license. Each Pro account supports up to 2 devices.' },
+                { q: 'What if I change devices?', a: 'Email madhavvan@minicaai.com to transfer your license. Each Pro account supports up to 2 devices.' },
               ].map(({ q, a }, i) => (
                 <div key={i} className="p-5 rounded-xl border border-white/[0.06] bg-white/[0.02]">
                   <h4 className="text-sm font-semibold text-white mb-2">{q}</h4>

@@ -15,6 +15,7 @@ const paymentRoutes = require('./routes/payments');
 const licenseRoutes = require('./routes/license');
 const webhookRoutes = require('./routes/webhooks');
 const adminRoutes = require('./routes/admin');
+const aiRoutes = require('./routes/ai');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -43,7 +44,7 @@ app.use(cors({
 // Stripe webhooks need raw body — must be BEFORE express.json()
 app.use('/api/v1/webhooks', webhookRoutes);
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 // ── Rate limiting ──
 const { RateLimiterMemory } = require('rate-limiter-flexible');
@@ -78,6 +79,7 @@ app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/payments', paymentRoutes);
 app.use('/api/v1/license', licenseRoutes);
 app.use('/api/v1/admin', adminRoutes);
+app.use('/api/v1/ai', aiRoutes);
 
 // ── Health check ──
 app.get('/api/health', (req, res) => {

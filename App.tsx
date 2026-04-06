@@ -5,10 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { geminiService } from './services/geminiService';
-import { groqService } from './services/groqService';
-import { openaiService } from './services/openaiService';
-import { xaiService } from './services/xaiService';
+import { generateGemini, generateOpenAI, generateXAI, generateGroq } from './services/aiProxyService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
 import { useDatabase } from './hooks/useDatabase';
@@ -968,21 +965,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     }
   }, [inputText]);
 
-  // --- Initialization ---
-  useEffect(() => {
-    if (settings.apiKey) {
-      geminiService.init(settings.apiKey);
-    }
-    if (settings.groqApiKey) {
-      groqService.init(settings.groqApiKey);
-    }
-    if (settings.openaiApiKey) {
-      openaiService.init(settings.openaiApiKey);
-    }
-    if (settings.xaiApiKey) {
-      xaiService.init(settings.xaiApiKey);
-    }
-  }, [settings.apiKey, settings.groqApiKey, settings.openaiApiKey, settings.xaiApiKey]);
+  // API keys are now managed server-side — no client init needed
 
   // Handle Auto-Scrolling
   useEffect(() => {
@@ -1063,37 +1046,10 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         }
         let responseText = "";
 
-        // Route request based on selected model
-        if (currentSettings.selectedModel === 'groq') {
-             responseText = await groqService.generateResponse(
-                userMsg.content,
-                messagesRef.current,
-                contextFiles,
-                currentSettings.generalMode
-             );
-        } else if (currentSettings.selectedModel === 'openai') {
-            responseText = await openaiService.generateResponse(
-                userMsg.content,
-                messagesRef.current,
-                contextFiles,
-                currentSettings.generalMode
-            );
-        } else if (currentSettings.selectedModel === 'xai') {
-             responseText = await xaiService.generateResponse(
-                userMsg.content,
-                messagesRef.current,
-                contextFiles,
-                currentSettings.generalMode
-             );
-        } else {
-             // Default to Gemini
-             responseText = await geminiService.generateResponse(
-                userMsg.content,
-                messagesRef.current, 
-                contextFiles,
-                currentSettings.generalMode
-             );
-        }
+        // Route request through server proxy based on selected model
+        const generators: Record<string, Function> = { groq: generateGroq, openai: generateOpenAI, xai: generateXAI, gemini: generateGemini };
+        const gen = generators[currentSettings.selectedModel] || generateGemini;
+        responseText = await gen(userMsg.content, messagesRef.current, contextFiles, currentSettings.generalMode);
         
         if (responseText !== "Listening...") {
             const aiMsg: Message = {
@@ -1451,35 +1407,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         const contextFiles = contextFilesRef.current;
         let responseText = "";
 
-        if (currentSettings.selectedModel === 'groq') {
-            responseText = await groqService.generateResponse(
-                lastUserMsg.content,
-                historyForService,
-                contextFiles,
-                currentSettings.generalMode
-            );
-        } else if (currentSettings.selectedModel === 'openai') {
-            responseText = await openaiService.generateResponse(
-                lastUserMsg.content,
-                historyForService,
-                contextFiles,
-                currentSettings.generalMode
-            );
-        } else if (currentSettings.selectedModel === 'xai') {
-            responseText = await xaiService.generateResponse(
-                lastUserMsg.content,
-                historyForService,
-                contextFiles,
-                currentSettings.generalMode
-            );
-        } else {
-            responseText = await geminiService.generateResponse(
-                lastUserMsg.content,
-                historyForService,
-                contextFiles,
-                currentSettings.generalMode
-            );
-        }
+        const generators: Record<string, Function> = { groq: generateGroq, openai: generateOpenAI, xai: generateXAI, gemini: generateGemini };
+        const gen = generators[currentSettings.selectedModel] || generateGemini;
+        responseText = await gen(lastUserMsg.content, historyForService, contextFiles, currentSettings.generalMode);
 
         if (responseText !== "Listening...") {
             const aiMsg: Message = {
@@ -1837,100 +1767,24 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                 </div>
             </div>
 
-            {/* API Key Section */}
-            <div className="space-y-4">
-                <div className="space-y-1">
-                    <div className="flex items-center justify-between">
-                        <label className="text-sm font-medium text-text">Gemini API Key {tempModel === 'gemini' && <span className="text-red-500">*</span>}</label>
-                        <a href="https://ai.google.dev/gemini-api/docs/api-key" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
-                             Get Key <ExternalLink size={10} />
-                        </a>
-                    </div>
-                    <input 
-                        type="password"
-                        value={tempApiKey}
-                        onChange={(e) => setTempApiKey(e.target.value)}
-                        placeholder="Enter Gemini API Key"
-                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'gemini' && !tempApiKey ? 'border-red-500/50' : 'border-border'}`}
-                    />
+            {/* AI is powered by server — no API keys needed */}
+            <div className="bg-green-500/10 border border-green-500/20 rounded-lg p-3">
+                <div className="flex items-center gap-2 text-green-400 text-xs font-medium">
+                    <Check size={14} /> AI models are managed by minicaai — no API keys needed
                 </div>
-
-                <div className="space-y-1">
-                    <div className="flex items-center justify-between">
-                        <label className="text-sm font-medium text-text">Groq API Key {tempModel === 'groq' && <span className="text-red-500">*</span>}</label>
-                        <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
-                             Get Key <ExternalLink size={10} />
-                        </a>
-                    </div>
-                    <input 
-                        type="password"
-                        value={tempGroqKey}
-                        onChange={(e) => setTempGroqKey(e.target.value)}
-                        placeholder="Enter Groq API Key (gsk_...)"
-                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'groq' && !tempGroqKey ? 'border-red-500/50' : 'border-border'}`}
-                    />
-                </div>
-
-                <div className="space-y-1">
-                    <div className="flex items-center justify-between">
-                        <label className="text-sm font-medium text-text">OpenAI API Key {tempModel === 'openai' && <span className="text-red-500">*</span>}</label>
-                        <a href="https://platform.openai.com/settings/organization/api-keys" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
-                             Get Key <ExternalLink size={10} />
-                        </a>
-                    </div>
-                    <input 
-                        type="password"
-                        value={tempOpenAIKey}
-                        onChange={(e) => setTempOpenAIKey(e.target.value)}
-                        placeholder="Enter OpenAI API Key (sk-...)"
-                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'openai' && !tempOpenAIKey ? 'border-red-500/50' : 'border-border'}`}
-                    />
-                </div>
-
-                <div className="space-y-1">
-                    <div className="flex items-center justify-between">
-                        <label className="text-sm font-medium text-text">xAI (Grok) API Key {tempModel === 'xai' && <span className="text-red-500">*</span>}</label>
-                        <a href="https://console.x.ai/home" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
-                             Get Key <ExternalLink size={10} />
-                        </a>
-                    </div>
-                    <input 
-                        type="password"
-                        value={tempXaiKey}
-                        onChange={(e) => setTempXaiKey(e.target.value)}
-                        placeholder="Enter xAI API Key (xai-...)"
-                        className={`w-full bg-background border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm ${tempModel === 'xai' && !tempXaiKey ? 'border-red-500/50' : 'border-border'}`}
-                    />
-                </div>
-                
-                <div className="space-y-1 pt-2 border-t border-border">
-                    <div className="flex items-center justify-between">
-                        <label className="text-sm font-medium text-text">Deepgram API Key (System Audio)</label>
-                        <a href="https://console.deepgram.com/signup" target="_blank" rel="noreferrer" title="Create your own api key by signing up" className="text-xs text-primary hover:underline flex items-center gap-1">
-                             Get Key <ExternalLink size={10} />
-                        </a>
-                    </div>
-                    <input 
-                        type="password"
-                        value={tempDeepgramKey}
-                        onChange={(e) => setTempDeepgramKey(e.target.value)}
-                        placeholder="Enter Deepgram API Key"
-                        className="w-full bg-background border border-border rounded-lg px-4 py-2.5 text-text focus:ring-1 focus:ring-primary outline-none text-sm"
-                    />
-                </div>
-
-                <button 
-                    onClick={saveSettings}
-                    className={`w-full px-4 py-2 rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-all ${
-                        saveStatus === 'saved' 
-                        ? 'bg-green-500 text-white' 
-                        : 'bg-primary text-white hover:bg-blue-600'
-                    }`}
-                >
-                    {saveStatus === 'saved' ? <Check size={16} /> : <Save size={16} />}
-                    {saveStatus === 'saved' ? 'Settings Saved' : 'Save Settings'}
-                </button>
             </div>
+
+            <button
+                onClick={saveSettings}
+                className={`w-full px-4 py-2 rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-all ${
+                    saveStatus === 'saved'
+                    ? 'bg-green-500 text-white'
+                    : 'bg-primary text-white hover:bg-blue-600'
+                }`}
+            >
+                {saveStatus === 'saved' ? <Check size={16} /> : <Save size={16} />}
+                {saveStatus === 'saved' ? 'Settings Saved' : 'Save Settings'}
+            </button>
 
             <div className="border-t border-border pt-4 space-y-4">
                 {/* Theme Toggle */}
@@ -2101,58 +1955,61 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           </div>
       </Modal>
 
-      <Modal isOpen={showDownloadModal} onClose={() => setShowDownloadModal(false)} title="Download Interview Copilot">
-          <div className="space-y-6 text-center">
-              <div className="w-16 h-16 bg-gradient-to-br from-blue-500/20 to-purple-600/20 rounded-2xl flex items-center justify-center mx-auto mb-4 border border-blue-500/30">
-                  <Download size={32} className="text-blue-500" />
-              </div>
-              <h3 className="text-xl font-bold text-text">Experience Stealth Mode</h3>
-              <p className="text-sm text-gray-400 max-w-sm mx-auto leading-relaxed">
-                  The desktop app runs natively on your system and is <strong className="text-white">completely invisible to screen sharing apps</strong> like Zoom, Google Meet, and MS Teams.
-              </p>
-              
-              <div className="grid grid-cols-1 gap-3 pt-4">
-                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-blue-500 hover:bg-blue-500/5 transition-all group">
-                      <div className="flex items-center gap-4">
-                          <div className="p-2 bg-blue-500/10 rounded-lg group-hover:bg-blue-500/20 transition-colors">
-                              <Monitor size={24} className="text-blue-400 group-hover:text-blue-500" />
-                          </div>
-                          <div className="text-left">
-                              <div className="font-bold text-text group-hover:text-blue-400 transition-colors">Download for Windows</div>
-                              <div className="text-xs text-gray-500">Windows 10/11 (.exe)</div>
-                          </div>
-                      </div>
-                      <Download size={18} className="text-gray-500 group-hover:text-blue-500 transition-colors" />
-                  </a>
-                  
-                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac.dmg" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-purple-500 hover:bg-purple-500/5 transition-all group">
-                      <div className="flex items-center gap-4">
-                          <div className="p-2 bg-purple-500/10 rounded-lg group-hover:bg-purple-500/20 transition-colors">
-                              <Laptop size={24} className="text-purple-400 group-hover:text-purple-500" />
-                          </div>
-                          <div className="text-left">
-                              <div className="font-bold text-text group-hover:text-purple-400 transition-colors">Download for Mac</div>
-                              <div className="text-xs text-gray-500">macOS 10.15+ (.dmg)</div>
-                          </div>
-                      </div>
-                      <Download size={18} className="text-gray-500 group-hover:text-purple-500 transition-colors" />
-                  </a>
-                  
-                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-orange-500 hover:bg-orange-500/5 transition-all group">
-                      <div className="flex items-center gap-4">
-                          <div className="p-2 bg-orange-500/10 rounded-lg group-hover:bg-orange-500/20 transition-colors">
-                              <Terminal size={24} className="text-orange-400 group-hover:text-orange-500" />
-                          </div>
-                          <div className="text-left">
-                              <div className="font-bold text-text group-hover:text-orange-400 transition-colors">Download for Linux</div>
-                              <div className="text-xs text-gray-500">Any distro (.AppImage)</div>
-                          </div>
-                      </div>
-                      <Download size={18} className="text-gray-500 group-hover:text-orange-500 transition-colors" />
-                  </a>
-              </div>
-          </div>
-      </Modal>
+      {/* Download modal — web only, never shown in Electron */}
+      {!isElectron && (
+        <Modal isOpen={showDownloadModal} onClose={() => setShowDownloadModal(false)} title="Download Interview Copilot">
+            <div className="space-y-6 text-center">
+                <div className="w-16 h-16 bg-gradient-to-br from-blue-500/20 to-purple-600/20 rounded-2xl flex items-center justify-center mx-auto mb-4 border border-blue-500/30">
+                    <Download size={32} className="text-blue-500" />
+                </div>
+                <h3 className="text-xl font-bold text-text">Experience Stealth Mode</h3>
+                <p className="text-sm text-gray-400 max-w-sm mx-auto leading-relaxed">
+                    The desktop app runs natively on your system and is <strong className="text-white">completely invisible to screen sharing apps</strong> like Zoom, Google Meet, and MS Teams.
+                </p>
+
+                <div className="grid grid-cols-1 gap-3 pt-4">
+                    <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-blue-500 hover:bg-blue-500/5 transition-all group">
+                        <div className="flex items-center gap-4">
+                            <div className="p-2 bg-blue-500/10 rounded-lg group-hover:bg-blue-500/20 transition-colors">
+                                <Monitor size={24} className="text-blue-400 group-hover:text-blue-500" />
+                            </div>
+                            <div className="text-left">
+                                <div className="font-bold text-text group-hover:text-blue-400 transition-colors">Download for Windows</div>
+                                <div className="text-xs text-gray-500">Windows 10/11 (.exe)</div>
+                            </div>
+                        </div>
+                        <Download size={18} className="text-gray-500 group-hover:text-blue-500 transition-colors" />
+                    </a>
+
+                    <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac.dmg" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-purple-500 hover:bg-purple-500/5 transition-all group">
+                        <div className="flex items-center gap-4">
+                            <div className="p-2 bg-purple-500/10 rounded-lg group-hover:bg-purple-500/20 transition-colors">
+                                <Laptop size={24} className="text-purple-400 group-hover:text-purple-500" />
+                            </div>
+                            <div className="text-left">
+                                <div className="font-bold text-text group-hover:text-purple-400 transition-colors">Download for Mac</div>
+                                <div className="text-xs text-gray-500">macOS 10.15+ (.dmg)</div>
+                            </div>
+                        </div>
+                        <Download size={18} className="text-gray-500 group-hover:text-purple-500 transition-colors" />
+                    </a>
+
+                    <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-orange-500 hover:bg-orange-500/5 transition-all group">
+                        <div className="flex items-center gap-4">
+                            <div className="p-2 bg-orange-500/10 rounded-lg group-hover:bg-orange-500/20 transition-colors">
+                                <Terminal size={24} className="text-orange-400 group-hover:text-orange-500" />
+                            </div>
+                            <div className="text-left">
+                                <div className="font-bold text-text group-hover:text-orange-400 transition-colors">Download for Linux</div>
+                                <div className="text-xs text-gray-500">Any distro (.AppImage)</div>
+                            </div>
+                        </div>
+                        <Download size={18} className="text-gray-500 group-hover:text-orange-500 transition-colors" />
+                    </a>
+                </div>
+            </div>
+        </Modal>
+      )}
 
     </div>
   );
