@@ -47,8 +47,8 @@ router.post('/create-checkout', authMiddleware, async (req, res) => {
       return await createStripeCheckout(req, res);
     }
   } catch (err) {
-    console.error('Checkout error:', err.message);
-    res.status(500).json({ error: 'Failed to create checkout. Please try again.' });
+    console.error('Checkout error:', err.message, err.stack);
+    res.status(500).json({ error: err.message || 'Failed to create checkout. Please try again.' });
   }
 });
 

@@ -807,8 +807,8 @@ async function openProUpgrade() {
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
       body: JSON.stringify({ country_code: countryCode }),
     });
-    if (!response.ok) throw new Error('Failed to start checkout');
     const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Failed to start checkout');
     if (data.checkout_url) {
       // Open in default browser (works in Electron and web)
       if (typeof window !== 'undefined' && (window as any).require) {
@@ -817,8 +817,8 @@ async function openProUpgrade() {
         window.open(data.checkout_url, '_blank');
       }
     }
-  } catch {
-    alert('Could not start upgrade. Please try again or visit minicaai.com to upgrade.');
+  } catch (err: any) {
+    alert(`Upgrade failed: ${err.message || 'Unknown error'}. Please try again.`);
   }
 }
 

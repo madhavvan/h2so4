@@ -150,8 +150,8 @@ function getDB() {
   const setDefault = db.prepare('INSERT OR IGNORE INTO app_config (key, value, updated_at) VALUES (?, ?, ?)');
   setDefault.run('min_app_version', '2.0.0', Date.now());
   setDefault.run('latest_app_version', '2.0.0', Date.now());
-  setDefault.run('max_devices_free', '1', Date.now());
-  setDefault.run('max_devices_pro', '2', Date.now());
+  setDefault.run('max_devices_free', '2', Date.now());
+  setDefault.run('max_devices_pro', '3', Date.now());
 
   return db;
 }
@@ -296,13 +296,17 @@ function registerDevice(userId, deviceId, deviceName) {
     return existing;
   }
 
-  // Check device limit
+  // Check device limit — auto-replace oldest if full
   const user = getUserById(userId);
-  const maxDevices = user.tier === 'pro' ? getConfig('max_devices_pro', 2) : getConfig('max_devices_free', 1);
-  const activeCount = d.prepare('SELECT COUNT(*) as count FROM devices WHERE user_id = ? AND is_active = 1').get(userId).count;
+  const maxDevices = user.tier === 'pro' ? getConfig('max_devices_pro', 3) : getConfig('max_devices_free', 2);
+  const activeDevices = d.prepare('SELECT * FROM devices WHERE user_id = ? AND is_active = 1 ORDER BY last_seen_at ASC').all(userId);
 
-  if (activeCount >= maxDevices) {
-    return { error: `Device limit reached. ${user.tier === 'free' ? 'Free' : 'Pro'} accounts allow ${maxDevices} device(s). Deactivate an existing device or upgrade.` };
+  if (activeDevices.length >= maxDevices) {
+    // Deactivate the oldest device(s) to make room
+    const toDeactivate = activeDevices.slice(0, activeDevices.length - maxDevices + 1);
+    for (const old of toDeactivate) {
+      d.prepare('UPDATE devices SET is_active = 0 WHERE id = ?').run(old.id);
+    }
   }
 
   d.prepare('INSERT INTO devices (user_id, device_id, device_name, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?)')

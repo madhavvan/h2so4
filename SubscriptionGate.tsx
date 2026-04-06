@@ -1375,8 +1375,8 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             </button>
           </form>
 
-          {/* Google Sign-In */}
-          {GOOGLE_CLIENT_ID && (
+          {/* Google Sign-In — only on web, not in Electron (Google blocks localhost origins) */}
+          {GOOGLE_CLIENT_ID && !isElectron && (
             <>
               <div className="mt-6 flex items-center gap-3">
                 <div className="flex-1 h-px bg-white/[0.08]" />
@@ -1462,8 +1462,8 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             </p>
           </form>
 
-          {/* Google Sign-Up */}
-          {GOOGLE_CLIENT_ID && (
+          {/* Google Sign-Up — only on web, not in Electron */}
+          {GOOGLE_CLIENT_ID && !isElectron && (
             <>
               <div className="mt-6 flex items-center gap-3">
                 <div className="flex-1 h-px bg-white/[0.08]" />
