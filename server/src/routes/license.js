@@ -22,7 +22,7 @@ router.post('/validate', async (req, res) => {
         error: 'version_expired',
         message: 'This version is no longer supported. Please update.',
         min_version: minVersion,
-        download_url: 'http://localhost:4000/download',
+        download_url: 'https://github.com/madhavvan/h2so4/releases/latest',
       });
     }
 
@@ -168,7 +168,7 @@ router.get('/version', (req, res) => {
   res.json({
     min_version: db.getConfig('min_app_version', '2.0.0'),
     latest_version: db.getConfig('latest_app_version', '2.0.0'),
-    download_url: 'http://localhost:4000/download',
+    download_url: 'https://github.com/madhavvan/h2so4/releases/latest',
   });
 });
 

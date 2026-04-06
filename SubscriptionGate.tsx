@@ -158,7 +158,7 @@ const TutorialCard = ({ step, title, desc, duration }: { step: string; title: st
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  ADMIN DASHBOARD — Live data from server
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-const API_BASE = 'http://localhost:4000';
+const API_BASE = 'https://h2so4-production.up.railway.app';
 
 const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUser: UserProfile }) => {
   const [stats, setStats] = useState<any>(null);
@@ -779,7 +779,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       if (!token) throw new Error('Please sign in first');
 
       const countryCode = geo?.country_code || 'US';
-      const response = await fetch('http://localhost:4000/api/v1/payments/create-checkout', {
+      const response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-checkout', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -840,7 +840,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             // Payment successful — verify on server
             try {
               const token = licenseService.getToken();
-              const verifyRes = await fetch('http://localhost:4000/api/v1/payments/verify-razorpay', {
+              const verifyRes = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/verify-razorpay', {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
@@ -975,7 +975,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           </div>
           <h2 className="text-xl font-bold text-white mb-3">Update Required</h2>
           <p className="text-gray-400 text-sm mb-8 leading-relaxed">{error}</p>
-          <a href="http://localhost:4000/download" className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm transition-all shadow-lg shadow-blue-500/25">
+          <a href="https://github.com/madhavvan/h2so4/releases/latest" className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm transition-all shadow-lg shadow-blue-500/25">
             Download Latest Version <ArrowRight size={14} />
           </a>
         </div>
@@ -1099,7 +1099,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
           {/* Download buttons */}
           <div className="space-y-3 max-w-md mx-auto mb-12">
-            <a href="http://localhost:4000/download/InterviewCopilot-Setup.exe"
+            <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe"
               className="flex items-center justify-between p-4 rounded-xl border border-white/[0.08] bg-white/[0.02] hover:border-blue-500/40 hover:bg-blue-500/[0.04] transition-all group">
               <div className="flex items-center gap-4">
                 <div className="p-2.5 bg-blue-500/10 rounded-xl group-hover:bg-blue-500/20 transition-colors">
@@ -1113,7 +1113,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               <Download size={16} className="text-gray-600 group-hover:text-blue-400 transition-colors" />
             </a>
 
-            <a href="http://localhost:4000/download/InterviewCopilot-Mac.dmg"
+            <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac.dmg"
               className="flex items-center justify-between p-4 rounded-xl border border-white/[0.08] bg-white/[0.02] hover:border-purple-500/40 hover:bg-purple-500/[0.04] transition-all group">
               <div className="flex items-center gap-4">
                 <div className="p-2.5 bg-purple-500/10 rounded-xl group-hover:bg-purple-500/20 transition-colors">
@@ -1127,7 +1127,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               <Download size={16} className="text-gray-600 group-hover:text-purple-400 transition-colors" />
             </a>
 
-            <a href="http://localhost:4000/download/InterviewCopilot-Linux.AppImage"
+            <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage"
               className="flex items-center justify-between p-4 rounded-xl border border-white/[0.08] bg-white/[0.02] hover:border-orange-500/40 hover:bg-orange-500/[0.04] transition-all group">
               <div className="flex items-center gap-4">
                 <div className="p-2.5 bg-orange-500/10 rounded-xl group-hover:bg-orange-500/20 transition-colors">

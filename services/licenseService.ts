@@ -82,12 +82,12 @@ class LicenseService {
   private revalidationTimer: ReturnType<typeof setInterval> | null = null;
 
   // Will be set to real server URL when deployed
-  private API_BASE = 'http://localhost:4000';
+  private API_BASE = 'https://h2so4-production.up.railway.app';
 
   constructor() {
     // Use local server in development
     if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      this.API_BASE = 'http://localhost:4000';
+      this.API_BASE = 'https://h2so4-production.up.railway.app';
     }
   }
 

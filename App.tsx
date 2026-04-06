@@ -2082,7 +2082,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
               </p>
               
               <div className="grid grid-cols-1 gap-3 pt-4">
-                  <a href="http://localhost:4000/download/InterviewCopilot-Setup.exe" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-blue-500 hover:bg-blue-500/5 transition-all group">
+                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-blue-500 hover:bg-blue-500/5 transition-all group">
                       <div className="flex items-center gap-4">
                           <div className="p-2 bg-blue-500/10 rounded-lg group-hover:bg-blue-500/20 transition-colors">
                               <Monitor size={24} className="text-blue-400 group-hover:text-blue-500" />
@@ -2095,7 +2095,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                       <Download size={18} className="text-gray-500 group-hover:text-blue-500 transition-colors" />
                   </a>
                   
-                  <a href="http://localhost:4000/download/InterviewCopilot-Mac.dmg" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-purple-500 hover:bg-purple-500/5 transition-all group">
+                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac.dmg" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-purple-500 hover:bg-purple-500/5 transition-all group">
                       <div className="flex items-center gap-4">
                           <div className="p-2 bg-purple-500/10 rounded-lg group-hover:bg-purple-500/20 transition-colors">
                               <Laptop size={24} className="text-purple-400 group-hover:text-purple-500" />
@@ -2108,7 +2108,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                       <Download size={18} className="text-gray-500 group-hover:text-purple-500 transition-colors" />
                   </a>
                   
-                  <a href="http://localhost:4000/download/InterviewCopilot-Linux.AppImage" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-orange-500 hover:bg-orange-500/5 transition-all group">
+                  <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-orange-500 hover:bg-orange-500/5 transition-all group">
                       <div className="flex items-center gap-4">
                           <div className="p-2 bg-orange-500/10 rounded-lg group-hover:bg-orange-500/20 transition-colors">
                               <Terminal size={24} className="text-orange-400 group-hover:text-orange-500" />
