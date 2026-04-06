@@ -437,14 +437,15 @@ const ChatInterface = ({
 
                 <div className="flex items-center gap-2 md:gap-3">
                     {/* User tier badge */}
-                    {userLicense && (
-                      <div className={`hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border ${
-                        userLicense.tier === 'pro' ? 'bg-blue-500/10 border-blue-500/30 text-blue-400' : 'bg-gray-500/10 border-gray-500/30 text-gray-400'
-                      }`}>
-                        {userLicense.tier === 'pro' ? <Crown size={10} /> : <Zap size={10} />}
-                        {userLicense.tier.toUpperCase()}
+                    {userLicense && userLicense.tier === 'pro' ? (
+                      <div className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-blue-500/10 border-blue-500/30 text-blue-400">
+                        <Crown size={10} /> PRO
                       </div>
-                    )}
+                    ) : userLicense ? (
+                      <button onClick={openProUpgrade} className="hidden md:flex px-3 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/30 text-blue-400 hover:from-blue-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
+                        <Crown size={10} /> Upgrade to Pro
+                      </button>
+                    ) : null}
                     <div className={`hidden md:flex px-3 py-1 rounded-full text-xs font-medium items-center gap-2 border transition-all duration-300 ${isListening ? 'bg-red-500/10 border-red-500/50 text-red-500' : 'bg-surface border-border text-gray-500'}`}>
                         <div className={`w-2 h-2 rounded-full ${isListening ? 'bg-red-500 animate-pulse' : 'bg-gray-500'}`}></div>
                         {isListening ? 'LIVE' : 'OFF'}
@@ -789,6 +790,35 @@ function useFeatureGate(license: LicenseData | null) {
     canUseModel: (model: string) => gates.models.includes(model),
     getDefaultModel: () => gates.models[0] || 'gemini',
   };
+}
+
+// ── Upgrade to Pro — opens Stripe checkout in browser ──
+async function openProUpgrade() {
+  const { licenseService } = await import('./services/licenseService');
+  const token = licenseService.getToken();
+  if (!token) {
+    alert('Please sign in first.');
+    return;
+  }
+  try {
+    const response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ country_code: 'US' }),
+    });
+    if (!response.ok) throw new Error('Failed to start checkout');
+    const data = await response.json();
+    if (data.checkout_url) {
+      // Open in default browser (works in Electron and web)
+      if (typeof window !== 'undefined' && (window as any).require) {
+        (window as any).require('electron').shell.openExternal(data.checkout_url);
+      } else {
+        window.open(data.checkout_url, '_blank');
+      }
+    }
+  } catch {
+    alert('Could not start upgrade. Please try again or visit minicaai.com to upgrade.');
+  }
 }
 
 // ── Pro Feature Locked Overlay ──
@@ -1378,7 +1408,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       const gateMsg: Message = {
         id: Date.now().toString(),
         role: 'model',
-        content: '🔒 **Auto-Solve** is a Pro feature. Upgrade to Pro to capture your screen and get instant AI solutions.',
+        content: '🔒 **Auto-Solve** is a Pro feature. [Upgrade to Pro](upgrade) to capture your screen and get instant AI solutions.',
         timestamp: Date.now()
       };
       if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
@@ -1476,7 +1506,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
     // ── Feature Gate: Context file limit ──
     if (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) {
-      alert(`Free plan allows up to ${gate.maxContextFiles} context file${gate.maxContextFiles === 1 ? '' : 's'}. Upgrade to Pro for unlimited files.`);
+      if (confirm(`Free plan allows up to ${gate.maxContextFiles} context file${gate.maxContextFiles === 1 ? '' : 's'}. Upgrade to Pro for unlimited files?`)) openProUpgrade();
       return;
     }
 
@@ -1553,7 +1583,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       if (!pasteContent.trim()) return;
       // ── Feature Gate: Context file limit ──
       if (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) {
-        alert(`Free plan allows up to ${gate.maxContextFiles} context file${gate.maxContextFiles === 1 ? '' : 's'}. Upgrade to Pro for unlimited files.`);
+        if (confirm(`Free plan allows up to ${gate.maxContextFiles} context file${gate.maxContextFiles === 1 ? '' : 's'}. Upgrade to Pro for unlimited files?`)) openProUpgrade();
         return;
       }
       const newFile: ContextFile = {

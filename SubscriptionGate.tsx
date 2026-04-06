@@ -775,8 +775,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setPaymentError(null);
 
     try {
-      const token = licenseService.getToken();
-      if (!token) throw new Error('Please sign in first');
+      // Retry token fetch — it may not be in localStorage yet after signup
+      let token = licenseService.getToken();
+      if (!token) {
+        await new Promise(r => setTimeout(r, 500));
+        token = licenseService.getToken();
+      }
+      if (!token) throw new Error('Please sign in first to upgrade to Pro');
 
       const countryCode = geo?.country_code || 'US';
       const response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-checkout', {
