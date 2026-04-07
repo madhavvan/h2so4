@@ -111,7 +111,85 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`minicaai API running on port ${PORT}`);
   console.log(`Database initialized`);
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  LIVE SUPPORT CHAT (WebSocket)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const WebSocket = require('ws');
+const wss = new WebSocket.Server({ server, path: '/ws/support' });
+
+// Track connected clients: customers and agents
+const supportClients = new Map(); // sessionId -> { ws, type: 'customer'|'agent', email, name }
+
+wss.on('connection', (ws) => {
+  let clientId = null;
+
+  ws.on('message', (raw) => {
+    try {
+      const data = JSON.parse(raw);
+
+      if (data.type === 'join') {
+        clientId = `${data.role || 'customer'}_${data.user || Date.now()}`;
+        supportClients.set(clientId, {
+          ws,
+          type: data.role || 'customer',
+          email: data.user,
+          name: data.name || 'User'
+        });
+        console.log(`Support chat: ${data.name || data.user} connected as ${data.role || 'customer'}`);
+
+        // Notify agents of new customer
+        if (data.role !== 'agent') {
+          for (const [, client] of supportClients) {
+            if (client.type === 'agent' && client.ws.readyState === WebSocket.OPEN) {
+              client.ws.send(JSON.stringify({ type: 'customer_joined', email: data.user, name: data.name }));
+            }
+          }
+        }
+      }
+
+      if (data.type === 'message') {
+        const sender = supportClients.get(clientId);
+        if (!sender) return;
+
+        // Route message: customer->agents, agent->specific customer
+        if (sender.type === 'customer') {
+          // Send to all agents
+          for (const [, client] of supportClients) {
+            if (client.type === 'agent' && client.ws.readyState === WebSocket.OPEN) {
+              client.ws.send(JSON.stringify({ type: 'message', text: data.text, from: sender.email, name: sender.name }));
+            }
+          }
+        } else if (sender.type === 'agent' && data.to) {
+          // Send to specific customer
+          for (const [, client] of supportClients) {
+            if (client.type === 'customer' && client.email === data.to && client.ws.readyState === WebSocket.OPEN) {
+              client.ws.send(JSON.stringify({ type: 'message', text: data.text }));
+            }
+          }
+        }
+      }
+    } catch {}
+  });
+
+  ws.on('close', () => {
+    if (clientId) {
+      const client = supportClients.get(clientId);
+      if (client) {
+        // Notify agents when customer disconnects
+        if (client.type === 'customer') {
+          for (const [, c] of supportClients) {
+            if (c.type === 'agent' && c.ws.readyState === WebSocket.OPEN) {
+              c.ws.send(JSON.stringify({ type: 'customer_left', email: client.email }));
+            }
+          }
+        }
+      }
+      supportClients.delete(clientId);
+    }
+  });
 });

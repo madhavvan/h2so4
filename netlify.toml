@@ -2,6 +2,13 @@
   command = "npm run build"
   publish = "dist"
 
+# Redirect old Netlify subdomain to real domain
+[[redirects]]
+  from = "https://elegant-praline-7ced50.netlify.app/*"
+  to = "https://minicaai.com/:splat"
+  status = 301
+  force = true
+
 [[redirects]]
   from = "/*"
   to = "/index.html"

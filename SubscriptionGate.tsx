@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Shield, Zap, Crown, Check, X, ArrowRight, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut } from 'lucide-react';
+import { Shield, Zap, Crown, Check, X, ArrowRight, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send } from 'lucide-react';
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import { geoService, GeoData } from './services/geoService';
 import { pricingService, RegionPricing, PricingTier } from './services/pricingService';
@@ -16,7 +16,7 @@ interface SubscriptionGateProps {
   onAuthenticated: (user: UserProfile, license: LicenseData) => void;
 }
 
-type View = 'landing' | 'login' | 'signup' | 'pricing' | 'vpn_blocked' | 'download' | 'tutorials' | 'admin';
+type View = 'landing' | 'login' | 'signup' | 'pricing' | 'vpn_blocked' | 'download' | 'tutorials' | 'admin' | 'support';
 
 // ── Detect if running inside Electron ──
 const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
@@ -585,6 +585,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   const [paymentLoading, setPaymentLoading] = useState(false);
   const [paymentError, setPaymentError] = useState<string | null>(null);
 
+  // Support chat state
+  const [chatMessages, setChatMessages] = useState<Array<{ from: 'user' | 'agent'; text: string; time: string }>>([]);
+  const [chatInput, setChatInput] = useState('');
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatWsRef = useRef<WebSocket | null>(null);
+
   // ── Initialize ──
   useEffect(() => {
     async function init() {
@@ -919,6 +925,82 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
   const handleGoogleError = () => {
     setAuthError('Google sign-in was cancelled or failed. Please try again.');
+  };
+
+  // ── Google OAuth via system browser (for Electron) ──
+  const handleGoogleElectron = async () => {
+    setIsSubmitting(true);
+    setAuthError(null);
+
+    const sessionId = crypto.randomUUID();
+    const serverUrl = 'https://h2so4-production.up.railway.app';
+    const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}`;
+
+    try {
+      // Open Google sign-in in system browser
+      if (isElectron) {
+        (window as any).require('electron').shell.openExternal(authUrl);
+      } else {
+        window.open(authUrl, '_blank');
+      }
+
+      // Poll for result
+      let attempts = 0;
+      const maxAttempts = 60; // 60 * 2s = 2 minutes
+      const pollInterval = 2000;
+
+      const poll = async (): Promise<void> => {
+        attempts++;
+        try {
+          const res = await fetch(`${serverUrl}/api/v1/auth/google/poll?session_id=${sessionId}`);
+          const data = await res.json();
+
+          if (data.status === 'success') {
+            // Save auth data
+            if (data.license) data.license.last_validated = Date.now();
+            licenseService.saveAuth(data.user, data.license, data.token);
+
+            setCurrentUser(data.user);
+            setCurrentLicense(data.license);
+            setIsSubmitting(false);
+
+            if (isElectron) {
+              onAuthenticated(data.user, data.license);
+            } else {
+              setView('download');
+            }
+            return;
+          }
+
+          if (data.status === 'error') {
+            setAuthError(data.error || 'Google sign-in failed');
+            setIsSubmitting(false);
+            return;
+          }
+
+          // Still pending
+          if (attempts < maxAttempts) {
+            await new Promise(r => setTimeout(r, pollInterval));
+            return poll();
+          } else {
+            setAuthError('Sign-in timed out. Please try again.');
+            setIsSubmitting(false);
+          }
+        } catch {
+          if (attempts < maxAttempts) {
+            await new Promise(r => setTimeout(r, pollInterval));
+            return poll();
+          }
+          setAuthError('Connection error. Please try again.');
+          setIsSubmitting(false);
+        }
+      };
+
+      await poll();
+    } catch (err: any) {
+      setAuthError(err.message || 'Google sign-in failed');
+      setIsSubmitting(false);
+    }
   };
 
   // ── Logout ──
@@ -1324,7 +1406,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               <Bot size={14} /><span>minicaai.com</span>
             </div>
             <div className="flex items-center gap-6 text-xs text-gray-600">
-              <span>Privacy</span><span>Terms</span><a href="mailto:madhavvan@minicaai.com" className="hover:text-white transition-colors">Support</a>
+              <span>Privacy</span><span>Terms</span><button onClick={() => { if (currentUser) { setView('support'); } else { setView('login'); setAuthError('Please sign in to access support'); } }} className="hover:text-white transition-colors">Support</button>
             </div>
           </div>
         </footer>
@@ -1340,72 +1422,91 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       <div className="fixed inset-0 bg-[#050507] flex items-center justify-center p-6">
         <AnimatedBackground />
         <NoiseOverlay />
-        <div className="relative z-10 w-full max-w-sm">
-          <button onClick={() => setView('landing')} className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-300 transition-colors mb-8">
-            <ArrowRight size={14} className="rotate-180" /> Back
-          </button>
-          <Logo size="lg" />
-          <h2 className="text-xl font-bold text-white mt-8 mb-2">Welcome back</h2>
-          <p className="text-sm text-gray-500 mb-8">Sign in to your minicaai account</p>
+        <div className="relative z-10 w-full max-w-md">
+          <div className="relative rounded-3xl border border-white/[0.08] bg-gradient-to-b from-white/[0.06] to-white/[0.02] backdrop-blur-xl shadow-2xl shadow-black/40 p-8 pt-6">
+            {/* Close button */}
+            <button onClick={() => setView('landing')} className="absolute top-4 right-4 w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all">
+              <X size={16} />
+            </button>
 
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Email</label>
-              <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com"
-                className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" required autoFocus />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Password</label>
-              <div className="relative">
-                <input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Enter your password"
-                  className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all pr-10" required />
-                <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 transition-colors">
-                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                </button>
+            <Logo size="md" />
+            <h2 className="text-xl font-bold text-white mt-6 mb-1">Welcome back</h2>
+            <p className="text-sm text-gray-500 mb-6">Sign in to your minicaai account</p>
+
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1.5">Email</label>
+                <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com"
+                  className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" required autoFocus />
               </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1.5">Password</label>
+                <div className="relative">
+                  <input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Enter your password"
+                    className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all pr-10" required />
+                  <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 transition-colors">
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </div>
+              {authError && (
+                <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
+                  <AlertTriangle size={12} /> {authError}
+                </div>
+              )}
+              <button type="submit" disabled={isSubmitting}
+                className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex items-center justify-center gap-2 disabled:opacity-50">
+                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null} Sign In
+              </button>
+            </form>
+
+            {/* Google Sign-In */}
+            {GOOGLE_CLIENT_ID && (
+              <>
+                <div className="mt-6 flex items-center gap-3">
+                  <div className="flex-1 h-px bg-white/[0.08]" />
+                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">or</span>
+                  <div className="flex-1 h-px bg-white/[0.08]" />
+                </div>
+                {isElectron ? (
+                  <button
+                    onClick={handleGoogleElectron}
+                    disabled={isSubmitting}
+                    className="mt-4 w-full py-3 px-4 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.1] text-white text-sm font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-50"
+                  >
+                    {isSubmitting ? (
+                      <Loader2 size={16} className="animate-spin" />
+                    ) : (
+                      <svg width="18" height="18" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+                    )}
+                    {isSubmitting ? 'Waiting for sign-in...' : 'Continue with Google'}
+                  </button>
+                ) : (
+                  <div className="mt-4 flex justify-center [&_iframe]:rounded-xl">
+                    <GoogleLogin
+                      onSuccess={handleGoogleSuccess}
+                      onError={handleGoogleError}
+                      theme="filled_black"
+                      size="large"
+                      width="350"
+                      text="signin_with"
+                      shape="pill"
+                    />
+                  </div>
+                )}
+              </>
+            )}
+
+            <div className="mt-6 text-center">
+              <span className="text-xs text-gray-600">Don't have an account? </span>
+              <button onClick={() => setView('signup')} className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors">Create one</button>
             </div>
-            {authError && (
-              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
-                <AlertTriangle size={12} /> {authError}
+            {geo && (
+              <div className="mt-6 flex items-center justify-center gap-2 text-[10px] text-gray-600">
+                <Lock size={10} /> Secure connection from {geo.country_name}
               </div>
             )}
-            <button type="submit" disabled={isSubmitting}
-              className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex items-center justify-center gap-2 disabled:opacity-50">
-              {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null} Sign In
-            </button>
-          </form>
-
-          {/* Google Sign-In — only on web, not in Electron (Google blocks localhost origins) */}
-          {GOOGLE_CLIENT_ID && !isElectron && (
-            <>
-              <div className="mt-6 flex items-center gap-3">
-                <div className="flex-1 h-px bg-white/[0.08]" />
-                <span className="text-[10px] text-gray-600 uppercase tracking-wider">or</span>
-                <div className="flex-1 h-px bg-white/[0.08]" />
-              </div>
-              <div className="mt-4 flex justify-center [&_iframe]:rounded-xl">
-                <GoogleLogin
-                  onSuccess={handleGoogleSuccess}
-                  onError={handleGoogleError}
-                  theme="filled_black"
-                  size="large"
-                  width="350"
-                  text="signin_with"
-                  shape="pill"
-                />
-              </div>
-            </>
-          )}
-
-          <div className="mt-6 text-center">
-            <span className="text-xs text-gray-600">Don't have an account? </span>
-            <button onClick={() => setView('signup')} className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors">Create one</button>
           </div>
-          {geo && (
-            <div className="mt-8 flex items-center justify-center gap-2 text-[10px] text-gray-600">
-              <Lock size={10} /> Secure connection from {geo.country_name}
-            </div>
-          )}
         </div>
       </div>
     );
@@ -1419,80 +1520,226 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       <div className="fixed inset-0 bg-[#050507] flex items-center justify-center p-6">
         <AnimatedBackground />
         <NoiseOverlay />
-        <div className="relative z-10 w-full max-w-sm">
-          <button onClick={() => setView('landing')} className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-300 transition-colors mb-8">
-            <ArrowRight size={14} className="rotate-180" /> Back
-          </button>
-          <Logo size="lg" />
-          <h2 className="text-xl font-bold text-white mt-8 mb-2">Create your account</h2>
-          <p className="text-sm text-gray-500 mb-8">Start with 5 free interview sessions</p>
+        <div className="relative z-10 w-full max-w-md">
+          <div className="relative rounded-3xl border border-white/[0.08] bg-gradient-to-b from-white/[0.06] to-white/[0.02] backdrop-blur-xl shadow-2xl shadow-black/40 p-8 pt-6">
+            {/* Close button */}
+            <button onClick={() => setView('landing')} className="absolute top-4 right-4 w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all">
+              <X size={16} />
+            </button>
 
-          <form onSubmit={handleSignup} className="space-y-4">
-            <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Name</label>
-              <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name"
-                className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" autoFocus />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Email</label>
-              <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com"
-                className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" required />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">Password</label>
-              <div className="relative">
-                <input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Create a password (min 8 chars)"
-                  className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all pr-10" required minLength={8} />
-                <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 transition-colors">
-                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                </button>
+            <Logo size="md" />
+            <h2 className="text-xl font-bold text-white mt-6 mb-1">Create your account</h2>
+            <p className="text-sm text-gray-500 mb-6">Start with 5 free interview sessions</p>
+
+            <form onSubmit={handleSignup} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1.5">Name</label>
+                <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name"
+                  className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" autoFocus />
               </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1.5">Email</label>
+                <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com"
+                  className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" required />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1.5">Password</label>
+                <div className="relative">
+                  <input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Create a password (min 8 chars)"
+                    className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all pr-10" required minLength={8} />
+                  <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 transition-colors">
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </div>
+              {authError && (
+                <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
+                  <AlertTriangle size={12} /> {authError}
+                </div>
+              )}
+              <button type="submit" disabled={isSubmitting}
+                className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex items-center justify-center gap-2 disabled:opacity-50">
+                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null} Create Account
+              </button>
+              <p className="text-[10px] text-gray-600 text-center leading-relaxed">
+                By creating an account, you agree to our Terms of Service and Privacy Policy
+              </p>
+            </form>
+
+            {/* Google Sign-Up */}
+            {GOOGLE_CLIENT_ID && (
+              <>
+                <div className="mt-6 flex items-center gap-3">
+                  <div className="flex-1 h-px bg-white/[0.08]" />
+                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">or</span>
+                  <div className="flex-1 h-px bg-white/[0.08]" />
+                </div>
+                {isElectron ? (
+                  <button
+                    onClick={handleGoogleElectron}
+                    disabled={isSubmitting}
+                    className="mt-4 w-full py-3 px-4 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.1] text-white text-sm font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-50"
+                  >
+                    {isSubmitting ? (
+                      <Loader2 size={16} className="animate-spin" />
+                    ) : (
+                      <svg width="18" height="18" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+                    )}
+                    {isSubmitting ? 'Waiting for sign-up...' : 'Continue with Google'}
+                  </button>
+                ) : (
+                  <div className="mt-4 flex justify-center [&_iframe]:rounded-xl">
+                    <GoogleLogin
+                      onSuccess={handleGoogleSuccess}
+                      onError={handleGoogleError}
+                      theme="filled_black"
+                      size="large"
+                      width="350"
+                      text="signup_with"
+                      shape="pill"
+                    />
+                  </div>
+                )}
+              </>
+            )}
+
+            <div className="mt-6 text-center">
+              <span className="text-xs text-gray-600">Already have an account? </span>
+              <button onClick={() => setView('login')} className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors">Sign in</button>
             </div>
-            {authError && (
-              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
-                <AlertTriangle size={12} /> {authError}
+            {geo && (
+              <div className="mt-6 flex items-center justify-center gap-2 text-[10px] text-gray-600">
+                <Globe size={10} /> {geo.country_name} &middot; {pricing?.currencySymbol} {pricing?.currency}
               </div>
             )}
-            <button type="submit" disabled={isSubmitting}
-              className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex items-center justify-center gap-2 disabled:opacity-50">
-              {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null} Create Account
-            </button>
-            <p className="text-[10px] text-gray-600 text-center leading-relaxed">
-              By creating an account, you agree to our Terms of Service and Privacy Policy
-            </p>
-          </form>
-
-          {/* Google Sign-Up — only on web, not in Electron */}
-          {GOOGLE_CLIENT_ID && !isElectron && (
-            <>
-              <div className="mt-6 flex items-center gap-3">
-                <div className="flex-1 h-px bg-white/[0.08]" />
-                <span className="text-[10px] text-gray-600 uppercase tracking-wider">or</span>
-                <div className="flex-1 h-px bg-white/[0.08]" />
-              </div>
-              <div className="mt-4 flex justify-center [&_iframe]:rounded-xl">
-                <GoogleLogin
-                  onSuccess={handleGoogleSuccess}
-                  onError={handleGoogleError}
-                  theme="filled_black"
-                  size="large"
-                  width="350"
-                  text="signup_with"
-                  shape="pill"
-                />
-              </div>
-            </>
-          )}
-
-          <div className="mt-6 text-center">
-            <span className="text-xs text-gray-600">Already have an account? </span>
-            <button onClick={() => setView('login')} className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors">Sign in</button>
           </div>
-          {geo && (
-            <div className="mt-8 flex items-center justify-center gap-2 text-[10px] text-gray-600">
-              <Globe size={10} /> {geo.country_name} &middot; {pricing?.currencySymbol} {pricing?.currency}
+        </div>
+      </div>
+    );
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  //  LIVE SUPPORT CHAT
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  if (view === 'support') {
+    // If not logged in, redirect to login
+    if (!currentUser) {
+      setView('login');
+      setAuthError('Please sign in to access support');
+      return null;
+    }
+
+    const sendChatMessage = () => {
+      const text = chatInput.trim();
+      if (!text) return;
+      const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      setChatMessages(prev => [...prev, { from: 'user', text, time }]);
+      setChatInput('');
+
+      // Send via WebSocket if connected
+      if (chatWsRef.current?.readyState === WebSocket.OPEN) {
+        chatWsRef.current.send(JSON.stringify({ type: 'message', text, user: currentUser.email }));
+      }
+
+      // Auto-scroll
+      setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
+    };
+
+    // Initialize chat with welcome message if empty
+    if (chatMessages.length === 0) {
+      const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      setChatMessages([{
+        from: 'agent',
+        text: `Hi ${currentUser.name || 'there'}! I'm Hari, your support agent. How can I help you today?`,
+        time
+      }]);
+
+      // Connect WebSocket for live chat
+      const serverUrl = import.meta.env.VITE_SERVER_URL || 'https://h2so4-production.up.railway.app';
+      const wsUrl = serverUrl.replace(/^http/, 'ws') + '/ws/support';
+      try {
+        const ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'join', user: currentUser.email, name: currentUser.name }));
+        };
+        ws.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.type === 'message') {
+              const msgTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+              setChatMessages(prev => [...prev, { from: 'agent', text: data.text, time: msgTime }]);
+              setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
+            }
+          } catch {}
+        };
+        ws.onerror = () => {};
+        ws.onclose = () => {};
+        chatWsRef.current = ws;
+      } catch {}
+    }
+
+    return (
+      <div className="fixed inset-0 bg-[#050507] flex items-center justify-center p-6">
+        <AnimatedBackground />
+        <NoiseOverlay />
+        <div className="relative z-10 w-full max-w-lg h-[600px] max-h-[85vh] flex flex-col">
+          <div className="rounded-3xl border border-white/[0.08] bg-gradient-to-b from-white/[0.06] to-white/[0.02] backdrop-blur-xl shadow-2xl shadow-black/40 flex flex-col h-full overflow-hidden">
+            {/* Chat header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.08]">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-green-400 to-emerald-600 flex items-center justify-center shadow-lg shadow-green-500/20">
+                  <Headphones size={18} className="text-white" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-white">Hari</h3>
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+                    <span className="text-[10px] text-green-400 font-medium">Live Support Agent</span>
+                  </div>
+                </div>
+              </div>
+              <button onClick={() => { setView('landing'); if (chatWsRef.current) { chatWsRef.current.close(); chatWsRef.current = null; } setChatMessages([]); }}
+                className="w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all">
+                <X size={16} />
+              </button>
             </div>
-          )}
+
+            {/* Chat messages */}
+            <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+              {chatMessages.map((msg, i) => (
+                <div key={i} className={`flex ${msg.from === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[80%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${
+                    msg.from === 'user'
+                      ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-br-md'
+                      : 'bg-white/[0.06] border border-white/[0.08] text-gray-200 rounded-bl-md'
+                  }`}>
+                    <p>{msg.text}</p>
+                    <p className={`text-[9px] mt-1 ${msg.from === 'user' ? 'text-blue-200' : 'text-gray-600'}`}>{msg.time}</p>
+                  </div>
+                </div>
+              ))}
+              <div ref={chatEndRef} />
+            </div>
+
+            {/* Chat input */}
+            <div className="px-4 py-3 border-t border-white/[0.08]">
+              <form onSubmit={(e) => { e.preventDefault(); sendChatMessage(); }} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder="Type your message..."
+                  className="flex-1 px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all"
+                  autoFocus
+                />
+                <button type="submit"
+                  className="w-11 h-11 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white flex items-center justify-center hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex-shrink-0">
+                  <Send size={16} />
+                </button>
+              </form>
+              <p className="text-[10px] text-gray-600 text-center mt-2">Live chat with our support team</p>
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -1565,7 +1812,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 { q: 'Can I share the app with others?', a: 'No. Each license is bound to a specific device. Shared copies will not be able to authenticate and will be locked.' },
                 { q: 'What happens if I use a VPN?', a: 'VPN and proxy connections are detected and blocked. You must use a direct connection from your registered country.' },
                 { q: 'Can I cancel anytime?', a: 'Yes. Cancel from your account settings. Access continues until the end of your billing period.' },
-                { q: 'What if I change devices?', a: 'Email madhavvan@minicaai.com to transfer your license. Each Pro account supports up to 2 devices.' },
+                { q: 'What if I change devices?', a: 'Contact our live support to transfer your license. Each Pro account supports up to 3 devices.' },
               ].map(({ q, a }, i) => (
                 <div key={i} className="p-5 rounded-xl border border-white/[0.06] bg-white/[0.02]">
                   <h4 className="text-sm font-semibold text-white mb-2">{q}</h4>

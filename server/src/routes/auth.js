@@ -295,6 +295,206 @@ router.post('/google', async (req, res) => {
   }
 });
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  GOOGLE OAUTH — Server-side redirect flow (for Electron + any client)
+//  1. Client opens browser to /auth/google/start?session_id=XXX
+//  2. Server redirects to Google consent screen
+//  3. Google redirects back to /auth/google/callback
+//  4. Server logs user in, stores result keyed by session_id
+//  5. Client polls /auth/google/poll?session_id=XXX to get token
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// In-memory store for pending Google auth sessions (TTL: 5 min)
+const pendingGoogleSessions = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of pendingGoogleSessions) {
+    if (now - session.created_at > 5 * 60 * 1000) pendingGoogleSessions.delete(id);
+  }
+}, 60 * 1000);
+
+// Step 1: Start Google OAuth — redirects browser to Google
+router.get('/google/start', (req, res) => {
+  const { session_id } = req.query;
+  if (!session_id) return res.status(400).send('Missing session_id');
+
+  const googleClientId = process.env.GOOGLE_CLIENT_ID;
+  if (!googleClientId) return res.status(503).send('Google Sign-In not configured');
+
+  // Store pending session
+  pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'pending' });
+
+  // Build the Google OAuth URL
+  const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
+  const redirectUri = `${serverUrl}/api/v1/auth/google/callback`;
+
+  const params = new URLSearchParams({
+    client_id: googleClientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state: session_id,
+    access_type: 'offline',
+    prompt: 'select_account',
+  });
+
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+// Step 2: Google redirects here after user consents
+router.get('/google/callback', async (req, res) => {
+  const { code, state: session_id, error } = req.query;
+
+  if (error || !code || !session_id) {
+    if (session_id && pendingGoogleSessions.has(session_id)) {
+      pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: error || 'No authorization code received' });
+    }
+    return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Sign-in failed</h2><p style="color:#9ca3af">You can close this window and try again.</p></div></body></html>');
+  }
+
+  try {
+    const { OAuth2Client } = require('google-auth-library');
+    const googleClientId = process.env.GOOGLE_CLIENT_ID;
+    const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
+    const redirectUri = `${serverUrl}/api/v1/auth/google/callback`;
+
+    const oauth2Client = new OAuth2Client(googleClientId, googleClientSecret, redirectUri);
+
+    // Exchange code for tokens
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    // Get user info from ID token
+    const ticket = await oauth2Client.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: googleClientId,
+    });
+    const payload = ticket.getPayload();
+    const { sub: googleId, email, name, picture } = payload;
+
+    if (!email) {
+      pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: 'Google account has no email' });
+      return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">No email found</h2><p style="color:#9ca3af">Your Google account needs an email address.</p></div></body></html>');
+    }
+
+    const isDev = DEVELOPER_EMAILS.includes(email.toLowerCase());
+    let user = db.getUserByGoogleId(googleId);
+    let isNewUser = false;
+
+    if (!user) {
+      user = db.getUserByEmail(email);
+      if (user) {
+        db.linkGoogleAccount(user.id, googleId, picture);
+        user = db.getUserById(user.id);
+      } else {
+        isNewUser = true;
+        const userId = uuidv4();
+        const now = Date.now();
+
+        user = db.createUser({
+          id: userId,
+          email: email.toLowerCase(),
+          name: name || email.split('@')[0],
+          password: null,
+          tier: isDev ? 'pro' : 'free',
+          country_code: 'US',
+          google_id: googleId,
+          oauth_provider: 'google',
+          avatar_url: picture,
+        });
+
+        const licenseKey = `MNC-${userId.slice(0, 8).toUpperCase()}-${now.toString(36).toUpperCase()}`;
+        db.createLicense({
+          key: licenseKey,
+          user_id: userId,
+          email: email.toLowerCase(),
+          tier: isDev ? 'pro' : 'free',
+          status: isDev ? 'active' : 'trial',
+          country_code: 'US',
+          expires_at: isDev ? -1 : now + (30 * 24 * 60 * 60 * 1000),
+          sessions_limit: isDev ? -1 : 5,
+        });
+      }
+    }
+
+    if (user.is_banned) {
+      pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: 'Account suspended' });
+      return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Account Suspended</h2><p style="color:#9ca3af">Contact support for help.</p></div></body></html>');
+    }
+
+    // Update last login
+    const d = db.getDB();
+    d.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), user.id);
+
+    db.logLogin({
+      user_id: user.id,
+      email: user.email,
+      ip_address: req.ip || req.connection?.remoteAddress,
+      device_id: '',
+      country_code: user.country_code,
+      success: true,
+    });
+
+    const license = db.getLicenseByUserId(user.id);
+    const token = generateToken({ id: user.id, email: user.email, tier: user.tier });
+
+    // Store the result for polling
+    pendingGoogleSessions.set(session_id, {
+      created_at: Date.now(),
+      status: 'success',
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          tier: user.tier,
+          country_code: user.country_code,
+          created_at: user.created_at,
+          is_admin: DEVELOPER_EMAILS.includes(user.email),
+          avatar_url: user.avatar_url || picture,
+          oauth_provider: user.oauth_provider || 'google',
+        },
+        license: license ? { ...license, last_validated: Date.now() } : null,
+        token,
+        is_new_user: isNewUser,
+      },
+    });
+
+    // Show success page — user can close this tab
+    res.send(`<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><div style="width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;margin:0 auto 24px;font-size:28px">✓</div><h2 style="color:#4ade80;margin:0 0 8px">Signed in successfully!</h2><p style="color:#9ca3af;margin:0">You can close this window and return to the app.</p></div></body></html>`);
+
+  } catch (err) {
+    console.error('Google OAuth callback error:', err);
+    if (session_id && pendingGoogleSessions.has(session_id)) {
+      pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: 'Authentication failed' });
+    }
+    res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Something went wrong</h2><p style="color:#9ca3af">Please close this window and try again.</p></div></body></html>');
+  }
+});
+
+// Step 3: Client polls this endpoint to get the auth result
+router.get('/google/poll', (req, res) => {
+  const { session_id } = req.query;
+  if (!session_id) return res.status(400).json({ error: 'Missing session_id' });
+
+  const session = pendingGoogleSessions.get(session_id);
+  if (!session) return res.json({ status: 'pending' });
+
+  if (session.status === 'success') {
+    // Clean up after successful retrieval
+    pendingGoogleSessions.delete(session_id);
+    return res.json({ status: 'success', ...session.data });
+  }
+
+  if (session.status === 'error') {
+    pendingGoogleSessions.delete(session_id);
+    return res.json({ status: 'error', error: session.error });
+  }
+
+  res.json({ status: 'pending' });
+});
+
 // ── Get current user (full profile) ──
 router.get('/me', authMiddleware, (req, res) => {
   try {

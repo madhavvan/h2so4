@@ -8,20 +8,21 @@
     "dev": "nodemon src/index.js"
   },
   "dependencies": {
+    "@google/genai": "^1.36.0",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
     "google-auth-library": "^10.6.2",
+    "groq-sdk": "^0.9.1",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
+    "openai": "^4.24.1",
     "rate-limiter-flexible": "^5.0.3",
     "razorpay": "^2.9.6",
     "stripe": "^14.21.0",
     "uuid": "^9.0.1",
-    "@google/genai": "^1.36.0",
-    "openai": "^4.24.1",
-    "groq-sdk": "^0.9.1"
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
