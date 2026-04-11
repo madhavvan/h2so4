@@ -56,8 +56,11 @@ const { RateLimiterMemory } = require('rate-limiter-flexible');
 
 // General rate limiter
 const generalLimiter = new RateLimiterMemory({ points: 60, duration: 60 });
-// Strict auth rate limiter (prevent brute force)
+// Strict auth rate limiter (prevent brute force on login/signup)
 const authLimiter = new RateLimiterMemory({ points: 10, duration: 300 }); // 10 attempts per 5 min
+// Very strict forgot-password limiter — prevents mass email spam and
+// bill-bombing on transactional mail providers. 5 requests / 15 min / IP.
+const forgotPasswordLimiter = new RateLimiterMemory({ points: 5, duration: 900 });
 
 app.use(async (req, res, next) => {
   try {
@@ -70,6 +73,15 @@ app.use(async (req, res, next) => {
         await authLimiter.consume(key);
       } catch {
         return res.status(429).json({ error: 'Too many login attempts. Please wait 5 minutes.' });
+      }
+    }
+
+    // Even stricter limit on forgot-password to prevent reset-mail spam
+    if (req.path === '/api/v1/auth/forgot-password' && req.method === 'POST') {
+      try {
+        await forgotPasswordLimiter.consume(key);
+      } catch {
+        return res.status(429).json({ error: 'Too many reset requests. Please wait 15 minutes.' });
       }
     }
 

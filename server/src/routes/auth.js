@@ -474,8 +474,11 @@ router.get('/google/callback', async (req, res) => {
       },
     });
 
-    // Show success page — user can close this tab
-    res.send(`<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><div style="width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;margin:0 auto 24px;font-size:28px">✓</div><h2 style="color:#4ade80;margin:0 0 8px">Signed in successfully!</h2><p style="color:#9ca3af;margin:0">You can close this window and return to the app.</p></div></body></html>`);
+    // Show success page — try to auto-close the tab, fall back to a clear
+    // "return to app" message. The Electron renderer polls /google/poll and,
+    // on success, sends a 'focus-main-window' IPC so the desktop app jumps
+    // to the foreground while this tab fades.
+    res.send(`<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><div style="width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;margin:0 auto 24px;font-size:28px">✓</div><h2 style="color:#4ade80;margin:0 0 8px">Signed in successfully!</h2><p style="color:#9ca3af;margin:0">Returning to Interview Copilot…</p><p style="color:#6b7280;margin:16px 0 0;font-size:12px">You can close this tab.</p></div><script>setTimeout(function(){try{window.close();}catch(e){}},600);</script></body></html>`);
 
   } catch (err) {
     console.error('Google OAuth callback error:', err);
@@ -506,6 +509,92 @@ router.get('/google/poll', (req, res) => {
   }
 
   res.json({ status: 'pending' });
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PASSWORD RESET
+//  1. POST /forgot-password → email the user a reset link
+//  2. GET  /reset-password  → server-rendered "choose new password" form
+//  3. POST /reset-password  → consume token, update password
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const { sendMail, renderPasswordResetEmail } = require('../email');
+
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: 'A valid email address is required' });
+    }
+
+    const user = db.getUserByEmail(email);
+
+    // Always respond the same way so an attacker can't enumerate which
+    // addresses have accounts. Only send the email when the account
+    // exists AND has a password (Google-only accounts can't reset a
+    // password they don't have — they should use Google Sign-In).
+    if (user && user.password_hash) {
+      const rawToken = db.createPasswordResetToken(user.id, user.email);
+      const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
+      const resetUrl = `${serverUrl}/api/v1/auth/reset-password?token=${rawToken}`;
+      const { subject, html, text } = renderPasswordResetEmail({ name: user.name, resetUrl });
+      sendMail({ to: user.email, subject, html, text }).catch((err) => {
+        console.error('[forgot-password] sendMail failed:', err && err.message);
+      });
+    }
+
+    res.json({
+      ok: true,
+      message: 'If an account exists for that email, a password reset link has been sent.',
+    });
+  } catch (err) {
+    console.error('Forgot password error:', err);
+    res.status(500).json({ error: 'Failed to send reset email. Please try again.' });
+  }
+});
+
+// Server-rendered "choose a new password" form. Keeps the frontend
+// simple — the email link lands here in the system browser and the
+// user never has to bounce back into the app.
+router.get('/reset-password', (req, res) => {
+  const { token } = req.query;
+  // Tokens are 64-char hex from crypto.randomBytes(32) — reject anything
+  // else before it reaches the DB or the rendered HTML.
+  const isValidFormat = typeof token === 'string' && /^[a-f0-9]{64}$/i.test(token);
+  const row = isValidFormat ? db.getPasswordResetToken(token) : null;
+
+  const baseStyle = 'background:#050507;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px';
+
+  if (!row) {
+    return res.status(400).send(`<!doctype html><html><body style="${baseStyle}"><div style="max-width:420px;text-align:center"><div style="width:56px;height:56px;border-radius:14px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:28px">!</div><h2 style="color:#f87171;margin:0 0 8px;font-size:20px">Link expired or invalid</h2><p style="color:#9ca3af;margin:0;font-size:14px;line-height:1.5">This reset link has already been used or has expired. Request a new one from the app and try again.</p></div></body></html>`);
+  }
+
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reset your password</title></head><body style="${baseStyle}"><div style="max-width:420px;width:100%"><div style="display:flex;align-items:center;gap:10px;margin-bottom:24px"><div style="width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#8b5cf6)"></div><div style="font-weight:700;font-size:15px">minicaai</div></div><div style="border-radius:20px;border:1px solid rgba(255,255,255,0.08);background:linear-gradient(to bottom,rgba(255,255,255,0.06),rgba(255,255,255,0.02));padding:28px;backdrop-filter:blur(12px)"><h2 style="margin:0 0 6px;font-size:20px;font-weight:700">Choose a new password</h2><p style="margin:0 0 20px;font-size:13px;color:#9ca3af">Resetting for <strong style="color:#e5e7eb">${row.email.replace(/</g, '&lt;')}</strong></p><form id="f" onsubmit="return submitForm(event)"><label style="display:block;font-size:11px;color:#9ca3af;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em">New password</label><input id="p1" type="password" minlength="8" required placeholder="At least 8 characters" style="width:100%;box-sizing:border-box;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);color:#fff;font-size:14px;outline:none;margin-bottom:12px"/><label style="display:block;font-size:11px;color:#9ca3af;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em">Confirm password</label><input id="p2" type="password" minlength="8" required placeholder="Re-enter password" style="width:100%;box-sizing:border-box;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);color:#fff;font-size:14px;outline:none;margin-bottom:16px"/><div id="err" style="display:none;padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:12px;margin-bottom:12px"></div><button id="btn" type="submit" style="width:100%;padding:13px;border-radius:11px;background:linear-gradient(135deg,#3b82f6,#6366f1);border:none;color:#fff;font-weight:600;font-size:14px;cursor:pointer">Update password</button></form><div id="done" style="display:none;text-align:center;padding:8px 0"><div style="width:48px;height:48px;border-radius:12px;background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.3);display:flex;align-items:center;justify-content:center;margin:0 auto 14px;color:#4ade80;font-size:24px">&#10003;</div><h3 style="margin:0 0 6px;color:#4ade80;font-size:16px">Password updated</h3><p style="margin:0;font-size:13px;color:#9ca3af">You can now close this tab and sign in with your new password.</p></div></div></div><script>
+async function submitForm(e){e.preventDefault();var p1=document.getElementById('p1').value;var p2=document.getElementById('p2').value;var err=document.getElementById('err');var btn=document.getElementById('btn');err.style.display='none';if(p1!==p2){err.textContent='Passwords do not match.';err.style.display='block';return false;}if(p1.length<8){err.textContent='Password must be at least 8 characters.';err.style.display='block';return false;}btn.disabled=true;btn.textContent='Updating...';try{var r=await fetch('/api/v1/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:${JSON.stringify(token)},password:p1})});var d=await r.json();if(!r.ok){throw new Error(d.error||'Reset failed');}document.getElementById('f').style.display='none';document.getElementById('done').style.display='block';}catch(ex){err.textContent=ex.message||'Something went wrong. Try again.';err.style.display='block';btn.disabled=false;btn.textContent='Update password';}return false;}
+</script></body></html>`);
+});
+
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+    if (!token || !password) {
+      return res.status(400).json({ error: 'Missing token or password' });
+    }
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    const row = db.consumePasswordResetToken(token);
+    if (!row) {
+      return res.status(400).json({ error: 'This reset link has expired or already been used. Please request a new one.' });
+    }
+
+    db.updateUserPassword(row.user_id, password);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Reset password error:', err);
+    res.status(500).json({ error: 'Failed to reset password. Please try again.' });
+  }
 });
 
 // ── Get current user (full profile) ──

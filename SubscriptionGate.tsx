@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Shield, Zap, Crown, Check, X, ArrowRight, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send } from 'lucide-react';
+import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail } from 'lucide-react';
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import { geoService, GeoData } from './services/geoService';
 import { pricingService, RegionPricing, PricingTier } from './services/pricingService';
@@ -16,7 +16,7 @@ interface SubscriptionGateProps {
   onAuthenticated: (user: UserProfile, license: LicenseData) => void;
 }
 
-type View = 'landing' | 'login' | 'signup' | 'pricing' | 'vpn_blocked' | 'download' | 'tutorials' | 'admin' | 'support';
+type View = 'landing' | 'login' | 'signup' | 'forgot_password' | 'pricing' | 'vpn_blocked' | 'download' | 'tutorials' | 'admin' | 'support';
 
 // ── Detect if running inside Electron ──
 const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
@@ -575,6 +575,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [forgotSent, setForgotSent] = useState(false);
 
   // Authenticated user (for download/dashboard views)
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
@@ -743,6 +744,32 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       }
     } catch (err: any) {
       setAuthError(err.message || 'Login failed');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // ── Forgot password handler ──
+  // Server responds the same way whether or not the email is on file, so we
+  // always show a generic success message — no account enumeration.
+  const handleForgotPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email.trim()) return;
+    setIsSubmitting(true);
+    setAuthError(null);
+
+    try {
+      const serverUrl = 'https://h2so4-production.up.railway.app';
+      const res = await fetch(`${serverUrl}/api/v1/auth/forgot-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim() }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Failed to send reset email');
+      setForgotSent(true);
+    } catch (err: any) {
+      setAuthError(err.message || 'Failed to send reset email');
     } finally {
       setIsSubmitting(false);
     }
@@ -973,6 +1000,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             setIsSubmitting(false);
 
             if (isElectron) {
+              // Pull the Electron window back to the foreground — the browser
+              // "you can close this tab" page leaves the desktop app hidden
+              // behind it otherwise.
+              try {
+                (window as any).require('electron').ipcRenderer.send('focus-main-window');
+              } catch {}
               onAuthenticated(data.user, data.license);
             } else {
               setView('download');
@@ -1448,7 +1481,16 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" required autoFocus />
               </div>
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5">Password</label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-xs font-medium text-gray-400">Password</label>
+                  <button
+                    type="button"
+                    onClick={() => { setAuthError(null); setForgotSent(false); setView('forgot_password'); }}
+                    className="text-xs font-medium text-blue-400 hover:text-blue-300 transition-colors"
+                  >
+                    Forgot password?
+                  </button>
+                </div>
                 <div className="relative">
                   <input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Enter your password"
                     className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all pr-10" required />
@@ -1514,6 +1556,97 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 <Lock size={10} /> Secure connection from {geo.country_name}
               </div>
             )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  //  FORGOT PASSWORD
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  if (view === 'forgot_password') {
+    return (
+      <div className="fixed inset-0 bg-[#050507] flex items-center justify-center p-6">
+        <AnimatedBackground />
+        <NoiseOverlay />
+        <div className="relative z-10 w-full max-w-md">
+          <div className="relative rounded-3xl border border-white/[0.08] bg-gradient-to-b from-white/[0.06] to-white/[0.02] backdrop-blur-xl shadow-2xl shadow-black/40 p-8 pt-6">
+            <button
+              onClick={() => { setAuthError(null); setForgotSent(false); setView('login'); }}
+              className="absolute top-4 left-4 w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all"
+              aria-label="Back to login"
+            >
+              <ArrowLeft size={16} />
+            </button>
+            <button
+              onClick={() => { setAuthError(null); setForgotSent(false); setView('landing'); }}
+              className="absolute top-4 right-4 w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all"
+              aria-label="Close"
+            >
+              <X size={16} />
+            </button>
+
+            <div className="flex flex-col items-center mt-4 mb-6">
+              <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-500/20 to-purple-500/20 border border-white/[0.08] flex items-center justify-center mb-4">
+                {forgotSent ? <Check size={24} className="text-emerald-400" /> : <Mail size={22} className="text-blue-400" />}
+              </div>
+              <h2 className="text-xl font-bold text-white mb-1">
+                {forgotSent ? 'Check your email' : 'Forgot your password?'}
+              </h2>
+              <p className="text-sm text-gray-500 text-center max-w-xs">
+                {forgotSent
+                  ? `If an account exists for ${email}, a reset link is on its way. The link expires in 1 hour.`
+                  : "Enter the email you signed up with and we'll send you a link to reset your password."}
+              </p>
+            </div>
+
+            {!forgotSent ? (
+              <form onSubmit={handleForgotPassword} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-1.5">Email</label>
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="you@example.com"
+                    className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all"
+                    required
+                    autoFocus
+                  />
+                </div>
+                {authError && (
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
+                    <AlertTriangle size={12} /> {authError}
+                  </div>
+                )}
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
+                  Send reset link
+                </button>
+              </form>
+            ) : (
+              <button
+                onClick={() => { setForgotSent(false); setAuthError(null); setView('login'); }}
+                className="w-full py-3 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-white text-sm font-medium transition-all"
+              >
+                Back to sign in
+              </button>
+            )}
+
+            <div className="mt-6 text-center">
+              <span className="text-xs text-gray-600">Remembered it? </span>
+              <button
+                onClick={() => { setAuthError(null); setForgotSent(false); setView('login'); }}
+                className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors"
+              >
+                Sign in
+              </button>
+            </div>
           </div>
         </div>
       </div>

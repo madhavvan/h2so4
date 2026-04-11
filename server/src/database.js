@@ -106,6 +106,16 @@ function getDB() {
       updated_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      token_hash TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      used_at INTEGER,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -154,6 +164,8 @@ function getDB() {
     CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv ON conversation_messages(conversation_id);
     CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
     CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at);
+    CREATE INDEX IF NOT EXISTS idx_reset_tokens_user ON password_reset_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS idx_reset_tokens_expires ON password_reset_tokens(expires_at);
   `);
 
   // Set default app config
@@ -236,6 +248,76 @@ function updateUserTier(userId, tier) {
 
 function banUser(userId) {
   getDB().prepare('UPDATE users SET is_banned = 1, updated_at = ? WHERE id = ?').run(Date.now(), userId);
+}
+
+function updateUserPassword(userId, newPassword) {
+  const d = getDB();
+  const passwordHash = hashPassword(newPassword);
+  d.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')
+    .run(passwordHash, Date.now(), userId);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PASSWORD RESET TOKENS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+// The raw token is only ever returned to the caller once — the database
+// stores the SHA-256 hash so a DB dump doesn't yield reusable reset links.
+
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+function hashResetToken(rawToken) {
+  return crypto.createHash('sha256').update(rawToken).digest('hex');
+}
+
+function createPasswordResetToken(userId, email) {
+  const d = getDB();
+  // Invalidate any prior unused tokens for this user.
+  d.prepare('DELETE FROM password_reset_tokens WHERE user_id = ? AND used_at IS NULL').run(userId);
+
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = hashResetToken(rawToken);
+  const now = Date.now();
+  d.prepare(`
+    INSERT INTO password_reset_tokens (token_hash, user_id, email, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(tokenHash, userId, email.toLowerCase(), now + RESET_TOKEN_TTL_MS, now);
+
+  return rawToken;
+}
+
+// Look up a reset token without consuming it — used by the GET form page
+// so we can show "expired" before the user types a new password.
+function getPasswordResetToken(rawToken) {
+  if (!rawToken) return null;
+  const tokenHash = hashResetToken(rawToken);
+  const row = getDB()
+    .prepare('SELECT * FROM password_reset_tokens WHERE token_hash = ?')
+    .get(tokenHash);
+  if (!row) return null;
+  if (row.used_at) return null;
+  if (row.expires_at < Date.now()) return null;
+  return row;
+}
+
+// Validate and mark used in one transaction so a token can never be
+// replayed even if two requests land at the same millisecond.
+function consumePasswordResetToken(rawToken) {
+  if (!rawToken) return null;
+  const tokenHash = hashResetToken(rawToken);
+  const d = getDB();
+  const row = d.prepare('SELECT * FROM password_reset_tokens WHERE token_hash = ?').get(tokenHash);
+  if (!row) return null;
+  if (row.used_at) return null;
+  if (row.expires_at < Date.now()) return null;
+  const result = d
+    .prepare('UPDATE password_reset_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL')
+    .run(Date.now(), tokenHash);
+  if (result.changes === 0) return null;
+  return row;
+}
+
+function cleanupExpiredResetTokens() {
+  getDB().prepare('DELETE FROM password_reset_tokens WHERE expires_at < ?').run(Date.now());
 }
 
 function getAllUsers() {
@@ -529,7 +611,9 @@ module.exports = {
   getDB,
   // Users
   createUser, getUserByEmail, getUserById, getUserByGoogleId, linkGoogleAccount, verifyUserPassword,
-  updateUserTier, banUser, getAllUsers, getUserCount, getProUserCount, getActiveToday,
+  updateUserTier, updateUserPassword, banUser, getAllUsers, getUserCount, getProUserCount, getActiveToday,
+  // Password reset
+  createPasswordResetToken, getPasswordResetToken, consumePasswordResetToken, cleanupExpiredResetTokens,
   // Licenses
   createLicense, getLicenseByKey, getLicenseByUserId,
   incrementSessionCount, updateLicenseStatus, updateLicenseOnPayment,

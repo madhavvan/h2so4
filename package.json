@@ -1,7 +1,7 @@
 {
   "name": "interview-copilot-ai",
   "private": true,
-  "version": "1.8.0",
+  "version": "2.2.0",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "lint": "tsc --noEmit",
     "electron:start": "concurrently -k \"npm run dev\" \"wait-on tcp:3005 && electron .\"",
-    "electron:build": "npm run build && electron-builder"
+    "electron:build": "npm run build && electron-builder",
+    "electron:publish": "npm run build && electron-builder --publish=always"
   },
   "build": {
     "appId": "com.interviewcopilot.app",
@@ -22,6 +23,11 @@
       "dist/**/*",
       "electron/**/*"
     ],
+    "publish": {
+      "provider": "github",
+      "owner": "madhavvan",
+      "repo": "h2so4"
+    },
     "mac": {
       "category": "public.app-category.productivity",
       "artifactName": "InterviewCopilot-Mac.${ext}"
@@ -43,6 +49,7 @@
     "@google/genai": "^1.36.0",
     "@react-oauth/google": "^0.13.4",
     "better-sqlite3": "^12.8.0",
+    "electron-updater": "^6.3.9",
     "groq-sdk": "0.9.1",
     "lucide-react": "^0.562.0",
     "openai": "4.24.1",

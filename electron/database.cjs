@@ -10,17 +10,16 @@ function getDB() {
   const dbPath = path.join(app.getPath('userData'), 'copilot.db');
   db = new Database(dbPath);
 
-  // Performance settings
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
 
-  // Create tables
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      is_active INTEGER DEFAULT 1
+      is_active INTEGER DEFAULT 1,
+      user_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS messages (
@@ -44,31 +43,125 @@ function getDB() {
     );
   `);
 
+  // Migration: add user_id to existing sessions tables (pre-upgrade installs)
+  const sessionCols = db.prepare("PRAGMA table_info(sessions)").all();
+  if (!sessionCols.find(c => c.name === 'user_id')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN user_id TEXT');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_active_user ON sessions(is_active, user_id)');
+
   return db;
 }
 
 // ── Session operations ──
 
-function getOrCreateActiveSession() {
+// Claim sessions with no owner (one-time migration path: existing user upgrades
+// the app, signs in for the first time, and takes ownership of their pre-upgrade
+// conversations). Returns the number of rows claimed so the UI can show a toast.
+function claimOrphanSessions(userId) {
+  if (!userId) return 0;
   const d = getDB();
-  let session = d.prepare('SELECT * FROM sessions WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1').get();
+  const result = d.prepare('UPDATE sessions SET user_id = ? WHERE user_id IS NULL').run(userId);
+  return result.changes;
+}
+
+function getOrCreateActiveSession(userId) {
+  if (!userId) throw new Error('getOrCreateActiveSession: userId is required');
+  const d = getDB();
+  let session = d
+    .prepare('SELECT * FROM sessions WHERE is_active = 1 AND user_id = ? ORDER BY created_at DESC LIMIT 1')
+    .get(userId);
   if (!session) {
     const id = Date.now().toString();
-    d.prepare('INSERT INTO sessions (id, name, created_at, is_active) VALUES (?, ?, ?, 1)')
-      .run(id, 'Interview ' + new Date().toLocaleDateString(), Date.now());
+    d.prepare('INSERT INTO sessions (id, name, created_at, is_active, user_id) VALUES (?, ?, ?, 1, ?)')
+      .run(id, 'Interview ' + new Date().toLocaleDateString(), Date.now(), userId);
     session = d.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
   }
   return session;
 }
 
-function startNewSession(name) {
+function startNewSession(name, userId) {
+  if (!userId) throw new Error('startNewSession: userId is required');
   const d = getDB();
-  // Deactivate all current sessions
-  d.prepare('UPDATE sessions SET is_active = 0').run();
+  d.prepare('UPDATE sessions SET is_active = 0 WHERE user_id = ?').run(userId);
   const id = Date.now().toString();
-  d.prepare('INSERT INTO sessions (id, name, created_at, is_active) VALUES (?, ?, ?, 1)')
-    .run(id, name || 'Interview ' + new Date().toLocaleDateString(), Date.now());
+  d.prepare('INSERT INTO sessions (id, name, created_at, is_active, user_id) VALUES (?, ?, ?, 1, ?)')
+    .run(id, name || 'Interview ' + new Date().toLocaleDateString(), Date.now(), userId);
   return d.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
+}
+
+// List every session that belongs to this user. Returns a projection the
+// sidebar can render directly — id, name, created_at, active flag, message
+// count, and the first user message as a preview line.
+function listSessionsForUser(userId) {
+  if (!userId) return [];
+  return getDB().prepare(`
+    SELECT
+      s.id,
+      s.name,
+      s.created_at,
+      s.is_active,
+      (SELECT COUNT(*) FROM messages WHERE session_id = s.id) AS message_count,
+      (SELECT content FROM messages WHERE session_id = s.id AND role = 'user' ORDER BY timestamp ASC LIMIT 1) AS preview
+    FROM sessions s
+    WHERE s.user_id = ?
+    ORDER BY s.created_at DESC
+  `).all(userId);
+}
+
+// Switch to an existing session. Ownership-checked — you cannot target a
+// session that belongs to a different user even if you know the id.
+function switchToSession(sessionId, userId) {
+  if (!userId || !sessionId) return null;
+  const d = getDB();
+  const session = d.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?').get(sessionId, userId);
+  if (!session) return null;
+  d.prepare('UPDATE sessions SET is_active = 0 WHERE user_id = ?').run(userId);
+  d.prepare('UPDATE sessions SET is_active = 1 WHERE id = ? AND user_id = ?').run(sessionId, userId);
+  return d.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId);
+}
+
+function renameSession(sessionId, userId, newName) {
+  if (!userId || !sessionId) return false;
+  const trimmed = (newName || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  if (!trimmed) return false;
+  const result = getDB()
+    .prepare('UPDATE sessions SET name = ? WHERE id = ? AND user_id = ?')
+    .run(trimmed, sessionId, userId);
+  return result.changes > 0;
+}
+
+// Delete a session. Messages and context files cascade away via the FK.
+// If the deleted session was the active one, the most recent remaining
+// session becomes active; if none remain, a fresh empty session is created
+// so the caller always has something to display.
+function deleteSession(sessionId, userId) {
+  if (!userId || !sessionId) return { ok: false };
+  const d = getDB();
+  const session = d.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?').get(sessionId, userId);
+  if (!session) return { ok: false };
+
+  d.prepare('DELETE FROM sessions WHERE id = ? AND user_id = ?').run(sessionId, userId);
+
+  // If the deleted row wasn't active, nothing else to do.
+  if (session.is_active !== 1) {
+    return { ok: true, newActiveSession: null };
+  }
+
+  // Promote the most recent remaining session to active, or mint a fresh one.
+  const mostRecent = d
+    .prepare('SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
+    .get(userId);
+  if (mostRecent) {
+    d.prepare('UPDATE sessions SET is_active = 1 WHERE id = ?').run(mostRecent.id);
+    return { ok: true, newActiveSession: mostRecent };
+  }
+  const newId = Date.now().toString();
+  d.prepare('INSERT INTO sessions (id, name, created_at, is_active, user_id) VALUES (?, ?, ?, 1, ?)')
+    .run(newId, 'Interview ' + new Date().toLocaleDateString(), Date.now(), userId);
+  const fresh = d.prepare('SELECT * FROM sessions WHERE id = ?').get(newId);
+  return { ok: true, newActiveSession: fresh };
 }
 
 // ── Message operations ──
@@ -80,9 +173,28 @@ function getMessages(sessionId) {
 }
 
 function addMessage(sessionId, message) {
-  getDB()
-    .prepare('INSERT OR REPLACE INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)')
+  const d = getDB();
+  d.prepare('INSERT OR REPLACE INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)')
     .run(message.id, sessionId, message.role, message.content, message.timestamp);
+
+  // Auto-name: when the user sends their first message in a session that
+  // still carries the default "Interview <date>" name, derive a name from
+  // the message so the sidebar is scannable. Skip if the session has
+  // already been renamed (manually or automatically).
+  if (message.role === 'user' && message.content) {
+    const row = d.prepare('SELECT name FROM sessions WHERE id = ?').get(sessionId);
+    if (row && /^Interview\s/.test(row.name)) {
+      const userMsgCount = d
+        .prepare("SELECT COUNT(*) AS c FROM messages WHERE session_id = ? AND role = 'user'")
+        .get(sessionId).c;
+      if (userMsgCount === 1) {
+        const derived = String(message.content).replace(/\s+/g, ' ').trim().slice(0, 60);
+        if (derived) {
+          d.prepare('UPDATE sessions SET name = ? WHERE id = ?').run(derived, sessionId);
+        }
+      }
+    }
+  }
 }
 
 function clearMessages(sessionId) {
@@ -129,8 +241,13 @@ function closeDB() {
 }
 
 module.exports = {
+  claimOrphanSessions,
   getOrCreateActiveSession,
   startNewSession,
+  listSessionsForUser,
+  switchToSession,
+  renameSession,
+  deleteSession,
   getMessages,
   addMessage,
   clearMessages,

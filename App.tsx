@@ -8,7 +8,7 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { generateGemini, generateOpenAI, generateXAI, generateGroq } from './services/aiProxyService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
-import { useDatabase } from './hooks/useDatabase';
+import { useDatabase, SessionSummary } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
 import { SubscriptionGate } from './SubscriptionGate';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
@@ -176,7 +176,7 @@ const ChatInterface = ({
         const newModel = e.target.value as 'gemini' | 'groq' | 'openai' | 'xai';
         // ── Feature Gate: Block model switch for free users ──
         if (!gate.canUseModel(newModel)) return;
-        // Immediate state update
+        // Immediate optimistic update in whichever window this runs in
         const newSettings = {
             ...settings,
             selectedModel: newModel
@@ -184,6 +184,13 @@ const ChatInterface = ({
         setSettings(newSettings);
         // Persist immediately
         localStorage.setItem("SELECTED_MODEL", newModel);
+        // When this runs inside the Electron pop-out, also tell the main window
+        // — main is the one that actually calls executeSend, so its own
+        // settings.selectedModel has to flip too or the popout selector is
+        // purely cosmetic. Main echoes the change back via the state-sync push.
+        if (isElectron && isPopoutMode) {
+            electronIPC.send('relay-to-main', { type: 'cmd-set-model', model: newModel });
+        }
     };
 
     // Pop-out size presets: S → M → L cycle
@@ -830,12 +837,222 @@ const ProFeatureLocked = ({ feature, compact }: { feature: string; compact?: boo
   </div>
 );
 
+// ── Conversation sidebar (Electron main window only) ──
+// Buckets sessions into Today / Yesterday / Previous 7 days / Previous 30 days / Older
+// so long histories stay scannable.
+function groupSessionsByDate(sessions: SessionSummary[]): Array<{ label: string; items: SessionSummary[] }> {
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000;
+  const sevenDaysAgo = startOfToday - 7 * 24 * 60 * 60 * 1000;
+  const thirtyDaysAgo = startOfToday - 30 * 24 * 60 * 60 * 1000;
+
+  const groups: Record<string, SessionSummary[]> = {
+    'Today': [],
+    'Yesterday': [],
+    'Previous 7 days': [],
+    'Previous 30 days': [],
+    'Older': [],
+  };
+  for (const s of sessions) {
+    if (s.created_at >= startOfToday) groups['Today'].push(s);
+    else if (s.created_at >= startOfYesterday) groups['Yesterday'].push(s);
+    else if (s.created_at >= sevenDaysAgo) groups['Previous 7 days'].push(s);
+    else if (s.created_at >= thirtyDaysAgo) groups['Previous 30 days'].push(s);
+    else groups['Older'].push(s);
+  }
+  return Object.entries(groups)
+    .filter(([, items]) => items.length > 0)
+    .map(([label, items]) => ({ label, items }));
+}
+
+const ConversationSidebar = ({
+  db,
+  onClose,
+}: {
+  db: ReturnType<typeof useDatabase>;
+  onClose: () => void;
+}) => {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState('');
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+
+  const groups = groupSessionsByDate(db.sessions);
+
+  const startEdit = (s: SessionSummary) => {
+    setEditingId(s.id);
+    setEditName(s.name);
+  };
+
+  const saveEdit = async () => {
+    if (editingId && editName.trim()) {
+      await db.renameSession(editingId, editName.trim());
+    }
+    setEditingId(null);
+    setEditName('');
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditName('');
+  };
+
+  const confirmDelete = async () => {
+    if (deleteConfirmId) {
+      await db.deleteSession(deleteConfirmId);
+    }
+    setDeleteConfirmId(null);
+  };
+
+  return (
+    <>
+      <aside className="w-64 shrink-0 h-full flex flex-col bg-[#0a0a0d] border-r border-white/[0.06]">
+        <div className="p-3 flex items-center justify-between border-b border-white/[0.06]">
+          <div className="flex items-center gap-2 text-sm font-semibold text-white/90">
+            <MessageSquare size={14} className="text-blue-400" />
+            Conversations
+          </div>
+          <button
+            onClick={onClose}
+            className="w-7 h-7 rounded-lg hover:bg-white/[0.06] flex items-center justify-center text-gray-500 hover:text-white transition-colors"
+            aria-label="Close sidebar"
+          >
+            <X size={14} />
+          </button>
+        </div>
+
+        <button
+          onClick={() => db.newSession()}
+          className="mx-3 mt-3 px-3 py-2.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-sm text-white/90 font-medium transition-all flex items-center justify-center gap-2"
+        >
+          <Plus size={14} /> New chat
+        </button>
+
+        <div className="flex-1 overflow-y-auto px-2 py-3 space-y-4">
+          {db.sessions.length === 0 ? (
+            <div className="text-center text-xs text-gray-600 px-4 py-8">
+              No conversations yet. Start chatting to create one.
+            </div>
+          ) : (
+            groups.map((g) => (
+              <div key={g.label}>
+                <div className="text-[10px] uppercase tracking-wider text-gray-600 px-2 mb-1 font-medium">
+                  {g.label}
+                </div>
+                <div className="space-y-0.5">
+                  {g.items.map((s) => {
+                    const isActive = s.id === db.sessionId;
+                    const isEditing = editingId === s.id;
+                    return (
+                      <div
+                        key={s.id}
+                        className={`group relative rounded-lg transition-colors ${
+                          isActive
+                            ? 'bg-blue-500/15 border border-blue-500/20'
+                            : 'hover:bg-white/[0.04] border border-transparent'
+                        }`}
+                      >
+                        {isEditing ? (
+                          <input
+                            type="text"
+                            value={editName}
+                            onChange={(e) => setEditName(e.target.value)}
+                            onBlur={saveEdit}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') saveEdit();
+                              if (e.key === 'Escape') cancelEdit();
+                            }}
+                            autoFocus
+                            maxLength={100}
+                            className="w-full px-2.5 py-2 rounded-lg bg-white/[0.08] border border-blue-500/40 text-sm text-white outline-none"
+                          />
+                        ) : (
+                          <div
+                            onClick={() => db.switchSession(s.id)}
+                            className="cursor-pointer px-2.5 py-2 flex items-center gap-2 min-w-0"
+                            title={s.name}
+                          >
+                            <MessageSquare
+                              size={12}
+                              className={`shrink-0 ${isActive ? 'text-blue-400' : 'text-gray-600'}`}
+                            />
+                            <span
+                              className={`truncate text-sm flex-1 ${
+                                isActive ? 'text-white' : 'text-gray-300'
+                              }`}
+                            >
+                              {s.name}
+                            </span>
+                            <div className="hidden group-hover:flex items-center gap-0.5 shrink-0">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  startEdit(s);
+                                }}
+                                className="w-6 h-6 rounded hover:bg-white/[0.1] flex items-center justify-center text-gray-500 hover:text-white"
+                                title="Rename"
+                              >
+                                <Edit3 size={11} />
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setDeleteConfirmId(s.id);
+                                }}
+                                className="w-6 h-6 rounded hover:bg-red-500/20 flex items-center justify-center text-gray-500 hover:text-red-400"
+                                title="Delete"
+                              >
+                                <Trash2 size={11} />
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </aside>
+
+      {deleteConfirmId && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-[100]">
+          <div className="bg-[#111116] border border-white/[0.08] rounded-xl p-5 max-w-xs w-full">
+            <h3 className="text-sm font-semibold text-white mb-2">Delete conversation?</h3>
+            <p className="text-xs text-gray-400 mb-4">
+              This conversation and all its messages will be permanently deleted. This cannot be undone.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setDeleteConfirmId(null)}
+                className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-xs font-medium text-white transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDelete}
+                className="flex-1 px-3 py-2 rounded-lg bg-red-500/90 hover:bg-red-500 text-xs font-semibold text-white transition-colors"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+};
+
 function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProfile | null; userLicense: LicenseData | null; onLogout: () => void }) {
   // --- Feature Gates ---
   const gate = useFeatureGate(userLicense);
 
   // --- Database-backed state (Electron) / local fallback (browser) ---
-  const db = useDatabase();
+  // Pass the signed-in user's id so SQLite sessions are scoped per account
+  // and one user's conversation history never appears under another login.
+  const db = useDatabase(userProfile?.id || null);
   const messages = db.messages;
   const setMessages = db.setMessages;
   const messagesRef = useRef<Message[]>([]);
@@ -865,6 +1082,19 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   
   // PiP State — auto-enter if this is the Electron pop-out window
   const [isPipMode, setIsPipMode] = useState(isPopoutMode);
+
+  // Conversation sidebar open/closed, persisted so users don't have to
+  // re-open it every launch. Default open on first use for discoverability.
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('sidebar_open');
+      if (saved === null) return true;
+      return saved === '1';
+    } catch { return true; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('sidebar_open', sidebarOpen ? '1' : '0'); } catch {}
+  }, [sidebarOpen]);
 
   // Electron pop-out window: make transparent + set up cross-window sync
   useEffect(() => {
@@ -1150,6 +1380,21 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       streamRef.current = stream;
   }, [stream]);
 
+  // Refs used by the main-side popout command handler so request-state reads
+  // current values instead of stale closure snapshots. Without these, the first
+  // sync right after popout opens would echo whatever state main had when the
+  // handler was last registered.
+  const rawIsListeningRef = useRef(_rawIsListening);
+  const isProcessingRef = useRef(isProcessing);
+  const interimTextRef = useRef(interimText);
+  const rawSpeechErrorRef = useRef(_rawSpeechError);
+  const gateRef = useRef(gate);
+  useEffect(() => { rawIsListeningRef.current = _rawIsListening; }, [_rawIsListening]);
+  useEffect(() => { isProcessingRef.current = isProcessing; }, [isProcessing]);
+  useEffect(() => { interimTextRef.current = interimText; }, [interimText]);
+  useEffect(() => { rawSpeechErrorRef.current = _rawSpeechError; }, [_rawSpeechError]);
+  useEffect(() => { gateRef.current = gate; }, [gate]);
+
   // ── Cross-window state sync (Electron only) ──
   // Main window → pop-out: relay state whenever it changes
   useEffect(() => {
@@ -1162,8 +1407,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       inputText,
       autoSend: settings.autoSend,
       speechError: _rawSpeechError,
+      selectedModel: settings.selectedModel,
     });
-  }, [_rawIsListening, isProcessing, interimText, inputText, settings.autoSend, _rawSpeechError]);
+  }, [_rawIsListening, isProcessing, interimText, inputText, settings.autoSend, _rawSpeechError, settings.selectedModel]);
 
   // Pop-out: receive state from main window
   useEffect(() => {
@@ -1179,7 +1425,16 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         setInputText(data.inputText ?? '');
         setRemoteSpeechError(data.speechError ?? null);
         setIsProcessing(data.isProcessing);
-        setSettings(prev => prev.autoSend !== data.autoSend ? { ...prev, autoSend: data.autoSend } : prev);
+        setSettings(prev => {
+          const needsAutoSend = prev.autoSend !== data.autoSend;
+          const needsModel = data.selectedModel && prev.selectedModel !== data.selectedModel;
+          if (!needsAutoSend && !needsModel) return prev;
+          return {
+            ...prev,
+            ...(needsAutoSend ? { autoSend: data.autoSend } : {}),
+            ...(needsModel ? { selectedModel: data.selectedModel } : {}),
+          };
+        });
       }
     };
     ipc.on('from-main', handler);
@@ -1328,15 +1583,27 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         case 'cmd-set-input':
           setInputText(data.text ?? '');
           break;
+        case 'cmd-set-model': {
+          // Popout picked a model — validate against main's gate, persist, and
+          // let the push effect echo selectedModel back to popout for confirmation.
+          const requested = data.model as 'gemini' | 'groq' | 'openai' | 'xai';
+          if (!requested || !gateRef.current.canUseModel(requested)) break;
+          setSettings(prev => prev.selectedModel === requested ? prev : { ...prev, selectedModel: requested });
+          localStorage.setItem("SELECTED_MODEL", requested);
+          break;
+        }
         case 'request-state':
+          // Read via refs so the first sync after popout opens reflects current
+          // state, not whatever was closed over when this handler was registered.
           electronIPC.send('relay-to-popout', {
             type: 'state-sync',
-            isListening: _rawIsListening,
-            isProcessing,
-            interimText,
-            inputText,
-            autoSend: settings.autoSend,
-            speechError: _rawSpeechError,
+            isListening: rawIsListeningRef.current,
+            isProcessing: isProcessingRef.current,
+            interimText: interimTextRef.current,
+            inputText: inputTextRef.current,
+            autoSend: settingsRef.current.autoSend,
+            speechError: rawSpeechErrorRef.current,
+            selectedModel: settingsRef.current.selectedModel,
           });
           break;
       }
@@ -1592,12 +1859,52 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   const isPopoutElectron = isElectron && isPopoutMode;
 
   return (
-    <div 
-      className={`h-[100dvh] flex flex-col font-sans overflow-hidden transition-colors duration-300 ${
+    <div
+      className={`h-[100dvh] flex font-sans overflow-hidden transition-colors duration-300 ${
         isPopoutElectron ? '' : settings.theme === 'dark' ? 'dark bg-[#09090b]' : 'bg-slate-50'
       }`}
       style={isPopoutElectron ? { background: 'transparent' } : undefined}
     >
+        {/* Conversation sidebar — main Electron window only (hidden in pop-out and PiP) */}
+        {!isPopoutElectron && !isPipMode && sidebarOpen && (
+          <ConversationSidebar db={db} onClose={() => setSidebarOpen(false)} />
+        )}
+
+        {/* Floating toggle when sidebar is closed (main window only) */}
+        {!isPopoutElectron && !isPipMode && !sidebarOpen && (
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="fixed top-3 left-3 z-40 w-9 h-9 rounded-lg bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-all backdrop-blur-sm"
+            title="Open conversations"
+          >
+            <Menu size={16} />
+          </button>
+        )}
+
+        <div className="flex-1 flex flex-col relative min-w-0">
+        {/* Restored-conversations toast (shown once after upgrade/first-login) */}
+        {!isPopoutElectron && db.restoredCount > 0 && (
+          <div className="fixed top-4 right-4 z-[9999] max-w-sm animate-in fade-in slide-in-from-top-2">
+            <div className="flex items-start gap-3 bg-emerald-500/10 border border-emerald-500/30 backdrop-blur-sm rounded-lg px-4 py-3 shadow-lg">
+              <div className="flex-1 text-sm">
+                <div className="font-semibold text-emerald-300">
+                  Restored {db.restoredCount} conversation{db.restoredCount === 1 ? '' : 's'}
+                </div>
+                <div className="text-xs text-emerald-200/80 mt-0.5">
+                  Your history from before this update is now linked to your account.
+                </div>
+              </div>
+              <button
+                onClick={db.dismissRestoredToast}
+                className="text-emerald-300/80 hover:text-emerald-100 text-lg leading-none"
+                aria-label="Dismiss"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* ── CONTENT AREA ── */}
         {isPopoutElectron ? (
             /* Electron pop-out: always show compact chat */
@@ -1648,6 +1955,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                 <ChatInterface {...sharedProps} />
             </PiPWindow>
         )}
+        </div>
 
       {/* --- MODALS --- */}
       
