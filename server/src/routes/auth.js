@@ -318,8 +318,13 @@ router.get('/google/start', (req, res) => {
   const { session_id } = req.query;
   if (!session_id) return res.status(400).send('Missing session_id');
 
+  // Both vars are required for the server-side redirect flow used by Electron —
+  // CLIENT_SECRET is consumed in /google/callback by oauth2Client.getToken(code).
   const googleClientId = process.env.GOOGLE_CLIENT_ID;
-  if (!googleClientId) return res.status(503).send('Google Sign-In not configured');
+  const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  if (!googleClientId || !googleClientSecret) {
+    return res.status(503).send('Google Sign-In not configured on server. Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET.');
+  }
 
   // Store pending session
   pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'pending' });
@@ -356,6 +361,14 @@ router.get('/google/callback', async (req, res) => {
     const { OAuth2Client } = require('google-auth-library');
     const googleClientId = process.env.GOOGLE_CLIENT_ID;
     const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    if (!googleClientId || !googleClientSecret) {
+      pendingGoogleSessions.set(session_id, {
+        created_at: Date.now(),
+        status: 'error',
+        error: 'Google Sign-In not configured on server (missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET)',
+      });
+      return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Sign-in not configured</h2><p style="color:#9ca3af">The server is missing Google OAuth credentials. Contact support.</p></div></body></html>');
+    }
     const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
     const redirectUri = `${serverUrl}/api/v1/auth/google/callback`;
 

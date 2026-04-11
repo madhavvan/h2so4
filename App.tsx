@@ -2049,17 +2049,23 @@ export default function App() {
     );
   }
 
-  // In browser (not Electron) — block access, force download
+  // Web: only intercept Stripe post-payment redirects so SubscriptionGate can revalidate
+  // the license against the server. Otherwise a tab refresh would log the user out.
   if (!isElectron && !isPopoutMode) {
-    return (
-      <SubscriptionGate
-        onAuthenticated={(u, l) => {
-          setUser(u);
-          setLicense(l);
-          setAuthenticated(true);
-        }}
-      />
-    );
+    const isPaymentRedirect =
+      typeof window !== 'undefined' &&
+      new URLSearchParams(window.location.search).get('payment') === 'success';
+    if (isPaymentRedirect) {
+      return (
+        <SubscriptionGate
+          onAuthenticated={(u, l) => {
+            setUser(u);
+            setLicense(l);
+            setAuthenticated(true);
+          }}
+        />
+      );
+    }
   }
 
   return <MainApp userProfile={user} userLicense={license} onLogout={handleLogout} />;

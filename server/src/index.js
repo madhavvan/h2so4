@@ -21,6 +21,10 @@ const conversationRoutes = require('./routes/conversations');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Behind Railway's reverse proxy — without this, req.protocol returns 'http'
+// and breaks the Google OAuth redirect URI match, and req.ip returns the proxy IP.
+app.set('trust proxy', 1);
+
 // ── Security ──
 app.use(helmet());
 app.use(cors({
