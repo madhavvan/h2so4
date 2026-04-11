@@ -651,6 +651,14 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         setPricing(pricingService.getPricing('US'));
       }
 
+      // Restore saved session so refresh stays on the download page instead of login.
+      const savedAuth = licenseService.loadAuth();
+      if (savedAuth.user && savedAuth.license && licenseService.isLicenseValid(savedAuth.license)) {
+        setCurrentUser(savedAuth.user);
+        setCurrentLicense(savedAuth.license);
+        setView('download');
+      }
+
       // Check for Stripe success redirect
       const urlParams = new URLSearchParams(window.location.search);
       if (urlParams.get('payment') === 'success') {
