@@ -14,6 +14,16 @@ function getDB() {
 
   const dbPath = process.env.DATABASE_PATH || path.join(__dirname, '..', 'data', 'minicaai.db');
 
+  if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_PATH) {
+    console.warn('━'.repeat(70));
+    console.warn('⚠  DATABASE_PATH is not set. SQLite will write to the container');
+    console.warn('   filesystem, which is EPHEMERAL on Railway. All users, licenses,');
+    console.warn('   and conversations will be LOST on every restart/redeploy.');
+    console.warn('   Fix: attach a Railway Volume and set DATABASE_PATH=/data/minicaai.db');
+    console.warn('━'.repeat(70));
+  }
+  console.log(`[db] Using SQLite at: ${dbPath}`);
+
   // Ensure data directory exists
   const fs = require('fs');
   const dataDir = path.dirname(dbPath);
