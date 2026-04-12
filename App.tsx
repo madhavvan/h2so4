@@ -5,7 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { generateGemini, generateOpenAI, generateXAI, generateGroq } from './services/aiProxyService';
+import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq } from './services/aiProxyService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
 import { useDatabase, SessionSummary } from './hooks/useDatabase';
@@ -139,9 +139,10 @@ const Modal = ({ isOpen, onClose, title, children }: any) => {
 };
 
 // Extracted for re-use between Main Window and PiP Window
-const ChatInterface = ({ 
-    messages, 
-    settings, 
+const ChatInterface = ({
+    messages,
+    streamingMsg,
+    settings,
     setSettings, // Added to allow model switching from main UI
     isListening, 
     isProcessing, 
@@ -329,7 +330,19 @@ const ChatInterface = ({
                         </div>
                     ))}
 
-                    {isProcessing && (
+                    {streamingMsg && (
+                        <div key={streamingMsg.id} className="msg ai streaming">
+                            <span className="msg-name">minicaai</span>
+                            <div className="bubble">
+                                {streamingMsg.content
+                                    ? <MessageRenderer content={streamingMsg.content} fontSize={settings.fontSize} />
+                                    : <span className="typing-bubble"><span className="typing-dot"></span><span className="typing-dot"></span><span className="typing-dot"></span></span>}
+                                <span className="stream-caret" aria-hidden="true" />
+                            </div>
+                        </div>
+                    )}
+
+                    {isProcessing && !streamingMsg && (
                         <div className="msg ai" id="typing">
                             <span className="msg-name">minicaai</span>
                             <div className="bubble typing-bubble">
@@ -507,8 +520,8 @@ const ChatInterface = ({
                     {messages.map((msg: Message) => (
                     <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-in slide-in-from-bottom-2 duration-300`}>
                         <div className={`max-w-[95%] md:max-w-[85%] rounded-2xl p-3 md:p-5 shadow-lg ${
-                        msg.role === 'user' 
-                            ? 'bg-transparent text-text border border-white/20 rounded-tr-sm' 
+                        msg.role === 'user'
+                            ? 'bg-transparent text-text border border-white/20 rounded-tr-sm'
                             : msg.role === 'system'
                             ? 'bg-transparent border border-red-500/50 text-red-500'
                             : 'bg-transparent border border-white/15 text-text rounded-tl-sm'
@@ -523,7 +536,32 @@ const ChatInterface = ({
                     </div>
                     ))}
 
-                    {isProcessing && (
+                    {streamingMsg && (
+                    <div key={streamingMsg.id} className="flex justify-start animate-in slide-in-from-bottom-2 duration-300">
+                        <div className="max-w-[95%] md:max-w-[85%] rounded-2xl p-3 md:p-5 shadow-lg bg-transparent border border-white/15 text-text rounded-tl-sm">
+                            <div className="text-[10px] font-bold mb-2 opacity-60 uppercase tracking-wider flex items-center gap-1">
+                                <Zap size={10} /> Answer
+                            </div>
+                            {streamingMsg.content ? (
+                                <>
+                                    <MessageRenderer content={streamingMsg.content} fontSize={settings.fontSize} />
+                                    <span className="stream-caret" aria-hidden="true" />
+                                </>
+                            ) : (
+                                <div className="flex gap-1 items-center text-xs text-gray-500">
+                                    <span className="font-semibold text-primary tracking-wider">THINKING ({settings.selectedModel.toUpperCase()})</span>
+                                    <div className="flex gap-1">
+                                        <div className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0ms'}}></div>
+                                        <div className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '150ms'}}></div>
+                                        <div className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '300ms'}}></div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                    )}
+
+                    {isProcessing && !streamingMsg && (
                     <div className="flex justify-start">
                         <div className="bg-transparent border border-white/15 rounded-2xl px-4 py-3 rounded-tl-sm flex items-center gap-2 text-gray-500 text-xs shadow-lg">
                             <span className="font-semibold text-primary tracking-wider">THINKING ({settings.selectedModel.toUpperCase()})</span>
@@ -1071,6 +1109,23 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   const [interimText, setInterimText] = useState("");
   
   const [isProcessing, setIsProcessing] = useState(false);
+  // Transient message shown while the current AI response streams in.
+  // It's rendered after the committed `messages` list and cleared the
+  // moment the full text lands in the DB, so we never double-show it.
+  const [streamingMsg, setStreamingMsg] = useState<Message | null>(null);
+  // Controller for the in-flight AI stream. We abort it whenever a new
+  // stream starts, the session is cleared/switched, or the component
+  // unmounts — so a stale `onToken` from a dead request can never
+  // land on the new session's state, and the server-side `req.on(
+  // 'close')` stops paying for tokens no one will ever see.
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const cancelActiveStream = useCallback(() => {
+    const ctrl = streamAbortRef.current;
+    if (ctrl) {
+      streamAbortRef.current = null;
+      try { ctrl.abort(); } catch {}
+    }
+  }, []);
   const streamRef = useRef<MediaStream | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showContext, setShowContext] = useState(false);
@@ -1185,7 +1240,15 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
   // API keys are now managed server-side — no client init needed
 
-  // Handle Auto-Scrolling
+  // Handle Auto-Scrolling.
+  //
+  // This tracks `streamingMsg?.content` as well so the view keeps up
+  // with tokens as they arrive — BUT only when `shouldAutoScroll` is
+  // true. `handleScroll` below flips that flag off the moment the user
+  // drags more than 50px away from the bottom, so scrolling up during
+  // a stream is never fought: the stream just keeps growing below and
+  // the viewport stays wherever the user parked it. Walking back near
+  // the bottom re-arms auto-follow.
   useEffect(() => {
     if (shouldAutoScroll && chatContainerRef.current) {
       chatContainerRef.current.scrollTo({
@@ -1193,14 +1256,31 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           behavior: 'smooth'
       });
     }
-  }, [messages, interimText, shouldAutoScroll]);
+  }, [messages, interimText, shouldAutoScroll, streamingMsg?.content]);
 
-  // Pop-out: re-enable auto-scroll when new messages arrive (since executeSend doesn't run here)
+  // Pop-out: when a new message commits from cross-window sync, only
+  // re-arm auto-follow if the user was already near the bottom. If
+  // they scrolled up mid-stream to re-read earlier messages, respect
+  // that — don't yank them back when the final token lands.
   useEffect(() => {
-    if (isPopoutMode && messages.length > 0) {
-      setShouldAutoScroll(true);
-    }
+    if (!isPopoutMode || messages.length === 0) return;
+    const el = chatContainerRef.current;
+    if (!el) return;
+    const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+    if (isNearBottom) setShouldAutoScroll(true);
   }, [messages.length]);
+
+  // If the user switches or creates a session while a stream is in
+  // flight, the old stream belongs to the previous conversation —
+  // abort it so its final token doesn't commit onto the new session.
+  useEffect(() => {
+    cancelActiveStream();
+    setStreamingMsg(null);
+  }, [db.sessionId, cancelActiveStream]);
+
+  // Abort any in-flight stream on unmount so background fetches
+  // don't keep paying for tokens after the window closes.
+  useEffect(() => () => { cancelActiveStream(); }, [cancelActiveStream]);
 
   const handleScroll = () => {
       if (!chatContainerRef.current) return;
@@ -1247,6 +1327,17 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       setInputText("");
       setShouldAutoScroll(true);
 
+      // Kill any previous in-flight stream before starting this one.
+      // Two back-to-back sends must never both be running against
+      // the same `streamingMsg` — the late one would win and the
+      // earlier one would commit a truncated answer to the DB.
+      cancelActiveStream();
+      const abort = new AbortController();
+      streamAbortRef.current = abort;
+
+      const pendingId = (Date.now() + 1).toString();
+      const inPopout = isElectron && isPopoutMode;
+
       try {
         const currentSettings = settingsRef.current;
         let contextFiles = contextFilesRef.current;
@@ -1264,14 +1355,38 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         }
         let responseText = "";
 
-        // Route request through server proxy based on selected model
-        const generators: Record<string, Function> = { groq: generateGroq, openai: generateOpenAI, xai: generateXAI, gemini: generateGemini };
-        const gen = generators[currentSettings.selectedModel] || generateGemini;
-        responseText = await gen(userMsg.content, messagesRef.current, contextFiles, currentSettings.generalMode);
-        
+        // Route request through the streaming proxy based on selected model.
+        // Every token arriving from the server is appended to `streamingMsg`
+        // AND relayed to the popout so BOTH windows render character-by-
+        // character instead of the popout seeing one final pop.
+        const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini };
+        const gen = streamers[currentSettings.selectedModel] || streamGemini;
+        setStreamingMsg({ id: pendingId, role: 'model', content: '', timestamp: Date.now() });
+        if (!inPopout) {
+          electronIPC.send('relay-to-popout', { type: 'stream-start', id: pendingId });
+        }
+        responseText = await gen(
+          userMsg.content,
+          messagesRef.current,
+          contextFiles,
+          currentSettings.generalMode,
+          (_chunk: string, full: string) => {
+            // Guard against a late callback from an already-aborted
+            // stream — without this check, a cancelled run could stomp
+            // the new stream's state a frame or two after abort().
+            if (streamAbortRef.current !== abort) return;
+            setStreamingMsg(prev => prev && prev.id === pendingId ? { ...prev, content: full } : prev);
+            if (!inPopout) {
+              electronIPC.send('relay-to-popout', { type: 'stream-chunk', id: pendingId, full });
+            }
+          },
+          abort.signal
+        );
+        // Commit the final text to the DB/state once — the transient
+        // streaming bubble is cleared in the same tick to avoid a flash.
         if (responseText !== "Listening...") {
             const aiMsg: Message = {
-              id: (Date.now() + 1).toString(),
+              id: pendingId,
               role: 'model',
               content: responseText,
               timestamp: Date.now()
@@ -1282,8 +1397,22 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
               setMessages(prev => [...prev, aiMsg]);
             }
         }
-      } catch (err) {
+        setStreamingMsg(null);
+        if (!inPopout) {
+          electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
+        }
+      } catch (err: any) {
+        // Swallow aborts: they're user-initiated cancellations, not
+        // real failures. The new executeSend call has already seeded
+        // its own streamingMsg, so we must NOT clobber it here.
+        if (err?.name === 'AbortError' || streamAbortRef.current !== abort) {
+          return;
+        }
         console.error(err);
+        setStreamingMsg(null);
+        if (!inPopout) {
+          electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
+        }
         const errorMsg: Message = {
           id: Date.now().toString(),
           role: 'system',
@@ -1296,9 +1425,15 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           setMessages(prev => [...prev, errorMsg]);
         }
       } finally {
-        setIsProcessing(false);
+        // Only the owner of the current controller should flip
+        // isProcessing/ref back off. A cancelled run losing the race
+        // to a newer one must NOT reset state the newer run set.
+        if (streamAbortRef.current === abort) {
+          streamAbortRef.current = null;
+          setIsProcessing(false);
+        }
       }
-  }, []); 
+  }, [cancelActiveStream]);
 
   // --- Speech Handling ---
   const handleSpeechResult = useCallback(({ final, interim }: { final: string, interim: string }) => {
@@ -1435,6 +1570,20 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
             ...(needsModel ? { selectedModel: data.selectedModel } : {}),
           };
         });
+      } else if (data?.type === 'stream-start') {
+        // Main is about to begin a stream. Mint a transient bubble
+        // here too so the popout renders tokens as they arrive.
+        setStreamingMsg({ id: data.id, role: 'model', content: '', timestamp: Date.now() });
+      } else if (data?.type === 'stream-chunk') {
+        // Ignore chunks whose id doesn't match our current stream —
+        // guards against out-of-order frames from a cancelled run.
+        setStreamingMsg(prev => prev && prev.id === data.id ? { ...prev, content: data.full } : prev);
+      } else if (data?.type === 'stream-end') {
+        // Final text is already landing via `db:messages-updated`,
+        // so we just clear the transient bubble. If `db.addMessage`
+        // arrives a tick later, React batches the two into one
+        // paint and the user sees no flash.
+        setStreamingMsg(prev => prev && prev.id === data.id ? null : prev);
       }
     };
     ipc.on('from-main', handler);
@@ -1654,27 +1803,67 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
     if (!lastUserMsg) return;
 
+    cancelActiveStream();
+    const abort = new AbortController();
+    streamAbortRef.current = abort;
+
     setIsProcessing(true);
+    const pendingId = Date.now().toString();
+    const inPopout = isElectron && isPopoutMode;
+
     try {
         const historyForService = messages.filter(m => m.id !== lastUserMsg.id && m.role !== 'system');
         const currentSettings = settingsRef.current;
         const contextFiles = contextFilesRef.current;
         let responseText = "";
 
-        const generators: Record<string, Function> = { groq: generateGroq, openai: generateOpenAI, xai: generateXAI, gemini: generateGemini };
-        const gen = generators[currentSettings.selectedModel] || generateGemini;
-        responseText = await gen(lastUserMsg.content, historyForService, contextFiles, currentSettings.generalMode);
+        const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini };
+        const gen = streamers[currentSettings.selectedModel] || streamGemini;
+        setStreamingMsg({ id: pendingId, role: 'model', content: '', timestamp: Date.now() });
+        if (!inPopout) {
+          electronIPC.send('relay-to-popout', { type: 'stream-start', id: pendingId });
+        }
+        responseText = await gen(
+          lastUserMsg.content,
+          historyForService,
+          contextFiles,
+          currentSettings.generalMode,
+          (_chunk: string, full: string) => {
+            if (streamAbortRef.current !== abort) return;
+            setStreamingMsg(prev => prev && prev.id === pendingId ? { ...prev, content: full } : prev);
+            if (!inPopout) {
+              electronIPC.send('relay-to-popout', { type: 'stream-chunk', id: pendingId, full });
+            }
+          },
+          abort.signal
+        );
 
         if (responseText !== "Listening...") {
             const aiMsg: Message = {
-                id: Date.now().toString(),
+                id: pendingId,
                 role: 'model',
                 content: responseText,
                 timestamp: Date.now()
             };
-            setMessages(prev => [...prev, aiMsg]);
+            if (db.isElectron) { db.addMessage(aiMsg); } else { setMessages(prev => [...prev, aiMsg]); }
         }
-    } catch (err) { console.error(err); } finally { setIsProcessing(false); }
+        setStreamingMsg(null);
+        if (!inPopout) {
+          electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
+        }
+    } catch (err: any) {
+        if (err?.name === 'AbortError' || streamAbortRef.current !== abort) return;
+        console.error(err);
+        setStreamingMsg(null);
+        if (!inPopout) {
+          electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
+        }
+    } finally {
+        if (streamAbortRef.current === abort) {
+          streamAbortRef.current = null;
+          setIsProcessing(false);
+        }
+    }
   };
 
   const triggerFileUpload = () => {
@@ -1818,7 +2007,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // --- RENDER HELPERS ---
 
   const sharedProps = {
-    messages, settings, setSettings, isListening, isProcessing, inputText, setInputText, interimText,
+    messages, streamingMsg, settings, setSettings, isListening, isProcessing, inputText, setInputText, interimText,
     speechError, toggleAutoSend, startListening, stopListening, handleManualSend, handleAutoSolve,
     handleClear, handleRegenerate, chatContainerRef, textareaRef, handleScroll,
     onOpenSettings: () => setShowSettings(true),

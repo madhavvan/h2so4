@@ -34,6 +34,17 @@
         --surface-color: #ffffff; /* White */
         --border-color: #e2e8f0; /* Slate 200 */
         --text-color: #0f172a; /* Slate 900 */
+
+        /* ── iOS motion tokens ──
+           These map to the feel of UIKit's standard spring curves.
+           Use these everywhere instead of hard-coded `ease-*` so the
+           whole app picks up the same cadence. */
+        --ease-ios:       cubic-bezier(0.32, 0.72, 0, 1);   /* iOS spring-ish */
+        --ease-ios-out:   cubic-bezier(0.16, 1,   0.3, 1);  /* snappy emphasis */
+        --ease-ios-in:    cubic-bezier(0.55, 0,   0.85, 0); /* press / dismiss */
+        --dur-ios-fast:   180ms;
+        --dur-ios:        260ms;
+        --dur-ios-slow:   420ms;
       }
 
       .dark {
@@ -44,25 +55,103 @@
         --text-color: #e4e4e7; /* Zinc 200 */
       }
 
-      /* Custom Scrollbar */
+      /* ── Typography: SF-family, -webkit-font-smoothing for iOS feel ── */
+      html, body, #root {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+                     "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-rendering: optimizeLegibility;
+        letter-spacing: -0.01em;
+      }
+
+      /* ── Smooth, rubber-band-ish scrolling for any scrollable area ── */
+      html {
+        scroll-behavior: smooth;
+      }
+      body,
+      #root,
+      .overflow-auto,
+      .overflow-y-auto,
+      [data-scrollable] {
+        overscroll-behavior: contain;
+        -webkit-overflow-scrolling: touch;
+      }
+
+      /* Custom Scrollbar — slim, iOS-feel, fades in on hover */
       ::-webkit-scrollbar {
         width: 8px;
         height: 8px;
       }
       ::-webkit-scrollbar-track {
-        background: var(--surface-color); 
+        background: transparent;
       }
       ::-webkit-scrollbar-thumb {
-        background: var(--border-color); 
-        border-radius: 4px;
+        background: color-mix(in oklab, var(--border-color) 70%, transparent);
+        border-radius: 999px;
+        transition: background var(--dur-ios) var(--ease-ios);
       }
       ::-webkit-scrollbar-thumb:hover {
-        background: #71717a; 
+        background: #71717a;
       }
+
       body {
         background-color: var(--bg-color);
         color: var(--text-color);
-        transition: background-color 0.3s, color 0.3s;
+        transition: background-color var(--dur-ios-slow) var(--ease-ios),
+                    color var(--dur-ios-slow) var(--ease-ios);
+      }
+
+      /* ── Press-down affordance on every interactive surface ──
+         Matches the iOS feel of tiles that "push" into the screen
+         when you tap them. Kept global so we don't need to touch
+         every button's className. */
+      button,
+      [role="button"],
+      .pip-textarea,
+      a {
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+        transition:
+          transform  var(--dur-ios-fast) var(--ease-ios),
+          opacity    var(--dur-ios-fast) var(--ease-ios),
+          background var(--dur-ios)      var(--ease-ios),
+          border-color var(--dur-ios)    var(--ease-ios),
+          box-shadow var(--dur-ios)      var(--ease-ios),
+          color      var(--dur-ios)      var(--ease-ios);
+      }
+      button:active,
+      [role="button"]:active {
+        transform: scale(0.965);
+      }
+
+      /* ── Streaming caret — blinks at the end of the last token ──
+         Pure CSS, no state. Rendered by the <span className="stream-caret" />
+         we added to the streaming bubble in App.tsx. */
+      .stream-caret {
+        display: inline-block;
+        width: 2px;
+        height: 1.05em;
+        margin-left: 2px;
+        vertical-align: -0.15em;
+        background: currentColor;
+        border-radius: 1px;
+        opacity: 0.85;
+        animation: stream-caret-blink 1.05s steps(2, start) infinite;
+      }
+      @keyframes stream-caret-blink {
+        to { visibility: hidden; }
+      }
+
+      /* ── iOS spring entrance for message bubbles ──
+         Gentle translate + scale that rides the UIKit curve.
+         Applied to the `animate-in` utility React already ships. */
+      @keyframes ios-bubble-in {
+        0%   { opacity: 0; transform: translateY(8px) scale(0.98); }
+        100% { opacity: 1; transform: translateY(0)   scale(1);    }
+      }
+      .animate-in {
+        animation: ios-bubble-in var(--dur-ios) var(--ease-ios-out) both;
       }
 
       /* Electron pop-out window transparency */
@@ -70,6 +159,16 @@
       html.electron-transparent body {
         background: transparent !important;
         background-color: transparent !important;
+      }
+
+      /* Respect reduced-motion preference — disables all iOS springs */
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+          scroll-behavior: auto !important;
+        }
       }
     </style>
 <link rel="stylesheet" href="/index.css">

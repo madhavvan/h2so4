@@ -30,6 +30,78 @@ async function proxyRequest(endpoint: string, body: any): Promise<string> {
   return data.text || '';
 }
 
+// ─────────────────────────────────────────────────────────────
+//  STREAMING TRANSPORT — consume the server's SSE endpoints
+//  Each chunk is `data: {"t":"piece"}\n\n`, terminated by
+//  `data: [DONE]\n\n`. Invoke `onToken` for every piece and
+//  resolve with the full concatenated text so callers can
+//  still persist / post-process once the stream completes.
+// ─────────────────────────────────────────────────────────────
+export type OnToken = (chunk: string, full: string) => void;
+
+async function proxyStream(
+  endpoint: string,
+  body: any,
+  onToken: OnToken,
+  signal?: AbortSignal,
+): Promise<string> {
+  const token = licenseService.getToken();
+  if (!token) throw new Error('Not authenticated');
+
+  const response = await fetch(`${API_BASE}/api/v1/ai${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok || !response.body) {
+    const err = await response.json().catch(() => ({ error: 'AI request failed' }));
+    throw new Error(err.error || 'AI request failed');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  let full = '';
+  let streamError: string | null = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // Split on SSE frame boundary (blank line). Keep the trailing
+    // partial frame in `buffer` so multi-byte / split chunks are safe.
+    let sep;
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      const line = frame.split('\n').find(l => l.startsWith('data:'));
+      if (!line) continue;
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') { buffer = ''; break; }
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed.error) { streamError = parsed.error; continue; }
+        if (parsed.t) {
+          full += parsed.t;
+          onToken(parsed.t, full);
+        }
+      } catch {
+        // Ignore malformed frame and keep reading — the next frame may be fine.
+      }
+    }
+  }
+
+  if (streamError) throw new Error(streamError);
+  return full;
+}
+
 // ── Shared prompt builders (extracted from individual services) ──
 
 function buildTextContext(contextFiles: ContextFile[]): string {
@@ -200,6 +272,112 @@ export async function generateGroq(
 
   const text = await proxyRequest('/chat/groq', { messages });
   return text.trim() === '...' ? 'Listening...' : text;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  STREAMING PUBLIC API — same arguments as the generate*
+//  functions, plus an `onToken` callback that is called for
+//  every incoming chunk. The resolved promise is the final
+//  full text so callers can persist it to the DB as one row.
+// ─────────────────────────────────────────────────────────────
+
+export async function streamGemini(
+  query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
+  onToken: OnToken, signal?: AbortSignal
+): Promise<string> {
+  const textContext = buildTextContext(contextFiles);
+  const systemInstruction = buildGeminiSystemInstruction(textContext, generalMode);
+
+  const chatHistoryText = history
+    .filter(m => m.role !== 'system')
+    .map(m => `${m.role === 'user' ? 'Interviewer (Transcript)' : 'Candidate (You)'}: ${m.content}`)
+    .join('\n');
+
+  const prompt = `${chatHistoryText}\n\nInterviewer (Current Audio): ${query}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."`;
+
+  const fileParts = contextFiles
+    .filter(f => f.base64 && f.mimeType)
+    .map(f => ({ mimeType: f.mimeType!, data: f.base64! }));
+
+  const full = await proxyStream('/stream/gemini', { prompt, systemInstruction, fileParts }, onToken, signal);
+  return full.trim() === '...' ? 'Listening...' : full;
+}
+
+export async function streamOpenAI(
+  query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
+  onToken: OnToken, signal?: AbortSignal
+): Promise<string> {
+  const textContext = buildTextContext(contextFiles);
+  const systemInstruction = buildOpenAISystemInstruction(textContext, generalMode);
+
+  const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
+
+  const messages: any[] = [{ role: 'system', content: systemInstruction }];
+  history.forEach(m => {
+    if (m.role !== 'system') {
+      messages.push({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content });
+    }
+  });
+
+  const contentParts: any[] = [{ type: 'text', text: generalMode ? query : `${query}\n\n[Remember: draw from the Knowledge Base where relevant.]` }];
+  imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
+  messages.push({ role: 'user', content: contentParts });
+
+  const full = await proxyStream('/stream/openai', { messages }, onToken, signal);
+  return (full.trim() === '...' || full.trim().toLowerCase() === 'listening...') ? 'Listening...' : full;
+}
+
+export async function streamXAI(
+  query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
+  onToken: OnToken, signal?: AbortSignal
+): Promise<string> {
+  const textContext = buildTextContext(contextFiles);
+  const systemInstruction = buildGeminiSystemInstruction(textContext, generalMode);
+
+  const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
+
+  const messages: any[] = [{ role: 'system', content: systemInstruction }];
+  history.forEach(m => {
+    if (m.role !== 'system') {
+      messages.push({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content });
+    }
+  });
+
+  const promptText = `Interviewer (Current Audio): ${query}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."`;
+  const contentParts: any[] = [{ type: 'text', text: promptText }];
+  imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
+  messages.push({ role: 'user', content: contentParts });
+
+  const full = await proxyStream('/stream/xai', { messages }, onToken, signal);
+  return (full.trim() === '...' || full.trim().toLowerCase() === 'listening...') ? 'Listening...' : full;
+}
+
+export async function streamGroq(
+  query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
+  onToken: OnToken, signal?: AbortSignal
+): Promise<string> {
+  const textContext = buildTextContext(contextFiles);
+  const systemInstruction = buildGeminiSystemInstruction(textContext, generalMode);
+
+  const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
+
+  const chatHistoryText = history
+    .filter(m => m.role !== 'system')
+    .map(m => `${m.role === 'user' ? 'Interviewer (Transcript)' : 'Candidate (You)'}: ${m.content}`)
+    .join('\n');
+
+  const promptText = `${chatHistoryText}\n\nInterviewer (Current Audio): ${query}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."`;
+
+  const contentParts: any[] = [{ type: 'text', text: promptText }];
+  imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
+
+  const messages: any[] = [
+    { role: 'system', content: systemInstruction },
+    { role: 'user', content: contentParts },
+  ];
+
+  const full = await proxyStream('/stream/groq', { messages }, onToken, signal);
+  return full.trim() === '...' ? 'Listening...' : full;
 }
 
 export async function getDeepgramKey(): Promise<string> {
