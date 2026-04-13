@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Allow unsigned code (Electron's native modules) -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Allow loading Electron's dylibs -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <!-- Allow dyld environment variables for native modules like better-sqlite3 -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+
+    <!-- Disable library validation so native .node addons load correctly -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Audio input (microphone / system audio capture) -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- Screen recording (screen capture for Auto-Solve) -->
+    <key>com.apple.security.device.screen-capture</key>
+    <true/>
+
+    <!-- Network access (API calls to Railway server, Deepgram WebSocket) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+</dict>
+</plist>

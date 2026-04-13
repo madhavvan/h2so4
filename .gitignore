@@ -29,7 +29,8 @@ server/data/
 # ── Electron build artifacts ──
 out/
 release/
-build/
+build/*
+!build/entitlements.mac.plist
 *.exe
 *.dmg
 *.AppImage
