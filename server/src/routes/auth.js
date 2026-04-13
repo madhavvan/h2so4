@@ -538,9 +538,15 @@ router.post('/forgot-password', async (req, res) => {
       const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
       const resetUrl = `${serverUrl}/api/v1/auth/reset-password?token=${rawToken}`;
       const { subject, html, text } = renderPasswordResetEmail({ name: user.name, resetUrl });
-      sendMail({ to: user.email, subject, html, text }).catch((err) => {
-        console.error('[forgot-password] sendMail failed:', err && err.message);
-      });
+      const result = await sendMail({ to: user.email, subject, html, text });
+      console.log('[forgot-password] sendMail result:', JSON.stringify(result));
+      if (!result.ok) {
+        console.error('[forgot-password] email NOT sent:', result.reason, result.error || '');
+      }
+    } else if (user && !user.password_hash) {
+      console.log('[forgot-password] user exists but has no password (Google-only account):', email);
+    } else {
+      console.log('[forgot-password] no account found for:', email);
     }
 
     res.json({

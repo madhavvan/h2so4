@@ -16,7 +16,10 @@ function getTransporter() {
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
 
+  console.log(`[email] SMTP config — host=${host || '(not set)'}, port=${port}, user=${user || '(not set)'}, pass=${pass ? '****' : '(not set)'}`);
+
   if (!host || !user || !pass) {
+    console.error('[email] SMTP not configured — missing:', [!host && 'SMTP_HOST', !user && 'SMTP_USER', !pass && 'SMTP_PASS'].filter(Boolean).join(', '));
     transporterPromise = Promise.resolve(null);
     return transporterPromise;
   }
@@ -28,6 +31,12 @@ function getTransporter() {
       port,
       secure: port === 465,
       auth: { user, pass },
+    });
+    // Verify the connection on startup
+    transporter.verify().then(() => {
+      console.log('[email] SMTP connection verified — ready to send');
+    }).catch((err) => {
+      console.error('[email] SMTP connection FAILED:', err.message);
     });
     transporterPromise = Promise.resolve(transporter);
   } catch (err) {
