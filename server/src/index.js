@@ -91,6 +91,38 @@ app.use(async (req, res, next) => {
   }
 });
 
+// ── Version Check Middleware ──
+// Detects old app versions and can force updates
+// Client sends version via X-App-Version header OR app_version in body
+const MIN_SUPPORTED_VERSION = '2.3.0'; // Versions below this get a warning
+const FORCE_UPDATE_VERSION = '1.0.0';  // Versions below this are BLOCKED (set low initially)
+
+app.use((req, res, next) => {
+  // Check header first, then body (old apps send in body during login/signup)
+  const clientVersion = req.headers['x-app-version'] || req.body?.app_version;
+
+  // Skip if no version info
+  if (!clientVersion) return next();
+
+  // Check if version is too old and must be blocked
+  if (compareVersions(clientVersion, FORCE_UPDATE_VERSION) < 0) {
+    return res.status(426).json({
+      error: 'App update required',
+      message: 'Your app version is no longer supported. Please download the latest version from our website.',
+      updateRequired: true,
+      latestVersion: LATEST_APP_VERSION.version,
+      downloadUrl: LATEST_APP_VERSION.downloadUrl,
+    });
+  }
+
+  // Add update hint to response for slightly old versions
+  if (compareVersions(clientVersion, MIN_SUPPORTED_VERSION) < 0) {
+    res.setHeader('X-Update-Available', LATEST_APP_VERSION.version);
+  }
+
+  next();
+});
+
 // ── Routes ──
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/payments', paymentRoutes);
