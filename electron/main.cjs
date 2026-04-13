@@ -517,21 +517,79 @@ app.whenReady().then(() => {
   createMainWindow();
   createTray();
 
-  // Auto-update: check GitHub Releases for a newer build. Skipped in dev
-  // (unpackaged) and guarded so a missing module or network failure can
-  // never keep the app from starting. The user is notified natively when
-  // an update has been downloaded and will be installed on next quit.
+  // ── Auto-Update System ──
+  // Checks GitHub Releases for a newer build. Skipped in dev.
+  // Sends status to all renderer windows so the UI can show
+  // "Update available" / "Downloading" / "Restart to update" in Settings.
   if (!isDev) {
     try {
       const { autoUpdater } = require('electron-updater');
       autoUpdater.autoDownload = true;
-      autoUpdater.on('error', (err) => console.error('[updater] error:', err && err.message));
-      autoUpdater.on('update-available', (info) => console.log('[updater] update available:', info && info.version));
-      autoUpdater.on('update-not-available', () => console.log('[updater] up to date'));
-      autoUpdater.on('update-downloaded', (info) => console.log('[updater] downloaded:', info && info.version));
+      autoUpdater.autoInstallOnAppQuit = true;
+
+      // Broadcast update status to all open windows
+      function sendUpdateStatus(status, info) {
+        const payload = { status, ...info };
+        BrowserWindow.getAllWindows().forEach(win => {
+          if (!win.isDestroyed()) win.webContents.send('update-status', payload);
+        });
+      }
+
+      autoUpdater.on('checking-for-update', () => {
+        console.log('[updater] checking...');
+        sendUpdateStatus('checking', {});
+      });
+
+      autoUpdater.on('update-available', (info) => {
+        console.log('[updater] update available:', info && info.version);
+        sendUpdateStatus('available', { version: info.version, releaseNotes: info.releaseNotes });
+      });
+
+      autoUpdater.on('update-not-available', () => {
+        console.log('[updater] up to date');
+        sendUpdateStatus('up-to-date', {});
+      });
+
+      autoUpdater.on('download-progress', (progress) => {
+        sendUpdateStatus('downloading', {
+          percent: Math.round(progress.percent),
+          transferred: progress.transferred,
+          total: progress.total,
+        });
+      });
+
+      autoUpdater.on('update-downloaded', (info) => {
+        console.log('[updater] downloaded:', info && info.version);
+        sendUpdateStatus('ready', { version: info.version });
+      });
+
+      autoUpdater.on('error', (err) => {
+        console.error('[updater] error:', err && err.message);
+        sendUpdateStatus('error', { message: err && err.message });
+      });
+
+      // User clicks "Restart & Update" in the UI
+      ipcMain.on('install-update', () => {
+        autoUpdater.quitAndInstall(false, true);
+      });
+
+      // User clicks "Check for Updates" in Settings
+      ipcMain.on('check-for-updates', () => {
+        autoUpdater.checkForUpdatesAndNotify().catch((e) => {
+          console.error('[updater] manual check failed:', e && e.message);
+        });
+      });
+
+      // Auto-check 3 seconds after launch, then every 30 minutes
       setTimeout(() => {
-        autoUpdater.checkForUpdatesAndNotify().catch((e) => console.error('[updater] check failed:', e && e.message));
+        autoUpdater.checkForUpdatesAndNotify().catch((e) => {
+          console.error('[updater] check failed:', e && e.message);
+        });
       }, 3000);
+
+      setInterval(() => {
+        autoUpdater.checkForUpdatesAndNotify().catch(() => {});
+      }, 30 * 60 * 1000);
     } catch (err) {
       console.error('[updater] unavailable:', err && err.message);
     }

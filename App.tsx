@@ -499,7 +499,7 @@ const ChatInterface = ({
                 <div 
                     ref={chatContainerRef} 
                     onScroll={handleScroll}
-                    className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 md:space-y-6 pb-40 md:pb-48 scroll-smooth custom-scrollbar"
+                    className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 md:space-y-6 pb-40 md:pb-48 custom-scrollbar"
                 >
                     {messages.length === 0 && (
                         <div className="flex flex-col items-center justify-center h-[60%] text-gray-400 space-y-6 opacity-60 mt-10">
@@ -1134,7 +1134,28 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   
   // Local state for Quick Paste in Context Modal
   const [pasteContent, setPasteContent] = useState("");
-  
+
+  // ── Auto-Update State (Electron only) ──
+  const [updateStatus, setUpdateStatus] = useState<{
+    status: 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'up-to-date' | 'error';
+    version?: string;
+    percent?: number;
+    message?: string;
+  }>({ status: 'idle' });
+
+  useEffect(() => {
+    if (!isElectron) return;
+    try {
+      const ipc = (window as any).require?.('electron')?.ipcRenderer;
+      if (!ipc) return;
+      const handler = (_e: any, data: any) => {
+        setUpdateStatus(data);
+      };
+      ipc.on('update-status', handler);
+      return () => ipc.removeListener('update-status', handler);
+    } catch {}
+  }, []);
+
   // PiP State — auto-enter if this is the Electron pop-out window
   const [isPipMode, setIsPipMode] = useState(isPopoutMode);
 
@@ -1223,6 +1244,8 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
   // Scroll State
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
+  const shouldAutoScrollRef = useRef(true);
+  const scrollRAFRef = useRef<number | null>(null);
 
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1242,21 +1265,47 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
   // Handle Auto-Scrolling.
   //
-  // This tracks `streamingMsg?.content` as well so the view keeps up
-  // with tokens as they arrive — BUT only when `shouldAutoScroll` is
-  // true. `handleScroll` below flips that flag off the moment the user
-  // drags more than 50px away from the bottom, so scrolling up during
-  // a stream is never fought: the stream just keeps growing below and
-  // the viewport stays wherever the user parked it. Walking back near
-  // the bottom re-arms auto-follow.
+  // During streaming: set scrollTop directly (instant), throttled to
+  // one update per animation frame so rapid tokens don't stack up
+  // smooth-scroll animations and cause stutter.
+  //
+  // Outside streaming (new message, interim text): use smooth scroll
+  // for a polished feel on discrete events.
+  //
+  // Uses `shouldAutoScrollRef` (a ref) instead of the state value
+  // inside the effect body so the check is always up-to-date — no
+  // race between the scroll handler flipping the flag and the next
+  // token triggering this effect.
   useEffect(() => {
-    if (shouldAutoScroll && chatContainerRef.current) {
+    if (!shouldAutoScrollRef.current || !chatContainerRef.current) return;
+
+    if (streamingMsg) {
+      // Streaming: instant scroll, at most once per frame
+      if (scrollRAFRef.current) return;
+      scrollRAFRef.current = requestAnimationFrame(() => {
+        scrollRAFRef.current = null;
+        if (shouldAutoScrollRef.current && chatContainerRef.current) {
+          chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+        }
+      });
+    } else {
+      // Discrete event (new message, interim text): smooth scroll
       chatContainerRef.current.scrollTo({
-          top: chatContainerRef.current.scrollHeight,
-          behavior: 'smooth'
+        top: chatContainerRef.current.scrollHeight,
+        behavior: 'smooth'
       });
     }
   }, [messages, interimText, shouldAutoScroll, streamingMsg?.content]);
+
+  // Clean up any pending animation frame on unmount
+  useEffect(() => {
+    return () => {
+      if (scrollRAFRef.current) {
+        cancelAnimationFrame(scrollRAFRef.current);
+        scrollRAFRef.current = null;
+      }
+    };
+  }, []);
 
   // Pop-out: when a new message commits from cross-window sync, only
   // re-arm auto-follow if the user was already near the bottom. If
@@ -1267,7 +1316,10 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     const el = chatContainerRef.current;
     if (!el) return;
     const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
-    if (isNearBottom) setShouldAutoScroll(true);
+    if (isNearBottom) {
+      shouldAutoScrollRef.current = true;
+      setShouldAutoScroll(true);
+    }
   }, [messages.length]);
 
   // If the user switches or creates a session while a stream is in
@@ -1286,6 +1338,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       if (!chatContainerRef.current) return;
       const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
       const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
+      shouldAutoScrollRef.current = isAtBottom;
       setShouldAutoScroll(isAtBottom);
   };
 
@@ -1325,6 +1378,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       setIsProcessing(true);
       setInterimText("");
       setInputText("");
+      shouldAutoScrollRef.current = true;
       setShouldAutoScroll(true);
 
       // Kill any previous in-flight stream before starting this one.
@@ -1443,40 +1497,6 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         silenceTimerRef.current = null;
     }
     if (final) {
-        // --- NOISE GATE / FILLER FILTER ---
-        // 1. Clean punctuation for matching
-        const raw = final.trim().toLowerCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g,"");
-        
-        // 2. Extended Filler Dictionary
-        const IGNORED_PHRASES = new Set([
-            "ok", "okay", "k", "kk", "alright", "right", "sure", "yeah", "yep", "yup", "yes",
-            "cool", "nice", "great", "awesome", "perfect", "fine", "good",
-            "hmm", "hm", "mm", "mmm", "uh", "um", "huh", "ah", "er", "oh",
-            "got it", "i see", "makes sense", "understood", "no problem", "no worries",
-            "thank you", "thanks", "thanks a lot",
-            "hello", "hi", "hey", "guys", "everyone",
-            "bye", "goodbye", "see ya",
-            "so", "and", "but", "or", "actually", "basically", "literally",
-            "wait", "hold on", "one sec", "one second",
-            "what", "really", "wow", "oh wow",
-            "ok cool", "okay cool", "sounds good", "sounds great", "fair enough",
-            "ok bye", "okay bye", "all good"
-        ]);
-
-        // 3. Regex for repeated characters (e.g. "hmmm", "ooookay", "umm")
-        // Catches h+m+, u+m+, u+h+, o+k+, a+h+, e+r+
-        const isRepeatedFiller = /^(h+m+|u+m+|u+h+|o+k+|a+h+|e+r+)$/.test(raw);
-
-        // 4. Logic: Ignore if exact match, repeated filler pattern, or very short noise (<2 chars)
-        const isIgnored = IGNORED_PHRASES.has(raw) || isRepeatedFiller || raw.length < 2;
-
-        if (isIgnored) {
-            console.log("Ignored filler/noise:", final);
-            setInterimText(""); 
-            return; // EXIT: Do not add to input text, do not send to AI.
-        }
-        // ----------------------------------
-
         setInputText(prev => {
             const separator = prev.length > 0 && !prev.endsWith(' ') ? " " : "";
             return prev + separator + final;
@@ -2094,6 +2114,29 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           </div>
         )}
 
+        {/* ── Update ready banner ── */}
+        {!isPopoutElectron && isElectron && updateStatus.status === 'ready' && (
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[9999] animate-in fade-in slide-in-from-top-2">
+            <div className="flex items-center gap-3 bg-blue-500/10 border border-blue-500/30 backdrop-blur-sm rounded-lg px-4 py-2.5 shadow-lg">
+              <Download size={14} className="text-blue-400 shrink-0" />
+              <span className="text-sm text-blue-300">v{updateStatus.version} is ready</span>
+              <button
+                onClick={() => electronIPC.send('install-update')}
+                className="px-3 py-1 rounded-md text-xs font-bold bg-blue-500 text-white hover:bg-blue-600 transition-colors"
+              >
+                Restart & Update
+              </button>
+              <button
+                onClick={() => setUpdateStatus({ status: 'idle' })}
+                className="text-blue-300/60 hover:text-blue-100 text-lg leading-none ml-1"
+                aria-label="Dismiss"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* ── CONTENT AREA ── */}
         {isPopoutElectron ? (
             /* Electron pop-out: always show compact chat */
@@ -2297,6 +2340,56 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                     </div>
                 </div>
             </div>
+
+            {/* ── App Updates (Electron only) ── */}
+            {isElectron && (
+              <div className="border-t border-border pt-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <span className="text-sm font-medium text-text">App Updates</span>
+                    <p className="text-xs text-gray-500 mt-0.5">v{(window as any).require?.('electron')?.remote?.app?.getVersion?.() || '2.2.0'}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {updateStatus.status === 'idle' || updateStatus.status === 'up-to-date' || updateStatus.status === 'error' ? (
+                      <button
+                        onClick={() => electronIPC.send('check-for-updates')}
+                        className="px-3 py-1.5 rounded-lg text-xs font-medium border border-border hover:border-primary text-gray-400 hover:text-primary transition-all flex items-center gap-1.5"
+                      >
+                        <RefreshCw size={12} /> Check for Updates
+                      </button>
+                    ) : updateStatus.status === 'checking' ? (
+                      <span className="text-xs text-gray-500 flex items-center gap-1.5">
+                        <RefreshCw size={12} className="animate-spin" /> Checking...
+                      </span>
+                    ) : updateStatus.status === 'available' ? (
+                      <span className="text-xs text-blue-400 flex items-center gap-1.5">
+                        <Download size={12} /> v{updateStatus.version} downloading...
+                      </span>
+                    ) : updateStatus.status === 'downloading' ? (
+                      <div className="flex items-center gap-2">
+                        <div className="w-24 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                          <div className="h-full bg-blue-500 rounded-full transition-all" style={{ width: `${updateStatus.percent || 0}%` }} />
+                        </div>
+                        <span className="text-xs text-blue-400">{updateStatus.percent}%</span>
+                      </div>
+                    ) : updateStatus.status === 'ready' ? (
+                      <button
+                        onClick={() => electronIPC.send('install-update')}
+                        className="px-3 py-1.5 rounded-lg text-xs font-bold bg-green-500/20 border border-green-500/40 text-green-400 hover:bg-green-500/30 transition-all flex items-center gap-1.5"
+                      >
+                        <Download size={12} /> Restart & Update to v{updateStatus.version}
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+                {updateStatus.status === 'up-to-date' && (
+                  <p className="text-xs text-green-400/70 mt-1.5 flex items-center gap-1"><Check size={10} /> You're on the latest version</p>
+                )}
+                {updateStatus.status === 'error' && (
+                  <p className="text-xs text-red-400/70 mt-1.5">Update check failed. Try again later.</p>
+                )}
+              </div>
+            )}
 
          </div>
       </Modal>
