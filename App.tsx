@@ -8,6 +8,7 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq } from './services/aiProxyService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
+import { extractTextFromDocx } from './services/docxService';
 import { useDatabase, SessionSummary } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
 import { SubscriptionGate } from './SubscriptionGate';
@@ -1990,9 +1991,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     fileInputRef.current?.click();
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
 
     // Reset input so same file can be selected again
     e.target.value = '';
@@ -2003,72 +2004,101 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       return;
     }
 
-    // Check if it's likely a text file to allow text-based models (like OpenAI) to read it.
-    const isText = file.type.startsWith('text/') ||
-                   file.name.endsWith('.txt') ||
-                   file.name.endsWith('.md') ||
-                   file.name.endsWith('.js') ||
-                   file.name.endsWith('.ts') ||
-                   file.name.endsWith('.py') ||
-                   file.name.endsWith('.json') ||
-                   file.name.endsWith('.html') ||
-                   file.name.endsWith('.css') ||
-                   file.name.endsWith('.csv');
+    // Process each file
+    const processFile = async (file: File, index: number) => {
+      const isText = file.type.startsWith('text/') ||
+                     file.name.endsWith('.txt') ||
+                     file.name.endsWith('.md') ||
+                     file.name.endsWith('.js') ||
+                     file.name.endsWith('.ts') ||
+                     file.name.endsWith('.py') ||
+                     file.name.endsWith('.json') ||
+                     file.name.endsWith('.html') ||
+                     file.name.endsWith('.css') ||
+                     file.name.endsWith('.csv');
 
-    const isPdf = file.type === 'application/pdf' || file.name.endsWith('.pdf');
+      const isPdf = file.type === 'application/pdf' || file.name.endsWith('.pdf');
+      const isDocx = file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || file.name.endsWith('.docx');
 
-    const reader = new FileReader();
-
-    if (isPdf) {
+      if (isPdf) {
         setIsProcessing(true);
-        extractTextFromPdf(file).then(text => {
-            const newFile: ContextFile = {
-                id: Date.now().toString(),
-                name: file.name,
-                content: text,
-                type: 'custom',
-                mimeType: 'text/plain',
-                base64: undefined
-            };
-            db.addContextFile(newFile);
-        }).catch(err => {
-            console.error(err);
-            alert("Failed to extract text from PDF");
-        }).finally(() => {
-            setIsProcessing(false);
-        });
-    } else if (isText) {
+        try {
+          const text = await extractTextFromPdf(file);
+          db.addContextFile({
+            id: `${Date.now()}-${index}`,
+            name: file.name,
+            content: text,
+            type: 'custom',
+            mimeType: 'text/plain',
+            base64: undefined
+          });
+        } catch (err) {
+          console.error(err);
+          alert(`Failed to extract text from PDF: ${file.name}`);
+        } finally {
+          setIsProcessing(false);
+        }
+      } else if (isDocx) {
+        setIsProcessing(true);
+        try {
+          const text = await extractTextFromDocx(file);
+          db.addContextFile({
+            id: `${Date.now()}-${index}`,
+            name: file.name,
+            content: text,
+            type: 'custom',
+            mimeType: 'text/plain',
+            base64: undefined
+          });
+        } catch (err) {
+          console.error(err);
+          alert(`Failed to extract text from Word document: ${file.name}`);
+        } finally {
+          setIsProcessing(false);
+        }
+      } else if (isText) {
+        const reader = new FileReader();
         reader.onload = (event) => {
-            const text = event.target?.result as string;
-            const newFile: ContextFile = {
-                id: Date.now().toString(),
-                name: file.name,
-                content: text,
-                type: 'custom',
-                mimeType: file.type || 'text/plain',
-                base64: undefined
-            };
-            db.addContextFile(newFile);
+          const text = event.target?.result as string;
+          db.addContextFile({
+            id: `${Date.now()}-${index}`,
+            name: file.name,
+            content: text,
+            type: 'custom',
+            mimeType: file.type || 'text/plain',
+            base64: undefined
+          });
         };
         reader.readAsText(file);
-    } else {
-        // Binary (Image/PDF)
+      } else {
+        // Binary (Image)
+        const reader = new FileReader();
         reader.onload = (event) => {
           const result = event.target?.result as string;
           const base64Data = result.split(',')[1];
           const mimeType = result.split(':')[1].split(';')[0];
-
-          const newFile: ContextFile = {
-            id: Date.now().toString(),
+          db.addContextFile({
+            id: `${Date.now()}-${index}`,
             name: file.name,
-            content: "[Binary File]",
+            content: '[Binary File]',
             type: 'custom',
             mimeType: mimeType,
             base64: base64Data
-          };
-          db.addContextFile(newFile);
+          });
         };
         reader.readAsDataURL(file);
+      }
+    };
+
+    // Process all selected files (Pro users can select multiple)
+    let filesProcessed = 0;
+    for (let i = 0; i < files.length; i++) {
+      // For free users, check limit before each file
+      if (gate.maxContextFiles !== -1 && db.contextFiles.length + filesProcessed >= gate.maxContextFiles) {
+        break;
+      }
+      await processFile(files[i], i);
+      filesProcessed++;
     }
   };
   
@@ -2540,12 +2570,13 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                        <Plus size={12} /> {gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles ? 'Limit reached' : 'Add File'}
                    </button>
                    {/* HIDDEN INPUT */}
-                   <input 
-                       type="file" 
-                       ref={fileInputRef} 
+                   <input
+                       type="file"
+                       ref={fileInputRef}
                        className="hidden"
                        onChange={handleFileUpload}
-                       accept=".pdf,.txt,.md,.json,.js,.ts,.py,.html,.css,.csv,.png,.jpg,.jpeg"
+                       accept=".pdf,.docx,.txt,.md,.json,.js,.ts,.py,.html,.css,.csv,.png,.jpg,.jpeg"
+                       multiple={gate.maxContextFiles === -1}
                    />
                </div>
                
