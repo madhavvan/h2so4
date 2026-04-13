@@ -1246,6 +1246,8 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const shouldAutoScrollRef = useRef(true);
   const scrollRAFRef = useRef<number | null>(null);
+  const userScrolledAwayRef = useRef(false);
+  const userScrollCooldownRef = useRef<number | null>(null);
 
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1272,11 +1274,12 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // Outside streaming (new message, interim text): use smooth scroll
   // for a polished feel on discrete events.
   //
-  // Uses `shouldAutoScrollRef` (a ref) instead of the state value
-  // inside the effect body so the check is always up-to-date — no
-  // race between the scroll handler flipping the flag and the next
-  // token triggering this effect.
+  // IMPORTANT: If the user has scrolled away (userScrolledAwayRef),
+  // we completely skip auto-scrolling until they scroll back to bottom.
+  // This prevents the "slap back" effect when user is trying to read
+  // earlier content during streaming.
   useEffect(() => {
+    if (userScrolledAwayRef.current) return;
     if (!shouldAutoScrollRef.current || !chatContainerRef.current) return;
 
     if (streamingMsg) {
@@ -1284,7 +1287,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       if (scrollRAFRef.current) return;
       scrollRAFRef.current = requestAnimationFrame(() => {
         scrollRAFRef.current = null;
-        if (shouldAutoScrollRef.current && chatContainerRef.current) {
+        if (!userScrolledAwayRef.current && shouldAutoScrollRef.current && chatContainerRef.current) {
           chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
         }
       });
@@ -1334,13 +1337,57 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // don't keep paying for tokens after the window closes.
   useEffect(() => () => { cancelActiveStream(); }, [cancelActiveStream]);
 
+  // Track user-initiated scroll via wheel/touch to prevent auto-scroll
+  // from fighting with user intent during streaming
+  const handleUserScroll = useCallback((e: WheelEvent | TouchEvent) => {
+    if (!chatContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 80;
+
+    // If user scrolls UP (away from bottom), mark as scrolled away
+    if (!isAtBottom) {
+      userScrolledAwayRef.current = true;
+      shouldAutoScrollRef.current = false;
+      setShouldAutoScroll(false);
+      // Clear any existing cooldown
+      if (userScrollCooldownRef.current) {
+        clearTimeout(userScrollCooldownRef.current);
+      }
+    }
+  }, []);
+
   const handleScroll = () => {
       if (!chatContainerRef.current) return;
       const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
       const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
-      shouldAutoScrollRef.current = isAtBottom;
-      setShouldAutoScroll(isAtBottom);
+
+      // If user scrolled back to bottom, re-enable auto-scroll
+      if (isAtBottom && userScrolledAwayRef.current) {
+        userScrolledAwayRef.current = false;
+        shouldAutoScrollRef.current = true;
+        setShouldAutoScroll(true);
+      } else if (!isAtBottom) {
+        shouldAutoScrollRef.current = false;
+        setShouldAutoScroll(false);
+      }
   };
+
+  // Attach wheel/touch listeners to detect user scroll intent
+  useEffect(() => {
+    const container = chatContainerRef.current;
+    if (!container) return;
+
+    container.addEventListener('wheel', handleUserScroll, { passive: true });
+    container.addEventListener('touchmove', handleUserScroll, { passive: true });
+
+    return () => {
+      container.removeEventListener('wheel', handleUserScroll);
+      container.removeEventListener('touchmove', handleUserScroll);
+      if (userScrollCooldownRef.current) {
+        clearTimeout(userScrollCooldownRef.current);
+      }
+    };
+  }, [handleUserScroll]);
 
   // --- Core Logic ---
   const executeSend = useCallback(async (textToSend: string, imageBase64?: string) => {
