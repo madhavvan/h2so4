@@ -46,9 +46,7 @@
     },
     "win": {
       "target": "nsis",
-      "artifactName": "InterviewCopilot-Setup.${ext}",
-      "signingHashAlgorithms": null,
-      "sign": null
+      "artifactName": "InterviewCopilot-Setup.${ext}"
     },
     "nsis": {
       "oneClick": true,

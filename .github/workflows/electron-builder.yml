@@ -55,7 +55,9 @@ jobs:
           files: |
             dist-electron/*.exe
             dist-electron/*.dmg
+            dist-electron/*.zip
             dist-electron/*.AppImage
+            dist-electron/*.deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -67,4 +69,6 @@ jobs:
           path: |
             dist-electron/*.exe
             dist-electron/*.dmg
+            dist-electron/*.zip
             dist-electron/*.AppImage
+            dist-electron/*.deb
