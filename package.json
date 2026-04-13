@@ -2,6 +2,11 @@
   "name": "interview-copilot-ai",
   "private": true,
   "version": "2.3.0",
+  "description": "AI-powered real-time interview assistant",
+  "author": {
+    "name": "Interview Copilot",
+    "email": "support@interviewcopilot.app"
+  },
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
