@@ -1993,7 +1993,12 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
+    console.log('[FileUpload] handleFileUpload called, files:', files?.length);
     if (!files || files.length === 0) return;
+
+    // Copy files to array BEFORE resetting (FileList can become invalid after reset)
+    const fileArray = Array.from(files);
+    console.log('[FileUpload] fileArray created:', fileArray.map(f => f.name));
 
     // Reset input so same file can be selected again
     e.target.value = '';
@@ -2006,6 +2011,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
     // Process each file
     const processFile = async (file: File, index: number) => {
+      console.log('[FileUpload] processFile:', file.name, 'type:', file.type);
       const isText = file.type.startsWith('text/') ||
                      file.name.endsWith('.txt') ||
                      file.name.endsWith('.md') ||
@@ -2019,6 +2025,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
       const isPdf = file.type === 'application/pdf' || file.name.endsWith('.pdf');
       const isDocx = file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || file.name.endsWith('.docx');
+      console.log('[FileUpload] isText:', isText, 'isPdf:', isPdf, 'isDocx:', isDocx);
 
       if (isPdf) {
         setIsProcessing(true);
@@ -2057,10 +2064,12 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           setIsProcessing(false);
         }
       } else if (isText) {
+        console.log('[FileUpload] Processing as text file');
         await new Promise<void>((resolve) => {
           const reader = new FileReader();
           reader.onload = (event) => {
             const text = event.target?.result as string;
+            console.log('[FileUpload] Text read, length:', text?.length);
             db.addContextFile({
               id: `${Date.now()}-${index}`,
               name: file.name,
@@ -2069,9 +2078,13 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
               mimeType: file.type || 'text/plain',
               base64: undefined
             });
+            console.log('[FileUpload] db.addContextFile called for text');
             resolve();
           };
-          reader.onerror = () => resolve(); // Still resolve on error to continue
+          reader.onerror = (err) => {
+            console.error('[FileUpload] FileReader error:', err);
+            resolve();
+          };
           reader.readAsText(file);
         });
       } else {
@@ -2100,14 +2113,19 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
     // Process all selected files (Pro users can select multiple)
     let filesProcessed = 0;
-    for (let i = 0; i < files.length; i++) {
+    console.log('[FileUpload] Starting to process', fileArray.length, 'files');
+    for (let i = 0; i < fileArray.length; i++) {
       // For free users, check limit before each file
       if (gate.maxContextFiles !== -1 && db.contextFiles.length + filesProcessed >= gate.maxContextFiles) {
+        console.log('[FileUpload] Hit file limit, breaking');
         break;
       }
-      await processFile(files[i], i);
+      console.log('[FileUpload] Processing file:', fileArray[i].name);
+      await processFile(fileArray[i], i);
       filesProcessed++;
+      console.log('[FileUpload] Processed file:', fileArray[i].name);
     }
+    console.log('[FileUpload] Done processing all files');
   };
   
   const handleAddPasteText = () => {
