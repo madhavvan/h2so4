@@ -104,6 +104,48 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', version: '1.0.0', service: 'minicaai-api' });
 });
 
+// ── App Version Check ──
+// Returns the latest app version info. All clients (including old versions)
+// can call this to check if they need to update. This works even when the
+// built-in Electron auto-updater fails.
+const LATEST_APP_VERSION = {
+  version: '2.3.0',
+  minVersion: '2.0.0', // Versions below this MUST update
+  releaseDate: '2026-04-13',
+  releaseNotes: 'Performance improvements and bug fixes',
+  downloadUrl: {
+    windows: 'https://github.com/madhavvan/h2so4/releases/latest/download/Interview.Copilot.Setup.exe',
+    mac: 'https://github.com/madhavvan/h2so4/releases/latest/download/Interview.Copilot.dmg',
+    linux: 'https://github.com/madhavvan/h2so4/releases/latest/download/Interview.Copilot.AppImage',
+  },
+};
+
+app.get('/api/v1/app-version', (req, res) => {
+  const clientVersion = req.query.v || '0.0.0';
+  const isOutdated = compareVersions(clientVersion, LATEST_APP_VERSION.version) < 0;
+  const mustUpdate = compareVersions(clientVersion, LATEST_APP_VERSION.minVersion) < 0;
+
+  res.json({
+    latest: LATEST_APP_VERSION.version,
+    current: clientVersion,
+    isOutdated,
+    mustUpdate,
+    releaseNotes: LATEST_APP_VERSION.releaseNotes,
+    downloadUrl: LATEST_APP_VERSION.downloadUrl,
+  });
+});
+
+// Simple semver comparison: returns -1 if a < b, 0 if equal, 1 if a > b
+function compareVersions(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) < (pb[i] || 0)) return -1;
+    if ((pa[i] || 0) > (pb[i] || 0)) return 1;
+  }
+  return 0;
+}
+
 // ── 404 ──
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
