@@ -1153,7 +1153,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     downloadUrl?: { windows: string; mac: string; linux: string };
   } | null>(null);
 
-  const APP_VERSION = '2.3.0'; // Keep in sync with package.json
+  const APP_VERSION = '3.3.1'; // Keep in sync with package.json
 
   useEffect(() => {
     if (!isElectron) return;
