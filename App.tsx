@@ -2057,36 +2057,44 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           setIsProcessing(false);
         }
       } else if (isText) {
-        const reader = new FileReader();
-        reader.onload = (event) => {
-          const text = event.target?.result as string;
-          db.addContextFile({
-            id: `${Date.now()}-${index}`,
-            name: file.name,
-            content: text,
-            type: 'custom',
-            mimeType: file.type || 'text/plain',
-            base64: undefined
-          });
-        };
-        reader.readAsText(file);
+        await new Promise<void>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const text = event.target?.result as string;
+            db.addContextFile({
+              id: `${Date.now()}-${index}`,
+              name: file.name,
+              content: text,
+              type: 'custom',
+              mimeType: file.type || 'text/plain',
+              base64: undefined
+            });
+            resolve();
+          };
+          reader.onerror = () => resolve(); // Still resolve on error to continue
+          reader.readAsText(file);
+        });
       } else {
         // Binary (Image)
-        const reader = new FileReader();
-        reader.onload = (event) => {
-          const result = event.target?.result as string;
-          const base64Data = result.split(',')[1];
-          const mimeType = result.split(':')[1].split(';')[0];
-          db.addContextFile({
-            id: `${Date.now()}-${index}`,
-            name: file.name,
-            content: '[Binary File]',
-            type: 'custom',
-            mimeType: mimeType,
-            base64: base64Data
-          });
-        };
-        reader.readAsDataURL(file);
+        await new Promise<void>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const result = event.target?.result as string;
+            const base64Data = result.split(',')[1];
+            const mimeType = result.split(':')[1].split(';')[0];
+            db.addContextFile({
+              id: `${Date.now()}-${index}`,
+              name: file.name,
+              content: '[Binary File]',
+              type: 'custom',
+              mimeType: mimeType,
+              base64: base64Data
+            });
+            resolve();
+          };
+          reader.onerror = () => resolve();
+          reader.readAsDataURL(file);
+        });
       }
     };
 
