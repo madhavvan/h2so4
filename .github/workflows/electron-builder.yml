@@ -43,7 +43,7 @@ jobs:
         run: npm run build
 
       - name: Build Electron app
-        run: npx electron-builder ${{ matrix.platform }} --publish never
+        run: npx electron-builder ${{ matrix.platform }} ${{ github.event_name == 'release' && '--publish always' || '--publish never' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
@@ -52,16 +52,22 @@ jobs:
         run: ls -la dist-electron/
         shell: bash
 
-      - name: Upload to release
+      # Note: When triggered by a release, electron-builder with --publish always
+      # automatically uploads binaries AND the auto-update manifest files (latest.yml, etc.)
+      # to GitHub Releases. The softprops action is kept as a fallback for any files
+      # that electron-builder might miss.
+      - name: Upload any additional files to release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
         with:
           files: |
+            dist-electron/*.yml
             dist-electron/*.exe
             dist-electron/*.dmg
             dist-electron/*.zip
             dist-electron/*.AppImage
             dist-electron/*.deb
+            dist-electron/*.blockmap
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

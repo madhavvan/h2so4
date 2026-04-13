@@ -1143,6 +1143,17 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     message?: string;
   }>({ status: 'idle' });
 
+  // Server-side version check (fallback when Electron updater fails)
+  const [serverVersionInfo, setServerVersionInfo] = useState<{
+    latest: string;
+    isOutdated: boolean;
+    mustUpdate: boolean;
+    releaseNotes?: string;
+    downloadUrl?: { windows: string; mac: string; linux: string };
+  } | null>(null);
+
+  const APP_VERSION = '2.3.0'; // Keep in sync with package.json
+
   useEffect(() => {
     if (!isElectron) return;
     try {
@@ -1154,6 +1165,25 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       ipc.on('update-status', handler);
       return () => ipc.removeListener('update-status', handler);
     } catch {}
+  }, []);
+
+  // Check server for updates (works even when Electron updater fails)
+  useEffect(() => {
+    const checkServerVersion = async () => {
+      try {
+        const res = await fetch(`https://h2so4-production.up.railway.app/api/v1/app-version?v=${APP_VERSION}`);
+        if (res.ok) {
+          const data = await res.json();
+          setServerVersionInfo(data);
+        }
+      } catch {
+        // Silently fail — server check is a fallback
+      }
+    };
+    checkServerVersion();
+    // Re-check every 30 minutes
+    const interval = setInterval(checkServerVersion, 30 * 60 * 1000);
+    return () => clearInterval(interval);
   }, []);
 
   // PiP State — auto-enter if this is the Electron pop-out window
@@ -2328,13 +2358,6 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                 </div>
             </div>
 
-            {/* AI is powered by server — no API keys needed */}
-            <div className="bg-green-500/10 border border-green-500/20 rounded-lg p-3">
-                <div className="flex items-center gap-2 text-green-400 text-xs font-medium">
-                    <Check size={14} /> AI models are managed by minicaai — no API keys needed
-                </div>
-            </div>
-
             <button
                 onClick={saveSettings}
                 className={`w-full px-4 py-2 rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-all ${
@@ -2394,7 +2417,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                 <div className="flex items-center justify-between">
                   <div>
                     <span className="text-sm font-medium text-text">App Updates</span>
-                    <p className="text-xs text-gray-500 mt-0.5">v{(window as any).require?.('electron')?.remote?.app?.getVersion?.() || '2.2.0'}</p>
+                    <p className="text-xs text-gray-500 mt-0.5">v{APP_VERSION}</p>
                   </div>
                   <div className="flex items-center gap-2">
                     {updateStatus.status === 'idle' || updateStatus.status === 'up-to-date' || updateStatus.status === 'error' ? (
@@ -2429,10 +2452,38 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                     ) : null}
                   </div>
                 </div>
-                {updateStatus.status === 'up-to-date' && (
+                {updateStatus.status === 'up-to-date' && !serverVersionInfo?.isOutdated && (
                   <p className="text-xs text-green-400/70 mt-1.5 flex items-center gap-1"><Check size={10} /> You're on the latest version</p>
                 )}
-                {updateStatus.status === 'error' && (
+                {/* Fallback: Show server-detected update when Electron updater fails or says up-to-date but server disagrees */}
+                {(updateStatus.status === 'error' || updateStatus.status === 'up-to-date' || updateStatus.status === 'idle') && serverVersionInfo?.isOutdated && (
+                  <div className="mt-2 p-2.5 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+                    <p className="text-xs text-blue-300 mb-2">
+                      <span className="font-medium">v{serverVersionInfo.latest}</span> is available! {serverVersionInfo.releaseNotes}
+                    </p>
+                    <div className="flex gap-2 flex-wrap">
+                      {serverVersionInfo.downloadUrl?.windows && (
+                        <a href={serverVersionInfo.downloadUrl.windows} target="_blank" rel="noopener noreferrer"
+                          className="px-2.5 py-1 rounded text-xs font-medium bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 transition-colors">
+                          Windows
+                        </a>
+                      )}
+                      {serverVersionInfo.downloadUrl?.mac && (
+                        <a href={serverVersionInfo.downloadUrl.mac} target="_blank" rel="noopener noreferrer"
+                          className="px-2.5 py-1 rounded text-xs font-medium bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 transition-colors">
+                          macOS
+                        </a>
+                      )}
+                      {serverVersionInfo.downloadUrl?.linux && (
+                        <a href={serverVersionInfo.downloadUrl.linux} target="_blank" rel="noopener noreferrer"
+                          className="px-2.5 py-1 rounded text-xs font-medium bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 transition-colors">
+                          Linux
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {updateStatus.status === 'error' && !serverVersionInfo?.isOutdated && (
                   <p className="text-xs text-red-400/70 mt-1.5">Update check failed. Try again later.</p>
                 )}
               </div>
