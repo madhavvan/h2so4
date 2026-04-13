@@ -46,6 +46,31 @@
   min-height: 100vh;
   overflow-x: hidden;
   margin: 0;
+  cursor: default !important;
+}
+
+/* Force default cursor everywhere in popout except resize handles */
+.pip-body *,
+.pip-body *::before,
+.pip-body *::after {
+  cursor: default !important;
+}
+
+/* Keep text cursor only for actual text inputs */
+.pip-body textarea,
+.pip-body input[type="text"],
+.pip-body input[type="email"],
+.pip-body input[type="password"],
+.pip-body .pip-textarea {
+  cursor: text !important;
+}
+
+/* Disable text selection cursor on code blocks and bubbles */
+.pip-body code,
+.pip-body pre,
+.pip-body .bubble {
+  cursor: default !important;
+  user-select: text;
 }
 
 /* Global press-down + transition language — everything interactive
@@ -233,7 +258,7 @@
 .send-btn {
   width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--glass-border);
   background: transparent;
-  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  cursor: default !important; display: flex; align-items: center; justify-content: center;
   flex-shrink: 0;
   transition:
     transform    var(--dur-ios-fast) var(--ease-ios),

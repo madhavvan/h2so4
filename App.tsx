@@ -1278,6 +1278,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   const scrollRAFRef = useRef<number | null>(null);
   const userScrolledAwayRef = useRef(false);
   const userScrollCooldownRef = useRef<number | null>(null);
+  const wasStreamingRef = useRef(false); // Track if we were just streaming
 
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1301,18 +1302,21 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // one update per animation frame so rapid tokens don't stack up
   // smooth-scroll animations and cause stutter.
   //
-  // Outside streaming (new message, interim text): use smooth scroll
-  // for a polished feel on discrete events.
-  //
   // IMPORTANT: If the user has scrolled away (userScrolledAwayRef),
   // we completely skip auto-scrolling until they scroll back to bottom.
   // This prevents the "slap back" effect when user is trying to read
   // earlier content during streaming.
+  //
+  // We track wasStreamingRef to avoid jerking when streaming ends —
+  // the smooth scroll should only happen for truly new user messages,
+  // not when a streaming response finishes.
   useEffect(() => {
     if (userScrolledAwayRef.current) return;
     if (!shouldAutoScrollRef.current || !chatContainerRef.current) return;
 
     if (streamingMsg) {
+      // Mark that we're streaming
+      wasStreamingRef.current = true;
       // Streaming: instant scroll, at most once per frame
       if (scrollRAFRef.current) return;
       scrollRAFRef.current = requestAnimationFrame(() => {
@@ -1321,14 +1325,33 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
         }
       });
-    } else {
-      // Discrete event (new message, interim text): smooth scroll
-      chatContainerRef.current.scrollTo({
-        top: chatContainerRef.current.scrollHeight,
-        behavior: 'smooth'
-      });
+    } else if (wasStreamingRef.current) {
+      // Streaming just ended — do NOT smooth scroll, just reset the flag
+      // The message is already visible; no need to jerk the view
+      wasStreamingRef.current = false;
     }
-  }, [messages, interimText, shouldAutoScroll, streamingMsg?.content]);
+    // Note: We removed the smooth scroll for "discrete events" because it was
+    // causing jerks. Auto-scroll during streaming is sufficient; when streaming
+    // ends, the user is already at the right position or intentionally scrolled away.
+  }, [streamingMsg?.content]);
+
+  // Scroll to bottom when user sends a NEW message (not when AI responds)
+  const prevMessagesLengthRef = useRef(messages.length);
+  useEffect(() => {
+    const prevLen = prevMessagesLengthRef.current;
+    prevMessagesLengthRef.current = messages.length;
+
+    // Only scroll for new user messages (length increased and last message is from user)
+    if (messages.length > prevLen && messages.length > 0) {
+      const lastMsg = messages[messages.length - 1];
+      if (lastMsg.role === 'user' && chatContainerRef.current && shouldAutoScrollRef.current) {
+        chatContainerRef.current.scrollTo({
+          top: chatContainerRef.current.scrollHeight,
+          behavior: 'smooth'
+        });
+      }
+    }
+  }, [messages.length]);
 
   // Clean up any pending animation frame on unmount
   useEffect(() => {
