@@ -1397,10 +1397,17 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // don't keep paying for tokens after the window closes.
   useEffect(() => () => { cancelActiveStream(); }, [cancelActiveStream]);
 
+  // Track if scroll was triggered by user (wheel/touch) vs programmatic
+  const isUserScrollingRef = useRef(false);
+
   // Track user-initiated scroll via wheel/touch to prevent auto-scroll
   // from fighting with user intent during streaming
   const handleUserScroll = useCallback((e: WheelEvent | TouchEvent) => {
     if (!chatContainerRef.current) return;
+
+    // Mark this as a user-initiated scroll so handleScroll knows to process it
+    isUserScrollingRef.current = true;
+
     const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
     const isAtBottom = scrollHeight - scrollTop - clientHeight < 80;
 
@@ -1414,14 +1421,25 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         clearTimeout(userScrollCooldownRef.current);
       }
     }
+
+    // Reset the user scrolling flag after a short delay
+    // This allows handleScroll to process user-initiated scrolls
+    setTimeout(() => {
+      isUserScrollingRef.current = false;
+    }, 100);
   }, []);
 
   const handleScroll = () => {
       if (!chatContainerRef.current) return;
+
+      // Only process scroll state changes if triggered by user action
+      // This prevents programmatic auto-scroll from re-enabling itself
+      if (!isUserScrollingRef.current) return;
+
       const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
       const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
 
-      // If user scrolled back to bottom, re-enable auto-scroll
+      // If user manually scrolled back to bottom, re-enable auto-scroll
       if (isAtBottom && userScrolledAwayRef.current) {
         userScrolledAwayRef.current = false;
         shouldAutoScrollRef.current = true;
