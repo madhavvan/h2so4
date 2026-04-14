@@ -1416,6 +1416,13 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       userScrolledAwayRef.current = true;
       shouldAutoScrollRef.current = false;
       setShouldAutoScroll(false);
+
+      // IMMEDIATELY cancel any pending auto-scroll RAF to prevent slap
+      if (scrollRAFRef.current) {
+        cancelAnimationFrame(scrollRAFRef.current);
+        scrollRAFRef.current = null;
+      }
+
       // Clear any existing cooldown
       if (userScrollCooldownRef.current) {
         clearTimeout(userScrollCooldownRef.current);
