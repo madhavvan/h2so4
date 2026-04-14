@@ -365,7 +365,7 @@ const ChatInterface = ({
                                 border: `1px solid ${settings.autoSend ? 'rgba(59,130,246,0.4)' : 'var(--glass-border)'}`,
                                 color: settings.autoSend ? '#3b82f6' : 'var(--text-muted)',
                                 padding: '3px 8px', borderRadius: '6px', fontSize: '10px', fontWeight: 700,
-                                cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px'
+                                display: 'flex', alignItems: 'center', gap: '4px'
                             }}
                         >
                             <Zap size={10} /> {settings.autoSend ? 'AUTO' : 'MANUAL'}
@@ -378,7 +378,7 @@ const ChatInterface = ({
                                 border: `1px solid ${isListening ? 'rgba(239,68,68,0.4)' : 'var(--glass-border)'}`,
                                 color: isListening ? '#ef4444' : 'var(--text-muted)',
                                 padding: '3px 8px', borderRadius: '6px', fontSize: '10px', fontWeight: 700,
-                                cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px'
+                                display: 'flex', alignItems: 'center', gap: '4px'
                             }}
                         >
                             {isListening ? <Mic size={10} /> : <MicOff size={10} />}
@@ -1399,11 +1399,17 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
   // Track if scroll was triggered by user (wheel/touch) vs programmatic
   const isUserScrollingRef = useRef(false);
+  const userScrollTimeoutRef = useRef<number | null>(null);
 
   // Track user-initiated scroll via wheel/touch to prevent auto-scroll
   // from fighting with user intent during streaming
   const handleUserScroll = useCallback((e: WheelEvent | TouchEvent) => {
     if (!chatContainerRef.current) return;
+
+    // Clear any pending timeout from previous scroll event
+    if (userScrollTimeoutRef.current) {
+      clearTimeout(userScrollTimeoutRef.current);
+    }
 
     // Mark this as a user-initiated scroll so handleScroll knows to process it
     isUserScrollingRef.current = true;
@@ -1431,8 +1437,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
     // Reset the user scrolling flag after a short delay
     // This allows handleScroll to process user-initiated scrolls
-    setTimeout(() => {
+    userScrollTimeoutRef.current = window.setTimeout(() => {
       isUserScrollingRef.current = false;
+      userScrollTimeoutRef.current = null;
     }, 100);
   }, []);
 
@@ -1470,6 +1477,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       container.removeEventListener('touchmove', handleUserScroll);
       if (userScrollCooldownRef.current) {
         clearTimeout(userScrollCooldownRef.current);
+      }
+      if (userScrollTimeoutRef.current) {
+        clearTimeout(userScrollTimeoutRef.current);
       }
     };
   }, [handleUserScroll]);
@@ -2024,12 +2034,10 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
-    console.log('[FileUpload] handleFileUpload called, files:', files?.length);
     if (!files || files.length === 0) return;
 
     // Copy files to array BEFORE resetting (FileList can become invalid after reset)
     const fileArray = Array.from(files);
-    console.log('[FileUpload] fileArray created:', fileArray.map(f => f.name));
 
     // Reset input so same file can be selected again
     e.target.value = '';
@@ -2042,7 +2050,6 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
     // Process each file
     const processFile = async (file: File, index: number) => {
-      console.log('[FileUpload] processFile:', file.name, 'type:', file.type);
       const isText = file.type.startsWith('text/') ||
                      file.name.endsWith('.txt') ||
                      file.name.endsWith('.md') ||
@@ -2056,7 +2063,6 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
       const isPdf = file.type === 'application/pdf' || file.name.endsWith('.pdf');
       const isDocx = file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || file.name.endsWith('.docx');
-      console.log('[FileUpload] isText:', isText, 'isPdf:', isPdf, 'isDocx:', isDocx);
 
       if (isPdf) {
         setIsProcessing(true);
@@ -2095,12 +2101,10 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           setIsProcessing(false);
         }
       } else if (isText) {
-        console.log('[FileUpload] Processing as text file');
         await new Promise<void>((resolve) => {
           const reader = new FileReader();
           reader.onload = (event) => {
             const text = event.target?.result as string;
-            console.log('[FileUpload] Text read, length:', text?.length);
             db.addContextFile({
               id: `${Date.now()}-${index}`,
               name: file.name,
@@ -2109,13 +2113,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
               mimeType: file.type || 'text/plain',
               base64: undefined
             });
-            console.log('[FileUpload] db.addContextFile called for text');
             resolve();
           };
-          reader.onerror = (err) => {
-            console.error('[FileUpload] FileReader error:', err);
-            resolve();
-          };
+          reader.onerror = () => resolve();
           reader.readAsText(file);
         });
       } else {
@@ -2144,19 +2144,14 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
     // Process all selected files (Pro users can select multiple)
     let filesProcessed = 0;
-    console.log('[FileUpload] Starting to process', fileArray.length, 'files');
     for (let i = 0; i < fileArray.length; i++) {
       // For free users, check limit before each file
       if (gate.maxContextFiles !== -1 && db.contextFiles.length + filesProcessed >= gate.maxContextFiles) {
-        console.log('[FileUpload] Hit file limit, breaking');
         break;
       }
-      console.log('[FileUpload] Processing file:', fileArray[i].name);
       await processFile(fileArray[i], i);
       filesProcessed++;
-      console.log('[FileUpload] Processed file:', fileArray[i].name);
     }
-    console.log('[FileUpload] Done processing all files');
   };
   
   const handleAddPasteText = () => {
