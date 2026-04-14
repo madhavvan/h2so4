@@ -161,6 +161,21 @@
         background-color: transparent !important;
       }
 
+      /* ── Pop-out mode cursor override ──
+         Forces default cursor in popout to look natural on screen share.
+         Interviewers won't see suspicious hand cursors on buttons. */
+      html.popout-mode,
+      html.popout-mode body,
+      html.popout-mode * {
+        cursor: default !important;
+      }
+      html.popout-mode textarea,
+      html.popout-mode input[type="text"],
+      html.popout-mode input[type="email"],
+      html.popout-mode input[type="password"] {
+        cursor: text !important;
+      }
+
       /* Respect reduced-motion preference — disables all iOS springs */
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after {

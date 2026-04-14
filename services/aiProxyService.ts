@@ -8,9 +8,58 @@ import { Message, ContextFile } from '../types';
 
 const API_BASE = 'https://h2so4-production.up.railway.app';
 
+// ── Retry configuration for resilient AI requests ──
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY = 1000; // 1 second
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = MAX_RETRIES,
+  signal?: AbortSignal
+): Promise<T> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Check if aborted before each attempt
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+
+      // Don't retry on abort
+      if (err?.name === 'AbortError') throw err;
+
+      // Don't retry on auth errors - user needs to re-login
+      if (err?.message?.includes('Not authenticated') ||
+          err?.message?.includes('Invalid token') ||
+          err?.message?.includes('Token expired')) {
+        throw err;
+      }
+
+      // Last attempt failed - throw
+      if (attempt === maxRetries) break;
+
+      // Exponential backoff: 1s, 2s, 4s
+      const delay = INITIAL_RETRY_DELAY * Math.pow(2, attempt);
+      console.log(`AI request failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delay}ms...`, err?.message);
+      await sleep(delay);
+    }
+  }
+
+  throw lastError || new Error('AI request failed after retries');
+}
+
 async function proxyRequest(endpoint: string, body: any): Promise<string> {
   const token = licenseService.getToken();
-  if (!token) throw new Error('Not authenticated');
+  if (!token) throw new Error('Not authenticated - please log in again');
 
   const response = await fetch(`${API_BASE}/api/v1/ai${endpoint}`, {
     method: 'POST',
@@ -23,7 +72,11 @@ async function proxyRequest(endpoint: string, body: any): Promise<string> {
 
   if (!response.ok) {
     const err = await response.json().catch(() => ({ error: 'AI request failed' }));
-    throw new Error(err.error || 'AI request failed');
+    // Include status code for debugging
+    const statusInfo = response.status === 401 ? ' (Token expired - please log in again)' :
+                       response.status === 429 ? ' (Rate limited - please wait)' :
+                       response.status >= 500 ? ' (Server error - retrying...)' : '';
+    throw new Error((err.error || 'AI request failed') + statusInfo);
   }
 
   const data = await response.json();
@@ -46,23 +99,31 @@ async function proxyStream(
   signal?: AbortSignal,
 ): Promise<string> {
   const token = licenseService.getToken();
-  if (!token) throw new Error('Not authenticated');
+  if (!token) throw new Error('Not authenticated - please log in again');
 
-  const response = await fetch(`${API_BASE}/api/v1/ai${endpoint}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'text/event-stream',
-      'Authorization': `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
+  // Wrap the fetch in retry logic for connection failures
+  const response = await withRetry(async () => {
+    const res = await fetch(`${API_BASE}/api/v1/ai${endpoint}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+      signal,
+    });
 
-  if (!response.ok || !response.body) {
-    const err = await response.json().catch(() => ({ error: 'AI request failed' }));
-    throw new Error(err.error || 'AI request failed');
-  }
+    if (!res.ok || !res.body) {
+      const err = await res.json().catch(() => ({ error: 'AI request failed' }));
+      // Include status code for debugging
+      const statusInfo = res.status === 401 ? ' (Token expired - please log in again)' :
+                         res.status === 429 ? ' (Rate limited - please wait)' :
+                         res.status >= 500 ? ' (Server error)' : '';
+      throw new Error((err.error || 'AI request failed') + statusInfo);
+    }
+    return res;
+  }, MAX_RETRIES, signal);
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder('utf-8');

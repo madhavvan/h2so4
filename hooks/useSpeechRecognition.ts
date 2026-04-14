@@ -99,15 +99,24 @@ export const useSpeechRecognition = ({
   const [currentStream, setCurrentStream] = useState<MediaStream | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
 
-  // Auto-reconnect state
+  // Keepalive interval to prevent timeout during silence (sends ping every 8s)
+  const keepaliveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Auto-reconnect state - unlimited attempts, connection stays alive until user stops
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intentionalStopRef = useRef(false); // true when user clicks stop
-  const MAX_RECONNECT_ATTEMPTS = 5;
+  const deepgramKeyRef = useRef<string | null>(null); // Cache key for reconnects
 
   const stopListening = useCallback(() => {
     intentionalStopRef.current = true;
     setIsListening(false);
+
+    // Clear keepalive interval
+    if (keepaliveIntervalRef.current) {
+      clearInterval(keepaliveIntervalRef.current);
+      keepaliveIntervalRef.current = null;
+    }
 
     // Clear any pending reconnect
     if (reconnectTimerRef.current) {
@@ -115,17 +124,25 @@ export const useSpeechRecognition = ({
       reconnectTimerRef.current = null;
     }
     reconnectAttemptsRef.current = 0;
+    deepgramKeyRef.current = null; // Clear cached key so next start gets fresh one
 
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-
-    if (socketRef.current) {
-      if (socketRef.current.readyState === 1 || socketRef.current.readyState === 0) {
-        socketRef.current.close();
+    // Stop and clear mediaRecorder
+    if (mediaRecorderRef.current) {
+      if (mediaRecorderRef.current.state !== 'inactive') {
+        try { mediaRecorderRef.current.stop(); } catch (_) {}
       }
+      mediaRecorderRef.current = null;
     }
 
+    // Close and clear socket
+    if (socketRef.current) {
+      if (socketRef.current.readyState === WebSocket.OPEN || socketRef.current.readyState === WebSocket.CONNECTING) {
+        try { socketRef.current.close(); } catch (_) {}
+      }
+      socketRef.current = null;
+    }
+
+    // Stop audio tracks
     if (audioStreamRef.current) {
       audioStreamRef.current.getTracks().forEach(track => track.stop());
       audioStreamRef.current = null;
@@ -140,7 +157,11 @@ export const useSpeechRecognition = ({
 
   // Connect (or reconnect) the Deepgram WebSocket using the existing audio stream
   const connectDeepgram = useCallback((audioStream: MediaStream, cleanKey: string) => {
-    // Tear down previous socket/recorder without touching the media streams
+    // Tear down previous socket/recorder/keepalive without touching the media streams
+    if (keepaliveIntervalRef.current) {
+      clearInterval(keepaliveIntervalRef.current);
+      keepaliveIntervalRef.current = null;
+    }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try { mediaRecorderRef.current.stop(); } catch (_) {}
     }
@@ -153,11 +174,25 @@ export const useSpeechRecognition = ({
       ['token', cleanKey]
     );
 
+    // Store socket ref immediately so event handlers can check if they're stale
+    socketRef.current = socket;
+
     socket.onopen = () => {
+      // Ignore if this socket is no longer current (user stopped/restarted)
+      if (socketRef.current !== socket) return;
+
       console.log('Deepgram Connected', reconnectAttemptsRef.current > 0 ? `(reconnect #${reconnectAttemptsRef.current})` : '');
       reconnectAttemptsRef.current = 0; // reset on successful connect
       setIsListening(true);
       setError(null);
+
+      // ── KEEPALIVE: Send ping every 8 seconds to prevent timeout during silence ──
+      // Deepgram closes idle connections after ~10-60s. This keeps it alive for hours.
+      keepaliveIntervalRef.current = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'KeepAlive' }));
+        }
+      }, 8000);
 
       let mimeType = 'audio/webm';
       if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
@@ -187,6 +222,9 @@ export const useSpeechRecognition = ({
     };
 
     socket.onmessage = (message) => {
+      // Ignore if this socket is no longer current
+      if (socketRef.current !== socket) return;
+
       try {
         const received = JSON.parse(message.data);
         const transcript = received.channel?.alternatives?.[0]?.transcript;
@@ -201,40 +239,58 @@ export const useSpeechRecognition = ({
     };
 
     socket.onclose = (event) => {
+      // Ignore if this socket is no longer current (prevents race condition on restart)
+      if (socketRef.current !== socket) return;
+
       console.log('Deepgram Closed', event.code, event.reason);
       setIsListening(false);
 
+      // Clear keepalive on close
+      if (keepaliveIntervalRef.current) {
+        clearInterval(keepaliveIntervalRef.current);
+        keepaliveIntervalRef.current = null;
+      }
+
       // Auto-reconnect if not intentionally stopped and audio stream is still alive
+      // No limit on reconnect attempts - keep trying until user stops
       if (
         !intentionalStopRef.current &&
         audioStreamRef.current &&
-        audioStreamRef.current.getAudioTracks().some(t => t.readyState === 'live') &&
-        reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS
+        audioStreamRef.current.getAudioTracks().some(t => t.readyState === 'live')
       ) {
         reconnectAttemptsRef.current += 1;
-        const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current - 1), 16000); // 1s, 2s, 4s, 8s, 16s
+        // Quick reconnect: 1s, then 2s, then cap at 5s for fast recovery
+        const delay = Math.min(1000 * Math.pow(2, Math.min(reconnectAttemptsRef.current - 1, 2)), 5000);
         console.log(`Deepgram auto-reconnect #${reconnectAttemptsRef.current} in ${delay}ms`);
-        setError(`Reconnecting... (${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
+        setError(`Reconnecting...`);
 
-        reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = setTimeout(async () => {
           if (!intentionalStopRef.current && audioStreamRef.current) {
-            connectDeepgram(audioStreamRef.current, cleanKey);
+            // Get fresh Deepgram key for reconnect (keys may expire)
+            let keyToUse = cleanKey;
+            try {
+              keyToUse = await getDeepgramKey();
+              deepgramKeyRef.current = keyToUse;
+            } catch (e) {
+              console.error('Failed to refresh Deepgram key:', e);
+              // Continue with old key
+            }
+            connectDeepgram(audioStreamRef.current, keyToUse);
           }
         }, delay);
-      } else if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
-        setError("Connection lost. Please restart listening.");
       }
     };
 
     socket.onerror = (e) => {
+      // Ignore if this socket is no longer current
+      if (socketRef.current !== socket) return;
+
       console.error("Deepgram Error", e);
       // Don't set a permanent error here — onclose will handle reconnect
       if (socket.readyState !== 1 && reconnectAttemptsRef.current === 0) {
         setError("Connection Error: Check API Key & Network.");
       }
     };
-
-    socketRef.current = socket;
   }, [onResult, stopListening]);
 
   const startListening = useCallback(async () => {
@@ -243,8 +299,12 @@ export const useSpeechRecognition = ({
     reconnectAttemptsRef.current = 0;
 
     try {
-      // 1. Fetch Deepgram key from server
-      const cleanKey = await getDeepgramKey();
+      // 1. Fetch Deepgram key from server (or use cached)
+      let cleanKey = deepgramKeyRef.current;
+      if (!cleanKey) {
+        cleanKey = await getDeepgramKey();
+        deepgramKeyRef.current = cleanKey;
+      }
       if (!cleanKey) {
         const msg = "Could not get Deepgram key. Please try again.";
         setError(msg);
