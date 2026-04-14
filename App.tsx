@@ -773,13 +773,19 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
                 };
                 pipWindow.document.head.appendChild(twScript);
 
-                // Inject CSS Vars
+                // Inject CSS Vars + Cursor overrides for screen share
                  const style = pipWindow.document.createElement('style');
                 style.textContent = `
                  :root { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
                  .dark { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
                  body { background-color: var(--bg-color); color: var(--text-color); }
-                 .pip-body { background: #000000; }
+                 .pip-body { background: #000000; cursor: default !important; }
+                 /* Force default cursor everywhere in popout - looks natural on screen share */
+                 .pip-body *, .pip-body *::before, .pip-body *::after { cursor: default !important; }
+                 /* Text cursor only for actual inputs */
+                 .pip-body textarea, .pip-body input[type="text"], .pip-body input[type="email"], .pip-body input[type="password"] { cursor: text !important; }
+                 /* Code blocks and message bubbles - default cursor, text still selectable */
+                 .pip-body code, .pip-body pre, .pip-body .bubble { cursor: default !important; user-select: text; }
                 `;
                 pipWindow.document.head.appendChild(style);
 
