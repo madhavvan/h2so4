@@ -354,7 +354,9 @@ class LicenseService {
       const serverData = await response.json();
       const updatedLicense = { ...license, ...serverData, last_validated: Date.now() };
       const user = this.loadAuth().user;
-      if (user) this.saveAuth(user, updatedLicense);
+      // If server returns a refreshed token, save it to prevent expiration during long sessions
+      const newToken = serverData.token || token;
+      if (user) this.saveAuth(user, updatedLicense, newToken);
       return updatedLicense;
     } catch {
       // Network error — free tier OK offline, pro tier locked
