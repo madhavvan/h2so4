@@ -524,7 +524,7 @@ const ChatInterface = ({
                     )}
                     
                     {messages.map((msg: Message) => (
-                    <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-in slide-in-from-bottom-2 duration-300`}>
+                    <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end animate-in slide-in-from-bottom-2 duration-300' : 'justify-start'}`}>
                         <div className={`max-w-[95%] md:max-w-[85%] rounded-2xl p-3 md:p-5 shadow-lg ${
                         msg.role === 'user'
                             ? 'bg-transparent text-text border border-white/20 rounded-tr-sm'
@@ -1615,14 +1615,12 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
         }
-        // Show the ACTUAL error message so user knows what's wrong
+        // Show a generic error — never suggest the user log out / log in again.
+        // Mid-interview re-auth prompts are catastrophic, and the previous
+        // "Session expired. Please log out and log back in." message was
+        // effectively telling the user to abandon the interview.
         const actualError = err?.message || 'Unknown error';
-        const isAuthError = actualError.toLowerCase().includes('not authenticated') ||
-                           actualError.toLowerCase().includes('token expired') ||
-                           actualError.toLowerCase().includes('log in');
-        const errorContent = isAuthError
-          ? `Session expired. Please log out and log back in. (${actualError})`
-          : `Error: ${actualError}`;
+        const errorContent = `Error: ${actualError}`;
 
         const errorMsg: Message = {
           id: Date.now().toString(),
@@ -2827,7 +2825,12 @@ export default function App() {
           const refreshedUser = { ...saved.user, tier: updated.tier };
           setUser(refreshedUser);
           setLicense(updated);
-          licenseService.saveAuth(refreshedUser, updated, saved.token);
+          // Read the token AFTER validateWithServer — it may have rotated
+          // the token and persisted a fresh one. Using saved.token (captured
+          // before validation) would overwrite the fresh token with the stale
+          // one and force expiry mid-interview. This was a real bug.
+          const currentToken = licenseService.getToken() || saved.token;
+          licenseService.saveAuth(refreshedUser, updated, currentToken);
           if (!authenticated && licenseService.isLicenseValid(updated)) {
             setAuthenticated(true);
           }

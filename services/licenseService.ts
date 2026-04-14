@@ -334,43 +334,43 @@ class LicenseService {
         }),
       });
 
-      if (response.status === 403) {
-        // Server says license is revoked/expired — lock the app
-        license.status = 'revoked';
-        const user = this.loadAuth().user;
-        if (user) this.saveAuth(user, license);
-        return license;
-      }
-
+      // ── NEVER REVOKE CLIENT-SIDE ──
+      // A failed revalidation must NEVER disrupt an active interview.
+      // If the server rejects the token (401/403) or is unreachable,
+      // we keep using the cached license as-is. Any forced re-login
+      // path here would be catastrophic mid-interview — the user
+      // cannot pause an interviewer to re-authenticate.
+      // Revalidation is best-effort: it can UPGRADE the cached state
+      // (tier change, token rotation) but never DEGRADE it.
       if (!response.ok) {
-        // Server unreachable — use cached license for free tier only
-        if (license.tier === 'free') {
-          return license;
-        }
-        // Pro users must have server validation
-        return null;
+        return license;
       }
 
       const serverData = await response.json();
       const updatedLicense = { ...license, ...serverData, last_validated: Date.now() };
       const user = this.loadAuth().user;
-      // If server returns a refreshed token, save it to prevent expiration during long sessions
+      // If server rotated the token, save the new one so the next
+      // request doesn't hit 401. Falls back to existing token otherwise.
       const newToken = serverData.token || token;
       if (user) this.saveAuth(user, updatedLicense, newToken);
       return updatedLicense;
     } catch {
-      // Network error — free tier OK offline, pro tier locked
-      if (license.tier === 'free') return license;
-      return null;
+      // Network hiccup — keep the cached license, do not lock anything.
+      return license;
     }
   }
 
-  // ── Periodic revalidation ──
+  // ── Startup revalidation ──
+  // Fires exactly once when the app boots / logs in — no periodic timer.
+  //
+  // Rationale: this app is used during live job interviews. Any auth
+  // disruption mid-session is catastrophic (the user cannot pause an
+  // interviewer to re-login), so we do not poll. The one-shot call on
+  // startup is enough to pick up a server-rotated token or a tier change
+  // that happened between sessions. Errors are swallowed so a transient
+  // network issue at launch never surfaces to the user.
   startRevalidation(): void {
-    this.stopRevalidation();
-    this.revalidationTimer = setInterval(async () => {
-      await this.validateWithServer();
-    }, REVALIDATION_INTERVAL);
+    this.validateWithServer().catch(() => {});
   }
 
   stopRevalidation(): void {
