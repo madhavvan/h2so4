@@ -19,6 +19,11 @@ import './pip-styles.css';
 const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
 const isPopoutMode = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('mode') === 'popout';
 
+// Add popout-mode class to HTML for CSS targeting (cursor override for screen share)
+if (isPopoutMode && typeof document !== 'undefined') {
+  document.documentElement.classList.add('popout-mode');
+}
+
 const electronIPC = {
   send: (channel: string, data?: any) => {
     if (isElectron) {
@@ -1609,10 +1614,19 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
         }
+        // Show the ACTUAL error message so user knows what's wrong
+        const actualError = err?.message || 'Unknown error';
+        const isAuthError = actualError.toLowerCase().includes('not authenticated') ||
+                           actualError.toLowerCase().includes('token expired') ||
+                           actualError.toLowerCase().includes('log in');
+        const errorContent = isAuthError
+          ? `Session expired. Please log out and log back in. (${actualError})`
+          : `Error: ${actualError}`;
+
         const errorMsg: Message = {
           id: Date.now().toString(),
           role: 'system',
-          content: "Error generating response. Check API Key.",
+          content: errorContent,
           timestamp: Date.now()
         };
         if (db.isElectron) {
