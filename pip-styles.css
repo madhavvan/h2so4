@@ -164,10 +164,19 @@
 
 .msg {
   display: flex; flex-direction: column; max-width: 85%;
+}
+.msg.user {
+  align-self: flex-end; align-items: flex-end;
   animation: pip-bubble-in var(--dur-ios) var(--ease-ios-out) both;
 }
-.msg.user { align-self: flex-end; align-items: flex-end; }
 .msg.ai   { align-self: flex-start; align-items: flex-start; }
+/* Animate only the streaming bubble entrance — the committed AI bubble
+   that replaces it at stream end must NOT animate, otherwise the user
+   (who may have scrolled up to read) sees a jerk when content below
+   them translates/scales into place. */
+.msg.ai.streaming {
+  animation: pip-bubble-in var(--dur-ios) var(--ease-ios-out) both;
+}
 
 /* Streaming bubble: soft pulsing outline so users can tell the
    answer is still being generated — no layout shift. */
