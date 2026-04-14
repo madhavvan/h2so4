@@ -1338,8 +1338,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         }
       });
     } else if (wasStreamingRef.current) {
-      // Streaming just ended — do NOT smooth scroll, just reset the flag
-      // The message is already visible; no need to jerk the view
+      // Streaming just ended — do NOT scroll
+      // User is already at the right position from streaming, or intentionally scrolled away
+      // Any scroll here causes a "slap" effect
       wasStreamingRef.current = false;
     }
     // Note: We removed the smooth scroll for "discrete events" because it was
