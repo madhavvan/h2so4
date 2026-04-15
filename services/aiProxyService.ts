@@ -6,7 +6,10 @@
 import { licenseService } from './licenseService';
 import { Message, ContextFile } from '../types';
 
-const API_BASE = 'https://h2so4-production.up.railway.app';
+// API_BASE is overridable via VITE_API_BASE in a .env file, so the sandbox
+// can point at a local server without editing code. Falls back to prod URL
+// if the env var is unset (e.g. in a production build that forgot to set it).
+const API_BASE = (import.meta.env?.VITE_API_BASE as string | undefined) || 'https://h2so4-production.up.railway.app';
 
 // ── Retry configuration for resilient AI requests ──
 const MAX_RETRIES = 3;

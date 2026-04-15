@@ -7,7 +7,9 @@ export default defineConfig(({ mode }) => {
     return {
       base: './',
       server: {
-        port: 3005,
+        // Sandbox port — production uses 3005. This lets both dev servers
+        // run simultaneously without port conflict.
+        port: 3006,
         host: '0.0.0.0',
       },
       plugins: [react()],

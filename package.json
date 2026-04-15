@@ -14,13 +14,13 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
-    "electron:start": "concurrently -k \"npm run dev\" \"wait-on tcp:3005 && electron .\"",
-    "electron:build": "npm run build && electron-builder",
-    "electron:publish": "npm run build && electron-builder --publish=always"
+    "electron:start": "concurrently -k \"npm run dev\" \"wait-on tcp:3006 && electron .\"",
+    "electron:build": "npm run build && electron-builder --publish=never",
+    "electron:publish": "echo 'Publish is disabled in the sandbox worktree. Merge feature/live-coding into main and publish from there.' && exit 1"
   },
   "build": {
-    "appId": "com.interviewcopilot.app",
-    "productName": "Interview Copilot",
+    "appId": "com.interviewcopilot.app.dev",
+    "productName": "Interview Copilot (Dev)",
     "directories": {
       "output": "dist-electron"
     },
@@ -28,11 +28,7 @@
       "dist/**/*",
       "electron/**/*"
     ],
-    "publish": {
-      "provider": "github",
-      "owner": "madhavvan",
-      "repo": "h2so4"
-    },
+    "publish": null,
     "mac": {
       "category": "public.app-category.productivity",
       "target": [
@@ -51,7 +47,7 @@
           ]
         }
       ],
-      "artifactName": "InterviewCopilot-Mac-${arch}.${ext}",
+      "artifactName": "InterviewCopilot-DEV-Mac-${arch}.${ext}",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
@@ -63,7 +59,7 @@
     },
     "win": {
       "target": "nsis",
-      "artifactName": "InterviewCopilot-Setup.${ext}"
+      "artifactName": "InterviewCopilot-DEV-Setup.${ext}"
     },
     "nsis": {
       "oneClick": true,
@@ -74,7 +70,7 @@
         "AppImage",
         "deb"
       ],
-      "artifactName": "InterviewCopilot-Linux.${ext}",
+      "artifactName": "InterviewCopilot-DEV-Linux.${ext}",
       "category": "Utility"
     }
   },

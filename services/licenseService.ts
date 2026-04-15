@@ -81,15 +81,11 @@ class LicenseService {
   private readonly TOKEN_KEY = 'minicaai_token';
   private revalidationTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Will be set to real server URL when deployed
-  private API_BASE = 'https://h2so4-production.up.railway.app';
-
-  constructor() {
-    // Use local server in development
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      this.API_BASE = 'https://h2so4-production.up.railway.app';
-    }
-  }
+  // API_BASE is overridable via VITE_API_BASE (see .env.development in the
+  // sandbox worktree) so local dev can hit a local server without editing
+  // code. Falls back to prod URL if unset. The previous hostname === 'localhost'
+  // branch was dead code — it set the same URL in both branches.
+  private API_BASE = (import.meta.env?.VITE_API_BASE as string | undefined) || 'https://h2so4-production.up.railway.app';
 
   // ── Device Fingerprint ──
   async getDeviceId(): Promise<string> {
