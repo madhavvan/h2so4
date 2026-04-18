@@ -106,18 +106,19 @@ app.use((req, res, next) => {
 
   // Check if version is too old and must be blocked
   if (compareVersions(clientVersion, FORCE_UPDATE_VERSION) < 0) {
+    const latest = getLatestVersion();
     return res.status(426).json({
       error: 'App update required',
       message: 'Your app version is no longer supported. Please download the latest version from our website.',
       updateRequired: true,
-      latestVersion: LATEST_APP_VERSION.version,
-      downloadUrl: LATEST_APP_VERSION.downloadUrl,
+      latestVersion: latest.version,
+      downloadUrl: latest.downloadUrl,
     });
   }
 
   // Add update hint to response for slightly old versions
   if (compareVersions(clientVersion, MIN_SUPPORTED_VERSION) < 0) {
-    res.setHeader('X-Update-Available', LATEST_APP_VERSION.version);
+    res.setHeader('X-Update-Available', getLatestVersion().version);
   }
 
   next();
@@ -140,30 +141,98 @@ app.get('/api/health', (req, res) => {
 // Returns the latest app version info. All clients (including old versions)
 // can call this to check if they need to update. This works even when the
 // built-in Electron auto-updater fails.
-const LATEST_APP_VERSION = {
-  version: '2.3.0',
-  minVersion: '2.0.0', // Versions below this MUST update
-  releaseDate: '2026-04-13',
+//
+// Source of truth is the GitHub Releases API — we cache the response in
+// memory for VERSION_CACHE_TTL_MS so cutting a release auto-propagates
+// without a server deploy. Falls back to FALLBACK_VERSION when GitHub is
+// unreachable, so clients never get a broken response.
+//
+// Download filenames MUST match electron-builder's artifactName entries
+// in package.json → build → {win,mac,linux}.
+const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/h2so4/releases/latest';
+const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+const FALLBACK_VERSION = {
+  version: '3.3.5',
+  minVersion: '2.0.0',
+  releaseDate: '2026-04-14',
   releaseNotes: 'Performance improvements and bug fixes',
   downloadUrl: {
-    windows: 'https://github.com/madhavvan/h2so4/releases/latest/download/Interview.Copilot.Setup.exe',
-    mac: 'https://github.com/madhavvan/h2so4/releases/latest/download/Interview.Copilot.dmg',
-    linux: 'https://github.com/madhavvan/h2so4/releases/latest/download/Interview.Copilot.AppImage',
+    windows: 'https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe',
+    // x64 DMG works on all Macs (Apple Silicon runs it under Rosetta). When
+    // we add per-arch detection client-side we can offer arm64 directly.
+    mac: 'https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac-x64.dmg',
+    linux: 'https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage',
   },
 };
 
+const versionCache = {
+  value: FALLBACK_VERSION,
+  fetchedAt: 0,
+  refreshing: false,
+};
+
+async function refreshVersionCache() {
+  if (versionCache.refreshing) return;
+  versionCache.refreshing = true;
+  try {
+    const res = await fetch(GITHUB_RELEASES_URL, {
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'minicaai-server',
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`GitHub API ${res.status}`);
+    const data = await res.json();
+    const tag = (data.tag_name || '').replace(/^v/, '');
+    if (!/^\d+\.\d+\.\d+$/.test(tag)) throw new Error(`Bad tag: ${data.tag_name}`);
+    versionCache.value = {
+      version: tag,
+      minVersion: FALLBACK_VERSION.minVersion,
+      releaseDate: data.published_at || FALLBACK_VERSION.releaseDate,
+      releaseNotes: data.body || FALLBACK_VERSION.releaseNotes,
+      // "/releases/latest/download/<asset>" always resolves to current latest,
+      // so the same URLs work after every release.
+      downloadUrl: FALLBACK_VERSION.downloadUrl,
+    };
+    versionCache.fetchedAt = Date.now();
+  } catch (err) {
+    // Keep the last good cached value. On a cold start where GitHub was
+    // never reachable, this stays at FALLBACK_VERSION — clients still get
+    // a sane (if slightly stale) answer rather than a 500.
+    console.warn('[version-check] GitHub fetch failed:', err.message);
+  } finally {
+    versionCache.refreshing = false;
+  }
+}
+
+function getLatestVersion() {
+  // Sync getter. If the cache is stale, kick off a background refresh for
+  // the next caller — never blocks this request.
+  if (Date.now() - versionCache.fetchedAt > VERSION_CACHE_TTL_MS) {
+    refreshVersionCache();
+  }
+  return versionCache.value;
+}
+
+// Warm the cache at boot so the first request after restart isn't served
+// the cold-start fallback.
+refreshVersionCache();
+
 app.get('/api/v1/app-version', (req, res) => {
+  const latest = getLatestVersion();
   const clientVersion = req.query.v || '0.0.0';
-  const isOutdated = compareVersions(clientVersion, LATEST_APP_VERSION.version) < 0;
-  const mustUpdate = compareVersions(clientVersion, LATEST_APP_VERSION.minVersion) < 0;
+  const isOutdated = compareVersions(clientVersion, latest.version) < 0;
+  const mustUpdate = compareVersions(clientVersion, latest.minVersion) < 0;
 
   res.json({
-    latest: LATEST_APP_VERSION.version,
+    latest: latest.version,
     current: clientVersion,
     isOutdated,
     mustUpdate,
-    releaseNotes: LATEST_APP_VERSION.releaseNotes,
-    downloadUrl: LATEST_APP_VERSION.downloadUrl,
+    releaseNotes: latest.releaseNotes,
+    downloadUrl: latest.downloadUrl,
   });
 });
 

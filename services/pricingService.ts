@@ -3,15 +3,16 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 export interface PricingTier {
-  id: 'free' | 'pro';
+  id: 'free' | 'basic' | 'pro' | 'max';
   name: string;
   price: number;
   currency: string;
   currencySymbol: string;
-  period: 'month';
+  period: 'month' | 'year' | 'one-time';
   features: string[];
   popular?: boolean;
   cta: string;
+  subtitle?: string; // e.g. "3 interviews · 14-day expiry"
 }
 
 export interface RegionPricing {
@@ -67,10 +68,21 @@ const EXCHANGE_RATES: Record<string, { rate: number; symbol: string; code: strin
 const EUROZONE = ['AT', 'BE', 'CY', 'EE', 'FI', 'FR', 'DE', 'GR', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PT', 'SK', 'SI', 'ES'];
 
 const BASE_FEATURES_FREE = [
-  '5 interview sessions per month',
-  'Gemini Flash model only',
+  '30-minute full-experience trial on signup',
+  'Gemini Flash model only (after trial)',
   'Basic transcript capture',
   'Community support',
+];
+
+const BASE_FEATURES_BASIC = [
+  '3 interview credits (3 hours total)',
+  'All AI models (Gemini, GPT, Groq, Grok)',
+  'Pop-out stealth mode',
+  'Auto-solve with screen analysis',
+  'Resume & JD context upload',
+  'Session history & export',
+  'Renewable: +1h for $6.99',
+  '14-day credit expiry',
 ];
 
 const BASE_FEATURES_PRO = [
@@ -81,6 +93,14 @@ const BASE_FEATURES_PRO = [
   'Resume & JD context upload',
   'Pop-out stealth mode',
   'Session history & export',
+  'Priority support',
+];
+
+const BASE_FEATURES_MAX = [
+  'Everything in Pro',
+  'Auto-Type into any editor (HackerRank, CoderPad, etc.)',
+  'Human-like typing rhythm & indent handling',
+  'No copy-paste detection',
   'Priority support',
 ];
 
@@ -97,11 +117,18 @@ function roundPrice(price: number, code: string): number {
   return Math.floor(price) + 0.99;
 }
 
+// USD base prices — single source of truth. Non-USD regions scale via exchange rate.
+const USD_PRICES = {
+  basic: 25,     // one-time, 3 credits, 14-day expiry
+  pro: 29,       // monthly subscription
+  max: 69,       // monthly subscription
+} as const;
+
 class PricingService {
   getPricing(countryCode: string): RegionPricing {
     const cc = countryCode.toUpperCase();
 
-    // Special pricing: India
+    // Special pricing: India (hand-tuned for market)
     if (cc === 'IN') {
       return {
         country_code: 'IN',
@@ -115,15 +142,26 @@ class PricingService {
             features: BASE_FEATURES_FREE, cta: 'Get Started Free',
           },
           {
-            id: 'pro', name: 'Pro', price: 3999,
+            id: 'basic', name: 'Basic', price: 1999,
+            currency: 'INR', currencySymbol: '₹', period: 'one-time',
+            features: BASE_FEATURES_BASIC, popular: true, cta: 'Get 3 Interviews',
+            subtitle: '3 credits · 14-day expiry',
+          },
+          {
+            id: 'pro', name: 'Pro', price: 2499,
             currency: 'INR', currencySymbol: '₹', period: 'month',
-            features: BASE_FEATURES_PRO, popular: true, cta: 'Start Pro Trial',
+            features: BASE_FEATURES_PRO, cta: 'Start Pro',
+          },
+          {
+            id: 'max', name: 'Max', price: 5999,
+            currency: 'INR', currencySymbol: '₹', period: 'month',
+            features: BASE_FEATURES_MAX, cta: 'Start Max',
           },
         ],
       };
     }
 
-    // Special pricing: USA
+    // Special pricing: USA (source of truth)
     if (cc === 'US') {
       return {
         country_code: 'US',
@@ -137,28 +175,33 @@ class PricingService {
             features: BASE_FEATURES_FREE, cta: 'Get Started Free',
           },
           {
-            id: 'pro', name: 'Pro', price: 50,
+            id: 'basic', name: 'Basic', price: USD_PRICES.basic,
+            currency: 'USD', currencySymbol: '$', period: 'one-time',
+            features: BASE_FEATURES_BASIC, popular: true, cta: 'Get 3 Interviews',
+            subtitle: '3 credits · 14-day expiry',
+          },
+          {
+            id: 'pro', name: 'Pro', price: USD_PRICES.pro,
             currency: 'USD', currencySymbol: '$', period: 'month',
-            features: BASE_FEATURES_PRO, popular: true, cta: 'Start Pro Trial',
+            features: BASE_FEATURES_PRO, cta: 'Start Pro',
+          },
+          {
+            id: 'max', name: 'Max', price: USD_PRICES.max,
+            currency: 'USD', currencySymbol: '$', period: 'month',
+            features: BASE_FEATURES_MAX, cta: 'Start Max',
           },
         ],
       };
     }
 
-    // All other countries: $50 USD converted to local currency
+    // All other countries: USD base × exchange rate, rounded
     let exchange = EXCHANGE_RATES[cc];
+    if (!exchange && EUROZONE.includes(cc)) exchange = EXCHANGE_RATES['EU'];
+    if (!exchange) exchange = { rate: 1, symbol: '$', code: 'USD' };
 
-    // Eurozone fallback
-    if (!exchange && EUROZONE.includes(cc)) {
-      exchange = EXCHANGE_RATES['EU'];
-    }
-
-    // Default to USD if country not in rate table
-    if (!exchange) {
-      exchange = { rate: 1, symbol: '$', code: 'USD' };
-    }
-
-    const proPrice = roundPrice(50 * exchange.rate, exchange.code);
+    const basicPrice = roundPrice(USD_PRICES.basic * exchange.rate, exchange.code);
+    const proPrice = roundPrice(USD_PRICES.pro * exchange.rate, exchange.code);
+    const maxPrice = roundPrice(USD_PRICES.max * exchange.rate, exchange.code);
 
     return {
       country_code: cc,
@@ -172,9 +215,20 @@ class PricingService {
           features: BASE_FEATURES_FREE, cta: 'Get Started Free',
         },
         {
+          id: 'basic', name: 'Basic', price: basicPrice,
+          currency: exchange.code, currencySymbol: exchange.symbol, period: 'one-time',
+          features: BASE_FEATURES_BASIC, popular: true, cta: 'Get 3 Interviews',
+          subtitle: '3 credits · 14-day expiry',
+        },
+        {
           id: 'pro', name: 'Pro', price: proPrice,
           currency: exchange.code, currencySymbol: exchange.symbol, period: 'month',
-          features: BASE_FEATURES_PRO, popular: true, cta: 'Start Pro Trial',
+          features: BASE_FEATURES_PRO, cta: 'Start Pro',
+        },
+        {
+          id: 'max', name: 'Max', price: maxPrice,
+          currency: exchange.code, currencySymbol: exchange.symbol, period: 'month',
+          features: BASE_FEATURES_MAX, cta: 'Start Max',
         },
       ],
     };
@@ -187,6 +241,22 @@ class PricingService {
       return `${symbol}${price.toLocaleString()}`;
     }
     return `${symbol}${price.toFixed(2)}`;
+  }
+
+  // Basic-tier renewal: +1 credit (1 hour). Only offered to Basic users.
+  // Returns { price, currency, currencySymbol } in the user's region.
+  getBasicRenewalPrice(countryCode: string): { price: number; currency: string; currencySymbol: string } {
+    const cc = countryCode.toUpperCase();
+    if (cc === 'US') return { price: 6.99, currency: 'USD', currencySymbol: '$' };
+    if (cc === 'IN') return { price: 599, currency: 'INR', currencySymbol: '₹' };
+    let exchange = EXCHANGE_RATES[cc];
+    if (!exchange && EUROZONE.includes(cc)) exchange = EXCHANGE_RATES['EU'];
+    if (!exchange) exchange = { rate: 1, symbol: '$', code: 'USD' };
+    return {
+      price: roundPrice(6.99 * exchange.rate, exchange.code),
+      currency: exchange.code,
+      currencySymbol: exchange.symbol,
+    };
   }
 }
 

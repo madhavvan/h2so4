@@ -9,6 +9,20 @@ if (process.env.STRIPE_SECRET_KEY) {
   stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 }
 
+// ── Tier helpers (mirror of payments.js — kept local to avoid a cross-file
+//    dependency; webhooks may run in a separate worker in the future). ──
+const VALID_TIERS = ['basic', 'pro', 'max'];
+const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+function resolveTier(t, fallback = 'pro') {
+  return VALID_TIERS.includes(t) ? t : fallback;
+}
+function grantConfigForTier(tier) {
+  if (tier === 'basic') {
+    return { tier: 'basic', sessions_limit: 3, expires_at: Date.now() + FOURTEEN_DAYS_MS };
+  }
+  return { tier, sessions_limit: -1, expires_at: -1 };
+}
+
 router.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
 
@@ -27,19 +41,33 @@ router.post('/stripe', express.raw({ type: 'application/json' }), async (req, re
     case 'checkout.session.completed': {
       const session = event.data.object;
       const email = session.customer_email || session.metadata?.user_email;
-      console.log('[WEBHOOK] Payment completed:', email);
+      // `mode === 'renewal'` signals the Basic +1/+1h top-up flow —
+      // grant the renewal instead of resetting to full Basic.
+      const isRenewal = session.metadata?.mode === 'renewal';
+      const tier = resolveTier(session.metadata?.tier);
+      console.log('[WEBHOOK] Payment completed:', email, isRenewal ? '(renewal)' : `tier: ${tier}`);
 
       if (email) {
         const user = db.getUserByEmail(email);
         if (user) {
-          db.updateUserTier(user.id, 'pro');
-          db.updateLicenseOnPayment(user.id, {
-            tier: 'pro',
-            status: 'active',
-            expires_at: -1,  // Managed by Stripe
-            sessions_limit: -1,
-          });
-          // Save Stripe customer ID
+          let grantedTier;
+          if (isRenewal) {
+            const updated = db.grantBasicRenewal(user.id);
+            grantedTier = (updated && updated.tier) || 'basic';
+          } else {
+            const grant = grantConfigForTier(tier);
+            grantedTier = grant.tier;
+            db.updateUserTier(user.id, grant.tier);
+            db.updateLicenseOnPayment(user.id, {
+              tier: grant.tier,
+              status: 'active',
+              expires_at: grant.expires_at,  // Basic: now+14d, Pro/Max: -1 (Stripe-managed)
+              sessions_limit: grant.sessions_limit, // Basic: 3, Pro/Max: -1
+            });
+          }
+          // Save Stripe customer ID (even on renewal — may be the first
+          // time we see this customer if they renewed via a different
+          // email / guest flow).
           if (session.customer) {
             const d = db.getDB();
             d.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
@@ -52,13 +80,18 @@ router.post('/stripe', express.raw({ type: 'application/json' }), async (req, re
             provider: 'stripe',
             provider_payment_id: session.payment_intent || session.id,
             provider_subscription_id: session.subscription || null,
-            amount: session.amount_total || 5000,
+            amount: session.amount_total || 0,
             currency: (session.currency || 'usd').toUpperCase(),
             status: 'completed',
-            tier_granted: 'pro',
-            metadata: { checkout_session_id: session.id, customer_id: session.customer },
+            tier_granted: grantedTier,
+            metadata: {
+              checkout_session_id: session.id,
+              customer_id: session.customer,
+              tier: grantedTier,
+              mode: isRenewal ? 'renewal' : 'tier',
+            },
           });
-          console.log('[WEBHOOK] User upgraded to Pro:', email);
+          console.log('[WEBHOOK]', isRenewal ? 'Renewal applied for:' : `User upgraded to ${grantedTier.toUpperCase()}:`, email);
         }
       }
       break;
@@ -67,30 +100,38 @@ router.post('/stripe', express.raw({ type: 'application/json' }), async (req, re
     case 'customer.subscription.updated': {
       const subscription = event.data.object;
       const customerId = subscription.customer;
-      console.log('[WEBHOOK] Subscription updated:', customerId);
+      // Tier rides on subscription_data.metadata set at checkout creation.
+      // Fall back to the user's current license tier so an update event
+      // doesn't accidentally downgrade a Max user to Pro.
+      const subTier = resolveTier(subscription.metadata?.tier, null);
+      console.log('[WEBHOOK] Subscription updated:', customerId, 'tier:', subTier);
 
       const d = db.getDB();
       const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
       if (user) {
+        const currentLicense = db.getLicenseByUserId(user.id);
+        const tier = subTier || resolveTier(currentLicense?.tier);
+        const grant = grantConfigForTier(tier);
+
         const isActive = ['active', 'trialing'].includes(subscription.status);
         const isCanceling = subscription.cancel_at_period_end;
 
         if (isActive && !isCanceling) {
-          db.updateUserTier(user.id, 'pro');
+          db.updateUserTier(user.id, grant.tier);
           db.updateLicenseOnPayment(user.id, {
-            tier: 'pro',
+            tier: grant.tier,
             status: 'active',
-            expires_at: -1,
-            sessions_limit: -1,
+            expires_at: grant.expires_at,
+            sessions_limit: grant.sessions_limit,
           });
         } else if (isCanceling) {
-          // Will cancel at period end — keep pro until then
+          // Will cancel at period end — keep the paid tier until then.
           const periodEnd = subscription.current_period_end * 1000;
           db.updateLicenseOnPayment(user.id, {
-            tier: 'pro',
+            tier: grant.tier,
             status: 'active',
             expires_at: periodEnd,
-            sessions_limit: -1,
+            sessions_limit: grant.sessions_limit,
           });
           console.log('[WEBHOOK] Subscription canceling at period end for:', user.email);
         } else if (subscription.status === 'past_due') {
@@ -200,17 +241,19 @@ router.post('/razorpay', express.json(), async (req, res) => {
       const subscription = payload.subscription?.entity;
       const payment = payload.payment?.entity;
       const email = subscription?.notes?.user_email || payment?.notes?.user_email;
-      console.log('[RZP WEBHOOK] Subscription charged:', email);
+      const tier = resolveTier(subscription?.notes?.tier || payment?.notes?.tier);
+      const grant = grantConfigForTier(tier);
+      console.log('[RZP WEBHOOK] Subscription charged:', email, 'tier:', tier);
 
       if (email) {
         const user = db.getUserByEmail(email);
         if (user) {
-          db.updateUserTier(user.id, 'pro');
+          db.updateUserTier(user.id, grant.tier);
           db.updateLicenseOnPayment(user.id, {
-            tier: 'pro',
+            tier: grant.tier,
             status: 'active',
-            expires_at: -1,
-            sessions_limit: -1,
+            expires_at: grant.expires_at,
+            sessions_limit: grant.sessions_limit,
           });
           const d = db.getDB();
           d.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
@@ -221,13 +264,13 @@ router.post('/razorpay', express.json(), async (req, res) => {
             provider: 'razorpay',
             provider_payment_id: payment?.id,
             provider_subscription_id: subscription?.id,
-            amount: payment?.amount || 399900,
+            amount: payment?.amount || 0,
             currency: payment?.currency?.toUpperCase() || 'INR',
             status: 'completed',
-            tier_granted: 'pro',
-            metadata: { event: 'subscription.charged' },
+            tier_granted: grant.tier,
+            metadata: { event: 'subscription.charged', tier: grant.tier },
           });
-          console.log('[RZP WEBHOOK] User upgraded to Pro:', email);
+          console.log('[RZP WEBHOOK] User upgraded to', grant.tier.toUpperCase(), ':', email);
         }
       }
       break;
@@ -270,18 +313,32 @@ router.post('/razorpay', express.json(), async (req, res) => {
     case 'payment.captured': {
       const payment = payload.payment?.entity;
       const email = payment?.notes?.user_email;
-      console.log('[RZP WEBHOOK] Payment captured:', email);
+      const rawTier = payment?.notes?.tier;
+      // `notes.mode === 'renewal'` signals a Basic top-up (+1 session /
+      // +1h) rather than a fresh tier grant. Either flow requires a
+      // known tier stamped at order creation — that blocks stray
+      // payment.captured events for unrelated orders.
+      const isRenewal = payment?.notes?.mode === 'renewal';
+      console.log('[RZP WEBHOOK] Payment captured:', email, isRenewal ? '(renewal)' : `tier: ${rawTier}`);
 
-      if (email && payment?.notes?.tier === 'pro') {
+      if (email && VALID_TIERS.includes(rawTier)) {
         const user = db.getUserByEmail(email);
         if (user) {
-          db.updateUserTier(user.id, 'pro');
-          db.updateLicenseOnPayment(user.id, {
-            tier: 'pro',
-            status: 'active',
-            expires_at: -1,
-            sessions_limit: -1,
-          });
+          let grantedTier;
+          if (isRenewal) {
+            const updated = db.grantBasicRenewal(user.id);
+            grantedTier = (updated && updated.tier) || 'basic';
+          } else {
+            const grant = grantConfigForTier(rawTier);
+            grantedTier = grant.tier;
+            db.updateUserTier(user.id, grant.tier);
+            db.updateLicenseOnPayment(user.id, {
+              tier: grant.tier,
+              status: 'active',
+              expires_at: grant.expires_at,
+              sessions_limit: grant.sessions_limit,
+            });
+          }
           const d = db.getDB();
           d.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
             .run(`rzp_${payment.id}`, Date.now(), user.id);
@@ -291,13 +348,18 @@ router.post('/razorpay', express.json(), async (req, res) => {
             provider: 'razorpay',
             provider_payment_id: payment.id,
             provider_subscription_id: null,
-            amount: payment.amount || 399900,
+            amount: payment.amount || 0,
             currency: (payment.currency || 'inr').toUpperCase(),
             status: 'completed',
-            tier_granted: 'pro',
-            metadata: { event: 'payment.captured', order_id: payment.order_id },
+            tier_granted: grantedTier,
+            metadata: {
+              event: 'payment.captured',
+              order_id: payment.order_id,
+              tier: grantedTier,
+              mode: isRenewal ? 'renewal' : 'tier',
+            },
           });
-          console.log('[RZP WEBHOOK] User upgraded to Pro:', email);
+          console.log('[RZP WEBHOOK]', isRenewal ? 'Renewal applied for:' : `User upgraded to ${grantedTier.toUpperCase()}:`, email);
         }
       }
       break;

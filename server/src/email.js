@@ -1,22 +1,54 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  EMAIL — nodemailer wrapper for transactional messages
+//  EMAIL — Resend (HTTPS) primary, SMTP fallback
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Config is read lazily so missing SMTP env vars never crash the server
-// at boot. If SMTP is unconfigured we log the message (including reset
-// links) to the console — useful in local dev but the caller should
-// still treat it as a "sent" for user-facing messaging.
+// Primary transport is Resend over HTTPS (port 443). Railway (and most
+// cloud hosts) blocks or rate-limits outbound SMTP to Gmail/Office365,
+// which is why we moved off nodemailer-to-Gmail. Resend uses plain
+// HTTPS so the TCP path always works.
+//
+// If RESEND_API_KEY is not set we fall back to nodemailer/SMTP — still
+// useful for local dev against Mailhog or a personal Gmail. If neither
+// is configured we log the message (including reset links) to the
+// console so local dev never silently swallows email.
 
+let resendClient = null;
+let resendInitAttempted = false;
 let transporterPromise = null;
+
+function getResendClient() {
+  if (resendInitAttempted) return resendClient;
+  resendInitAttempted = true;
+
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    console.log('[email] RESEND_API_KEY not set — falling back to SMTP');
+    return null;
+  }
+
+  try {
+    const { Resend } = require('resend');
+    resendClient = new Resend(apiKey);
+    console.log('[email] Resend initialized — using HTTPS API transport');
+  } catch (err) {
+    console.error('[email] resend package not installed — run `npm install resend` in the server directory:', err && err.message);
+    resendClient = null;
+  }
+  return resendClient;
+}
 
 function getTransporter() {
   if (transporterPromise) return transporterPromise;
 
   const host = process.env.SMTP_HOST;
   const port = parseInt(process.env.SMTP_PORT || '587', 10);
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
+  // Strip whitespace. Gmail app passwords are shown as "abcd efgh ijkl mnop"
+  // and users paste them as-is into Railway; those spaces then travel
+  // through SMTP AUTH PLAIN and Gmail rejects (often slowly, hanging the
+  // connection). Same hygiene on the username to be safe.
+  const user = (process.env.SMTP_USER || '').trim();
+  const pass = (process.env.SMTP_PASS || '').replace(/\s+/g, '');
 
-  console.log(`[email] SMTP config — host=${host || '(not set)'}, port=${port}, user=${user || '(not set)'}, pass=${pass ? '****' : '(not set)'}`);
+  console.log(`[email] SMTP config — host=${host || '(not set)'}, port=${port}, user=${user || '(not set)'}, pass=${pass ? `**** (${pass.length} chars)` : '(not set)'}`);
 
   if (!host || !user || !pass) {
     console.error('[email] SMTP not configured — missing:', [!host && 'SMTP_HOST', !user && 'SMTP_USER', !pass && 'SMTP_PASS'].filter(Boolean).join(', '));
@@ -31,13 +63,22 @@ function getTransporter() {
       port,
       secure: port === 465,
       auth: { user, pass },
+      // Aggressive timeouts. Nodemailer defaults are 2 min connect and
+      // 10 min socket — any stuck Gmail handshake would hang requests
+      // effectively forever. Fail fast so callers can retry or respond.
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 15_000,
     });
-    // Verify the connection on startup
-    transporter.verify().then(() => {
-      console.log('[email] SMTP connection verified — ready to send');
-    }).catch((err) => {
-      console.error('[email] SMTP connection FAILED:', err.message);
-    });
+    // Probe the connection. On failure, clear the cached promise so the
+    // next sendMail rebuilds the transport — otherwise one bad boot
+    // permanently breaks email until the process restarts.
+    transporter.verify()
+      .then(() => console.log('[email] SMTP connection verified — ready to send'))
+      .catch((err) => {
+        console.error('[email] SMTP connection FAILED:', err && err.message);
+        transporterPromise = null;
+      });
     transporterPromise = Promise.resolve(transporter);
   } catch (err) {
     console.error('[email] nodemailer not installed — run `npm install nodemailer` in the server directory.');
@@ -47,24 +88,56 @@ function getTransporter() {
 }
 
 async function sendMail({ to, subject, html, text }) {
-  const transporter = await getTransporter();
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER || 'noreply@minicaai.com';
+  const from = process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER || 'noreply@minicaai.com';
 
+  // ── Primary: Resend (HTTPS, survives cloud egress restrictions) ──
+  const resend = getResendClient();
+  if (resend) {
+    try {
+      // Resend SDK v3+ returns { data, error } instead of throwing.
+      // Wrap `to` as an array — string works too, but array is the
+      // documented shape and avoids SDK edge cases.
+      const result = await resend.emails.send({
+        from,
+        to: Array.isArray(to) ? to : [to],
+        subject,
+        html,
+        text,
+      });
+      if (result && result.error) {
+        const msg = result.error.message || JSON.stringify(result.error);
+        console.error('[email:resend] send failed:', msg);
+        return { ok: false, reason: 'resend_failed', error: msg };
+      }
+      const messageId = result && result.data && result.data.id;
+      console.log('[email:resend] sent' + (messageId ? ` messageId=${messageId}` : ''));
+      return { ok: true, messageId };
+    } catch (err) {
+      console.error('[email:resend] send threw:', err && err.message);
+      return { ok: false, reason: 'resend_threw', error: err && err.message };
+    }
+  }
+
+  // ── Fallback: SMTP (nodemailer) ──
+  const transporter = await getTransporter();
   if (!transporter) {
     console.warn('━'.repeat(60));
-    console.warn('[email] SMTP not configured — message not sent.');
+    console.warn('[email] No transport configured (no RESEND_API_KEY and no SMTP) — message not sent.');
     console.warn(`        To:      ${to}`);
     console.warn(`        Subject: ${subject}`);
     if (text) console.warn(`        Body:    ${text}`);
     console.warn('━'.repeat(60));
-    return { ok: false, reason: 'smtp_not_configured' };
+    return { ok: false, reason: 'no_transport_configured' };
   }
 
   try {
     const info = await transporter.sendMail({ from, to, subject, html, text });
     return { ok: true, messageId: info.messageId };
   } catch (err) {
-    console.error('[email] send failed:', err && err.message);
+    console.error('[email:smtp] send failed:', err && err.message);
+    // Bust the transport cache on failure so the next call rebuilds.
+    // Cheap, and avoids a zombie transporter on transient network blips.
+    transporterPromise = null;
     return { ok: false, reason: 'send_failed', error: err && err.message };
   }
 }

@@ -354,20 +354,6 @@ html.electron-transparent .send-btn {
   background: rgba(255, 255, 255, 0.08) !important;
 }
 
-/* Resize grip indicator in bottom-right corner */
-html.electron-transparent .popup::after {
-  content: '';
-  position: fixed;
-  bottom: 4px;
-  right: 4px;
-  width: 12px;
-  height: 12px;
-  border-right: 2px solid rgba(255, 255, 255, 0.3);
-  border-bottom: 2px solid rgba(255, 255, 255, 0.3);
-  pointer-events: none;
-  z-index: 9999;
-}
-
 /* Respect reduced-motion — kills bubble-in, caret blink, and
    the iOS easings we sprinkled above. Accessibility > polish. */
 @media (prefers-reduced-motion: reduce) {

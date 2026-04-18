@@ -116,6 +116,19 @@ function getDB() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
+    -- Every admin mutation is recorded here. Read-only from the API surface;
+    -- writes happen through logAdminAction() on the server only.
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      admin_email TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target_user_id TEXT,
+      target_email TEXT,
+      details_json TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at);
+
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -168,12 +181,27 @@ function getDB() {
     CREATE INDEX IF NOT EXISTS idx_reset_tokens_expires ON password_reset_tokens(expires_at);
   `);
 
-  // Set default app config
+  // Set default app config. Per-tier device limits — admin can tune each via
+  // app_config without a code deploy. Max is highest to support users who
+  // legitimately work from multiple machines.
   const setDefault = db.prepare('INSERT OR IGNORE INTO app_config (key, value, updated_at) VALUES (?, ?, ?)');
   setDefault.run('min_app_version', '2.0.0', Date.now());
   setDefault.run('latest_app_version', '2.0.0', Date.now());
   setDefault.run('max_devices_free', '2', Date.now());
+  setDefault.run('max_devices_basic', '2', Date.now());
   setDefault.run('max_devices_pro', '3', Date.now());
+  setDefault.run('max_devices_max', '5', Date.now());
+
+  // ── Idempotent migrations ──
+  // SQLite has no "ADD COLUMN IF NOT EXISTS", so we check PRAGMA table_info.
+  // Any column added AFTER initial deploy must be handled this way.
+  const userCols = db.prepare("PRAGMA table_info(users)").all();
+  if (!userCols.find(c => c.name === 'tokens_revoked_after')) {
+    // Every token signed BEFORE this timestamp is rejected by authMiddleware.
+    // Used to force-logout a user without banning them — bump this value and
+    // all of their existing sessions die on the next request.
+    db.exec('ALTER TABLE users ADD COLUMN tokens_revoked_after INTEGER DEFAULT 0');
+  }
 
   return db;
 }
@@ -232,6 +260,10 @@ function getUserById(id) {
 function verifyUserPassword(email, password) {
   const user = getUserByEmail(email);
   if (!user) return null;
+  // Google-only accounts have no password_hash. Treat as "wrong password"
+  // rather than letting verifyPassword crash on null.split(':') — same 401
+  // the caller returns for a real mismatch, no information leak.
+  if (!user.password_hash) return null;
   if (!verifyPassword(password, user.password_hash)) return null;
   // Update last login
   getDB().prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), user.id);
@@ -388,9 +420,23 @@ function registerDevice(userId, deviceId, deviceName) {
     return existing;
   }
 
-  // Check device limit — auto-replace oldest if full
+  // Check device limit — auto-replace oldest if full. Each tier has its own
+  // configurable limit (see app_config defaults). Falls back to the free-tier
+  // limit if the user's tier string is something unexpected.
   const user = getUserById(userId);
-  const maxDevices = user.tier === 'pro' ? getConfig('max_devices_pro', 3) : getConfig('max_devices_free', 2);
+  if (!user) {
+    // Caller passed a userId that no longer exists (deleted user, stale
+    // license row, race with account deletion). Fail loud rather than
+    // crash on `user.tier` below.
+    throw new Error(`registerDevice: user ${userId} not found`);
+  }
+  const tierDeviceLimits = {
+    free: getConfig('max_devices_free', 2),
+    basic: getConfig('max_devices_basic', 2),
+    pro: getConfig('max_devices_pro', 3),
+    max: getConfig('max_devices_max', 5),
+  };
+  const maxDevices = tierDeviceLimits[user.tier] ?? tierDeviceLimits.free;
   const activeDevices = d.prepare('SELECT * FROM devices WHERE user_id = ? AND is_active = 1 ORDER BY last_seen_at ASC').all(userId);
 
   if (activeDevices.length >= maxDevices) {
@@ -574,6 +620,145 @@ function getPaymentStats() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ADMIN ACTIONS (audit-logged mutations)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Writes a single row into audit_log. Caller is responsible for providing
+// the admin's identity — the function doesn't know who's calling it.
+function logAdminAction(adminEmail, action, targetUserId, targetEmail, details) {
+  getDB().prepare(`
+    INSERT INTO audit_log (admin_email, action, target_user_id, target_email, details_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    adminEmail,
+    action,
+    targetUserId || null,
+    targetEmail || null,
+    details ? JSON.stringify(details) : null,
+    Date.now()
+  );
+}
+
+function getAuditLog(limit = 100) {
+  return getDB()
+    .prepare('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?')
+    .all(Math.min(Math.max(limit, 1), 500));
+}
+
+// Force-logout: set a timestamp; authMiddleware rejects any token issued
+// before this. Bumping invalidates every existing session for this user.
+function forceLogoutUser(userId) {
+  getDB().prepare('UPDATE users SET tokens_revoked_after = ?, updated_at = ? WHERE id = ?')
+    .run(Date.now(), Date.now(), userId);
+}
+
+// Hot path — called on every authenticated request. Returns 0 if never set.
+function getTokensRevokedAfter(userId) {
+  const row = getDB().prepare('SELECT tokens_revoked_after FROM users WHERE id = ?').get(userId);
+  return row ? (row.tokens_revoked_after || 0) : 0;
+}
+
+// Mark every device for a user inactive. Device rows are preserved so
+// historical device-usage data stays intact; the user just has to re-bind
+// on next login.
+function resetUserDevices(userId) {
+  const d = getDB();
+  const result = d.prepare('UPDATE devices SET is_active = 0 WHERE user_id = ? AND is_active = 1').run(userId);
+  return result.changes;
+}
+
+// Grant N credit-sessions (Basic tier). If the license is unlimited
+// (sessions_limit === -1), this is a no-op — Pro/Max don't use credits.
+// Returns the updated license (or null if user has none).
+function grantCreditSessions(userId, n) {
+  const license = getLicenseByUserId(userId);
+  if (!license) return null;
+  if (license.sessions_limit === -1) return license;
+  const newLimit = Math.max(0, (license.sessions_limit || 0) + n);
+  getDB().prepare('UPDATE licenses SET sessions_limit = ? WHERE user_id = ?')
+    .run(newLimit, userId);
+  return getLicenseByUserId(userId);
+}
+
+// Push the license expiry out by N days from whichever is later: now, or the
+// current expiry. -1 (never-expires, for Pro/Max) is preserved.
+function extendLicenseExpiry(userId, days) {
+  const license = getLicenseByUserId(userId);
+  if (!license) return null;
+  if (license.expires_at === -1) return license;
+  const base = Math.max(Date.now(), license.expires_at);
+  const newExpiry = base + days * 24 * 60 * 60 * 1000;
+  getDB().prepare('UPDATE licenses SET expires_at = ? WHERE user_id = ?')
+    .run(newExpiry, userId);
+  return getLicenseByUserId(userId);
+}
+
+// Basic-tier renewal top-up: +1 session credit, +1 hour wall-clock. The
+// renewal button charges a fraction of the full Basic price and must
+// only add to what's already there — NEVER reset back to 3 sessions /
+// 14 days (that would be a full re-purchase, not a renewal).
+//
+// For Pro/Max (sessions_limit === -1, expires_at === -1), the renewal
+// product isn't offered in the UI; if it somehow triggered server-side,
+// we leave the unlimited values intact and only flip status→active.
+// For Free or expired users, we reactivate Basic with sessions_limit=1
+// and expires_at=now+1h — paying for a 1-hour session is a valid path.
+function grantBasicRenewal(userId) {
+  const license = getLicenseByUserId(userId);
+  if (!license) return null;
+
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  let newLimit;
+  let newExpiresAt;
+  let newTier = 'basic';
+
+  if (license.sessions_limit === -1 || license.expires_at === -1) {
+    // Pro/Max — leave unlimited values alone, just re-affirm active.
+    newTier = license.tier;
+    newLimit = license.sessions_limit;
+    newExpiresAt = license.expires_at;
+  } else {
+    newLimit = (license.sessions_limit || 0) + 1;
+    // Anchor from whichever is later: now, or the existing expiry. Then
+    // add 1h. An already-expired license starts its new 1h from now;
+    // a still-valid one gets its expiry pushed out by 1h.
+    const base = Math.max(Date.now(), license.expires_at || 0);
+    newExpiresAt = base + ONE_HOUR_MS;
+  }
+
+  getDB().prepare(`
+    UPDATE licenses SET tier = ?, status = 'active', expires_at = ?, sessions_limit = ? WHERE user_id = ?
+  `).run(newTier, newExpiresAt, newLimit, userId);
+  return getLicenseByUserId(userId);
+}
+
+// Look up a user's most recent Razorpay subscription id from the payments
+// history — needed for the customer-initiated cancel flow since we don't
+// store the active subscription id on the user row. Orders the query by
+// created_at desc and filters to payments that actually carry a sub id
+// (one-time Basic purchases won't match).
+function getLatestRazorpaySubscriptionId(userId) {
+  const row = getDB().prepare(`
+    SELECT provider_subscription_id FROM payments
+    WHERE user_id = ? AND provider = 'razorpay' AND provider_subscription_id IS NOT NULL
+    ORDER BY created_at DESC LIMIT 1
+  `).get(userId);
+  return row ? row.provider_subscription_id : null;
+}
+
+// Undo a revocation. Removes the revoked_keys row and flips the license
+// status back to 'active'. Paired with revokeKey().
+function unrevokeKey(key) {
+  const d = getDB();
+  d.prepare('DELETE FROM revoked_keys WHERE key = ?').run(key);
+  d.prepare("UPDATE licenses SET status = 'active' WHERE key = ?").run(key);
+}
+
+function unbanUser(userId) {
+  getDB().prepare('UPDATE users SET is_banned = 0, updated_at = ? WHERE id = ?').run(Date.now(), userId);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
 //  ADMIN STATS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -582,10 +767,54 @@ function getStats() {
   const dayAgo = Date.now() - (24 * 60 * 60 * 1000);
   const monthAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
 
+  // Full per-tier user count — single GROUP BY scan instead of four COUNTs.
+  const tierRows = d.prepare('SELECT tier, COUNT(*) as c FROM users GROUP BY tier').all();
+  const tiers = { free: 0, basic: 0, pro: 0, max: 0 };
+  for (const row of tierRows) {
+    if (row.tier in tiers) tiers[row.tier] = row.c;
+  }
+
+  // Month-to-date revenue split by the tier that each payment granted.
+  // NB: this groups payments by `tier_granted` which is set at checkout time,
+  // so if a user upgraded from Basic→Pro within the month, the Basic payment
+  // still appears in the basic row. That's the right behaviour.
+  const revenueRows = d.prepare(`
+    SELECT tier_granted, COALESCE(SUM(amount), 0) as total, COUNT(*) as c
+    FROM payments
+    WHERE status = 'completed' AND created_at > ?
+    GROUP BY tier_granted
+  `).all(monthAgo);
+  const revenueByTier = { basic: 0, pro: 0, max: 0 };
+  const paymentsByTier = { basic: 0, pro: 0, max: 0 };
+  for (const row of revenueRows) {
+    if (row.tier_granted && row.tier_granted in revenueByTier) {
+      revenueByTier[row.tier_granted] = row.total;
+      paymentsByTier[row.tier_granted] = row.c;
+    }
+  }
+
+  // Signups broken down by tier — lets admin see whether marketing is
+  // driving Pro/Max or mostly free-tier sign-ups.
+  const signupRows = d.prepare(`
+    SELECT tier, COUNT(*) as c FROM users WHERE created_at > ? GROUP BY tier
+  `).all(monthAgo);
+  const signupsByTier = { free: 0, basic: 0, pro: 0, max: 0 };
+  for (const row of signupRows) {
+    if (row.tier in signupsByTier) signupsByTier[row.tier] = row.c;
+  }
+
   return {
     total_users: d.prepare('SELECT COUNT(*) as c FROM users').get().c,
-    pro_users: d.prepare("SELECT COUNT(*) as c FROM users WHERE tier = 'pro'").get().c,
-    free_users: d.prepare("SELECT COUNT(*) as c FROM users WHERE tier = 'free'").get().c,
+    // Legacy flat fields — kept so older client builds keep working.
+    pro_users: tiers.pro,
+    free_users: tiers.free,
+    // New 4-tier breakdown.
+    tiers,
+    basic_users: tiers.basic,
+    max_users: tiers.max,
+    revenue_by_tier: revenueByTier,
+    payments_by_tier: paymentsByTier,
+    signups_by_tier: signupsByTier,
     active_today: d.prepare('SELECT COUNT(*) as c FROM users WHERE last_login_at > ?').get(dayAgo).c,
     signups_this_month: d.prepare('SELECT COUNT(*) as c FROM users WHERE created_at > ?').get(monthAgo).c,
     total_devices: d.prepare('SELECT COUNT(*) as c FROM devices WHERE is_active = 1').get().c,
@@ -611,14 +840,16 @@ module.exports = {
   getDB,
   // Users
   createUser, getUserByEmail, getUserById, getUserByGoogleId, linkGoogleAccount, verifyUserPassword,
-  updateUserTier, updateUserPassword, banUser, getAllUsers, getUserCount, getProUserCount, getActiveToday,
+  updateUserTier, updateUserPassword, banUser, unbanUser, getAllUsers, getUserCount, getProUserCount, getActiveToday,
   // Password reset
   createPasswordResetToken, getPasswordResetToken, consumePasswordResetToken, cleanupExpiredResetTokens,
   // Licenses
   createLicense, getLicenseByKey, getLicenseByUserId,
   incrementSessionCount, updateLicenseStatus, updateLicenseOnPayment,
+  extendLicenseExpiry, grantCreditSessions, grantBasicRenewal,
+  getLatestRazorpaySubscriptionId,
   // Devices
-  registerDevice, getUserDevices, deactivateDevice, isDeviceAuthorized,
+  registerDevice, getUserDevices, deactivateDevice, isDeviceAuthorized, resetUserDevices,
   // Conversations
   createConversation, getConversationsByUser, getConversationById, updateConversation, deleteConversation,
   addConversationMessage, addConversationMessages, getConversationMessages, clearConversationMessages,
@@ -627,11 +858,13 @@ module.exports = {
   // Login logs
   logLogin, getRecentLogins,
   // Revoked keys
-  revokeKey, isKeyRevoked, getRevokedKeys,
+  revokeKey, unrevokeKey, isKeyRevoked, getRevokedKeys,
   // Config
   getConfig, setConfig,
   // Stats
   getStats,
+  // Admin actions / audit
+  logAdminAction, getAuditLog, forceLogoutUser, getTokensRevokedAfter,
   // Cleanup
   closeDB,
   // Password utils (for testing)
