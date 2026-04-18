@@ -549,6 +549,10 @@ router.post('/forgot-password', async (req, res) => {
     // password they don't have — they should use Google Sign-In).
     if (user && user.password_hash) {
       const rawToken = db.createPasswordResetToken(user.id, user.email);
+      // Log first 8 chars so we can correlate issued → clicked in Railway
+      // logs (e.g. diagnose "did the user click the same link we emailed?").
+      // Full token stays secret — 8 hex chars is 32 bits, not enough to brute.
+      console.log(`[forgot-password] token issued user_id=${user.id} token=${rawToken.slice(0, 8)}...`);
       const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
       const resetUrl = `${serverUrl}/api/v1/auth/reset-password?token=${rawToken}`;
       const { subject, html, text } = renderPasswordResetEmail({ name: user.name, resetUrl });
@@ -588,7 +592,31 @@ router.get('/reset-password', (req, res) => {
   // Tokens are 64-char hex from crypto.randomBytes(32) — reject anything
   // else before it reaches the DB or the rendered HTML.
   const isValidFormat = typeof token === 'string' && /^[a-f0-9]{64}$/i.test(token);
-  const row = isValidFormat ? db.getPasswordResetToken(token) : null;
+
+  // Look the row up raw (used/expired tokens included) so we can log the
+  // *specific* rejection reason when the page ends up showing "Link expired".
+  // Without this the logs say nothing and the user + support can't tell
+  // "wrong token shape" from "token consumed" from "expired by 3 minutes".
+  let row = null;
+  let rejectReason = null;
+  if (!isValidFormat) {
+    rejectReason = 'invalid_format';
+  } else {
+    const raw = db.getRawPasswordResetToken(token);
+    if (!raw) {
+      rejectReason = 'not_found';
+    } else if (raw.used_at) {
+      rejectReason = `used_at=${new Date(raw.used_at).toISOString()}`;
+    } else if (raw.expires_at < Date.now()) {
+      rejectReason = `expired_${Math.round((Date.now() - raw.expires_at) / 1000)}s_ago`;
+    } else {
+      row = raw;
+    }
+  }
+  if (!row) {
+    const prefix = typeof token === 'string' ? token.slice(0, 8) : '(missing)';
+    console.log(`[reset-password] GET rejected token=${prefix}... reason=${rejectReason}`);
+  }
 
   // Brand URL for the "Request a new link" CTA on the error page. Falls
   // back to the public domain so the page never ships a dead link even
@@ -622,10 +650,22 @@ router.post('/reset-password', async (req, res) => {
 
     const row = db.consumePasswordResetToken(token);
     if (!row) {
+      // Mirror the GET-side logging so the server log tells us which of
+      // the three real reasons ("already used", "expired", "never existed")
+      // fired — otherwise support has to guess from the user's side alone.
+      const raw = db.getRawPasswordResetToken(token);
+      let reason;
+      if (!raw) reason = 'not_found';
+      else if (raw.used_at) reason = `used_at=${new Date(raw.used_at).toISOString()}`;
+      else if (raw.expires_at < Date.now()) reason = `expired_${Math.round((Date.now() - raw.expires_at) / 1000)}s_ago`;
+      else reason = 'consume_race';
+      const prefix = typeof token === 'string' ? token.slice(0, 8) : '(missing)';
+      console.log(`[reset-password] POST rejected token=${prefix}... reason=${reason}`);
       return res.status(400).json({ error: 'This reset link has expired or already been used. Please request a new one.' });
     }
 
     db.updateUserPassword(row.user_id, password);
+    console.log(`[reset-password] POST success user_id=${row.user_id}`);
     res.json({ ok: true });
   } catch (err) {
     console.error('Reset password error:', err);

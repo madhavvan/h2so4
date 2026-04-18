@@ -303,8 +303,14 @@ function hashResetToken(rawToken) {
 
 function createPasswordResetToken(userId, email) {
   const d = getDB();
-  // Invalidate any prior unused tokens for this user.
-  d.prepare('DELETE FROM password_reset_tokens WHERE user_id = ? AND used_at IS NULL').run(userId);
+  // NOTE: intentionally do NOT delete prior unused tokens for this user.
+  // Previously we did — and it bit users hard: clicking "Forgot password"
+  // twice (common when the first email takes a few seconds to arrive)
+  // invalidated the earlier token. Resend can also reorder deliveries,
+  // so a user might click the email that *arrived* first (older token)
+  // thinking it's fresh. Each token is already single-use, 1-hour TTL,
+  // and 256-bit random — letting up to a handful coexist has the same
+  // effective blast radius as one.
 
   const rawToken = crypto.randomBytes(32).toString('hex');
   const tokenHash = hashResetToken(rawToken);
@@ -315,6 +321,17 @@ function createPasswordResetToken(userId, email) {
   `).run(tokenHash, userId, email.toLowerCase(), now + RESET_TOKEN_TTL_MS, now);
 
   return rawToken;
+}
+
+// Diagnostic lookup — returns the row regardless of used/expired state so
+// the route can log WHY a token was rejected. getPasswordResetToken (below)
+// does the real "is this usable" check; this one exists for logging only.
+function getRawPasswordResetToken(rawToken) {
+  if (!rawToken) return null;
+  const tokenHash = hashResetToken(rawToken);
+  return getDB()
+    .prepare('SELECT * FROM password_reset_tokens WHERE token_hash = ?')
+    .get(tokenHash) || null;
 }
 
 // Look up a reset token without consuming it — used by the GET form page
@@ -842,7 +859,7 @@ module.exports = {
   createUser, getUserByEmail, getUserById, getUserByGoogleId, linkGoogleAccount, verifyUserPassword,
   updateUserTier, updateUserPassword, banUser, unbanUser, getAllUsers, getUserCount, getProUserCount, getActiveToday,
   // Password reset
-  createPasswordResetToken, getPasswordResetToken, consumePasswordResetToken, cleanupExpiredResetTokens,
+  createPasswordResetToken, getPasswordResetToken, getRawPasswordResetToken, consumePasswordResetToken, cleanupExpiredResetTokens,
   // Licenses
   createLicense, getLicenseByKey, getLicenseByUserId,
   incrementSessionCount, updateLicenseStatus, updateLicenseOnPayment,
