@@ -1180,8 +1180,16 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         setView('download');
       }
 
-      // Check for Stripe success redirect
+      // URL-based overrides for incoming deep-links.
       const urlParams = new URLSearchParams(window.location.search);
+
+      // Deep-link from the server-rendered reset-password "Link expired" page:
+      // clicking "Request a new reset link" lands here with ?view=forgot_password
+      // so the user can re-request without re-navigating through login.
+      if (urlParams.get('view') === 'forgot_password') {
+        setView('forgot_password');
+      }
+
       if (urlParams.get('payment') === 'success') {
         const saved = licenseService.loadAuth();
         if (saved.user) {
