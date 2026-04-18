@@ -175,8 +175,8 @@ ${modeInstruction}
             messages: messages as any,
             max_completion_tokens: 16000,
             temperature: 0.7,
-            stream: false
-        });
+            stream: false,
+        } as any);
 
         const text = completion.choices[0]?.message?.content || "";
         

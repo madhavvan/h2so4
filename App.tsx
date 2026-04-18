@@ -1,18 +1,20 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, LogOut, Lock, Crown } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, LogOut, Crown } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq } from './services/aiProxyService';
+import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT } from './services/aiProxyService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
 import { extractTextFromDocx } from './services/docxService';
 import { useDatabase, SessionSummary } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
 import { SubscriptionGate } from './SubscriptionGate';
-import { licenseService, UserProfile, LicenseData } from './services/licenseService';
+import { licenseService, UserProfile, LicenseData, TIME_CONSTANTS } from './services/licenseService';
+import { creditTimerService } from './services/creditTimerService';
+import { pricingService } from './services/pricingService';
 import './pip-styles.css';
 
 // --- Electron Helpers ---
@@ -33,58 +35,554 @@ const electronIPC = {
       } catch (e) { console.warn('IPC send failed:', e); }
     }
   },
-  on: (channel: string, callback: (data: any) => void) => {
-    if (isElectron) {
-      try {
-        const ipc = (window as any).require?.('electron')?.ipcRenderer;
-        ipc?.on(channel, (_event: any, data: any) => callback(data));
-      } catch (e) { console.warn('IPC on failed:', e); }
+  // ipcRenderer.on receives (event, ...args), so we wrap the caller's
+  // (data) => void. removeListener uses reference equality, so the caller
+  // can't remove the wrapper using its own callback — we return a disposer
+  // that closes over the exact wrapper instance we registered.
+  on: (channel: string, callback: (data: any) => void): (() => void) => {
+    if (!isElectron) return () => {};
+    try {
+      const ipc = (window as any).require?.('electron')?.ipcRenderer;
+      if (!ipc) return () => {};
+      const wrapped = (_event: any, data: any) => callback(data);
+      ipc.on(channel, wrapped);
+      return () => {
+        try { ipc.removeListener(channel, wrapped); }
+        catch (e) { console.warn('IPC off failed:', e); }
+      };
+    } catch (e) {
+      console.warn('IPC on failed:', e);
+      return () => {};
     }
+  },
+  invoke: async (channel: string, ...args: any[]): Promise<any> => {
+    if (!isElectron) return null;
+    try {
+      const ipc = (window as any).require?.('electron')?.ipcRenderer;
+      return await ipc?.invoke(channel, ...args);
+    } catch (e) { console.warn('IPC invoke failed:', e); return null; }
   }
 };
 
+// ────────────────────────────────────────────────────────────────
+// AUTO-TYPE SMART SKIP — OCR the target editor before typing so
+// we can drop any leading lines that are already on screen (e.g.
+// the platform's starter function signature / imports). Passive:
+// no Ctrl+A, no Ctrl+C, no clipboard touch — just a screenshot.
+//
+// OCR is inherently fuzzy on code fonts. When the signal is weak
+// or noisy we return 0 (skip nothing) and let the full block type.
+// ────────────────────────────────────────────────────────────────
+
+async function captureScreenBase64ForOCR(): Promise<string | null> {
+  if (!isElectron) return null;
+  let tempStream: MediaStream | null = null;
+  try {
+    const { ipcRenderer } = (window as any).require('electron');
+    const sources = await ipcRenderer.invoke('get-desktop-sources');
+    if (!sources || sources.length === 0) return null;
+    const screenSource = sources.find((s: any) =>
+      s.name === 'Entire Screen' || s.name === 'Screen 1' || s.name.toLowerCase().includes('screen')
+    ) || sources[0];
+
+    tempStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: screenSource.id,
+          maxWidth: 1920,
+          maxHeight: 1080,
+          maxFrameRate: 5,
+        }
+      } as any,
+    });
+    const videoTrack = tempStream.getVideoTracks()[0];
+    if (!videoTrack || videoTrack.readyState !== 'live') return null;
+
+    const video = document.createElement('video');
+    video.srcObject = new MediaStream([videoTrack]);
+    await video.play();
+
+    // Upscale for OCR — tesseract struggles on small monospace glyphs at
+    // 1:1. 1.5x bump trades bytes for noticeably better code-font accuracy.
+    const scale = 1.5;
+    const width = Math.round(video.videoWidth * scale);
+    const height = Math.round(video.videoHeight * scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.imageSmoothingEnabled = true;
+      (ctx as any).imageSmoothingQuality = 'high';
+      ctx.drawImage(video, 0, 0, width, height);
+    }
+    const dataUrl = canvas.toDataURL('image/png');
+
+    video.pause();
+    video.srcObject = null;
+    video.remove();
+    canvas.remove();
+    return dataUrl;
+  } catch (e) {
+    console.warn('[auto-type-ocr] capture failed:', e);
+    return null;
+  } finally {
+    if (tempStream) tempStream.getTracks().forEach(t => t.stop());
+  }
+}
+
+// Normalize a line for fuzzy comparison: strip whitespace, lowercase,
+// fold the most common OCR confusables on code fonts (0/O, 1/l/I/|).
+// rn→m isn't folded because it causes more false positives than it fixes.
+function normalizeForOCRCompare(s: string): string {
+  return s
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/[o]/g, '0')
+    .replace(/[li|]/g, '1');
+}
+
+function levenshteinRatio(a: string, b: string): number {
+  if (!a.length && !b.length) return 1;
+  if (!a.length || !b.length) return 0;
+  const m = a.length, n = b.length;
+  const dp: number[] = new Array(n + 1);
+  for (let j = 0; j <= n; j++) dp[j] = j;
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const temp = dp[j];
+      dp[j] = a[i - 1] === b[j - 1]
+        ? prev
+        : 1 + Math.min(prev, dp[j - 1], dp[j]);
+      prev = temp;
+    }
+  }
+  return 1 - dp[n] / Math.max(m, n);
+}
+
+async function computeAutoTypeSkipLines(
+  code: string,
+  isCancelled: () => boolean = () => false,
+): Promise<number> {
+  try {
+    if (isCancelled()) return 0;
+    const dataUrl = await captureScreenBase64ForOCR();
+    if (isCancelled()) return 0;
+    if (!dataUrl) return 0;
+
+    // Lazy-load tesseract — it's ~3MB of WASM, don't block app startup.
+    const Tesseract: any = await import('tesseract.js');
+    if (isCancelled()) return 0;
+    const recognize = Tesseract.recognize || Tesseract.default?.recognize;
+    if (!recognize) return 0;
+
+    const { data } = await recognize(dataUrl, 'eng', {
+      // PSM 6: uniform block of text — best for dense code regions.
+      tessedit_pageseg_mode: '6',
+      preserve_interword_spaces: '1',
+    });
+    if (isCancelled()) return 0;
+    const ocrText: string = (data && data.text) || '';
+    if (!ocrText.trim()) return 0;
+
+    const ocrLines = ocrText.split('\n').map(normalizeForOCRCompare).filter(Boolean);
+    if (ocrLines.length === 0) return 0;
+
+    const codeLines = code.split('\n');
+    let skip = 0;
+    let substantiveMatched = 0;
+
+    for (const rawLine of codeLines) {
+      const norm = normalizeForOCRCompare(rawLine);
+      // Blank / near-blank lines: advance the skip without counting as a
+      // real match signal. Otherwise a code block starting with a blank
+      // line would "match" trivially and we'd skip real content below.
+      if (norm.length < 3) { skip++; continue; }
+
+      let found = false;
+      for (const ol of ocrLines) {
+        if (ol.includes(norm)) { found = true; break; }
+        if (norm.length >= 6 && levenshteinRatio(norm, ol) >= 0.82) { found = true; break; }
+      }
+      if (!found) break;
+      skip++;
+      substantiveMatched++;
+    }
+
+    // Trust threshold: need at least one substantive match, and if the skip
+    // would eat the entire block we bail (OCR almost certainly over-fired).
+    if (substantiveMatched < 1) return 0;
+    if (skip >= codeLines.length) return 0;
+    return skip;
+  } catch (e) {
+    console.warn('[auto-type-ocr] OCR/skip compute failed, typing full block:', e);
+    return 0;
+  }
+}
+
 // --- Helper: Code Block Renderer ---
 
-const CodeBlock: React.FC<{ code: string; language: string }> = ({ code, language }) => {
+// Auto-type phases drive the button UI while nut-js drives keystrokes in main.
+// 'idle' = default, 'countdown' = waiting for user to alt-tab to target editor,
+// 'preparing' = OCR running before countdown, 'typing' = keystrokes in flight,
+// 'done' = brief success flash, 'verify-mismatch' = typed but UIA read-back
+// disagreed with what we typed (editor may have stripped/reformatted or we
+// dropped input) — surfaced so the user can eyeball the result.
+type AutoTypePhase = 'idle' | 'preparing' | 'countdown' | 'typing' | 'done' | 'verify-mismatch';
+
+const CodeBlock: React.FC<{
+    code: string;
+    language: string;
+    canAutoType?: boolean;
+    // True while the parent message is still streaming. In that case we
+    // skip the Prism syntax highlighter (which re-tokenizes the entire
+    // code block every render — easily 10-20ms per frame on long blocks
+    // at 60fps, enough to stall textarea input on the main thread) and
+    // render plain <pre><code> instead. The block re-renders ONCE with
+    // full highlighting at commit time — the user sees a single pleasant
+    // "flash to colored" when their answer is complete, not a gradual
+    // jank.
+    isStreaming?: boolean;
+}> = React.memo(({ code, language, canAutoType, isStreaming }) => {
     const [copied, setCopied] = useState(false);
+    const [atPhase, setAtPhase] = useState<AutoTypePhase>('idle');
+    const [atCountdown, setAtCountdown] = useState(0);
+    // Transient error banner for the Auto-Type flow. We can't use an OS
+    // alert() — it paints outside setContentProtection and leaks on screen
+    // share. Renders inline under the header and self-clears after 8s.
+    const [atError, setAtError] = useState<string | null>(null);
+    const atErrorTimerRef = useRef<number | null>(null);
+    const surfaceAtError = (msg: string) => {
+        setAtError(msg);
+        if (atErrorTimerRef.current !== null) window.clearTimeout(atErrorTimerRef.current);
+        atErrorTimerRef.current = window.setTimeout(() => {
+            atErrorTimerRef.current = null;
+            setAtError(null);
+        }, 8000);
+    };
+    // Cancel flag for the 'preparing' (OCR) phase. Main doesn't know about
+    // Auto-Type yet during OCR, so the usual auto-type:abort IPC is a no-op
+    // — we cancel locally and short-circuit before invoking the typing IPC.
+    const prepCancelledRef = useRef(false);
+    // Latches whether the most recent type cycle ended with a UIA verify
+    // mismatch. Written by the status listener when 'verify-mismatch' fires,
+    // read when 'done' fires (verify signals always arrive before 'done').
+    // Cleared at the start of each cycle so stale verdicts don't bleed across.
+    const verifyMismatchRef = useRef(false);
+    // Timer id for the post-'done' flash revert. Tracked so we can cancel it
+    // on unmount (stops setState-on-unmounted warnings when the CodeBlock is
+    // torn down mid-flash) and on a fresh click (stops a stale revert from
+    // kicking us back to idle just after we queued a new cycle).
+    const flashTimerRef = useRef<number | null>(null);
+    // Synchronous double-click guard. State updates are batched, so two rapid
+    // clicks both observe atPhase==='idle' and both try to start a cycle —
+    // the ref flips synchronously and blocks the second entry.
+    const clickInFlightRef = useRef(false);
+    const copyTimerRef = useRef<number | null>(null);
+
+    const clearFlashTimer = () => {
+        if (flashTimerRef.current !== null) {
+            window.clearTimeout(flashTimerRef.current);
+            flashTimerRef.current = null;
+        }
+    };
+    const scheduleFlashRevert = (ms: number) => {
+        clearFlashTimer();
+        flashTimerRef.current = window.setTimeout(() => {
+            flashTimerRef.current = null;
+            setAtPhase('idle');
+        }, ms);
+    };
+
+    // Cancel any pending timers if the CodeBlock unmounts mid-flash / mid-copy-reset.
+    useEffect(() => () => {
+        clearFlashTimer();
+        if (copyTimerRef.current !== null) {
+            window.clearTimeout(copyTimerRef.current);
+            copyTimerRef.current = null;
+        }
+        if (atErrorTimerRef.current !== null) {
+            window.clearTimeout(atErrorTimerRef.current);
+            atErrorTimerRef.current = null;
+        }
+    }, []);
 
     const handleCopy = () => {
         navigator.clipboard.writeText(code);
         setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
+        if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = window.setTimeout(() => {
+            copyTimerRef.current = null;
+            setCopied(false);
+        }, 2000);
     };
+
+    // Listen for status events from main while a type is in flight.
+    // Registered only while button is in non-idle state to avoid stale listeners.
+    // Event ordering from main: countdown* → typing → [verify-ok | verify-mismatch]? → done
+    // The verify signal (when present) arrives right before 'done'; we latch
+    // any mismatch into a ref and consult it when 'done' lands so the user
+    // actually sees the warning — otherwise 'done' would clobber it.
+    useEffect(() => {
+        if (atPhase === 'idle') return;
+        const handler = (data: any) => {
+            if (!data || typeof data !== 'object') return;
+            if (data.phase === 'countdown') {
+                setAtPhase('countdown');
+                setAtCountdown(data.n);
+            } else if (data.phase === 'typing') {
+                // Fresh cycle: clear last cycle's verdict.
+                verifyMismatchRef.current = false;
+                setAtPhase('typing');
+            } else if (data.phase === 'verify-mismatch') {
+                verifyMismatchRef.current = true;
+            } else if (data.phase === 'verify-ok') {
+                verifyMismatchRef.current = false;
+            } else if (data.phase === 'done') {
+                if (data.aborted) {
+                    // Aborted type: straight to idle. No green "Done" because
+                    // nothing landed, and no verify-mismatch warning either —
+                    // main never ran verification on an aborted run.
+                    clearFlashTimer();
+                    setAtPhase('idle');
+                } else if (verifyMismatchRef.current) {
+                    // Actionable warning — linger longer so the user notices.
+                    setAtPhase('verify-mismatch');
+                    scheduleFlashRevert(3500);
+                } else {
+                    setAtPhase('done');
+                    scheduleFlashRevert(1500);
+                }
+            }
+        };
+        const dispose = electronIPC.on('auto-type:status', handler);
+        return dispose;
+    }, [atPhase]);
+
+    const handleAutoType = async () => {
+        // Web mode can't drive OS keyboard events, so the button is hidden in
+        // render below. Kept as a defensive guard in case the hide condition
+        // ever regresses.
+        if (!isElectron) return;
+        if (atPhase === 'preparing') {
+            // Abort during OCR: main isn't involved yet, cancel locally.
+            prepCancelledRef.current = true;
+            clearFlashTimer();
+            setAtPhase('idle');
+            return;
+        }
+        if (atPhase === 'countdown' || atPhase === 'typing') {
+            // Second click during countdown / typing = abort via main.
+            electronIPC.send('auto-type:abort');
+            return;
+        }
+        // Fresh start — reachable from 'idle' and from the brief 'done' /
+        // 'verify-mismatch' flash windows. Treating the flash phases as
+        // re-entry points means a user who wants to immediately retry isn't
+        // blocked by the 1.5s/3.5s setTimeout.
+        if (clickInFlightRef.current) return;
+        clickInFlightRef.current = true;
+        // Kill any pending flash revert so it can't stomp the phase transitions
+        // we're about to queue.
+        clearFlashTimer();
+
+        try {
+            // macOS requires Accessibility permission. Check before countdown so we
+            // don't strand the user mid-flow with a silent failure.
+            const perm = await electronIPC.invoke('auto-type:check-permission');
+            if (perm && perm.ok === false) {
+                surfaceAtError(perm.message || 'Auto-Type needs Accessibility permission. Grant it in System Settings → Privacy & Security → Accessibility, then restart the app.');
+                setAtPhase('idle');
+                return;
+            }
+
+            // Smart skip planning. Two paths:
+            //
+            //   (A) Windows w/ UIA — accessibility bridge in main owns planning
+            //       (deterministic prefix match against the focused control's
+            //       actual text). No OCR, no Tesseract WASM load, no "preparing"
+            //       stall. Main runs the plan inside auto-type:send AFTER the
+            //       countdown dwell, when the user has actually focused the
+            //       target editor — so the read is of the right control.
+            //
+            //   (B) Everything else — fall back to screen OCR (Tesseract) as the
+            //       preparing step before countdown. Slower but portable.
+            //
+            // Degrades to 0 (type everything) on any failure.
+            prepCancelledRef.current = false;
+            let skipLines = 0;
+            let useMainPlanner = false;
+            try {
+                const caps = await electronIPC.invoke('auto-type:capabilities');
+                if (caps && caps.hasA11y === true) {
+                    useMainPlanner = true;
+                }
+            } catch (_) {
+                // Old main without capabilities handler — fall through to OCR.
+            }
+
+            if (!useMainPlanner) {
+                setAtPhase('preparing');
+                skipLines = await computeAutoTypeSkipLines(code, () => prepCancelledRef.current);
+                if (prepCancelledRef.current) {
+                    setAtPhase('idle');
+                    return;
+                }
+            }
+
+            setAtPhase('countdown');
+            setAtCountdown(3);
+            const result = await electronIPC.invoke('auto-type:send', { code, skipLines });
+            if (result && result.error) {
+                surfaceAtError(`Auto-Type failed: ${result.error}`);
+                setAtPhase('idle');
+            }
+        } finally {
+            clickInFlightRef.current = false;
+        }
+    };
+
+    const autoTypeLabel =
+        atPhase === 'preparing'       ? 'Scanning editor…' :
+        atPhase === 'countdown'       ? `Typing in ${atCountdown}…  (click to cancel)` :
+        atPhase === 'typing'          ? 'Typing…  (click to cancel)' :
+        atPhase === 'done'            ? 'Done' :
+        atPhase === 'verify-mismatch' ? 'Done — please verify editor' :
+                                        'Auto-Type';
+    const autoTypeClass =
+        atPhase === 'done'            ? 'text-green-400'
+      : atPhase === 'verify-mismatch' ? 'text-amber-400'
+      : atPhase !== 'idle'            ? 'text-amber-400'
+      :                                 'text-gray-400 hover:text-white';
 
     return (
         <div className="my-3 rounded-lg overflow-hidden border border-gray-700/50 bg-black/20 backdrop-blur-sm shadow-lg">
             <div className="flex items-center justify-between px-4 py-2 bg-black/40 border-b border-gray-700/50">
                 <span className="text-xs font-mono text-gray-400 lowercase">{language || 'code'}</span>
-                <button 
-                    onClick={handleCopy} 
-                    className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white transition-colors"
-                >
-                    {copied ? <Check size={12} className="text-green-400"/> : <Copy size={12} />}
-                    {copied ? "Copied" : "Copy"}
-                </button>
+                <div className="flex items-center gap-3">
+                    {isElectron && (
+                        <button
+                            onClick={handleAutoType}
+                            disabled={!canAutoType && atPhase === 'idle'}
+                            className={`flex items-center gap-1.5 text-xs transition-colors ${canAutoType || atPhase !== 'idle' ? autoTypeClass : 'text-gray-600 cursor-not-allowed'}`}
+                            aria-label={canAutoType ? 'Types this code into the currently focused editor (HackerRank, CoderPad, etc.)' : 'Auto-Type — Max only'}
+                        >
+                            {atPhase === 'done'
+                                ? <Check size={12} />
+                                : atPhase === 'verify-mismatch'
+                                ? <AlertTriangle size={12} />
+                                : <Zap size={12} className={atPhase !== 'idle' ? 'animate-pulse' : ''} />}
+                            <span>{autoTypeLabel}</span>
+                            {!canAutoType && atPhase === 'idle' && <Crown size={10} className="text-amber-400" />}
+                        </button>
+                    )}
+                    <button
+                        onClick={handleCopy}
+                        className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white transition-colors"
+                    >
+                        {copied ? <Check size={12} className="text-green-400"/> : <Copy size={12} />}
+                        {copied ? "Copied" : "Copy"}
+                    </button>
+                </div>
             </div>
-            <div className="p-4 overflow-x-auto bg-transparent">
-                <SyntaxHighlighter
-                    language={language || 'text'}
-                    style={vscDarkPlus}
-                    customStyle={{ margin: 0, padding: 0, background: 'transparent' }}
-                    wrapLines={true}
+            {atError && (
+                <div
+                    role="alert"
+                    className="flex items-start gap-2 px-4 py-2 bg-amber-500/10 border-b border-amber-500/30 text-[11px] text-amber-200"
                 >
-                    {code.trim()}
-                </SyntaxHighlighter>
+                    <AlertTriangle size={12} className="mt-0.5 shrink-0 text-amber-400" />
+                    <span className="flex-1 leading-snug">{atError}</span>
+                    <button
+                        onClick={() => {
+                            if (atErrorTimerRef.current !== null) {
+                                window.clearTimeout(atErrorTimerRef.current);
+                                atErrorTimerRef.current = null;
+                            }
+                            setAtError(null);
+                        }}
+                        aria-label="Dismiss"
+                        className="shrink-0 text-amber-400/70 hover:text-amber-200 transition-colors"
+                    >
+                        <X size={12} />
+                    </button>
+                </div>
+            )}
+            <div className="p-4 overflow-x-auto bg-transparent">
+                {isStreaming ? (
+                    // Cheap plain-text render during streaming. Styles MUST
+                    // match vscDarkPlus's pre/code rules exactly (font,
+                    // size, line-height, tab-size, whitespace) so the block
+                    // has the same pixel height whether this lightweight
+                    // renderer or the real SyntaxHighlighter is drawing it.
+                    // If heights differ, the stream→commit swap shifts the
+                    // scroll position, which the user feels as a "jerk" at
+                    // the end of the answer.
+                    //
+                    // Source of truth:
+                    //   node_modules/react-syntax-highlighter/dist/esm/
+                    //   styles/prism/vsc-dark-plus.js
+                    <pre
+                        style={{
+                            margin: 0,
+                            padding: 0,
+                            background: 'transparent',
+                            color: '#d4d4d4',
+                            fontSize: '13px',
+                            fontFamily: 'Menlo, Monaco, Consolas, "Andale Mono", "Ubuntu Mono", "Courier New", monospace',
+                            lineHeight: '1.5',
+                            tabSize: 4,
+                            MozTabSize: 4,
+                            whiteSpace: 'pre',
+                            textAlign: 'left',
+                            direction: 'ltr',
+                            wordSpacing: 'normal',
+                            wordBreak: 'normal',
+                            textShadow: 'none',
+                            overflow: 'auto',
+                        } as React.CSSProperties}
+                    >
+                        <code
+                            style={{
+                                color: '#d4d4d4',
+                                fontSize: '13px',
+                                fontFamily: 'Menlo, Monaco, Consolas, "Andale Mono", "Ubuntu Mono", "Courier New", monospace',
+                                lineHeight: '1.5',
+                                tabSize: 4,
+                                MozTabSize: 4,
+                                whiteSpace: 'pre',
+                                textShadow: 'none',
+                            } as React.CSSProperties}
+                        >{code.trim()}</code>
+                    </pre>
+                ) : (
+                    <SyntaxHighlighter
+                        language={language || 'text'}
+                        style={vscDarkPlus}
+                        customStyle={{ margin: 0, padding: 0, background: 'transparent' }}
+                        wrapLines={true}
+                    >
+                        {code.trim()}
+                    </SyntaxHighlighter>
+                )}
             </div>
         </div>
     );
-};
+});
 
-const MessageRenderer = ({ content, fontSize }: { content: string, fontSize: string }) => {
+// Memoized so that when a streaming bubble updates its content, React
+// can bail on re-rendering every committed message above it. Without this
+// memoization, typing into the textarea stalls behind a full ReactMarkdown
+// + Prism reconciliation pass for N messages × 60fps.
+const MessageRenderer = React.memo(({ content, fontSize, canAutoType, isStreaming }: { content: string, fontSize: string, canAutoType?: boolean, isStreaming?: boolean }) => {
     // Font size mapping
-    const sizeClass = 
-        fontSize === 'small' ? 'prose-sm' : 
-        fontSize === 'large' ? 'prose-lg' : 
+    const sizeClass =
+        fontSize === 'small' ? 'prose-sm' :
+        fontSize === 'large' ? 'prose-lg' :
         'prose-base';
 
     return (
@@ -95,7 +593,7 @@ const MessageRenderer = ({ content, fontSize }: { content: string, fontSize: str
                     code({ node, inline, className, children, ...props }: any) {
                         const match = /language-(\w+)/.exec(className || '');
                         return !inline && match ? (
-                            <CodeBlock code={String(children).replace(/\n$/, '')} language={match[1]} />
+                            <CodeBlock code={String(children).replace(/\n$/, '')} language={match[1]} canAutoType={canAutoType} isStreaming={isStreaming} />
                         ) : (
                             <code className="bg-gray-200 dark:bg-gray-800 rounded px-1 py-0.5 font-mono text-sm" {...props}>
                                 {children}
@@ -108,7 +606,7 @@ const MessageRenderer = ({ content, fontSize }: { content: string, fontSize: str
             </ReactMarkdown>
         </div>
     );
-};
+});
 
 // --- Components ---
 
@@ -118,11 +616,11 @@ const Modal = ({ isOpen, onClose, title, children }: any) => {
   return (
     <div 
       className="fixed inset-0 flex items-center justify-center p-4"
-      style={{ 
+      style={{
         background: inElectron ? 'rgba(0,0,0,0.92)' : 'rgba(0,0,0,0.5)',
-        zIndex: 99999,  // Above everything including screen-saver level content
-        WebkitAppRegion: 'no-drag' as any,  // Ensure clicks work in frameless window
-      }}
+        zIndex: 99999,
+        WebkitAppRegion: 'no-drag',
+      } as any}
       onClick={onClose}
     >
       <div 
@@ -161,11 +659,14 @@ const ChatInterface = ({
     stopListening, 
     handleManualSend, 
     handleAutoSolve,
-    handleClear, 
+    handleClear,
     handleRegenerate,
     chatContainerRef,
     textareaRef,
     handleScroll,
+    isPinned,
+    newSinceUnpin,
+    handleJumpToLatest,
     onOpenSettings,
     onOpenContext,
     onOpenHelp,
@@ -176,7 +677,10 @@ const ChatInterface = ({
     userProfile,
     userLicense,
     onLogout,
-    gate
+    gate,
+    creditTimer,
+    effectiveTier,
+    markPendingPopoutModel,
 }: any) => {
 
     const handleModelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -196,6 +700,10 @@ const ChatInterface = ({
         // settings.selectedModel has to flip too or the popout selector is
         // purely cosmetic. Main echoes the change back via the state-sync push.
         if (isElectron && isPopoutMode) {
+            // Mark as pending BEFORE the IPC so any stale state-sync that
+            // happens to cross paths with our request is ignored by the
+            // popout's state-sync handler.
+            markPendingPopoutModel?.(newModel);
             electronIPC.send('relay-to-main', { type: 'cmd-set-model', model: newModel });
         }
     };
@@ -230,8 +738,8 @@ const ChatInterface = ({
                 <div className="bg-layer"></div>
                 
                 {/* ── HEADER ── */}
-                <div 
-                    className="popup-header" 
+                <div
+                    className="popup-header"
                     id="dragHandle"
                     style={inElectron ? { WebkitAppRegion: 'drag', padding: '10px 12px' } as any : undefined}
                 >
@@ -243,25 +751,60 @@ const ChatInterface = ({
                     </div>
 
                     {/* Right: Controls row */}
-                    <div 
-                        className="ml-auto flex items-center" 
+                    <div
+                        className="ml-auto flex items-center"
                         style={inElectron ? { WebkitAppRegion: 'no-drag', gap: '6px' } as any : { gap: '6px' }}
                     >
-                        {/* Model selector — compact */}
-                        <select
-                            value={settings.selectedModel}
-                            onChange={handleModelChange}
-                            className="text-[10px] rounded px-1.5 py-0.5 outline-none cursor-pointer"
-                            style={glassBtn}
-                        >
-                            <option value="gemini" className="text-black">Gemini</option>
-                            <option value="groq" disabled={!gate.canUseModel('groq')} className="text-black">Groq{!gate.canUseModel('groq') ? ' 🔒' : ''}</option>
-                            <option value="openai" disabled={!gate.canUseModel('openai')} className="text-black">GPT{!gate.canUseModel('openai') ? ' 🔒' : ''}</option>
-                            <option value="xai" disabled={!gate.canUseModel('xai')} className="text-black">Grok{!gate.canUseModel('xai') ? ' 🔒' : ''}</option>
-                        </select>
+                        {/* Tier & credit chips — only at M/L sizes so the S preset
+                            (340px) doesn't wrap the controls onto two rows. */}
+                        {sizeIndex >= 1 && effectiveTier === 'max' && (
+                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400">
+                            <Crown size={9} /> MAX
+                          </div>
+                        )}
+                        {sizeIndex >= 1 && effectiveTier === 'pro' && (
+                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold border bg-blue-500/10 border-blue-500/30 text-blue-400">
+                            <Crown size={9} /> PRO
+                          </div>
+                        )}
+                        {sizeIndex >= 1 && effectiveTier === 'basic' && (
+                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold border bg-emerald-500/10 border-emerald-500/30 text-emerald-400">
+                            <Zap size={9} /> BASIC
+                          </div>
+                        )}
+                        {sizeIndex >= 1 && creditTimer && (creditTimer.source === 'credits' || creditTimer.source === 'trial') && creditTimer.remaining > 0 && (
+                          <div
+                            className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-semibold border ${
+                              creditTimer.remaining <= TIME_CONSTANTS.LOW_WARNING_SECONDS
+                                ? 'bg-red-500/10 border-red-500/40 text-red-400'
+                                : creditTimer.source === 'trial'
+                                  ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                                  : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                            }`}
+                            aria-label={creditTimer.source === 'trial' ? 'Free trial time remaining' : 'Plan time remaining'}
+                          >
+                            {creditTimer.source === 'trial' ? 'TRIAL' : ''} {formatTimeRemaining(creditTimer.remaining)}
+                          </div>
+                        )}
+                        {/* Model selector — compact, with custom chevron so it matches the
+                            main window instead of the platform's default OS arrow. */}
+                        <div className="relative flex items-center">
+                          <select
+                              value={settings.selectedModel}
+                              onChange={handleModelChange}
+                              className="appearance-none text-[10px] rounded pl-1.5 pr-5 py-0.5 outline-none cursor-pointer"
+                              style={glassBtn}
+                          >
+                              <option value="gemini" className="text-black">Gemini</option>
+                              <option value="groq" disabled={!gate.canUseModel('groq')} className="text-black">Groq{!gate.canUseModel('groq') ? ' — PRO' : ''}</option>
+                              <option value="openai" disabled={!gate.canUseModel('openai')} className="text-black">GPT{!gate.canUseModel('openai') ? ' — PRO' : ''}</option>
+                              <option value="xai" disabled={!gate.canUseModel('xai')} className="text-black">Grok{!gate.canUseModel('xai') ? ' — PRO' : ''}</option>
+                          </select>
+                          <ChevronDown size={10} className="absolute right-1 top-1/2 -translate-y-1/2 pointer-events-none opacity-70" />
+                        </div>
 
                         {/* Settings */}
-                        <button onClick={onOpenSettings} className="p-1 rounded transition-colors hover:bg-white/10" title="Settings" style={glassBtn}>
+                        <button onClick={onOpenSettings} className="p-1 rounded transition-colors hover:bg-white/10" aria-label="Settings" style={glassBtn}>
                             <Settings size={13} strokeWidth={1.5} />
                         </button>
 
@@ -272,30 +815,30 @@ const ChatInterface = ({
                                 <div style={{ width: 1, height: 16, background: 'var(--glass-border)', margin: '0 2px' }} />
 
                                 {/* Size cycle: S → M → L */}
-                                <button 
-                                    onClick={cycleSize} 
+                                <button
+                                    onClick={cycleSize}
                                     className="rounded transition-colors hover:bg-white/10"
-                                    title={`Resize (now ${sizePresets[sizeIndex].label})`}
+                                    aria-label={`Resize (now ${sizePresets[sizeIndex].label})`}
                                     style={{ ...glassBtn, padding: '2px 6px', fontSize: '10px', fontWeight: 700, letterSpacing: '0.5px' }}
                                 >
                                     {sizePresets[sizeIndex].label}
                                 </button>
 
                                 {/* Minimize */}
-                                <button 
-                                    onClick={() => electronIPC.send('minimize-window')} 
-                                    className="p-1 rounded transition-colors hover:bg-white/10" 
-                                    title="Minimize"
+                                <button
+                                    onClick={() => electronIPC.send('minimize-window')}
+                                    className="p-1 rounded transition-colors hover:bg-white/10"
+                                    aria-label="Minimize"
                                     style={glassBtn}
                                 >
                                     <svg width="12" height="12" viewBox="0 0 12 12"><line x1="2" y1="6" x2="10" y2="6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
                                 </button>
 
                                 {/* Close */}
-                                <button 
-                                    onClick={() => electronIPC.send('close-window')} 
-                                    className="p-1 rounded transition-colors hover:bg-red-500/30" 
-                                    title="Close"
+                                <button
+                                    onClick={() => electronIPC.send('close-window')}
+                                    className="p-1 rounded transition-colors hover:bg-red-500/30"
+                                    aria-label="Close"
                                     style={glassBtn}
                                 >
                                     <X size={13} strokeWidth={1.5} />
@@ -305,22 +848,23 @@ const ChatInterface = ({
                     </div>
                 </div>
 
-                <div 
-                    className="messages" 
+                <div style={{ position: 'relative', flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                <div
+                    className="messages"
                     id="messages"
-                    ref={chatContainerRef} 
+                    ref={chatContainerRef}
                     onScroll={handleScroll}
                 >
                     {messages.length === 0 && (
                         <div className="flex flex-col items-center justify-center h-full space-y-4 opacity-80 mt-10" style={{ color: 'var(--text-muted)' }}>
                             <div className="w-16 h-16 rounded-full flex items-center justify-center relative border border-current" style={{ background: 'var(--bubble-user)' }}>
-                                {isListening ? <ScreenShare size={24} strokeWidth={1.5} className="animate-pulse" style={{ color: 'var(--text-main)' }} /> : <ScreenShareOff size={24} strokeWidth={1.5} />}
+                                {isListening ? <Mic size={24} strokeWidth={1.5} className="animate-pulse" style={{ color: 'var(--text-main)' }} /> : <MicOff size={24} strokeWidth={1.5} />}
                                 {settings.autoSend && <div className="absolute top-0 right-0 w-3 h-3 rounded-full border-2" style={{ background: 'var(--text-main)', borderColor: 'var(--glass-bg)' }}></div>}
                             </div>
                             <div className="text-center px-4">
                                 <p className="font-medium mb-1 text-sm" style={{ color: 'var(--text-main)' }}>System Audio Copilot</p>
                                 <p className="text-xs leading-relaxed max-w-xs mx-auto">
-                                    Click the Mic button to share your screen tab.
+                                    {isListening ? 'Listening to system audio — speak or wait for the interviewer.' : 'Press Mic to start capturing system audio.'}
                                 </p>
                             </div>
                         </div>
@@ -330,7 +874,7 @@ const ChatInterface = ({
                         <div key={msg.id} className={`msg ${msg.role === 'user' ? 'user' : 'ai'}`}>
                             <span className="msg-name">{msg.role === 'user' ? 'You' : 'minicaai'}</span>
                             <div className="bubble">
-                                <MessageRenderer content={msg.content} fontSize={settings.fontSize} />
+                                <MessageRenderer content={msg.content} fontSize={settings.fontSize} canAutoType={gate.canAutoType} />
                             </div>
                             <span className="msg-time">{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                         </div>
@@ -341,7 +885,7 @@ const ChatInterface = ({
                             <span className="msg-name">minicaai</span>
                             <div className="bubble">
                                 {streamingMsg.content
-                                    ? <MessageRenderer content={streamingMsg.content} fontSize={settings.fontSize} />
+                                    ? <MessageRenderer content={streamingMsg.content} fontSize={settings.fontSize} canAutoType={gate.canAutoType} isStreaming />
                                     : <span className="typing-bubble"><span className="typing-dot"></span><span className="typing-dot"></span><span className="typing-dot"></span></span>}
                                 <span className="stream-caret" aria-hidden="true" />
                             </div>
@@ -358,6 +902,37 @@ const ChatInterface = ({
                             </div>
                         </div>
                     )}
+                </div>
+                {!isPinned && (
+                    <button
+                        onClick={handleJumpToLatest}
+                        aria-label="Jump to latest messages"
+                        style={{
+                            position: 'absolute',
+                            bottom: 12,
+                            left: '50%',
+                            transform: 'translateX(-50%)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 6,
+                            padding: '5px 12px',
+                            borderRadius: 999,
+                            fontSize: 11,
+                            fontWeight: 600,
+                            color: 'var(--text-main)',
+                            background: 'var(--glass-bg, rgba(20,20,28,0.78))',
+                            border: '1px solid var(--glass-border, rgba(255,255,255,0.14))',
+                            backdropFilter: 'blur(8px)',
+                            WebkitBackdropFilter: 'blur(8px)',
+                            boxShadow: '0 4px 14px rgba(0,0,0,0.28)',
+                            cursor: 'pointer',
+                            zIndex: 5,
+                        }}
+                    >
+                        <ChevronDown size={12} strokeWidth={2} />
+                        {newSinceUnpin > 0 ? `${newSinceUnpin} new` : 'Latest'}
+                    </button>
+                )}
                 </div>
 
                 <div className="input-area" style={{ flexDirection: 'column', gap: '0' }}>
@@ -400,17 +975,18 @@ const ChatInterface = ({
                     {/* ── Input row ── */}
                     <div style={{ display: 'flex', alignItems: 'flex-end', gap: '8px', padding: '8px' }}>
                     <div className="input-wrap">
-                        <textarea 
-                            id="inputBox" 
+                        <textarea
+                            id="inputBox"
                             className="pip-textarea"
                             placeholder={settings.autoSend ? "Listening for interviewer..." : "Type a message…"}
                             rows={1}
                             value={inputText}
-                            onChange={(e) => {
-                                setInputText(e.target.value);
-                                e.target.style.height = 'auto';
-                                e.target.style.height = Math.min(e.target.scrollHeight, 110) + 'px';
-                            }}
+                            // `field-sizing: content` delegates auto-grow to the browser and
+                            // avoids the JS-triggered layout recomputation that caused
+                            // per-keystroke typing lag. max-height (110px) in pip-styles.css
+                            // continues to cap the grow region, with overflow scrolling past.
+                            style={{ fieldSizing: 'content', maxHeight: 110 } as React.CSSProperties}
+                            onChange={(e) => setInputText(e.target.value)}
                             onKeyDown={(e) => {
                                 if (e.key === 'Enter' && !e.shiftKey) {
                                     e.preventDefault();
@@ -436,10 +1012,15 @@ const ChatInterface = ({
                         aria-label={gate.canAutoSolve ? "Auto-Solve" : "Auto-Solve — Pro only"}
                         onClick={handleAutoSolve}
                         disabled={isProcessing || !gate.canAutoSolve}
-                        title={gate.canAutoSolve ? "Auto-Solve Screen" : "Auto-Solve — Pro only 🔒"}
                         style={{ opacity: (isProcessing || !gate.canAutoSolve) ? 0.4 : 1, position: 'relative' }}
                     >
                         <Wand2 size={18} strokeWidth={1.5} />
+                        {!gate.canAutoSolve && (
+                            <span
+                                className="absolute -top-1 -right-1 text-[7px] font-bold tracking-wider bg-amber-400/15 text-amber-300 px-1 py-px rounded border border-amber-400/40"
+                                style={{ letterSpacing: '0.05em', lineHeight: 1 }}
+                            >PRO</span>
+                        )}
                     </button>
                     </div>
                 </div>
@@ -460,15 +1041,39 @@ const ChatInterface = ({
 
                 <div className="flex items-center gap-2 md:gap-3">
                     {/* User tier badge */}
-                    {userLicense && userLicense.tier === 'pro' ? (
+                    {userLicense && userLicense.tier === 'max' ? (
+                      <div className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400">
+                        <Crown size={10} /> MAX
+                      </div>
+                    ) : userLicense && userLicense.tier === 'pro' ? (
                       <div className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-blue-500/10 border-blue-500/30 text-blue-400">
                         <Crown size={10} /> PRO
+                      </div>
+                    ) : userLicense && userLicense.tier === 'basic' ? (
+                      <div className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-emerald-500/10 border-emerald-500/30 text-emerald-400">
+                        <Zap size={10} /> BASIC
                       </div>
                     ) : userLicense ? (
                       <button onClick={openProUpgrade} className="hidden md:flex px-3 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/30 text-blue-400 hover:from-blue-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
                         <Crown size={10} /> Upgrade to Pro
                       </button>
                     ) : null}
+
+                    {/* Live credit / trial countdown chip (Basic users + Free on trial) */}
+                    {creditTimer && (creditTimer.source === 'credits' || creditTimer.source === 'trial') && creditTimer.remaining > 0 && (
+                      <div
+                        className={`hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-semibold items-center gap-1.5 border transition-all duration-300 ${
+                          creditTimer.remaining <= TIME_CONSTANTS.LOW_WARNING_SECONDS
+                            ? 'bg-red-500/10 border-red-500/40 text-red-400'
+                            : creditTimer.source === 'trial'
+                              ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                              : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                        }`}
+                        aria-label={creditTimer.source === 'trial' ? 'Free trial time remaining' : 'Basic plan time remaining'}
+                      >
+                        {creditTimer.source === 'trial' ? 'TRIAL' : ''} {formatTimeRemaining(creditTimer.remaining)}
+                      </div>
+                    )}
                     <div className={`hidden md:flex px-3 py-1 rounded-full text-xs font-medium items-center gap-2 border transition-all duration-300 ${isListening ? 'bg-red-500/10 border-red-500/50 text-red-500' : 'bg-surface border-border text-gray-500'}`}>
                         <div className={`w-2 h-2 rounded-full ${isListening ? 'bg-red-500 animate-pulse' : 'bg-gray-500'}`}></div>
                         {isListening ? 'LIVE' : 'OFF'}
@@ -482,20 +1087,20 @@ const ChatInterface = ({
                                 ? 'text-primary hover:bg-blue-500/10 border-blue-500/20'
                                 : 'text-gray-500 border-gray-500/20 cursor-not-allowed opacity-60'
                             }`}
-                            title={gate.canPopout ? "Pop Out (Hide from Screen Share)" : "Pop-out Mode — Pro only 🔒"}
+                            aria-label={gate.canPopout ? "Pop Out (Hide from Screen Share)" : "Pop-out Mode — Pro only"}
                         >
                             <ExternalLink size={20} />
-                            {!gate.canPopout && <Lock size={8} className="absolute top-1 right-1 text-amber-400" />}
+                            {!gate.canPopout && <Crown size={8} className="absolute top-1 right-1 text-amber-400" />}
                         </button>
                     )}
 
                     {onNewSession && (
-                        <button onClick={onNewSession} className="p-2 text-gray-400 hover:text-green-400 hover:bg-green-500/10 border border-transparent hover:border-green-500/20 rounded-lg transition-all" title="New Interview Session"><Plus size={20} /></button>
+                        <button onClick={onNewSession} className="p-2 text-gray-400 hover:text-green-400 hover:bg-green-500/10 border border-transparent hover:border-green-500/20 rounded-lg transition-all" aria-label="New Interview Session"><Plus size={20} /></button>
                     )}
-                    <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Audio Help"><HelpCircle size={20} /></button>
-                    <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" title="Files (Knowledge Base)"><FileText size={20} /></button>
-                    <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border text-gray-400 hover:text-text hover:bg-surface`} title="Settings"><Settings size={20} /></button>
-                    <button onClick={onLogout} className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 rounded-lg transition-all" title="Logout"><LogOut size={20} /></button>
+                    <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Audio Help"><HelpCircle size={20} /></button>
+                    <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Files (Knowledge Base)"><FileText size={20} /></button>
+                    <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border text-gray-400 hover:text-text hover:bg-surface`} aria-label="Settings"><Settings size={20} /></button>
+                    <button onClick={onLogout} className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 rounded-lg transition-all" aria-label="Logout"><LogOut size={20} /></button>
                 </div>
             </header>
 
@@ -537,7 +1142,7 @@ const ChatInterface = ({
                             {msg.role === 'user' ? 'Transcript' : msg.role === 'system' ? 'System' : 'Answer'}
                         </div>
                         {/* Use Custom Message Renderer */}
-                        <MessageRenderer content={msg.content} fontSize={settings.fontSize} />
+                        <MessageRenderer content={msg.content} fontSize={settings.fontSize} canAutoType={gate.canAutoType} />
                         </div>
                     </div>
                     ))}
@@ -550,7 +1155,7 @@ const ChatInterface = ({
                             </div>
                             {streamingMsg.content ? (
                                 <>
-                                    <MessageRenderer content={streamingMsg.content} fontSize={settings.fontSize} />
+                                    <MessageRenderer content={streamingMsg.content} fontSize={settings.fontSize} canAutoType={gate.canAutoType} isStreaming />
                                     <span className="stream-caret" aria-hidden="true" />
                                 </>
                             ) : (
@@ -580,6 +1185,18 @@ const ChatInterface = ({
                     </div>
                     )}
                 </div>
+
+                {!isPinned && (
+                    <button
+                        onClick={handleJumpToLatest}
+                        aria-label="Jump to latest messages"
+                        className="absolute left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold text-text bg-black/60 border border-white/15 backdrop-blur-md shadow-lg hover:bg-black/75 hover:border-white/25 transition-all z-30"
+                        style={{ bottom: '11rem' }}
+                    >
+                        <ChevronDown size={13} strokeWidth={2.2} />
+                        {newSinceUnpin > 0 ? `${newSinceUnpin} new` : 'Latest'}
+                    </button>
+                )}
 
                 {/* --- INPUT BAR --- */}
                 <div className="absolute bottom-0 left-0 right-0 bg-transparent pt-4 pb-4 px-2 md:px-6 z-20">
@@ -628,9 +1245,9 @@ const ChatInterface = ({
                                             className="appearance-none bg-surface text-text text-[10px] md:text-xs font-bold px-2.5 py-1 pr-6 rounded-md border border-border hover:border-primary focus:outline-none focus:ring-1 focus:ring-primary transition-all cursor-pointer"
                                         >
                                             <option value="gemini" className="bg-white dark:bg-gray-800 text-black dark:text-white">Gemini 3.1 Flash</option>
-                                            <option value="groq" disabled={!gate.canUseModel('groq')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Groq{!gate.canUseModel('groq') ? ' 🔒' : ''}</option>
-                                            <option value="openai" disabled={!gate.canUseModel('openai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">GPT-5.4 Mini{!gate.canUseModel('openai') ? ' 🔒' : ''}</option>
-                                            <option value="xai" disabled={!gate.canUseModel('xai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Grok (xAI){!gate.canUseModel('xai') ? ' 🔒' : ''}</option>
+                                            <option value="groq" disabled={!gate.canUseModel('groq')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Groq{!gate.canUseModel('groq') ? ' — PRO' : ''}</option>
+                                            <option value="openai" disabled={!gate.canUseModel('openai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">GPT-5.4 Mini{!gate.canUseModel('openai') ? ' — PRO' : ''}</option>
+                                            <option value="xai" disabled={!gate.canUseModel('xai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Grok (xAI){!gate.canUseModel('xai') ? ' — PRO' : ''}</option>
                                         </select>
                                         <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500">
                                             <ChevronDown size={10} />
@@ -639,7 +1256,7 @@ const ChatInterface = ({
                                 </div>
                                 
                                 {!isProcessing && messages.length > 0 && (
-                                    <button onClick={handleRegenerate} className="text-gray-500 hover:text-primary transition-colors p-1" title="Regenerate last answer">
+                                    <button onClick={handleRegenerate} className="text-gray-500 hover:text-primary transition-colors p-1" aria-label="Regenerate last answer">
                                         <RefreshCw size={14} />
                                     </button>
                                 )}
@@ -658,6 +1275,10 @@ const ChatInterface = ({
                                         onChange={(e) => setInputText(e.target.value)}
                                         placeholder={settings.autoSend ? "Listening for interviewer..." : "Type or speak context..."}
                                         className="w-full bg-transparent text-text placeholder-gray-500 px-3 py-2.5 focus:outline-none rounded-xl text-sm md:text-base leading-relaxed resize-none z-10 relative custom-scrollbar max-h-[150px] overflow-y-auto"
+                                        // Native CSS auto-grow — avoids the JS layout-thrash that
+                                        // caused per-keystroke typing lag. Browsers without support
+                                        // fall back to the rAF-batched resize effect in MainApp.
+                                        style={{ fieldSizing: 'content' } as React.CSSProperties}
                                         rows={1}
                                         onKeyDown={(e) => {
                                             if (e.key === 'Enter' && !e.shiftKey) {
@@ -678,7 +1299,7 @@ const ChatInterface = ({
                                         <button
                                             onClick={handleAutoSolve}
                                             disabled={isProcessing || !gate.canAutoSolve}
-                                            title={gate.canAutoSolve ? "Auto-Solve Screen" : "Auto-Solve — Pro only"}
+                                            aria-label={gate.canAutoSolve ? "Auto-Solve Screen" : "Auto-Solve — Pro only"}
                                             className={`p-2 rounded-xl transition-all shadow-lg relative ${
                                                 !gate.canAutoSolve
                                                 ? 'bg-gray-600/30 text-gray-500 cursor-not-allowed border border-gray-500/20'
@@ -688,7 +1309,7 @@ const ChatInterface = ({
                                             }`}
                                         >
                                             <Wand2 size={18} />
-                                            {!gate.canAutoSolve && <Lock size={8} className="absolute top-1 right-1 text-amber-400" />}
+                                            {!gate.canAutoSolve && <Crown size={8} className="absolute top-1 right-1 text-amber-400" />}
                                         </button>
                                         <button 
                                             onClick={handleManualSend}
@@ -719,7 +1340,11 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
 
     useEffect(() => {
         if (!window.documentPictureInPicture) {
-            alert("Your browser does not support Document Picture-in-Picture (Pop-out). Please use Chrome 111+ or Edge.");
+            // Defensive fallback — togglePip already pre-checks support and
+            // shows a chat message before mounting this component. If we
+            // somehow still land here, close silently rather than popping a
+            // native alert (alerts paint outside content protection and leak
+            // on screen share).
             onClose();
             return;
         }
@@ -826,17 +1451,28 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
 import { FEATURE_GATES } from './services/licenseService';
 
 // ── Feature Gate Helper ──
+// Resolves effective tier: Max ⊃ Pro ⊃ Basic ⊃ Free. A Free user with
+// trial_remaining_seconds > 0 gets boosted to Basic features for the taste-test
+// window (see licenseService.getEffectiveTier). Keep `actualTier` around
+// separately for billing/upgrade UI that should ignore the trial boost.
 function useFeatureGate(license: LicenseData | null) {
-  const tier = license?.tier === 'pro' ? 'pro' : 'free';
+  const tier = licenseService.getEffectiveTier(license);
+  const actualTier = (license?.tier ?? 'free') as 'free' | 'basic' | 'pro' | 'max';
   const gates = FEATURE_GATES[tier];
+  const onTrial = licenseService.isTrialActive(license);
 
   return {
     tier,
+    actualTier,
+    isMax: tier === 'max',
     isPro: tier === 'pro',
+    isBasic: tier === 'basic',
     isFree: tier === 'free',
+    onTrial,
     allowedModels: gates.models,
     canScreenCapture: gates.screenCapture,
     canAutoSolve: gates.autoSolve,
+    canAutoType: gates.autoType,
     canPopout: gates.popout,
     maxContextFiles: gates.contextFiles,
     maxSessions: gates.sessionsPerMonth,
@@ -846,12 +1482,193 @@ function useFeatureGate(license: LicenseData | null) {
   };
 }
 
+// Format seconds as "1h 23m" / "23m 05s" / "45s" for chips and modals
+function formatTimeRemaining(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  if (h > 0) return `${h}h ${m.toString().padStart(2, '0')}m`;
+  if (m > 0) return `${m}m ${ss.toString().padStart(2, '0')}s`;
+  return `${ss}s`;
+}
+
+// ── useCreditTimer ──
+// Drives the ticking session clock for Basic users and Free-tier trial users.
+// Pro/Max = unlimited; creditTimerService.start() silently no-ops for them so
+// this hook is safe to mount for everyone and just stays dormant.
+function useCreditTimer(params: {
+  isListening: boolean;
+  license: LicenseData | null;
+  onForceStop: () => void;
+}) {
+  const { isListening, license, onForceStop } = params;
+  const [remaining, setRemaining] = useState<number>(() => licenseService.getLiveTimeBalance(license).seconds);
+  const [source, setSource] = useState<'trial' | 'credits' | 'unlimited' | 'none'>(() => licenseService.getLiveTimeBalance(license).source);
+  const [hourBoundary, setHourBoundary] = useState(false);
+  const [lowWarning, setLowWarning] = useState(false);
+  const [exhausted, setExhausted] = useState(false);
+
+  // onForceStop may be a fresh arrow every render (e.g. Electron popout path).
+  // Pin it to a ref so the listener-subscription effect runs exactly once.
+  const forceStopRef = useRef(onForceStop);
+  useEffect(() => { forceStopRef.current = onForceStop; }, [onForceStop]);
+
+  // Re-read balance when license changes (e.g. after renewal purchase)
+  useEffect(() => {
+    const bal = licenseService.getLiveTimeBalance(license);
+    setRemaining(bal.seconds);
+    setSource(bal.source);
+  }, [license]);
+
+  // Subscribe to timer events — mount once, stable identity.
+  useEffect(() => {
+    const offStarted = creditTimerService.on('started', (p: any) => {
+      setRemaining(p.remainingSeconds);
+      setSource(p.source);
+    });
+    const offTick = creditTimerService.on('tick', (p: any) => {
+      setRemaining(p.remainingSeconds);
+      setSource(p.source);
+    });
+    const offHour = creditTimerService.on('hour-boundary', (p: any) => {
+      setRemaining(p.remainingSeconds);
+      setHourBoundary(true);
+    });
+    const offLow = creditTimerService.on('low-warning', () => setLowWarning(true));
+    const offOut = creditTimerService.on('exhausted', () => {
+      setExhausted(true);
+      forceStopRef.current();
+    });
+    return () => { offStarted(); offTick(); offHour(); offLow(); offOut(); };
+  }, []);
+
+  // Start/stop mirror the mic. Pro/Max = unlimited → start() no-ops internally.
+  useEffect(() => {
+    if (isListening) creditTimerService.start();
+    else creditTimerService.stop();
+  }, [isListening]);
+
+  const acknowledgeHourBoundary = useCallback((decision: 'continue' | 'stop') => {
+    creditTimerService.acknowledgeHourBoundary(decision);
+    setHourBoundary(false);
+    if (decision === 'stop') forceStopRef.current();
+  }, []);
+
+  return {
+    remaining,
+    source,
+    hourBoundary,
+    lowWarning,
+    exhausted,
+    acknowledgeHourBoundary,
+    dismissLowWarning: () => setLowWarning(false),
+    dismissExhausted: () => setExhausted(false),
+  };
+}
+
+// ── Hour-boundary modal — gentle prompt before dipping into the next credit
+const HourBoundaryModal = ({ remainingSeconds, onDecision }: { remainingSeconds: number; onDecision: (d: 'continue' | 'stop') => void }) => (
+  <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-sm">
+    <div className="max-w-md w-full mx-4 rounded-2xl border border-emerald-500/30 bg-[#0a0a0f] shadow-2xl shadow-emerald-500/10 p-6">
+      <div className="flex items-center gap-3 mb-3">
+        <div className="w-10 h-10 rounded-xl bg-emerald-500/15 flex items-center justify-center">
+          <Zap size={20} className="text-emerald-400" />
+        </div>
+        <div>
+          <h3 className="text-base font-bold text-white">One hour down</h3>
+          <p className="text-xs text-gray-500">Use your next interview credit to keep going?</p>
+        </div>
+      </div>
+      <p className="text-sm text-gray-400 mb-5 leading-relaxed">
+        You've been live for 60 minutes. You have <span className="text-emerald-400 font-semibold">{formatTimeRemaining(remainingSeconds)}</span> left on your Basic plan. Continuing will use your next credit.
+      </p>
+      <div className="flex gap-3">
+        <button onClick={() => onDecision('stop')} className="flex-1 px-4 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-gray-300 text-sm font-semibold hover:bg-white/[0.08] transition-all">
+          Stop session
+        </button>
+        <button onClick={() => onDecision('continue')} className="flex-1 px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-bold transition-all shadow-lg shadow-emerald-500/20">
+          Continue with next credit
+        </button>
+      </div>
+    </div>
+  </div>
+);
+
+// ── Low-warning toast — 2-minute warning, auto-dismiss after 8s
+const LowWarningToast = ({ remainingSeconds, onDismiss }: { remainingSeconds: number; onDismiss: () => void }) => {
+  useEffect(() => {
+    const t = setTimeout(onDismiss, 8000);
+    return () => clearTimeout(t);
+  }, [onDismiss]);
+  return (
+    <div className="fixed top-20 right-6 z-[95] max-w-sm px-4 py-3 rounded-xl bg-amber-500/[0.12] border border-amber-500/40 text-amber-300 text-sm font-medium shadow-xl backdrop-blur-sm flex items-center gap-3 animate-pulse">
+      <AlertTriangle size={16} className="shrink-0" />
+      <span>Only <b>{formatTimeRemaining(remainingSeconds)}</b> left on your plan. Wrap up or renew soon.</span>
+      <button onClick={onDismiss} className="text-amber-400 hover:text-amber-200 ml-1"><X size={14} /></button>
+    </div>
+  );
+};
+
+// ── Exhausted modal — blocking; offers renew CTA for Basic, upgrade for Free
+const ExhaustedModal = ({
+  source, actualTier, countryCode, onRenew, onUpgrade, onDismiss,
+}: {
+  source: 'trial' | 'credits' | 'unlimited' | 'none';
+  actualTier: 'free' | 'basic' | 'pro' | 'max';
+  countryCode: string;
+  onRenew: () => void;
+  onUpgrade: () => void;
+  onDismiss: () => void;
+}) => {
+  const wasTrial = source === 'trial' || actualTier === 'free';
+  const renewal = pricingService.getBasicRenewalPrice(countryCode);
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm">
+      <div className="max-w-md w-full mx-4 rounded-2xl border border-red-500/30 bg-[#0a0a0f] shadow-2xl shadow-red-500/10 p-6">
+        <div className="flex items-center gap-3 mb-3">
+          <div className="w-10 h-10 rounded-xl bg-red-500/15 flex items-center justify-center">
+            <AlertTriangle size={20} className="text-red-400" />
+          </div>
+          <div>
+            <h3 className="text-base font-bold text-white">{wasTrial ? 'Trial complete' : "You're out of interview time"}</h3>
+            <p className="text-xs text-gray-500">{wasTrial ? 'Your 30-minute trial just ended.' : 'All credits have been used.'}</p>
+          </div>
+        </div>
+        <p className="text-sm text-gray-400 mb-5 leading-relaxed">
+          {wasTrial
+            ? 'Grab the Basic plan to keep using the full feature set — 3 interview credits (3 hours) valid for 14 days.'
+            : 'Add another hour for a single renewal, or upgrade to Pro for unlimited sessions.'}
+        </p>
+        <div className="flex flex-col gap-2">
+          {!wasTrial && actualTier === 'basic' && (
+            <button onClick={onRenew} className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-bold transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2">
+              <Zap size={14} />
+              Renew +1 hour · {pricingService.formatPrice(renewal.price, renewal.currencySymbol, renewal.currency)}
+            </button>
+          )}
+          <button onClick={onUpgrade} className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-400 hover:to-purple-400 text-white text-sm font-bold transition-all shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2">
+            <Crown size={14} /> {wasTrial ? 'See plans' : 'Upgrade to Pro (Unlimited)'}
+          </button>
+          <button onClick={onDismiss} className="px-4 py-2 rounded-xl text-gray-500 text-xs font-medium hover:text-gray-300 transition-all">
+            Dismiss
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ── Upgrade to Pro — opens Stripe checkout in browser ──
+// No native alerts inside — alert()/confirm() are OS dialogs that bypass
+// setContentProtection and leak on screen share. Failures log to console;
+// the Upgrade button itself is already tier-gated in render so the
+// no-token branch is a defensive no-op in practice.
 async function openProUpgrade() {
   const { licenseService } = await import('./services/licenseService');
   const token = licenseService.getToken();
   if (!token) {
-    alert('Please sign in first.');
+    console.warn('[openProUpgrade] No auth token — aborting.');
     return;
   }
   try {
@@ -875,14 +1692,14 @@ async function openProUpgrade() {
       }
     }
   } catch (err: any) {
-    alert(`Upgrade failed: ${err.message || 'Unknown error'}. Please try again.`);
+    console.error('[openProUpgrade] Checkout failed:', err?.message || err);
   }
 }
 
 // ── Pro Feature Locked Overlay ──
 const ProFeatureLocked = ({ feature, compact }: { feature: string; compact?: boolean }) => (
   <div className={`flex items-center gap-1.5 ${compact ? 'text-[10px]' : 'text-xs'} text-amber-400/80`}>
-    <Lock size={compact ? 10 : 12} />
+    <Crown size={compact ? 10 : 12} />
     <span>Pro only{!compact && ` — ${feature}`}</span>
   </div>
 );
@@ -1020,7 +1837,7 @@ const ConversationSidebar = ({
                           <div
                             onClick={() => db.switchSession(s.id)}
                             className="cursor-pointer px-2.5 py-2 flex items-center gap-2 min-w-0"
-                            title={s.name}
+                            aria-label={s.name}
                           >
                             <MessageSquare
                               size={12}
@@ -1040,7 +1857,7 @@ const ConversationSidebar = ({
                                   startEdit(s);
                                 }}
                                 className="w-6 h-6 rounded hover:bg-white/[0.1] flex items-center justify-center text-gray-500 hover:text-white"
-                                title="Rename"
+                                aria-label="Rename"
                               >
                                 <Edit3 size={11} />
                               </button>
@@ -1050,7 +1867,7 @@ const ConversationSidebar = ({
                                   setDeleteConfirmId(s.id);
                                 }}
                                 className="w-6 h-6 rounded hover:bg-red-500/20 flex items-center justify-center text-gray-500 hover:text-red-400"
-                                title="Delete"
+                                aria-label="Delete"
                               >
                                 <Trash2 size={11} />
                               </button>
@@ -1138,6 +1955,45 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       try { ctrl.abort(); } catch {}
     }
   }, []);
+
+  // ─────────────────────────────────────────────────────────────
+  //  STREAM CHUNK COALESCING
+  // ─────────────────────────────────────────────────────────────
+  //  MessageRenderer parses markdown (+ syntax-highlights code) on every
+  //  content change. At 100 tokens/sec (Groq), that would be 100 parses/sec
+  //  — enough to jank the popout during fast answers. We coalesce bursts of
+  //  stream chunks to at most one React commit per animation frame. The
+  //  final string of each frame is what lands; intermediate tokens inside
+  //  the same frame are invisible to the user anyway.
+  //
+  //  Used by main's streaming callback AND by the popout's IPC chunk
+  //  handler so both windows get the same smooth rendering regardless of
+  //  how fast the upstream model is pushing tokens.
+  // ─────────────────────────────────────────────────────────────
+  const pendingChunkRAFRef = useRef<number | null>(null);
+  const latestChunkRef = useRef<{ id: string; content: string } | null>(null);
+
+  const applyStreamChunk = useCallback((id: string, full: string) => {
+    latestChunkRef.current = { id, content: full };
+    if (pendingChunkRAFRef.current !== null) return;
+    pendingChunkRAFRef.current = requestAnimationFrame(() => {
+      pendingChunkRAFRef.current = null;
+      const latest = latestChunkRef.current;
+      latestChunkRef.current = null;
+      if (!latest) return;
+      // `prev.id === latest.id` guards against out-of-order or late frames
+      // from a cancelled run landing in a newer stream's bubble.
+      setStreamingMsg(prev => prev && prev.id === latest.id ? { ...prev, content: latest.content } : prev);
+    });
+  }, []);
+
+  const flushStreamChunk = useCallback(() => {
+    if (pendingChunkRAFRef.current !== null) {
+      cancelAnimationFrame(pendingChunkRAFRef.current);
+      pendingChunkRAFRef.current = null;
+    }
+    latestChunkRef.current = null;
+  }, []);
   const streamRef = useRef<MediaStream | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showContext, setShowContext] = useState(false);
@@ -1164,7 +2020,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     downloadUrl?: { windows: string; mac: string; linux: string };
   } | null>(null);
 
-  const APP_VERSION = '3.3.1'; // Keep in sync with package.json
+  // Injected by Vite from package.json (see vite.config.ts). Single source
+  // of truth — no more version drift between manifest and the server check.
+  const APP_VERSION = __APP_VERSION__;
 
   useEffect(() => {
     if (!isElectron) return;
@@ -1221,16 +2079,16 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       document.body.style.background = 'transparent';
     }
     // Listen for popout closed (main window gets notified)
+    let disposeClosed: (() => void) | null = null;
+    let disposeOpened: (() => void) | null = null;
     if (isElectron && !isPopoutMode) {
-      electronIPC.on('popout-closed', () => {
-        setIsPipMode(false);
-      });
-      electronIPC.on('popout-opened', () => {
-        setIsPipMode(true);
-      });
+      disposeClosed = electronIPC.on('popout-closed', () => { setIsPipMode(false); });
+      disposeOpened = electronIPC.on('popout-opened', () => { setIsPipMode(true); });
     }
     return () => {
       document.documentElement.classList.remove('electron-transparent');
+      if (disposeClosed) disposeClosed();
+      if (disposeOpened) disposeOpened();
     };
   }, []);
 
@@ -1251,6 +2109,16 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // Settings Modal Local State
   const [tempModel, setTempModel] = useState<'gemini'|'groq'|'openai'|'xai'>('gemini');
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved'>('idle');
+  // Timer for the post-save "saved" → "idle" flash; cleared on unmount so a
+  // pending revert can't fire into a torn-down component (and cancelled on
+  // re-save so back-to-back saves don't leave a stale revert in flight).
+  const saveStatusTimerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (saveStatusTimerRef.current !== null) {
+      window.clearTimeout(saveStatusTimerRef.current);
+      saveStatusTimerRef.current = null;
+    }
+  }, []);
 
   // Ref for file input to ensure reliable click
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1284,214 +2152,448 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   }, [showSettings, settings.selectedModel]);
 
 
-  // Scroll State
-  const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
-  const shouldAutoScrollRef = useRef(true);
+  // ─────────────────────────────────────────────────────────────
+  //  SCROLL / PIN — single source of truth
+  // ─────────────────────────────────────────────────────────────
+  //  isPinned = true  → view is locked to bottom, new content auto-follows.
+  //  isPinned = false → user scrolled up; content does NOT yank their view,
+  //                     a floating "N new ↓" pill surfaces.
+  //
+  //  Every scroll event updates the pinned state uniformly, regardless of
+  //  source (wheel, touch, scrollbar drag, keyboard, arrow keys, End, etc.)
+  //  — so scrollbar dragging and keyboard navigation behave correctly.
+  //
+  //  Programmatic scrolls are flagged via programmaticScrollRef so the
+  //  handler doesn't interpret them as user intent.
+  // ─────────────────────────────────────────────────────────────
+  const PIN_THRESHOLD_PX = 32;
+  const [isPinned, setIsPinned] = useState(true);
+  const isPinnedRef = useRef(true);
+  const programmaticScrollRef = useRef(false);
+  const programmaticScrollClearRef = useRef<number | null>(null);
+  // Records how to detach a `scrollend` listener at guard-clear time —
+  // captures the element at add-time so a subsequent chatContainerRef
+  // change (e.g. between popout and regular layouts) can't orphan it.
+  const programmaticScrollEndCleanupRef = useRef<(() => void) | null>(null);
+  // Last observed distance-from-bottom, used to detect a user interrupting
+  // a programmatic smooth-scroll: distance converges to 0 from above during
+  // our animation, and grows when the user wheels/touches up against it.
+  const lastScrollDistanceRef = useRef(0);
   const scrollRAFRef = useRef<number | null>(null);
-  const userScrolledAwayRef = useRef(false);
-  const userScrollCooldownRef = useRef<number | null>(null);
-  const wasStreamingRef = useRef(false); // Track if we were just streaming
+  const [newSinceUnpin, setNewSinceUnpin] = useState(0);
+  const newSinceUnpinRef = useRef(0);
+  // When unpinned, a streaming draft contributes +1 to the pill counter.
+  // We store the stream's id here as a "claim" so the eventual committed
+  // message (same id — see executeSend's `pendingId`) can be recognized
+  // and the commit-effect can skip its normal +1 increment. Without this,
+  // a single AI response counts twice (once while streaming, once on
+  // commit) and the pill reads "1 new ↓" → "2 new ↓".
+  //
+  // If the stream ENDS without a matching commit landing immediately, we
+  // set claimFailedRef to mark "this claim is probably orphaned". The next
+  // message that commits (typically the error/system replacement main
+  // pushes on failure) then consumes the claim regardless of id match, so
+  // the pill glides straight from 1 to 1 instead of briefly showing 2.
+  const pendingStreamClaimIdRef = useRef<string | null>(null);
+  const claimFailedRef = useRef(false);
+  const claimReleaseTimerRef = useRef<number | null>(null);
+
+  // Popout-only: stream-end arrives as an IPC event, and the matching
+  // db:messages-updated arrives as a SEPARATE IPC event moments later.
+  // Those two handlers run in different tasks so React cannot batch them.
+  // If we null streamingMsg on stream-end, the streaming bubble unmounts
+  // one frame before the committed bubble mounts — the user sees a gap
+  // (the "flash/blink" at the end of every answer).
+  //
+  // Instead, on stream-end we record the ids here and let a messages-
+  // watching effect null streamingMsg atomically with the messages
+  // update. Fallback timer covers the degenerate case where no commit
+  // ever lands (main crashed, IPC dropped).
+  const pendingStreamEndIdRef = useRef<string | null>(null);
+  const pendingStreamEndCountRef = useRef(0);
+  const streamEndFallbackTimerRef = useRef<number | null>(null);
 
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const silenceTimerRef = useRef<any>(null);
   const inputTextRef = useRef(inputText);
 
+  // Track whether the browser natively supports CSS `field-sizing: content`
+  // (Chromium 123+, which Electron 41 satisfies). When available, we skip the
+  // JS-driven auto-resize entirely because every `style.height = 'auto'` +
+  // `scrollHeight` read forces a full synchronous layout recomputation, and
+  // doing that on every keystroke causes perceptible typing lag on pages
+  // with large message lists / syntax-highlighted code blocks.
+  const supportsFieldSizing = useMemo(
+    () => typeof CSS !== 'undefined' && typeof CSS.supports === 'function'
+      && CSS.supports('field-sizing', 'content'),
+    []
+  );
+
   useEffect(() => {
     inputTextRef.current = inputText;
-    if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-        const newHeight = Math.min(textareaRef.current.scrollHeight, 150);
-        textareaRef.current.style.height = newHeight + 'px';
-    }
-  }, [inputText]);
+    if (supportsFieldSizing) return; // CSS handles growth — no layout thrash
+    const ta = textareaRef.current;
+    if (!ta) return;
+    // Defer to rAF so the write doesn't block the keystroke's paint.
+    const id = requestAnimationFrame(() => {
+      ta.style.height = 'auto';
+      const newHeight = Math.min(ta.scrollHeight, 150);
+      ta.style.height = newHeight + 'px';
+    });
+    return () => cancelAnimationFrame(id);
+  }, [inputText, supportsFieldSizing]);
 
   // API keys are now managed server-side — no client init needed
 
-  // Handle Auto-Scrolling.
-  //
-  // During streaming: set scrollTop directly (instant), throttled to
-  // one update per animation frame so rapid tokens don't stack up
-  // smooth-scroll animations and cause stutter.
-  //
-  // IMPORTANT: If the user has scrolled away (userScrolledAwayRef),
-  // we completely skip auto-scrolling until they scroll back to bottom.
-  // This prevents the "slap back" effect when user is trying to read
-  // earlier content during streaming.
-  //
-  // We track wasStreamingRef to avoid jerking when streaming ends —
-  // the smooth scroll should only happen for truly new user messages,
-  // not when a streaming response finishes.
-  useEffect(() => {
-    if (userScrolledAwayRef.current) return;
-    if (!shouldAutoScrollRef.current || !chatContainerRef.current) return;
+  // Always read the latest streaming message from a ref inside rAF
+  // callbacks — closure-captured `streamingMsg` could be stale by the
+  // time the frame fires (e.g. regenerate started a new stream one tick
+  // after this effect was scheduled).
+  const streamingMsgRef = useRef<Message | null>(null);
+  useEffect(() => { streamingMsgRef.current = streamingMsg; }, [streamingMsg]);
 
-    if (streamingMsg) {
-      // Mark that we're streaming
-      wasStreamingRef.current = true;
-      // Streaming: instant scroll, at most once per frame
-      if (scrollRAFRef.current) return;
-      scrollRAFRef.current = requestAnimationFrame(() => {
-        scrollRAFRef.current = null;
-        if (!userScrolledAwayRef.current && shouldAutoScrollRef.current && chatContainerRef.current) {
-          chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
-        }
-      });
-    } else if (wasStreamingRef.current) {
-      // Streaming just ended — do NOT scroll
-      // User is already at the right position from streaming, or intentionally scrolled away
-      // Any scroll here causes a "slap" effect
-      wasStreamingRef.current = false;
+  // Tear down any active programmatic-scroll guard. Removes the `scrollend`
+  // listener (via the saved element-aware cleanup), clears the safety
+  // timeout, and drops the flag so the next scroll event is treated as
+  // user intent.
+  const clearProgrammaticGuard = useCallback(() => {
+    programmaticScrollRef.current = false;
+    if (programmaticScrollEndCleanupRef.current) {
+      programmaticScrollEndCleanupRef.current();
+      programmaticScrollEndCleanupRef.current = null;
     }
-    // Note: We removed the smooth scroll for "discrete events" because it was
-    // causing jerks. Auto-scroll during streaming is sufficient; when streaming
-    // ends, the user is already at the right position or intentionally scrolled away.
-  }, [streamingMsg?.content]);
+    if (programmaticScrollClearRef.current !== null) {
+      window.clearTimeout(programmaticScrollClearRef.current);
+      programmaticScrollClearRef.current = null;
+    }
+  }, []);
 
-  // Scroll to bottom when user sends a NEW message (not when AI responds)
+  // Keep ref + react state synchronized so that the render path reads
+  // a stable value while the imperative scroll code reads the ref.
+  // On repin, clear BOTH the pill counter and any outstanding stream
+  // claim — the view is fresh from here.
+  const setPinned = useCallback((next: boolean) => {
+    if (isPinnedRef.current === next) return;
+    isPinnedRef.current = next;
+    setIsPinned(next);
+    if (next) {
+      newSinceUnpinRef.current = 0;
+      setNewSinceUnpin(0);
+      pendingStreamClaimIdRef.current = null;
+      claimFailedRef.current = false;
+      if (claimReleaseTimerRef.current !== null) {
+        window.clearTimeout(claimReleaseTimerRef.current);
+        claimReleaseTimerRef.current = null;
+      }
+    } else {
+      // Unpinning mid-stream: cancel any auto-scroll frame already
+      // queued by the streaming effect. Otherwise it fires one frame
+      // after the user wheeled up and slaps scrollTop back to the
+      // bottom (the "jerk/slap"). The rAF also re-checks isPinnedRef
+      // so this is belt-and-suspenders — but when token rate is high
+      // the rAF can fire before React processes the unpin, so cancel
+      // explicitly.
+      if (scrollRAFRef.current !== null) {
+        cancelAnimationFrame(scrollRAFRef.current);
+        scrollRAFRef.current = null;
+      }
+    }
+  }, []);
+
+  // Programmatic scroll — sets a flag so the scroll handler can tell
+  // the difference between "we fired this" and "user fired this". The
+  // flag clears on the native `scrollend` event (fires exactly when the
+  // animation finishes, regardless of distance/device speed); a 1200ms
+  // hard-safety timeout covers the rare case where the container is
+  // remounted mid-animation so `scrollend` never lands. This replaces
+  // a previous fixed 450ms window that could clip early on slow machines
+  // (tail scroll events arriving after the flag cleared were misread as
+  // user intent, flickering the pin state).
+  const scrollToBottom = useCallback((smooth: boolean) => {
+    const el = chatContainerRef.current;
+    if (!el) return;
+    clearProgrammaticGuard();
+    programmaticScrollRef.current = true;
+    lastScrollDistanceRef.current = Math.max(0, el.scrollHeight - el.scrollTop - el.clientHeight);
+
+    if (smooth) {
+      const onEnd = () => clearProgrammaticGuard();
+      el.addEventListener('scrollend', onEnd, { once: true });
+      programmaticScrollEndCleanupRef.current = () => {
+        el.removeEventListener('scrollend', onEnd);
+      };
+      programmaticScrollClearRef.current = window.setTimeout(onEnd, 1200);
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    } else {
+      el.scrollTop = el.scrollHeight;
+      // Instant scroll dispatches exactly one `scroll` event on the next
+      // microtask; setTimeout(0) reliably outlives it on every browser.
+      programmaticScrollClearRef.current = window.setTimeout(() => {
+        programmaticScrollRef.current = false;
+        programmaticScrollClearRef.current = null;
+      }, 0);
+    }
+  }, [clearProgrammaticGuard]);
+
+  // Single scroll handler — wheel, touchmove, scrollbar drag, keyboard
+  // (PageUp/PageDown/Arrow/Home/End) all dispatch `scroll` events on
+  // the container, so one handler covers every intent source.
+  //
+  // During a programmatic smooth-scroll, the guard blocks pin-state
+  // updates — distance is converging toward 0 from above, so intermediate
+  // positions aren't user intent. BUT if the user wheels up against the
+  // animation, distance grows again — that's user intent beating our
+  // motion, and the guard must yield immediately or their input gets
+  // silently ignored. The +4px tolerance absorbs fractional-pixel jitter
+  // in Chromium's smooth interpolation.
+  const handleScroll = useCallback(() => {
+    const el = chatContainerRef.current;
+    if (!el) return;
+    const distance = Math.max(0, el.scrollHeight - el.scrollTop - el.clientHeight);
+    if (programmaticScrollRef.current) {
+      if (distance > lastScrollDistanceRef.current + 4) {
+        clearProgrammaticGuard();
+      } else {
+        lastScrollDistanceRef.current = distance;
+        return;
+      }
+    }
+    lastScrollDistanceRef.current = distance;
+    // During streaming, auto-scroll holds the view AT the bottom
+    // (distance ≈ 0). Any user-initiated upward movement creates
+    // distance > 0 — unambiguous "let me read this" intent, and we
+    // must unpin on even a tiny motion. The 32px default threshold
+    // is generous on purpose (absorbs bounce, rounding, inertial
+    // overshoot) but during a stream it's too generous: a 10px
+    // wheel flick would stay "pinned" and the next auto-scroll frame
+    // would slap the view back down. Use a tight 4px during streams.
+    const threshold = streamingMsgRef.current ? 4 : PIN_THRESHOLD_PX;
+    setPinned(distance < threshold);
+  }, [setPinned, clearProgrammaticGuard]);
+
+  // Pill click: smooth-scroll to bottom and re-pin in one motion.
+  const handleJumpToLatest = useCallback(() => {
+    scrollToBottom(true);
+    setPinned(true);
+  }, [scrollToBottom, setPinned]);
+
+  // Streaming: coalesces rapid content updates to one rAF per frame.
+  // While pinned, each frame scrolls to the latest scrollHeight (instant,
+  // not smooth — smooth-per-token queues stack into jitter). While
+  // unpinned, set the pill to "1 new" exactly once for the whole stream
+  // and record the stream's id as a pending claim; the commit-effect
+  // will consume that claim when the matching message lands, so the
+  // pill stays at 1 through the stream→commit transition (no flicker,
+  // no double-count). Stream ids == committed message ids (same
+  // `pendingId` — see executeSend:1842/1893), so id-based matching is
+  // reliable. rAF reads streamingMsgRef (not a closure) so a mid-frame
+  // regenerate doesn't operate on a stale id.
+  useEffect(() => {
+    if (!streamingMsg) return;
+    if (scrollRAFRef.current !== null) return;
+    scrollRAFRef.current = requestAnimationFrame(() => {
+      scrollRAFRef.current = null;
+      const current = streamingMsgRef.current;
+      if (!current) return;
+      if (isPinnedRef.current) {
+        scrollToBottom(false);
+      } else {
+        if (newSinceUnpinRef.current < 1) {
+          newSinceUnpinRef.current = 1;
+          setNewSinceUnpin(1);
+        }
+        // A fresh stream establishes a new claim — any stale "failed"
+        // state from a prior stream is no longer relevant.
+        claimFailedRef.current = false;
+        pendingStreamClaimIdRef.current = current.id;
+      }
+    });
+  }, [streamingMsg?.content, scrollToBottom]);
+
+  // Commit events (user sends / AI response lands / cross-window sync in
+  // popout). If pinned → follow the bottom. If unpinned → increment
+  // unread count on the pill, but CONSUME any pending stream claim whose
+  // id appears among the newly-committed messages. That message was
+  // already counted as the +1 draft during streaming, so counting it
+  // again would be a double-count. First non-empty render (initial load)
+  // pins instantly without animation; subsequent user sends use smooth
+  // scroll because the motion feels intentional.
   const prevMessagesLengthRef = useRef(messages.length);
   useEffect(() => {
     const prevLen = prevMessagesLengthRef.current;
     prevMessagesLengthRef.current = messages.length;
+    if (messages.length === 0 || messages.length <= prevLen) return;
 
-    // Only scroll for new user messages (length increased and last message is from user)
-    if (messages.length > prevLen && messages.length > 0) {
-      const lastMsg = messages[messages.length - 1];
-      if (lastMsg.role === 'user' && chatContainerRef.current && shouldAutoScrollRef.current) {
-        chatContainerRef.current.scrollTo({
-          top: chatContainerRef.current.scrollHeight,
-          behavior: 'smooth'
-        });
+    const lastMsg = messages[messages.length - 1];
+
+    if (isPinnedRef.current) {
+      const isInitialLoad = prevLen === 0;
+      const isUserSend = !isInitialLoad && lastMsg.role === 'user';
+      // Defer one frame so the newly-committed message has rendered
+      // and scrollHeight reflects its actual size before we scroll.
+      requestAnimationFrame(() => scrollToBottom(isUserSend));
+      return;
+    }
+
+    let added = messages.length - prevLen;
+    const claimId = pendingStreamClaimIdRef.current;
+    if (claimId !== null) {
+      const newMsgs = messages.slice(prevLen);
+      const matchById = newMsgs.some(m => m.id === claimId);
+      // If the stream ended without a matching commit landing immediately,
+      // claimFailedRef was set — meaning the response errored and main
+      // is about to push a replacement system/error message with a
+      // *different* id. Consume the claim on that next message too, so
+      // the pill glides 1 → 1 instead of briefly flashing 2 → 1 while
+      // the 1.5s release timer runs.
+      const consumable = matchById || (claimFailedRef.current && newMsgs.length > 0);
+      if (consumable) {
+        pendingStreamClaimIdRef.current = null;
+        claimFailedRef.current = false;
+        if (claimReleaseTimerRef.current !== null) {
+          window.clearTimeout(claimReleaseTimerRef.current);
+          claimReleaseTimerRef.current = null;
+        }
+        added -= 1;
       }
     }
-  }, [messages.length]);
-
-  // Clean up any pending animation frame on unmount
-  useEffect(() => {
-    return () => {
-      if (scrollRAFRef.current) {
-        cancelAnimationFrame(scrollRAFRef.current);
-        scrollRAFRef.current = null;
-      }
-    };
-  }, []);
-
-  // Pop-out: when a new message commits from cross-window sync, only
-  // re-arm auto-follow if the user was already near the bottom. If
-  // they scrolled up mid-stream to re-read earlier messages, respect
-  // that — don't yank them back when the final token lands.
-  useEffect(() => {
-    if (!isPopoutMode || messages.length === 0) return;
-    const el = chatContainerRef.current;
-    if (!el) return;
-    const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
-    if (isNearBottom) {
-      shouldAutoScrollRef.current = true;
-      setShouldAutoScroll(true);
+    if (added > 0) {
+      newSinceUnpinRef.current += added;
+      setNewSinceUnpin(newSinceUnpinRef.current);
     }
+  }, [messages.length, scrollToBottom]);
+
+  // When the streaming draft clears, its matching commit is expected
+  // within one tick (main calls db.addMessage() before relaying
+  // stream-end — see executeSend). If no match arrives within a grace
+  // window, the stream errored out and the +1 we added during streaming
+  // is now an orphan — release it so the pill doesn't stay one unit too
+  // high. The commit-effect's claim-consumption clears the timer for the
+  // success case; this handler only fires in the error/abort path.
+  useEffect(() => {
+    if (streamingMsg !== null) {
+      // New stream is live — any prior failure flag no longer applies.
+      claimFailedRef.current = false;
+      if (claimReleaseTimerRef.current !== null) {
+        window.clearTimeout(claimReleaseTimerRef.current);
+        claimReleaseTimerRef.current = null;
+      }
+      return;
+    }
+    const claimId = pendingStreamClaimIdRef.current;
+    if (claimId === null) return;
+    // Already-committed fast path: if the DB update raced ahead and the
+    // claim was satisfied before this effect ran, there's nothing to do.
+    if (messagesRef.current.some(m => m.id === claimId)) return;
+    // Stream ended with an outstanding claim and no matching commit yet.
+    // Mark the claim as probably-failed so the commit-effect can consume
+    // it against whatever different-id replacement lands next. The 1.5s
+    // timer below is the fallback for the "nothing ever commits" case.
+    claimFailedRef.current = true;
+    if (claimReleaseTimerRef.current !== null) {
+      window.clearTimeout(claimReleaseTimerRef.current);
+    }
+    claimReleaseTimerRef.current = window.setTimeout(() => {
+      claimReleaseTimerRef.current = null;
+      const id = pendingStreamClaimIdRef.current;
+      if (id === null) {
+        claimFailedRef.current = false;
+        return;
+      }
+      if (messagesRef.current.some(m => m.id === id)) {
+        claimFailedRef.current = false;
+        return;
+      }
+      pendingStreamClaimIdRef.current = null;
+      claimFailedRef.current = false;
+      if (newSinceUnpinRef.current > 0) {
+        newSinceUnpinRef.current -= 1;
+        setNewSinceUnpin(newSinceUnpinRef.current);
+      }
+    }, 1500);
+  }, [streamingMsg]);
+
+  // Popout flash fix: when a new message lands after stream-end, null
+  // streamingMsg in the SAME render that adds the committed bubble.
+  // Success path: messages gains a message with id === pendingStreamEnd
+  // (user's answer committed). Error path: messages grew by any amount
+  // (system error message with different id committed). Either way the
+  // streaming bubble's purpose has been served and we can unmount it
+  // atomically with the commit — no gap frame, no flash.
+  useEffect(() => {
+    if (pendingStreamEndIdRef.current === null) return;
+    if (messages.length <= pendingStreamEndCountRef.current) return;
+    const endId = pendingStreamEndIdRef.current;
+    pendingStreamEndIdRef.current = null;
+    if (streamEndFallbackTimerRef.current !== null) {
+      window.clearTimeout(streamEndFallbackTimerRef.current);
+      streamEndFallbackTimerRef.current = null;
+    }
+    setStreamingMsg(prev => prev && prev.id === endId ? null : prev);
   }, [messages.length]);
 
-  // If the user switches or creates a session while a stream is in
-  // flight, the old stream belongs to the previous conversation —
-  // abort it so its final token doesn't commit onto the new session.
+  // Session switch: abort any in-flight stream (tokens would land on the
+  // wrong conversation), flush any coalesced chunk (same reason — a late
+  // rAF could otherwise re-populate streamingMsg after we null it), then
+  // re-pin and jump to the bottom of whatever the new session shows.
+  // Double-RAF waits for React to commit the new message list before
+  // measuring scrollHeight.
   useEffect(() => {
     cancelActiveStream();
+    flushStreamChunk();
     setStreamingMsg(null);
-  }, [db.sessionId, cancelActiveStream]);
+    // Reset any pending stream-end bookkeeping — a stale id + length
+    // snapshot from the previous session could otherwise fire spuriously
+    // against the new session's messages.
+    pendingStreamEndIdRef.current = null;
+    pendingStreamEndCountRef.current = 0;
+    if (streamEndFallbackTimerRef.current !== null) {
+      window.clearTimeout(streamEndFallbackTimerRef.current);
+      streamEndFallbackTimerRef.current = null;
+    }
+    setPinned(true);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => scrollToBottom(false));
+    });
+  }, [db.sessionId, cancelActiveStream, flushStreamChunk, setPinned, scrollToBottom]);
 
-  // Abort any in-flight stream on unmount so background fetches
-  // don't keep paying for tokens after the window closes.
+  // Abort any in-flight stream on unmount so tokens don't keep
+  // costing money after the window closes.
   useEffect(() => () => { cancelActiveStream(); }, [cancelActiveStream]);
 
-  // Track if scroll was triggered by user (wheel/touch) vs programmatic
-  const isUserScrollingRef = useRef(false);
-  const userScrollTimeoutRef = useRef<number | null>(null);
-
-  // Track user-initiated scroll via wheel/touch to prevent auto-scroll
-  // from fighting with user intent during streaming
-  const handleUserScroll = useCallback((e: WheelEvent | TouchEvent) => {
-    if (!chatContainerRef.current) return;
-
-    // Clear any pending timeout from previous scroll event
-    if (userScrollTimeoutRef.current) {
-      clearTimeout(userScrollTimeoutRef.current);
-    }
-
-    // Mark this as a user-initiated scroll so handleScroll knows to process it
-    isUserScrollingRef.current = true;
-
-    const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
-    const isAtBottom = scrollHeight - scrollTop - clientHeight < 80;
-
-    // If user scrolls UP (away from bottom), mark as scrolled away
-    if (!isAtBottom) {
-      userScrolledAwayRef.current = true;
-      shouldAutoScrollRef.current = false;
-      setShouldAutoScroll(false);
-
-      // IMMEDIATELY cancel any pending auto-scroll RAF to prevent slap
-      if (scrollRAFRef.current) {
+  // Cleanup RAFs + timers + scrollend listener on unmount.
+  useEffect(() => {
+    return () => {
+      if (scrollRAFRef.current !== null) {
         cancelAnimationFrame(scrollRAFRef.current);
         scrollRAFRef.current = null;
       }
-
-      // Clear any existing cooldown
-      if (userScrollCooldownRef.current) {
-        clearTimeout(userScrollCooldownRef.current);
+      if (programmaticScrollEndCleanupRef.current) {
+        programmaticScrollEndCleanupRef.current();
+        programmaticScrollEndCleanupRef.current = null;
       }
-    }
-
-    // Reset the user scrolling flag after a short delay
-    // This allows handleScroll to process user-initiated scrolls
-    userScrollTimeoutRef.current = window.setTimeout(() => {
-      isUserScrollingRef.current = false;
-      userScrollTimeoutRef.current = null;
-    }, 100);
-  }, []);
-
-  const handleScroll = () => {
-      if (!chatContainerRef.current) return;
-
-      // Only process scroll state changes if triggered by user action
-      // This prevents programmatic auto-scroll from re-enabling itself
-      if (!isUserScrollingRef.current) return;
-
-      const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
-      const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
-
-      // If user manually scrolled back to bottom, re-enable auto-scroll
-      if (isAtBottom && userScrolledAwayRef.current) {
-        userScrolledAwayRef.current = false;
-        shouldAutoScrollRef.current = true;
-        setShouldAutoScroll(true);
-      } else if (!isAtBottom) {
-        shouldAutoScrollRef.current = false;
-        setShouldAutoScroll(false);
+      if (programmaticScrollClearRef.current !== null) {
+        window.clearTimeout(programmaticScrollClearRef.current);
+        programmaticScrollClearRef.current = null;
       }
-  };
-
-  // Attach wheel/touch listeners to detect user scroll intent
-  useEffect(() => {
-    const container = chatContainerRef.current;
-    if (!container) return;
-
-    container.addEventListener('wheel', handleUserScroll, { passive: true });
-    container.addEventListener('touchmove', handleUserScroll, { passive: true });
-
-    return () => {
-      container.removeEventListener('wheel', handleUserScroll);
-      container.removeEventListener('touchmove', handleUserScroll);
-      if (userScrollCooldownRef.current) {
-        clearTimeout(userScrollCooldownRef.current);
+      if (claimReleaseTimerRef.current !== null) {
+        window.clearTimeout(claimReleaseTimerRef.current);
+        claimReleaseTimerRef.current = null;
       }
-      if (userScrollTimeoutRef.current) {
-        clearTimeout(userScrollTimeoutRef.current);
+      if (streamEndFallbackTimerRef.current !== null) {
+        window.clearTimeout(streamEndFallbackTimerRef.current);
+        streamEndFallbackTimerRef.current = null;
+      }
+      if (pendingChunkRAFRef.current !== null) {
+        cancelAnimationFrame(pendingChunkRAFRef.current);
+        pendingChunkRAFRef.current = null;
       }
     };
-  }, [handleUserScroll]);
+  }, []);
 
   // --- Core Logic ---
-  const executeSend = useCallback(async (textToSend: string, imageBase64?: string) => {
+  const executeSend = useCallback(async (textToSend: string, imageBase64?: string, isAutoSolve?: boolean) => {
       if (!textToSend.trim()) return;
 
       // ── Feature Gate: Block disallowed models ──
@@ -1504,7 +2606,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         const gateMsg: Message = {
           id: Date.now().toString(),
           role: 'model',
-          content: `⚠️ **${currentModel.charAt(0).toUpperCase() + currentModel.slice(1)}** is a Pro-only model. Switched to **${fallback.charAt(0).toUpperCase() + fallback.slice(1)}**. Upgrade to Pro to unlock all AI models.`,
+          content: `**${currentModel.charAt(0).toUpperCase() + currentModel.slice(1)}** is a Pro-only model. Switched to **${fallback.charAt(0).toUpperCase() + fallback.slice(1)}**. Upgrade to Pro to unlock all AI models.`,
           timestamp: Date.now()
         };
         if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
@@ -1526,8 +2628,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       setIsProcessing(true);
       setInterimText("");
       setInputText("");
-      shouldAutoScrollRef.current = true;
-      setShouldAutoScroll(true);
+      setPinned(true);
 
       // Kill any previous in-flight stream before starting this one.
       // Two back-to-back sends must never both be running against
@@ -1577,12 +2678,15 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
             // stream — without this check, a cancelled run could stomp
             // the new stream's state a frame or two after abort().
             if (streamAbortRef.current !== abort) return;
-            setStreamingMsg(prev => prev && prev.id === pendingId ? { ...prev, content: full } : prev);
+            // rAF-coalesced so a 100 tok/s burst still only re-renders
+            // MessageRenderer (markdown + syntax-highlight) at frame rate.
+            applyStreamChunk(pendingId, full);
             if (!inPopout) {
               electronIPC.send('relay-to-popout', { type: 'stream-chunk', id: pendingId, full });
             }
           },
-          abort.signal
+          abort.signal,
+          isAutoSolve
         );
         // Commit the final text to the DB/state once — the transient
         // streaming bubble is cleared in the same tick to avoid a flash.
@@ -1599,6 +2703,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
               setMessages(prev => [...prev, aiMsg]);
             }
         }
+        // Cancel any queued chunk rAF before clearing — otherwise a late
+        // frame could re-populate the bubble we're about to null.
+        flushStreamChunk();
         setStreamingMsg(null);
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
@@ -1611,6 +2718,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           return;
         }
         console.error(err);
+        flushStreamChunk();
         setStreamingMsg(null);
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
@@ -1682,6 +2790,17 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   const [remoteIsProcessing, setRemoteIsProcessing] = useState(false);
   const [remoteSpeechError, setRemoteSpeechError] = useState<string | null>(null);
 
+  // Pop-out: shadow credit-timer state — main is authoritative, popout mirrors
+  // so it can render the hour-boundary / low-warning / exhausted modals while
+  // main is backgrounded (the common case during an interview).
+  const [remoteCreditHourBoundary, setRemoteCreditHourBoundary] = useState(false);
+  const [remoteCreditLowWarning, setRemoteCreditLowWarning] = useState(false);
+  const [remoteCreditExhausted, setRemoteCreditExhausted] = useState(false);
+  const [remoteCreditRemaining, setRemoteCreditRemaining] = useState(0);
+  const [remoteCreditSource, setRemoteCreditSource] = useState<'trial' | 'credits' | 'unlimited' | 'none'>('none');
+  const [remoteCreditActualTier, setRemoteCreditActualTier] = useState<'free' | 'basic' | 'pro' | 'max'>('free');
+  const [remoteCreditCountryCode, setRemoteCreditCountryCode] = useState('US');
+
   // Expose unified state — pop-out reads from remote, main reads from local
   const isListening = isPopoutThinClient ? remoteIsListening : _rawIsListening;
   const speechError = isPopoutThinClient ? remoteSpeechError : _rawSpeechError;
@@ -1704,6 +2823,28 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   useEffect(() => { interimTextRef.current = interimText; }, [interimText]);
   useEffect(() => { rawSpeechErrorRef.current = _rawSpeechError; }, [_rawSpeechError]);
   useEffect(() => { gateRef.current = gate; }, [gate]);
+
+  // Credit-timer refs — populated below once `creditTimer` is defined. Used by
+  // the main-side `request-state` reply so popout's first sync carries the
+  // current credit-modal state instead of stale boot-time values.
+  const creditTimerRef = useRef<{
+    hourBoundary: boolean; lowWarning: boolean; exhausted: boolean;
+    remaining: number; source: 'trial' | 'credits' | 'unlimited' | 'none';
+  }>({ hourBoundary: false, lowWarning: false, exhausted: false, remaining: 0, source: 'none' });
+  const userProfileRef = useRef(userProfile);
+  useEffect(() => { userProfileRef.current = userProfile; }, [userProfile]);
+
+  // Popout-side pending-model guard. When the popout user picks a model we
+  // update popout state optimistically AND send cmd-set-model to main. But
+  // main's state-sync push fires on every interim/input/isListening tick,
+  // so if the user is speaking, main can emit several syncs carrying the
+  // OLD selectedModel before it has processed our IPC. Without this guard
+  // the dropdown flickers back to the old value and then forward again,
+  // which the user sees as "the model selection keeps falling back."
+  //
+  // Rule: while pendingPopoutModelRef is set, ignore inbound selectedModel
+  // that doesn't match it. Clear once main echoes the requested value.
+  const pendingPopoutModelRef = useRef<string | null>(null);
 
   // ── Cross-window state sync (Electron only) ──
   // Main window → pop-out: relay state whenever it changes
@@ -1735,9 +2876,22 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         setInputText(data.inputText ?? '');
         setRemoteSpeechError(data.speechError ?? null);
         setIsProcessing(data.isProcessing);
+        // Echo-confirmation for a user's in-flight model pick. If main has
+        // caught up and sent back the model we were waiting for, drop the
+        // pending marker so future pushes from main are accepted normally.
+        if (data.selectedModel && pendingPopoutModelRef.current === data.selectedModel) {
+          pendingPopoutModelRef.current = null;
+        }
         setSettings(prev => {
           const needsAutoSend = prev.autoSend !== data.autoSend;
-          const needsModel = data.selectedModel && prev.selectedModel !== data.selectedModel;
+          let needsModel = data.selectedModel && prev.selectedModel !== data.selectedModel;
+          // Discard stale selectedModel pushes while a local pick is
+          // unconfirmed — otherwise the dropdown bounces: user → groq,
+          // main pushes gemini (stale), popout flips back, then main
+          // catches up and flips forward again.
+          if (needsModel && pendingPopoutModelRef.current && pendingPopoutModelRef.current !== data.selectedModel) {
+            needsModel = false;
+          }
           if (!needsAutoSend && !needsModel) return prev;
           return {
             ...prev,
@@ -1745,20 +2899,50 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
             ...(needsModel ? { selectedModel: data.selectedModel } : {}),
           };
         });
+      } else if (data?.type === 'credit-sync') {
+        setRemoteCreditHourBoundary(!!data.hourBoundary);
+        setRemoteCreditLowWarning(!!data.lowWarning);
+        setRemoteCreditExhausted(!!data.exhausted);
+        setRemoteCreditRemaining(typeof data.remaining === 'number' ? data.remaining : 0);
+        setRemoteCreditSource(data.source ?? 'none');
+        setRemoteCreditActualTier(data.actualTier ?? 'free');
+        setRemoteCreditCountryCode(data.countryCode ?? 'US');
       } else if (data?.type === 'stream-start') {
         // Main is about to begin a stream. Mint a transient bubble
-        // here too so the popout renders tokens as they arrive.
+        // here too so the popout renders tokens as they arrive. Discard
+        // any stale coalesced chunk from a previous stream that hasn't
+        // flushed yet — its id won't match this new stream and would
+        // otherwise be a dead letter sitting in the ref.
+        flushStreamChunk();
         setStreamingMsg({ id: data.id, role: 'model', content: '', timestamp: Date.now() });
       } else if (data?.type === 'stream-chunk') {
-        // Ignore chunks whose id doesn't match our current stream —
-        // guards against out-of-order frames from a cancelled run.
-        setStreamingMsg(prev => prev && prev.id === data.id ? { ...prev, content: data.full } : prev);
+        // rAF-coalesce to one React commit per frame. MessageRenderer
+        // re-parses markdown on every content change, so at upstream
+        // rates of 100 tok/s this is the difference between a smooth
+        // stream and a janky popout. The inner reducer guards id
+        // equality to drop out-of-order frames from a cancelled run.
+        applyStreamChunk(data.id, data.full);
       } else if (data?.type === 'stream-end') {
-        // Final text is already landing via `db:messages-updated`,
-        // so we just clear the transient bubble. If `db.addMessage`
-        // arrives a tick later, React batches the two into one
-        // paint and the user sees no flash.
-        setStreamingMsg(prev => prev && prev.id === data.id ? null : prev);
+        // DO NOT clear streamingMsg here — the commit arrives as a
+        // separate IPC (`db:messages-updated`) moments later and React
+        // cannot batch the two. Clearing now unmounts the streaming
+        // bubble one frame before the committed bubble mounts, which
+        // the user sees as a flash/blink. Instead, record the commit
+        // expectation and let the messages-watching effect below clear
+        // streamingMsg atomically with the messages update. The
+        // fallback timer handles "no commit ever arrived" (error path
+        // that failed to broadcast, crashed main, etc).
+        flushStreamChunk();
+        pendingStreamEndIdRef.current = data.id;
+        pendingStreamEndCountRef.current = messagesRef.current.length;
+        if (streamEndFallbackTimerRef.current !== null) {
+          window.clearTimeout(streamEndFallbackTimerRef.current);
+        }
+        streamEndFallbackTimerRef.current = window.setTimeout(() => {
+          streamEndFallbackTimerRef.current = null;
+          pendingStreamEndIdRef.current = null;
+          setStreamingMsg(prev => prev && prev.id === data.id ? null : prev);
+        }, 1500);
       }
     };
     ipc.on('from-main', handler);
@@ -1774,6 +2958,64 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   const stopListening = isPopoutThinClient
     ? () => electronIPC.send('relay-to-main', { type: 'cmd-stop-listening' })
     : _rawStopListening;
+
+  // ── Credit timer — only drives session time for Basic users + trial.
+  // Pro/Max get balance.source='unlimited' and the service auto no-ops.
+  // Popout is a thin UI client — the main window owns the authoritative timer,
+  // so skip mounting on popout to avoid double-ticking against localStorage.
+  const creditTimer = useCreditTimer({
+    isListening: isPopoutThinClient ? false : isListening,
+    license: userLicense,
+    onForceStop: stopListening,
+  });
+
+  // Keep the ref in sync so the `request-state` popout handler reads fresh values
+  // from any render — without this, the first IPC reply after popout-open would
+  // snapshot whatever state existed when the main-side IPC handler registered.
+  useEffect(() => {
+    creditTimerRef.current = {
+      hourBoundary: creditTimer.hourBoundary,
+      lowWarning: creditTimer.lowWarning,
+      exhausted: creditTimer.exhausted,
+      remaining: creditTimer.remaining,
+      source: creditTimer.source,
+    };
+  }, [creditTimer.hourBoundary, creditTimer.lowWarning, creditTimer.exhausted, creditTimer.remaining, creditTimer.source]);
+
+  // Main → popout: push credit-timer state so the popout can render its own
+  // copy of the modals. The first state-sync effect above is declared before
+  // `creditTimer` exists, so we keep this as a separate effect (no TDZ).
+  //
+  // `creditTimer.remaining` ticks every second, but the popout only reads it
+  // when a boolean (hourBoundary / lowWarning / exhausted) flips — and during
+  // hour-boundary the tick loop is paused anyway. So we deliberately leave
+  // `remaining` OUT of the dep list and read the latest value from the ref
+  // (which the effect above keeps fresh). This stops the IPC from firing
+  // every second during a session.
+  useEffect(() => {
+    if (!isElectron || isPopoutMode) return;
+    electronIPC.send('relay-to-popout', {
+      type: 'credit-sync',
+      hourBoundary: creditTimer.hourBoundary,
+      lowWarning: creditTimer.lowWarning,
+      exhausted: creditTimer.exhausted,
+      remaining: creditTimerRef.current.remaining,
+      source: creditTimer.source,
+      actualTier: gate.actualTier,
+      countryCode: userProfile?.country_code || 'US',
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [creditTimer.hourBoundary, creditTimer.lowWarning, creditTimer.exhausted, creditTimer.source, gate.actualTier, userProfile?.country_code]);
+
+  const handleRenewCredit = useCallback(async () => {
+    // v1: reuse the same checkout entry point. Server-side will eventually
+    // differentiate renewal charges from full-plan purchases.
+    try { await openProUpgrade(); } catch (e) { console.warn('renew failed:', e); }
+  }, []);
+
+  const handleOpenUpgrade = useCallback(async () => {
+    try { await openProUpgrade(); } catch (e) { console.warn('upgrade failed:', e); }
+  }, []);
 
   const handleManualSend = () => {
     if (isPopoutThinClient) {
@@ -1894,10 +3136,10 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           break;
         case 'cmd-auto-solve':
           captureScreenshot().then(screenshot => {
-            executeSend(
-              "Please analyze the code or problem visible on the screen and provide the solution.",
-              screenshot || undefined
-            );
+            // isAutoSolve=true swaps the system prompt to code-only output
+            // and skips the candidate-persona voice rules, so CodeBlock's
+            // auto-type receives pure code instead of prose-as-comments.
+            executeSend(AUTO_SOLVE_PROMPT, screenshot || undefined, true);
           });
           break;
         case 'cmd-clear':
@@ -1916,6 +3158,27 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           localStorage.setItem("SELECTED_MODEL", requested);
           break;
         }
+        // Credit-timer relays from popout. Main owns the authoritative state —
+        // these cases forward the popout's decision into local handlers, which
+        // update state, which re-broadcasts via the credit-sync effect and
+        // unmounts the popout modal. Self-consistent round-trip.
+        case 'cmd-credit-boundary-ack':
+          if (data.decision === 'continue' || data.decision === 'stop') {
+            creditTimer.acknowledgeHourBoundary(data.decision);
+          }
+          break;
+        case 'cmd-credit-low-dismiss':
+          creditTimer.dismissLowWarning();
+          break;
+        case 'cmd-credit-exhausted-dismiss':
+          creditTimer.dismissExhausted();
+          break;
+        case 'cmd-credit-renew':
+          handleRenewCredit();
+          break;
+        case 'cmd-credit-upgrade':
+          handleOpenUpgrade();
+          break;
         case 'request-state':
           // Read via refs so the first sync after popout opens reflects current
           // state, not whatever was closed over when this handler was registered.
@@ -1928,6 +3191,20 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
             autoSend: settingsRef.current.autoSend,
             speechError: rawSpeechErrorRef.current,
             selectedModel: settingsRef.current.selectedModel,
+          });
+          // Piggy-back the current credit-timer state so the popout can render
+          // modals it missed (e.g. user opened popout AFTER an hour-boundary
+          // fired on main). Without this, popout starts with all-false modals
+          // and only learns about subsequent transitions.
+          electronIPC.send('relay-to-popout', {
+            type: 'credit-sync',
+            hourBoundary: creditTimerRef.current.hourBoundary,
+            lowWarning: creditTimerRef.current.lowWarning,
+            exhausted: creditTimerRef.current.exhausted,
+            remaining: creditTimerRef.current.remaining,
+            source: creditTimerRef.current.source,
+            actualTier: gateRef.current.actualTier,
+            countryCode: userProfileRef.current?.country_code || 'US',
           });
           break;
       }
@@ -1942,7 +3219,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       const gateMsg: Message = {
         id: Date.now().toString(),
         role: 'model',
-        content: '🔒 **Auto-Solve** is a Pro feature. [Upgrade to Pro](upgrade) to capture your screen and get instant AI solutions.',
+        content: '**Auto-Solve** is a Pro feature. [Upgrade to Pro](upgrade) to capture your screen and get instant AI solutions.',
         timestamp: Date.now()
       };
       if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
@@ -1956,12 +3233,12 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     if (isProcessing) return;
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
 
-    // One-shot screen capture, then send with the image
+    // One-shot screen capture, then send with the image.
+    // isAutoSolve=true swaps the system prompt to code-only output and
+    // skips the candidate-persona voice rules, so CodeBlock's auto-type
+    // receives pure code instead of prose-as-comments.
     const screenshot = await captureScreenshot();
-    executeSend(
-      "Please analyze the code or problem visible on the screen and provide the solution.",
-      screenshot || undefined
-    );
+    executeSend(AUTO_SOLVE_PROMPT, screenshot || undefined, true);
   };
 
   const handleClear = () => {
@@ -1977,6 +3254,15 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     if (isProcessing) return;
     const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
     if (!lastUserMsg) return;
+
+    // Auto-solve regenerate needs special handling: the screenshot was never
+    // persisted on the user message, so naively re-streaming AUTO_SOLVE_PROMPT
+    // as plain text would reach the model with no image and produce garbage.
+    // Delegate back to handleAutoSolve so a fresh screenshot is captured and
+    // isAutoSolve=true gets set on the request.
+    if (lastUserMsg.content === AUTO_SOLVE_PROMPT) {
+      return handleAutoSolve();
+    }
 
     cancelActiveStream();
     const abort = new AbortController();
@@ -2005,7 +3291,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           currentSettings.generalMode,
           (_chunk: string, full: string) => {
             if (streamAbortRef.current !== abort) return;
-            setStreamingMsg(prev => prev && prev.id === pendingId ? { ...prev, content: full } : prev);
+            applyStreamChunk(pendingId, full);
             if (!inPopout) {
               electronIPC.send('relay-to-popout', { type: 'stream-chunk', id: pendingId, full });
             }
@@ -2022,6 +3308,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
             };
             if (db.isElectron) { db.addMessage(aiMsg); } else { setMessages(prev => [...prev, aiMsg]); }
         }
+        flushStreamChunk();
         setStreamingMsg(null);
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
@@ -2029,6 +3316,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     } catch (err: any) {
         if (err?.name === 'AbortError' || streamAbortRef.current !== abort) return;
         console.error(err);
+        flushStreamChunk();
         setStreamingMsg(null);
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
@@ -2056,8 +3344,11 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     e.target.value = '';
 
     // ── Feature Gate: Context file limit ──
+    // Silent return — the "Add File" button is already disabled + shows
+    // "Limit reached" in the modal (see line ~3829). A native confirm()
+    // here would pop an OS-level dialog that bypasses setContentProtection
+    // and leak the upgrade prompt on a screen share.
     if (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) {
-      if (confirm(`Free plan allows up to ${gate.maxContextFiles} context file${gate.maxContextFiles === 1 ? '' : 's'}. Upgrade to Pro for unlimited files?`)) openProUpgrade();
       return;
     }
 
@@ -2090,8 +3381,11 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
             base64: undefined
           });
         } catch (err) {
-          console.error(err);
-          alert(`Failed to extract text from PDF: ${file.name}`);
+          // Silent skip on extraction failure — a native alert() showing
+          // the filename would leak a resume/JD filename to screen-share.
+          // The file simply is not attached; user sees it is absent from
+          // the Attached Files list.
+          console.error('[context] PDF extract failed:', err);
         } finally {
           setIsProcessing(false);
         }
@@ -2108,8 +3402,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
             base64: undefined
           });
         } catch (err) {
-          console.error(err);
-          alert(`Failed to extract text from Word document: ${file.name}`);
+          console.error('[context] DOCX extract failed:', err);
         } finally {
           setIsProcessing(false);
         }
@@ -2170,8 +3463,10 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   const handleAddPasteText = () => {
       if (!pasteContent.trim()) return;
       // ── Feature Gate: Context file limit ──
+      // Silent return — paste button is gated by the same limit check in
+      // the render tree. See handleFileUpload above for the rationale on
+      // avoiding native confirm() dialogs on screen-share leaks.
       if (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) {
-        if (confirm(`Free plan allows up to ${gate.maxContextFiles} context file${gate.maxContextFiles === 1 ? '' : 's'}. Upgrade to Pro for unlimited files?`)) openProUpgrade();
         return;
       }
       const newFile: ContextFile = {
@@ -2216,15 +3511,39 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       settingsRef.current = newSettings;
 
       setSaveStatus('saved');
-      setTimeout(() => setSaveStatus('idle'), 2000);
+      if (saveStatusTimerRef.current !== null) window.clearTimeout(saveStatusTimerRef.current);
+      saveStatusTimerRef.current = window.setTimeout(() => {
+          saveStatusTimerRef.current = null;
+          setSaveStatus('idle');
+      }, 2000);
   };
 
   // --- RENDER HELPERS ---
 
+  // Flash-prevention: in the popout, `stream-end` IPC and
+  // `db:messages-updated` IPC arrive as separate events and can't be
+  // batched. If we show the streaming bubble until its own state clears,
+  // we get a gap frame between unmount and the commit's mount. Instead
+  // we derive the effective streaming message here: the bubble is hidden
+  // the moment `messages` already contains the committed version (success,
+  // same id) OR the moment `messages` has grown at all after `stream-end`
+  // arrived (error path, different-id system message). In both cases the
+  // next render swaps directly from streaming bubble → committed bubble
+  // with no visible intermediate state.
+  const effectiveStreamingMsg = !streamingMsg
+    ? null
+    : messages.some(m => m.id === streamingMsg.id)
+    ? null
+    : (pendingStreamEndIdRef.current === streamingMsg.id
+        && messages.length > pendingStreamEndCountRef.current)
+    ? null
+    : streamingMsg;
+
   const sharedProps = {
-    messages, streamingMsg, settings, setSettings, isListening, isProcessing, inputText, setInputText, interimText,
+    messages, streamingMsg: effectiveStreamingMsg, settings, setSettings, isListening, isProcessing, inputText, setInputText, interimText,
     speechError, toggleAutoSend, startListening, stopListening, handleManualSend, handleAutoSolve,
     handleClear, handleRegenerate, chatContainerRef, textareaRef, handleScroll,
+    isPinned, newSinceUnpin, handleJumpToLatest,
     onOpenSettings: () => setShowSettings(true),
     onOpenContext: () => { console.log('Opening Context'); setShowContext(true); },
     onOpenHelp: () => setShowHelp(true),
@@ -2236,7 +3555,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         const gateMsg: Message = {
           id: Date.now().toString(),
           role: 'model',
-          content: '🔒 **Pop-out Mode** is a Pro feature. Upgrade to Pro to use the invisible overlay during interviews.',
+          content: '**Pop-out Mode** is a Pro feature. Upgrade to Pro to use the invisible overlay during interviews.',
           timestamp: Date.now()
         };
         if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
@@ -2246,6 +3565,20 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         // In Electron: open a real transparent pop-out window
         electronIPC.send('open-popout', { width: 450, height: 700 });
       } else {
+        // Browser PiP requires Document Picture-in-Picture. Pre-check here so
+        // we surface the message in-app (chat) rather than via a native
+        // alert() from PiPWindow — alerts paint outside content protection
+        // and leak on screen share.
+        if (!('documentPictureInPicture' in window)) {
+          const unsupportedMsg: Message = {
+            id: Date.now().toString(),
+            role: 'model',
+            content: 'Pop-out Mode requires Chrome 111+ or Edge with Document Picture-in-Picture support. Please update your browser or use the desktop app.',
+            timestamp: Date.now()
+          };
+          if (db.isElectron) { db.addMessage(unsupportedMsg); } else { setMessages(prev => [...prev, unsupportedMsg]); }
+          return;
+        }
         setIsPipMode(true);
       }
     },
@@ -2254,7 +3587,29 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     userProfile,
     userLicense,
     onLogout,
-    gate
+    gate,
+    // In popout, the local useCreditTimer is a no-op (see isListening override
+    // at useCreditTimer call site). Main owns the authoritative timer and
+    // pushes ticks via credit-sync. Expose those values under the same shape
+    // so the header chip works transparently in both windows.
+    creditTimer: (isElectron && isPopoutMode) ? {
+      hourBoundary: remoteCreditHourBoundary,
+      lowWarning: remoteCreditLowWarning,
+      exhausted: remoteCreditExhausted,
+      remaining: remoteCreditRemaining,
+      source: remoteCreditSource,
+      acknowledgeHourBoundary: creditTimer.acknowledgeHourBoundary,
+      dismissLowWarning: creditTimer.dismissLowWarning,
+      dismissExhausted: creditTimer.dismissExhausted,
+    } : creditTimer,
+    // Effective tier for the header chip. In popout we trust the value main
+    // pushed via credit-sync (remoteCreditActualTier) because the popout's
+    // own userLicense may be stale until its first revalidation.
+    effectiveTier: (isElectron && isPopoutMode) ? remoteCreditActualTier : (userLicense?.tier ?? 'free'),
+    // Popout calls this right before IPC-ing main, so the state-sync listener
+    // knows to ignore stale inbound `selectedModel` values until main echoes
+    // the chosen one. See pendingPopoutModelRef for the full rationale.
+    markPendingPopoutModel: (model: string) => { pendingPopoutModelRef.current = model; },
   };
 
   // Sync is now handled by useDatabase hook (Electron) — no localStorage sync needed
@@ -2279,7 +3634,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           <button
             onClick={() => setSidebarOpen(true)}
             className="fixed top-3 left-3 z-40 w-9 h-9 rounded-lg bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-all backdrop-blur-sm"
-            title="Open conversations"
+            aria-label="Open conversations"
           >
             <Menu size={16} />
           </button>
@@ -2401,7 +3756,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                       </span>
                     ) : (
                       <span className="text-[10px] text-amber-400 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/20 flex items-center gap-1">
-                        <Lock size={8} /> Upgrade to Pro for all models
+                        <Crown size={8} /> Upgrade to Pro for all models
                       </span>
                     )}
                 </div>
@@ -2435,7 +3790,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                         <span className={`font-bold text-xs ${tempModel === 'groq' ? 'text-orange-500' : 'text-text'}`}>
                             Groq
                         </span>
-                        {!gate.canUseModel('groq') && <Lock size={10} className="text-amber-400 ml-1" />}
+                        {!gate.canUseModel('groq') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
                     </button>
 
                     <button
@@ -2453,7 +3808,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                         <span className={`font-bold text-xs ${tempModel === 'openai' ? 'text-green-500' : 'text-text'}`}>
                             GPT-5.4 Mini {gate.canUseModel('openai') && <span className="ml-1 text-[9px] bg-green-500 text-white px-1.5 py-0.5 rounded-full">Recommended</span>}
                         </span>
-                        {!gate.canUseModel('openai') && <Lock size={10} className="text-amber-400 ml-1" />}
+                        {!gate.canUseModel('openai') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
                     </button>
 
                     <button
@@ -2471,7 +3826,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                         <span className={`font-bold text-xs ${tempModel === 'xai' ? 'text-text' : 'text-text'}`}>
                             Grok (xAI)
                         </span>
-                        {!gate.canUseModel('xai') && <Lock size={10} className="text-amber-400 ml-1" />}
+                        {!gate.canUseModel('xai') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
                     </button>
                 </div>
             </div>
@@ -2682,11 +4037,11 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                         className="w-full h-32 bg-background border border-border rounded-xl p-3 text-xs focus:ring-1 focus:ring-primary outline-none resize-none custom-scrollbar"
                    />
                    <div className="absolute bottom-2 right-2">
-                       <button 
+                       <button
                             onClick={handleAddPasteText}
-                            disabled={!pasteContent.trim()}
-                            className={`p-2 rounded-lg transition-all ${pasteContent.trim() ? 'bg-primary text-white shadow-lg hover:bg-blue-600' : 'bg-surface text-gray-500 cursor-not-allowed border border-border'}`}
-                            title="Add as Context"
+                            disabled={!pasteContent.trim() || (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles)}
+                            className={`p-2 rounded-lg transition-all ${pasteContent.trim() && !(gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) ? 'bg-primary text-white shadow-lg hover:bg-blue-600' : 'bg-surface text-gray-500 cursor-not-allowed border border-border'}`}
+                            aria-label="Add as Context"
                        >
                            <Plus size={16} />
                        </button>
@@ -2792,6 +4147,56 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         </Modal>
       )}
 
+      {/* ── Credit-timer modals/toasts ── */}
+      {/* Main-window path: local creditTimer is authoritative. */}
+      {!isPopoutElectron && creditTimer.hourBoundary && (
+        <HourBoundaryModal
+          remainingSeconds={creditTimer.remaining}
+          onDecision={creditTimer.acknowledgeHourBoundary}
+        />
+      )}
+      {!isPopoutElectron && creditTimer.lowWarning && (
+        <LowWarningToast
+          remainingSeconds={creditTimer.remaining}
+          onDismiss={creditTimer.dismissLowWarning}
+        />
+      )}
+      {!isPopoutElectron && creditTimer.exhausted && (
+        <ExhaustedModal
+          source={creditTimer.source}
+          actualTier={gate.actualTier}
+          countryCode={userProfile?.country_code || 'US'}
+          onRenew={handleRenewCredit}
+          onUpgrade={handleOpenUpgrade}
+          onDismiss={creditTimer.dismissExhausted}
+        />
+      )}
+      {/* Popout path: mirror main's state via IPC and relay user actions back. */}
+      {/* Without this, main is typically backgrounded during a live interview so the user */}
+      {/* would hit the hour boundary / exhausted state with no visible prompt anywhere. */}
+      {isPopoutElectron && remoteCreditHourBoundary && (
+        <HourBoundaryModal
+          remainingSeconds={remoteCreditRemaining}
+          onDecision={(d) => electronIPC.send('relay-to-main', { type: 'cmd-credit-boundary-ack', decision: d })}
+        />
+      )}
+      {isPopoutElectron && remoteCreditLowWarning && (
+        <LowWarningToast
+          remainingSeconds={remoteCreditRemaining}
+          onDismiss={() => electronIPC.send('relay-to-main', { type: 'cmd-credit-low-dismiss' })}
+        />
+      )}
+      {isPopoutElectron && remoteCreditExhausted && (
+        <ExhaustedModal
+          source={remoteCreditSource}
+          actualTier={remoteCreditActualTier}
+          countryCode={remoteCreditCountryCode}
+          onRenew={() => electronIPC.send('relay-to-main', { type: 'cmd-credit-renew' })}
+          onUpgrade={() => electronIPC.send('relay-to-main', { type: 'cmd-credit-upgrade' })}
+          onDismiss={() => electronIPC.send('relay-to-main', { type: 'cmd-credit-exhausted-dismiss' })}
+        />
+      )}
+
     </div>
   );
 }
@@ -2803,6 +4208,12 @@ export default function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [user, setUser] = useState<UserProfile | null>(null);
   const [license, setLicense] = useState<LicenseData | null>(null);
+  // Guards the focus-revalidation handler from firing concurrently. Fast
+  // alt-tab in/out (common when paying in an external browser window and
+  // bouncing back) otherwise queues multiple validateWithServer calls; if
+  // they resolve out of order the earlier (stale) response can overwrite
+  // the newer one and snap the user's tier back to its pre-upgrade value.
+  const focusRevalidatingRef = useRef(false);
 
   useEffect(() => {
     const saved = licenseService.loadAuth();
@@ -2812,14 +4223,16 @@ export default function App() {
       setAuthenticated(true);
       licenseService.startRevalidation();
     }
-    return () => licenseService.stopRevalidation();
   }, []);
 
   // Revalidate license when app regains focus (e.g. after paying in browser)
   useEffect(() => {
     const handleFocus = async () => {
+      if (focusRevalidatingRef.current) return;
       const saved = licenseService.loadAuth();
-      if (saved.user && saved.token) {
+      if (!saved.user || !saved.token) return;
+      focusRevalidatingRef.current = true;
+      try {
         const updated = await licenseService.validateWithServer();
         if (updated) {
           const refreshedUser = { ...saved.user, tier: updated.tier };
@@ -2835,6 +4248,8 @@ export default function App() {
             setAuthenticated(true);
           }
         }
+      } finally {
+        focusRevalidatingRef.current = false;
       }
     };
     window.addEventListener('focus', handleFocus);

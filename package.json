@@ -14,6 +14,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
+    "postinstall": "electron-rebuild -f",
     "electron:start": "concurrently -k \"npm run dev\" \"wait-on tcp:3005 && electron .\"",
     "electron:build": "npm run build && electron-builder",
     "electron:publish": "npm run build && electron-builder --publish=always"
@@ -80,6 +81,7 @@
   },
   "dependencies": {
     "@google/genai": "^1.36.0",
+    "@nut-tree-fork/nut-js": "^4.2.6",
     "@react-oauth/google": "^0.13.4",
     "better-sqlite3": "^12.8.0",
     "electron-updater": "^6.3.9",

@@ -6,14 +6,26 @@
 //  - Device fingerprint is bound to the license at activation
 //  - Periodic revalidation every 30 minutes
 //  - No offline grace period for Pro — forces server check
-//  - Free tier: 5 sessions, Gemini only, no screen capture
-//  - Pro tier: unlimited, all models, all features
+//
+//  TIERS:
+//  - Free: 5 sessions, Gemini only, no stealth. NEW: 30-minute
+//    full-experience trial on first signup (acts as Basic-level features
+//    for that window) — time-gated by trial_remaining_seconds.
+//  - Basic: $25 for 3 credits (3 hours of live-session time),
+//    14-day expiry, all models, stealth, Auto-Solve. No Auto-Type.
+//    Renewal $6.99/credit. Time-gated by credits_remaining_seconds.
+//  - Pro: unlimited time, all models, most features (no Auto-Type).
+//  - Max: Pro + Auto-Type (Max-exclusive).
+//
+//  CREDITS vs TIME:
+//  Credits are a display abstraction — internally we track seconds.
+//  3600s = "1 credit". 5400s = "1 credit + 30 min".
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 export interface LicenseData {
   key: string;
   email: string;
-  tier: 'free' | 'pro';
+  tier: 'free' | 'basic' | 'pro' | 'max';
   status: 'active' | 'expired' | 'revoked' | 'trial';
   country_code: string;
   device_id: string;
@@ -22,6 +34,11 @@ export interface LicenseData {
   sessions_used: number;
   sessions_limit: number; // -1 for unlimited
   last_validated: number;
+  // ── Credit tracking (Basic tier + Free trial) ──
+  // Authoritative time balance in seconds. Pro/Max ignore these fields.
+  credits_remaining_seconds?: number;  // Paid balance (Basic tier)
+  credits_expire_at?: number;          // Unix ms — credits void after this
+  trial_remaining_seconds?: number;    // One-time 30-min trial for Free users
 }
 
 export interface AuthState {
@@ -38,28 +55,52 @@ export interface UserProfile {
   name: string;
   avatar?: string;
   avatar_url?: string;
-  tier: 'free' | 'pro';
+  tier: 'free' | 'basic' | 'pro' | 'max';
   country_code: string;
   created_at: number;
   is_admin?: boolean;
   oauth_provider?: string;
 }
 
-// Feature gates — what each tier can access
+// Feature gates — what each tier can access.
+// Basic = Pro features minus Auto-Type, gated by credit time balance.
+// Max = Pro + Auto-Type.
 export const FEATURE_GATES = {
   free: {
     models: ['gemini'] as string[],
     screenCapture: false,
     autoSolve: false,
+    autoType: false,
     popout: false,
     contextFiles: 1,     // max files
     sessionsPerMonth: 5,
     exportHistory: false,
   },
+  basic: {
+    models: ['gemini', 'groq', 'openai', 'xai'] as string[],
+    screenCapture: true,
+    autoSolve: true,
+    autoType: false,     // Auto-Type is Max-exclusive
+    popout: true,
+    contextFiles: -1,    // unlimited
+    sessionsPerMonth: -1, // session count isn't the gate — credit time is
+    exportHistory: true,
+  },
   pro: {
     models: ['gemini', 'groq', 'openai', 'xai'] as string[],
     screenCapture: true,
     autoSolve: true,
+    autoType: false,     // Auto-Type is Max-exclusive
+    popout: true,
+    contextFiles: -1,    // unlimited
+    sessionsPerMonth: -1, // unlimited
+    exportHistory: true,
+  },
+  max: {
+    models: ['gemini', 'groq', 'openai', 'xai'] as string[],
+    screenCapture: true,
+    autoSolve: true,
+    autoType: true,      // Max tier unlocks Auto-Type
     popout: true,
     contextFiles: -1,    // unlimited
     sessionsPerMonth: -1, // unlimited
@@ -71,6 +112,17 @@ const APP_VERSION = '3.3.1';
 const MIN_VERSION = '2.0.0';
 const REVALIDATION_INTERVAL = 30 * 60 * 1000; // 30 minutes
 
+// ── Time constants ──
+// Display-facing prices live in services/pricingService.ts (single source
+// of truth for regional/currency pricing). This file owns only the
+// client-side credit-math knobs.
+export const TIME_CONSTANTS = {
+  SECONDS_PER_CREDIT: 3600,         // 1 credit = 1 hour of session time
+  TRIAL_SECONDS: 30 * 60,           // Free signup = 30 minutes of Basic experience
+  BASIC_EXPIRY_DAYS: 14,            // Credits void 14 days after purchase
+  LOW_WARNING_SECONDS: 120,         // Fire "2 min left" warning here
+} as const;
+
 // Admin check is done server-side via ADMIN_EMAILS env var.
 // Frontend only checks if user was granted 'pro' with is_admin flag from server.
 const DEVELOPER_EMAILS: string[] = [];
@@ -79,7 +131,6 @@ class LicenseService {
   private readonly STORAGE_KEY = 'minicaai_license';
   private readonly AUTH_KEY = 'minicaai_auth';
   private readonly TOKEN_KEY = 'minicaai_token';
-  private revalidationTimer: ReturnType<typeof setInterval> | null = null;
 
   // Will be set to real server URL when deployed
   private API_BASE = 'https://h2so4-production.up.railway.app';
@@ -133,9 +184,12 @@ class LicenseService {
   }
 
   // ── Feature gate check ──
+  // Gate answer is based on EFFECTIVE tier: Free users with an active 30-min
+  // trial are treated as Basic for this window so they can experience the
+  // full product before the wall comes up.
   canUseFeature(license: LicenseData | null, feature: keyof typeof FEATURE_GATES.free): boolean {
     if (!license) return false;
-    const tier = license.tier === 'pro' ? 'pro' : 'free';
+    const tier = this.getEffectiveTier(license);
     const gates = FEATURE_GATES[tier];
     const value = gates[feature];
     if (typeof value === 'boolean') return value;
@@ -145,8 +199,25 @@ class LicenseService {
 
   canUseModel(license: LicenseData | null, model: string): boolean {
     if (!license) return false;
-    const tier = license.tier === 'pro' ? 'pro' : 'free';
+    const tier = this.getEffectiveTier(license);
     return FEATURE_GATES[tier].models.includes(model);
+  }
+
+  // ── Effective tier resolution (4-way) ──
+  // Free user inside their 30-min trial window gets Basic features.
+  // Basic user with expired credits falls back to Free features.
+  getEffectiveTier(license: LicenseData | null): 'free' | 'basic' | 'pro' | 'max' {
+    if (!license) return 'free';
+    if (license.tier === 'max') return 'max';
+    if (license.tier === 'pro') return 'pro';
+    if (license.tier === 'basic') {
+      // Basic with zero balance = locked out of Basic-only features
+      if (this.getCreditsRemainingSeconds(license) > 0) return 'basic';
+      return 'free';
+    }
+    // Free tier: check trial
+    if (this.isTrialActive(license)) return 'basic';
+    return 'free';
   }
 
   // ── Auth persistence ──
@@ -172,7 +243,6 @@ class LicenseService {
   }
 
   logout(): void {
-    this.stopRevalidation();
     localStorage.removeItem(this.AUTH_KEY);
     localStorage.removeItem(this.STORAGE_KEY);
     localStorage.removeItem(this.TOKEN_KEY);
@@ -193,12 +263,86 @@ class LicenseService {
 
   needsRevalidation(license: LicenseData | null): boolean {
     if (!license) return true;
-    // Pro users MUST revalidate with server
-    if (license.tier === 'pro') {
+    // All paid tiers MUST revalidate with server (Basic/Pro/Max)
+    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
       return Date.now() - license.last_validated > REVALIDATION_INTERVAL;
     }
     // Free users can work offline for longer
     return Date.now() - license.last_validated > (24 * 60 * 60 * 1000);
+  }
+
+  // ── Credit / trial balance helpers ──
+  // Returns 0 if credits are expired or absent. Basic users only.
+  getCreditsRemainingSeconds(license: LicenseData | null): number {
+    if (!license) return 0;
+    if (license.tier !== 'basic') return 0;
+    const expireAt = license.credits_expire_at ?? 0;
+    if (expireAt > 0 && Date.now() > expireAt) return 0;
+    return Math.max(0, license.credits_remaining_seconds ?? 0);
+  }
+
+  // Returns 0 if trial was never granted or is exhausted. Free users only.
+  getTrialRemainingSeconds(license: LicenseData | null): number {
+    if (!license) return 0;
+    if (license.tier !== 'free') return 0;
+    return Math.max(0, license.trial_remaining_seconds ?? 0);
+  }
+
+  isTrialActive(license: LicenseData | null): boolean {
+    return this.getTrialRemainingSeconds(license) > 0;
+  }
+
+  // Unified "how much live-session time does this user have left?"
+  // Used by the timer service to pick which bucket to consume.
+  // Returns { seconds, source } where source indicates which bucket.
+  getLiveTimeBalance(license: LicenseData | null): { seconds: number; source: 'trial' | 'credits' | 'unlimited' | 'none' } {
+    if (!license) return { seconds: 0, source: 'none' };
+    if (license.tier === 'pro' || license.tier === 'max') {
+      return { seconds: Infinity, source: 'unlimited' };
+    }
+    if (license.tier === 'basic') {
+      return { seconds: this.getCreditsRemainingSeconds(license), source: 'credits' };
+    }
+    // Free
+    const trial = this.getTrialRemainingSeconds(license);
+    return trial > 0 ? { seconds: trial, source: 'trial' } : { seconds: 0, source: 'none' };
+  }
+
+  // Deduct `seconds` from the appropriate bucket. Returns the updated license.
+  // Saves to storage. No-op for unlimited tiers.
+  consumeTime(license: LicenseData, seconds: number): LicenseData {
+    if (seconds <= 0) return license;
+    if (license.tier === 'pro' || license.tier === 'max') return license;
+    let updated = { ...license };
+    if (license.tier === 'basic') {
+      const remaining = Math.max(0, (license.credits_remaining_seconds ?? 0) - seconds);
+      updated.credits_remaining_seconds = remaining;
+    } else if (license.tier === 'free') {
+      const remaining = Math.max(0, (license.trial_remaining_seconds ?? 0) - seconds);
+      updated.trial_remaining_seconds = remaining;
+    }
+    const user = this.loadAuth().user;
+    if (user) this.saveAuth(user, updated);
+    return updated;
+  }
+
+  // Credit one additional hour (Basic renewal flow). Extends expiry to 14d.
+  //
+  // Base off effective balance, NOT the raw field: if the prior credits
+  // already expired (credits_expire_at < now), effective balance is 0 and
+  // stale seconds should not carry over. Otherwise a user whose credits
+  // expired with 1800s unused would pay for renewal and silently get
+  // 3600 + 1800 = 5400s — effectively a free half-credit.
+  grantRenewalCredit(license: LicenseData): LicenseData {
+    const effectiveRemaining = this.getCreditsRemainingSeconds(license);
+    const updated: LicenseData = {
+      ...license,
+      credits_remaining_seconds: effectiveRemaining + TIME_CONSTANTS.SECONDS_PER_CREDIT,
+      credits_expire_at: Date.now() + TIME_CONSTANTS.BASIC_EXPIRY_DAYS * 24 * 60 * 60 * 1000,
+    };
+    const user = this.loadAuth().user;
+    if (user) this.saveAuth(user, updated);
+    return updated;
   }
 
   canStartSession(license: LicenseData | null): boolean {
@@ -236,6 +380,12 @@ class LicenseService {
 
     const data = await response.json();
     data.license.last_validated = Date.now();
+    // Signup is by definition a new account — seed the trial client-side
+    // as a defensive default in case the server doesn't populate it yet.
+    // Paid tiers ignore this field entirely via getLiveTimeBalance.
+    if (data.license.tier === 'free' && data.license.trial_remaining_seconds === undefined) {
+      data.license.trial_remaining_seconds = TIME_CONSTANTS.TRIAL_SECONDS;
+    }
     this.saveAuth(data.user, data.license, data.token);
     this.startRevalidation();
     return data;
@@ -278,42 +428,23 @@ class LicenseService {
     }
 
     const data = await response.json();
-    if (data.license) data.license.last_validated = Date.now();
+    if (data.license) {
+      data.license.last_validated = Date.now();
+      // New Google-signup users get the 30-min trial. Existing users keep
+      // whatever balance the server remembers. `is_new_user` is the signal
+      // we trust from the server; falling back to undefined-check as a
+      // belt-and-suspenders guard.
+      if (
+        data.license.tier === 'free' &&
+        data.license.trial_remaining_seconds === undefined &&
+        data.is_new_user === true
+      ) {
+        data.license.trial_remaining_seconds = TIME_CONSTANTS.TRIAL_SECONDS;
+      }
+    }
     this.saveAuth(data.user, data.license, data.token);
     this.startRevalidation();
     return data;
-  }
-
-  // Fallback local auth when server is not yet deployed
-  async localSignup(email: string, password: string, name: string, countryCode: string): Promise<{ user: UserProfile; license: LicenseData }> {
-    const deviceId = await this.getDeviceId();
-    const isDev = this.isDeveloper(email);
-
-    const user: UserProfile = {
-      id: crypto.randomUUID(),
-      email,
-      name: name || email.split('@')[0],
-      tier: isDev ? 'pro' : 'free',
-      country_code: countryCode,
-      created_at: Date.now(),
-    };
-
-    const license: LicenseData = {
-      key: `MNC-${crypto.randomUUID().slice(0, 8).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
-      email,
-      tier: isDev ? 'pro' : 'free',
-      status: isDev ? 'active' : 'trial',
-      country_code: countryCode,
-      device_id: deviceId,
-      activated_at: Date.now(),
-      expires_at: isDev ? -1 : Date.now() + (30 * 24 * 60 * 60 * 1000),
-      sessions_used: 0,
-      sessions_limit: isDev ? -1 : 5,
-      last_validated: Date.now(),
-    };
-
-    this.saveAuth(user, license);
-    return { user, license };
   }
 
   async validateWithServer(): Promise<LicenseData | null> {
@@ -347,7 +478,38 @@ class LicenseService {
       }
 
       const serverData = await response.json();
-      const updatedLicense = { ...license, ...serverData, last_validated: Date.now() };
+
+      // ── Credit-field merge guard ──
+      // The client tick is authoritative for credits/trial seconds today
+      // (Option A, client-side ledger). A naive spread would let a stale
+      // server value overwrite the locally-consumed field — so on every
+      // focus/revalidation during a session the user would get their
+      // time refunded. Strip those fields from the merge unless the
+      // server is signalling a tier change (e.g. Basic→Pro upgrade),
+      // in which case the server's balance is authoritative for the new
+      // plan.
+      const tierChanged = serverData.tier && serverData.tier !== license.tier;
+      const {
+        credits_remaining_seconds: _crs,
+        credits_expire_at: _cea,
+        trial_remaining_seconds: _trs,
+        trial_started_at: _tsa,
+        ...serverSafe
+      } = serverData;
+      const creditOverride = tierChanged
+        ? {
+            credits_remaining_seconds: serverData.credits_remaining_seconds,
+            credits_expire_at: serverData.credits_expire_at,
+            trial_remaining_seconds: serverData.trial_remaining_seconds,
+          }
+        : {};
+
+      const updatedLicense = {
+        ...license,
+        ...serverSafe,
+        ...creditOverride,
+        last_validated: Date.now(),
+      };
       const user = this.loadAuth().user;
       // If server rotated the token, save the new one so the next
       // request doesn't hit 401. Falls back to existing token otherwise.
@@ -371,13 +533,6 @@ class LicenseService {
   // network issue at launch never surfaces to the user.
   startRevalidation(): void {
     this.validateWithServer().catch(() => {});
-  }
-
-  stopRevalidation(): void {
-    if (this.revalidationTimer) {
-      clearInterval(this.revalidationTimer);
-      this.revalidationTimer = null;
-    }
   }
 
   getAppVersion(): string {

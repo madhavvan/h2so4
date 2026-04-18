@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail } from 'lucide-react';
+import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock } from 'lucide-react';
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import { geoService, GeoData } from './services/geoService';
 import { pricingService, RegionPricing, PricingTier } from './services/pricingService';
@@ -20,6 +20,29 @@ type View = 'landing' | 'login' | 'signup' | 'forgot_password' | 'pricing' | 'vp
 
 // ── Detect if running inside Electron ──
 const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+
+// Single-flight Razorpay SDK loader. Without this, a user who clicks
+// "Upgrade" twice before the first checkout modal renders would append
+// two <script> tags, both of which race to define window.Razorpay and
+// can wire the second modal's handler to the first instance's state.
+let razorpayScriptPromise: Promise<void> | null = null;
+const loadRazorpayScript = (): Promise<void> => {
+  if (typeof window === 'undefined') return Promise.reject(new Error('No window'));
+  if ((window as any).Razorpay) return Promise.resolve();
+  if (razorpayScriptPromise) return razorpayScriptPromise;
+  razorpayScriptPromise = new Promise<void>((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => {
+      razorpayScriptPromise = null;
+      reject(new Error('Failed to load Razorpay SDK'));
+    };
+    document.body.appendChild(script);
+  });
+  return razorpayScriptPromise;
+};
 
 // ── Animated background ──
 const AnimatedBackground = () => (
@@ -67,33 +90,50 @@ const FeaturePill = ({ icon: Icon, text }: { icon: any; text: string }) => (
   </div>
 );
 
-// ── Pricing Card (Free + Pro only) ──
+// ── Pricing Card (Free / Basic / Pro / Max) ──
 const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelect: (tier: PricingTier) => void; isLoading: boolean }) => {
-  const isPro = tier.popular;
-  const isFree = tier.id === 'free';
+  const isPopular = !!tier.popular;
+
+  // Per-tier visual theme. Popular tier gets the highlighted "Recommended" card frame.
+  const theme =
+    tier.id === 'max'   ? { accent: 'amber',   iconBg: 'bg-amber-500/15',   icon: <Crown size={20} className="text-amber-400" /> } :
+    tier.id === 'pro'   ? { accent: 'blue',    iconBg: 'bg-blue-500/15',    icon: <Crown size={20} className="text-blue-400" /> } :
+    tier.id === 'basic' ? { accent: 'emerald', iconBg: 'bg-emerald-500/15', icon: <Sparkles size={20} className="text-emerald-400" /> } :
+                          { accent: 'gray',    iconBg: 'bg-gray-500/10',    icon: <Zap size={20} className="text-gray-400" /> };
+
+  const periodLabel = tier.period === 'month' ? '/mo' : tier.period === 'year' ? '/yr' : '';
+
+  const ctaClass = isPopular
+    ? 'bg-gradient-to-r from-emerald-500 to-emerald-600 text-white hover:from-emerald-400 hover:to-emerald-500 shadow-lg shadow-emerald-500/25'
+    : tier.id === 'max'
+      ? 'bg-gradient-to-r from-amber-500 to-purple-500 text-white hover:from-amber-400 hover:to-purple-400 shadow-lg shadow-amber-500/20'
+      : tier.id === 'pro'
+        ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white hover:from-blue-400 hover:to-blue-500 shadow-lg shadow-blue-500/25'
+        : 'bg-white/[0.06] text-white hover:bg-white/[0.1] border border-white/[0.1]';
+
+  const frameClass = isPopular
+    ? 'border-emerald-500/40 bg-gradient-to-b from-emerald-500/[0.08] to-transparent shadow-xl shadow-emerald-500/10'
+    : tier.id === 'max'
+      ? 'border-amber-500/30 bg-gradient-to-b from-amber-500/[0.05] to-transparent'
+      : 'border-white/[0.08] bg-white/[0.02] hover:border-white/[0.15]';
 
   return (
-    <div className={`relative rounded-2xl border transition-all duration-300 hover:scale-[1.02] ${
-      isPro
-        ? 'border-blue-500/40 bg-gradient-to-b from-blue-500/[0.08] to-transparent shadow-xl shadow-blue-500/10'
-        : 'border-white/[0.08] bg-white/[0.02] hover:border-white/[0.15]'
-    }`}>
-      {isPro && (
+    <div className={`relative rounded-2xl border transition-all duration-300 hover:scale-[1.02] ${frameClass}`}>
+      {isPopular && (
         <div className="absolute -top-3.5 left-1/2 -translate-x-1/2">
-          <div className="px-4 py-1 rounded-full bg-gradient-to-r from-blue-500 to-purple-500 text-white text-[10px] font-bold tracking-wider uppercase shadow-lg">
-            Recommended
+          <div className="px-4 py-1 rounded-full bg-gradient-to-r from-emerald-500 to-emerald-600 text-white text-[10px] font-bold tracking-wider uppercase shadow-lg">
+            Best Deal
           </div>
         </div>
       )}
 
       <div className="p-6 pt-8">
-        <div className={`w-10 h-10 rounded-xl flex items-center justify-center mb-4 ${
-          isFree ? 'bg-gray-500/10' : 'bg-blue-500/15'
-        }`}>
-          {isFree ? <Zap size={20} className="text-gray-400" /> : <Crown size={20} className="text-blue-400" />}
+        <div className={`w-10 h-10 rounded-xl flex items-center justify-center mb-4 ${theme.iconBg}`}>
+          {theme.icon}
         </div>
 
         <h3 className="text-lg font-bold text-white mb-1">{tier.name}</h3>
+        {tier.subtitle && <p className="text-[11px] text-gray-500 mb-3">{tier.subtitle}</p>}
 
         <div className="flex items-baseline gap-1 mb-6">
           {tier.price === 0 ? (
@@ -103,7 +143,7 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
               <span className="text-3xl font-bold text-white">
                 {pricingService.formatPrice(tier.price, tier.currencySymbol, tier.currency)}
               </span>
-              <span className="text-sm text-gray-500">/{tier.period}</span>
+              {periodLabel && <span className="text-sm text-gray-500">{periodLabel}</span>}
             </>
           )}
         </div>
@@ -111,11 +151,7 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
         <button
           onClick={() => onSelect(tier)}
           disabled={isLoading}
-          className={`w-full py-3 px-4 rounded-xl font-semibold text-sm transition-all duration-200 flex items-center justify-center gap-2 ${
-            isPro
-              ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white hover:from-blue-400 hover:to-blue-500 shadow-lg shadow-blue-500/25 hover:shadow-blue-500/40'
-              : 'bg-white/[0.06] text-white hover:bg-white/[0.1] border border-white/[0.1]'
-          }`}
+          className={`w-full py-3 px-4 rounded-xl font-semibold text-sm transition-all duration-200 flex items-center justify-center gap-2 ${ctaClass}`}
         >
           {isLoading ? <Loader2 size={16} className="animate-spin" /> : null}
           {tier.cta}
@@ -126,9 +162,11 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
           {tier.features.map((feature, i) => (
             <div key={i} className="flex items-start gap-2.5">
               <div className={`w-4 h-4 rounded-full flex items-center justify-center mt-0.5 shrink-0 ${
-                isPro ? 'bg-blue-500/20' : 'bg-white/[0.06]'
+                isPopular ? 'bg-emerald-500/20' : tier.id === 'max' ? 'bg-amber-500/20' : 'bg-white/[0.06]'
               }`}>
-                <Check size={10} className={isPro ? 'text-blue-400' : 'text-gray-400'} strokeWidth={3} />
+                <Check size={10} className={
+                  isPopular ? 'text-emerald-400' : tier.id === 'max' ? 'text-amber-400' : 'text-gray-400'
+                } strokeWidth={3} />
               </div>
               <span className="text-sm text-gray-400">{feature}</span>
             </div>
@@ -160,28 +198,75 @@ const TutorialCard = ({ step, title, desc, duration }: { step: string; title: st
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const API_BASE = 'https://h2so4-production.up.railway.app';
 
+type Tier = 'free' | 'basic' | 'pro' | 'max';
+const TIERS: Tier[] = ['free', 'basic', 'pro', 'max'];
+
+// Single source of truth for tier color-coding. Any place that shows a tier
+// pulls its Tailwind classes from here so Free/Basic/Pro/Max always look the
+// same across badges, cards, tables, and the action panel.
+const TIER_THEME: Record<Tier, { bg: string; text: string; border: string; bar: string; dot: string; Icon: any }> = {
+  free:  { bg: 'bg-slate-500/10',   text: 'text-slate-300',   border: 'border-slate-500/25',   bar: 'bg-slate-400',    dot: 'bg-slate-400',    Icon: Zap },
+  basic: { bg: 'bg-emerald-500/10', text: 'text-emerald-300', border: 'border-emerald-500/25', bar: 'bg-emerald-400',  dot: 'bg-emerald-400',  Icon: Sparkles },
+  pro:   { bg: 'bg-indigo-500/10',  text: 'text-indigo-300',  border: 'border-indigo-500/25',  bar: 'bg-indigo-400',   dot: 'bg-indigo-400',   Icon: Crown },
+  max:   { bg: 'bg-amber-500/10',   text: 'text-amber-300',   border: 'border-amber-500/25',   bar: 'bg-amber-400',    dot: 'bg-amber-400',    Icon: Crown },
+};
+const tierOf = (t?: string): (typeof TIER_THEME)[Tier] => (TIER_THEME as any)[t || ''] || TIER_THEME.free;
+
+const TierBadge = ({ tier }: { tier?: string }) => {
+  const th = tierOf(tier);
+  const label = (tier || 'free').toUpperCase();
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase border ${th.bg} ${th.text} ${th.border}`}>
+      {label === 'MAX' && <Crown size={9} />}
+      {label}
+    </span>
+  );
+};
+
 const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUser: UserProfile }) => {
   const [stats, setStats] = useState<any>(null);
   const [users, setUsers] = useState<any[]>([]);
   const [logins, setLogins] = useState<any[]>([]);
+  const [auditLog, setAuditLog] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [adminError, setAdminError] = useState<string | null>(null);
-  const [actionMsg, setActionMsg] = useState<string | null>(null);
-  const [adminTab, setAdminTab] = useState<'overview' | 'users' | 'logins'>('overview');
+  const [actionMsg, setActionMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [adminTab, setAdminTab] = useState<'overview' | 'users' | 'logins' | 'audit'>('overview');
 
-  // Action form state
+  // Quick-action form state
   const [revokeKey, setRevokeKey] = useState('');
   const [killVersion, setKillVersion] = useState('');
   const [searchEmail, setSearchEmail] = useState('');
   const [searchResult, setSearchResult] = useState<any>(null);
   const [actionLoading, setActionLoading] = useState(false);
 
+  // Action-panel state — only active when there's a searchResult.
+  const [panelTier, setPanelTier] = useState<Tier>('pro');
+  const [panelCredits, setPanelCredits] = useState('');
+  const [panelDays, setPanelDays] = useState('');
+  const [panelBusy, setPanelBusy] = useState<string | null>(null);
+
+  // Reusable confirm modal for destructive admin actions. We can't use the
+  // native confirm() — it paints outside Electron's setContentProtection and
+  // leaks the target email during a screen-shared interview.
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    body: string;
+    confirmLabel: string;
+    danger?: boolean;
+    onConfirm: () => void;
+  } | null>(null);
+
   const token = licenseService.getToken();
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` };
 
-  const showMsg = (msg: string) => { setActionMsg(msg); setTimeout(() => setActionMsg(null), 4000); };
+  const showMsg = (text: string, type: 'success' | 'error' = 'success') => {
+    setActionMsg({ text, type });
+    setTimeout(() => setActionMsg(null), 4000);
+  };
 
-  // Fetch all data on mount
+  // Fetch core data on mount. Audit log is lazy (fetched only when that tab
+  // opens) because it can be large and most sessions won't touch it.
   useEffect(() => {
     async function loadAdmin() {
       setLoading(true);
@@ -205,7 +290,37 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
     loadAdmin();
   }, []);
 
-  // ── Actions ──
+  useEffect(() => {
+    if (adminTab !== 'audit' || auditLog.length > 0) return;
+    fetch(`${API_BASE}/api/v1/admin/audit-log?limit=200`, { headers })
+      .then(r => r.ok ? r.json() : [])
+      .then(data => setAuditLog(Array.isArray(data) ? data : []))
+      .catch(() => {/* non-fatal — tab will just show empty */});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminTab]);
+
+  // Shared POST-mutation path. Handles fetch, JSON parse, error toast,
+  // busy-state, and returns the parsed body (or null on error) so callers
+  // can update local state only on success.
+  async function callMutation(path: string, body: any, successMsg: string) {
+    setPanelBusy(path);
+    try {
+      const res = await fetch(`${API_BASE}${path}`, {
+        method: 'POST', headers, body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Request failed');
+      showMsg(successMsg);
+      return data;
+    } catch (err: any) {
+      showMsg(`Error: ${err.message}`, 'error');
+      return null;
+    } finally {
+      setPanelBusy(null);
+    }
+  }
+
+  // ── Quick actions (unchanged) ──
   const handleRevoke = async () => {
     if (!revokeKey.trim()) return;
     setActionLoading(true);
@@ -217,7 +332,7 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
       if (!res.ok) throw new Error(data.error);
       showMsg(`License ${revokeKey} revoked`);
       setRevokeKey('');
-    } catch (err: any) { showMsg(`Error: ${err.message}`); }
+    } catch (err: any) { showMsg(`Error: ${err.message}`, 'error'); }
     finally { setActionLoading(false); }
   };
 
@@ -232,49 +347,115 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
       if (!res.ok) throw new Error(data.error);
       showMsg(`Min version set to ${killVersion}`);
       setKillVersion('');
-    } catch (err: any) { showMsg(`Error: ${err.message}`); }
+    } catch (err: any) { showMsg(`Error: ${err.message}`, 'error'); }
     finally { setActionLoading(false); }
   };
 
-  const handleSearch = async () => {
-    if (!searchEmail.trim()) return;
+  const handleSearch = async (emailOverride?: string) => {
+    const target = (emailOverride ?? searchEmail).trim();
+    if (!target) return;
+    setSearchEmail(target);
     setActionLoading(true);
     setSearchResult(null);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/users/search?email=${encodeURIComponent(searchEmail.trim())}`, { headers });
+      const res = await fetch(`${API_BASE}/api/v1/admin/users/search?email=${encodeURIComponent(target)}`, { headers });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setSearchResult(data);
-    } catch (err: any) { showMsg(`Error: ${err.message}`); setSearchResult(null); }
+      setPanelTier((data.user?.tier as Tier) || 'pro');
+    } catch (err: any) { showMsg(`Error: ${err.message}`, 'error'); setSearchResult(null); }
     finally { setActionLoading(false); }
   };
 
-  const handleBan = async (email: string) => {
-    if (!confirm(`Ban ${email}? This will revoke their license.`)) return;
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/users/ban`, {
-        method: 'POST', headers, body: JSON.stringify({ email }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      showMsg(`${email} banned`);
-      setUsers(prev => prev.map(u => u.email === email ? { ...u, is_banned: 1, tier: 'free' } : u));
-    } catch (err: any) { showMsg(`Error: ${err.message}`); }
+  // Patch the already-loaded user list so UI reflects the mutation without
+  // a full refetch. Search result is patched the same way if it matches.
+  const patchUserEverywhere = (email: string, patch: (u: any) => any) => {
+    setUsers(prev => prev.map(u => u.email === email ? patch(u) : u));
+    setSearchResult((sr: any) => sr && sr.user?.email === email ? { ...sr, user: patch(sr.user) } : sr);
   };
 
-  const handleUpgrade = async (email: string) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/users/upgrade`, {
-        method: 'POST', headers, body: JSON.stringify({ email }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      showMsg(`${email} upgraded to Pro`);
-      setUsers(prev => prev.map(u => u.email === email ? { ...u, tier: 'pro' } : u));
-    } catch (err: any) { showMsg(`Error: ${err.message}`); }
+  const handleChangeTier = async (email: string, tier: Tier) => {
+    const data = await callMutation('/api/v1/admin/users/change-tier', { email, tier }, `${email} → ${tier.toUpperCase()}`);
+    if (!data) return;
+    patchUserEverywhere(email, u => ({ ...u, tier }));
+    // Bump license in search result too — backend reset expires_at + sessions_limit.
+    if (searchResult?.user.email === email) {
+      setSearchResult((sr: any) => ({ ...sr, license: { ...sr.license, tier, status: 'active' } }));
+    }
+  };
+
+  const handleGrantCredits = async (email: string) => {
+    const n = parseInt(panelCredits, 10);
+    if (!Number.isFinite(n) || n === 0) return showMsg('Enter non-zero credits', 'error');
+    const data = await callMutation('/api/v1/admin/users/grant-credits', { email, credits: n }, `${n > 0 ? 'Granted' : 'Revoked'} ${Math.abs(n)} credit(s)`);
+    if (!data) return;
+    setPanelCredits('');
+    if (data.license && searchResult?.user.email === email) {
+      setSearchResult((sr: any) => ({ ...sr, license: data.license }));
+    }
+  };
+
+  const handleExtendExpiry = async (email: string) => {
+    const n = parseInt(panelDays, 10);
+    if (!Number.isFinite(n) || n === 0) return showMsg('Enter non-zero days', 'error');
+    const data = await callMutation('/api/v1/admin/users/extend-expiry', { email, days: n }, `${n > 0 ? 'Added' : 'Removed'} ${Math.abs(n)} day(s)`);
+    if (!data) return;
+    setPanelDays('');
+    if (data.license && searchResult?.user.email === email) {
+      setSearchResult((sr: any) => ({ ...sr, license: data.license }));
+    }
+  };
+
+  const handleResetDevices = (email: string) => {
+    setConfirmDialog({
+      title: 'Clear device bindings?',
+      body: `All device bindings for ${email} will be cleared. They'll need to re-bind on next sign-in.`,
+      confirmLabel: 'Clear devices',
+      onConfirm: async () => {
+        const data = await callMutation('/api/v1/admin/users/reset-devices', { email }, 'Devices cleared');
+        if (!data) return;
+        if (searchResult?.user.email === email) {
+          setSearchResult((sr: any) => ({ ...sr, devices: (sr.devices || []).map((d: any) => ({ ...d, is_active: 0 })) }));
+        }
+        patchUserEverywhere(email, u => ({ ...u, device_count: 0 }));
+      },
+    });
+  };
+
+  const handleForceLogout = (email: string) => {
+    setConfirmDialog({
+      title: 'Invalidate all sessions?',
+      body: `All active sessions for ${email} will be revoked. They'll need to sign in again on every device.`,
+      confirmLabel: 'Force logout',
+      onConfirm: async () => {
+        await callMutation('/api/v1/admin/users/force-logout', { email }, `${email} logged out everywhere`);
+      },
+    });
+  };
+
+  const handleBan = (email: string) => {
+    setConfirmDialog({
+      title: `Ban ${email}?`,
+      body: `Their license will be revoked and all active sessions invalidated. This action is logged in the audit trail.`,
+      confirmLabel: 'Ban user',
+      danger: true,
+      onConfirm: async () => {
+        const data = await callMutation('/api/v1/admin/users/ban', { email }, `${email} banned`);
+        if (!data) return;
+        patchUserEverywhere(email, u => ({ ...u, is_banned: 1 }));
+      },
+    });
+  };
+
+  const handleUnban = async (email: string) => {
+    const data = await callMutation('/api/v1/admin/users/unban', { email }, `${email} unbanned`);
+    if (!data) return;
+    patchUserEverywhere(email, u => ({ ...u, is_banned: 0 }));
   };
 
   const fmtDate = (ts: number) => ts ? new Date(ts).toLocaleString() : '—';
+  const fmtMoney = (n: number | null | undefined) => n == null ? '$0' : `$${Math.round(n).toLocaleString()}`;
+  const openUserInPanel = (email: string) => { setAdminTab('overview'); handleSearch(email); };
 
   return (
     <div className="fixed inset-0 bg-[#050507] text-white overflow-y-auto">
@@ -282,26 +463,26 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
       <NoiseOverlay />
       <nav className="relative z-10 flex items-center justify-between px-6 py-4 max-w-7xl mx-auto">
         <Logo size="md" />
-        <div className="flex items-center gap-3">
-          <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-red-500/20 text-red-400">Admin</span>
-          {/* Tab switcher */}
-          {['overview', 'users', 'logins'].map(tab => (
-            <button key={tab} onClick={() => setAdminTab(tab as any)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${adminTab === tab ? 'bg-white/[0.1] text-white border border-white/[0.15]' : 'text-gray-500 hover:text-gray-300'}`}>
+        <div className="flex items-center gap-2">
+          <span className="px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-gradient-to-r from-red-500/20 to-purple-500/20 text-red-300 border border-red-500/30 flex items-center gap-1.5">
+            <Shield size={10} /> Admin Console
+          </span>
+          {(['overview', 'users', 'logins', 'audit'] as const).map(tab => (
+            <button key={tab} onClick={() => setAdminTab(tab)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${adminTab === tab ? 'bg-white/[0.1] text-white border border-white/[0.15]' : 'text-gray-500 hover:text-gray-300 border border-transparent'}`}>
               {tab.charAt(0).toUpperCase() + tab.slice(1)}
             </button>
           ))}
           <button onClick={onBack} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1.5">
-            <ArrowRight size={14} className="rotate-180" /> Back
+            <ArrowLeft size={14} /> Back
           </button>
         </div>
       </nav>
 
       <div className="relative z-10 max-w-7xl mx-auto px-6 pt-6 pb-20">
-        {/* Action message toast */}
         {actionMsg && (
-          <div className="fixed top-4 right-4 z-50 px-4 py-3 rounded-xl bg-blue-500/20 border border-blue-500/30 text-blue-300 text-sm font-medium shadow-xl backdrop-blur-sm animate-pulse">
-            {actionMsg}
+          <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-xl text-sm font-medium shadow-xl backdrop-blur-sm ${actionMsg.type === 'success' ? 'bg-emerald-500/20 border border-emerald-500/30 text-emerald-300' : 'bg-red-500/20 border border-red-500/30 text-red-300'}`}>
+            {actionMsg.text}
           </div>
         )}
 
@@ -321,110 +502,265 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
             {/* ── OVERVIEW TAB ── */}
             {adminTab === 'overview' && (
               <div className="space-y-8">
-                <div>
-                  <h1 className="text-2xl font-bold mb-1">Dashboard</h1>
-                  <p className="text-gray-500 text-sm">Live data from minicaai.com server</p>
-                </div>
-
-                {/* Stats grid */}
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                  {[
-                    { label: 'Total Users', value: stats?.total_users ?? 0, color: 'text-white' },
-                    { label: 'Pro Users', value: stats?.pro_users ?? 0, color: 'text-blue-400' },
-                    { label: 'Free Users', value: stats?.free_users ?? 0, color: 'text-gray-400' },
-                    { label: 'Active Today', value: stats?.active_today ?? 0, color: 'text-green-400' },
-                    { label: 'Signups (30d)', value: stats?.signups_this_month ?? 0, color: 'text-purple-400' },
-                    { label: 'Logins Today', value: stats?.logins_today ?? 0, color: 'text-cyan-400' },
-                    { label: 'Failed Logins', value: stats?.failed_logins_today ?? 0, color: 'text-red-400' },
-                    { label: 'Devices', value: stats?.total_devices ?? 0, color: 'text-amber-400' },
-                    { label: 'Banned', value: stats?.banned_users ?? 0, color: 'text-red-400' },
-                    { label: 'Revoked Keys', value: stats?.revoked_licenses ?? 0, color: 'text-orange-400' },
-                  ].map(({ label, value, color }, i) => (
-                    <div key={i} className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02]">
-                      <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">{label}</p>
-                      <p className={`text-xl font-bold ${color}`}>{value}</p>
+                {/* Hero header */}
+                <div className="flex items-end justify-between flex-wrap gap-4">
+                  <div>
+                    <h1 className="text-3xl font-bold tracking-tight mb-1 bg-gradient-to-r from-white via-white to-blue-200 bg-clip-text text-transparent">Command Center</h1>
+                    <p className="text-gray-500 text-sm">Live intelligence · {currentUser.email}</p>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <div className="text-right">
+                      <p className="text-[10px] text-gray-600 uppercase tracking-widest">Monthly Revenue</p>
+                      <p className="text-3xl font-bold text-emerald-400 tracking-tight">{fmtMoney(stats?.revenue_this_month)}</p>
                     </div>
-                  ))}
+                    <div className="h-10 w-px bg-white/10" />
+                    <div className="text-right">
+                      <p className="text-[10px] text-gray-600 uppercase tracking-widest">All Time</p>
+                      <p className="text-2xl font-bold text-white tracking-tight">{fmtMoney(stats?.total_revenue)}</p>
+                    </div>
+                  </div>
                 </div>
 
-                {/* Quick Actions */}
+                {/* Primary search bar */}
+                <div className="p-5 rounded-2xl border border-blue-500/20 bg-gradient-to-br from-blue-500/[0.08] via-indigo-500/[0.04] to-transparent shadow-lg shadow-blue-500/5">
+                  <div className="flex items-center gap-2 mb-3">
+                    <div className="p-1.5 rounded-lg bg-blue-500/20"><Users size={14} className="text-blue-400" /></div>
+                    <h4 className="text-sm font-semibold text-white">User Lookup &amp; Control</h4>
+                    <span className="ml-auto text-[10px] text-gray-500 uppercase tracking-widest">Search · Modify · Audit</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <input value={searchEmail} onChange={e => setSearchEmail(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSearch()} placeholder="user@email.com" className="flex-1 px-4 py-2.5 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-blue-500/60 transition-colors" />
+                    <button onClick={() => handleSearch()} disabled={actionLoading} className="px-5 py-2.5 rounded-lg bg-blue-500 text-white text-sm font-semibold hover:bg-blue-400 transition-all shadow-md shadow-blue-500/20 disabled:opacity-50">
+                      {actionLoading ? 'Searching…' : 'Search'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* 4-Tier distribution */}
+                <div>
+                  <div className="flex items-center justify-between mb-3">
+                    <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold">Tier Distribution</h2>
+                    <p className="text-[10px] text-gray-600">{stats?.total_users ?? 0} total users</p>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    {TIERS.map(tier => {
+                      const th = TIER_THEME[tier];
+                      const Icon = th.Icon;
+                      const count = stats?.tiers?.[tier] ?? 0;
+                      const total = stats?.total_users || 1;
+                      const pct = Math.round((count / total) * 100);
+                      const revenue = stats?.revenue_by_tier?.[tier];
+                      const signups = stats?.signups_by_tier?.[tier] ?? 0;
+                      return (
+                        <div key={tier} className={`p-4 rounded-2xl border ${th.border} ${th.bg} relative overflow-hidden hover:scale-[1.02] transition-transform`}>
+                          <div className="flex items-start justify-between mb-3">
+                            <div className="p-2 rounded-lg bg-white/[0.06]"><Icon size={16} className={th.text} /></div>
+                            <span className={`text-[10px] font-bold uppercase tracking-widest ${th.text}`}>{tier}</span>
+                          </div>
+                          <p className="text-3xl font-bold text-white tracking-tight">{count.toLocaleString()}</p>
+                          <div className="flex items-baseline justify-between mt-1 mb-2">
+                            <p className="text-[10px] text-gray-500">{pct}% · +{signups} this month</p>
+                            {revenue != null && revenue > 0 && (
+                              <p className={`text-[11px] font-bold ${th.text}`}>{fmtMoney(revenue)}</p>
+                            )}
+                          </div>
+                          <div className="h-1 bg-white/[0.05] rounded-full overflow-hidden">
+                            <div className={`h-full rounded-full ${th.bar} transition-all duration-500`} style={{ width: `${Math.max(pct, 2)}%` }} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Search result — full action panel */}
+                {searchResult && (() => {
+                  const u = searchResult.user;
+                  const lic = searchResult.license;
+                  const devs = searchResult.devices || [];
+                  const activeDevs = devs.filter((d: any) => d.is_active).length;
+                  const loginHist = searchResult.login_history || [];
+                  const th = tierOf(u.tier);
+                  return (
+                    <div className={`p-6 rounded-2xl border ${th.border} ${th.bg} shadow-xl shadow-black/20`}>
+                      {/* Header */}
+                      <div className="flex items-start justify-between gap-3 mb-5 pb-4 border-b border-white/10">
+                        <div className="flex items-center gap-3">
+                          {u.avatar_url ? (
+                            <img src={u.avatar_url} alt="" className={`w-12 h-12 rounded-full border-2 ${th.border}`} />
+                          ) : (
+                            <div className={`w-12 h-12 rounded-full flex items-center justify-center text-lg font-bold ${th.text} border ${th.border} bg-black/30`}>
+                              {(u.name || u.email || '?').charAt(0).toUpperCase()}
+                            </div>
+                          )}
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h4 className="text-base font-bold text-white">{u.name || u.email}</h4>
+                              <TierBadge tier={u.tier} />
+                              {u.is_banned ? <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-red-500/20 text-red-400 border border-red-500/30">Banned</span> : null}
+                            </div>
+                            <p className="text-xs text-gray-400">{u.email} · {u.country_code || '—'} · joined {fmtDate(u.created_at)}</p>
+                          </div>
+                        </div>
+                        <button onClick={() => setSearchResult(null)} className="p-1.5 rounded-lg text-gray-500 hover:text-white hover:bg-white/[0.05] transition-all"><X size={16} /></button>
+                      </div>
+
+                      {/* Data grid */}
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs mb-6">
+                        <div><span className="text-gray-500 uppercase text-[9px] tracking-wider block mb-0.5">License</span><span className="text-white font-mono text-[11px]">{lic?.key || '—'}</span></div>
+                        <div><span className="text-gray-500 uppercase text-[9px] tracking-wider block mb-0.5">Status</span><span className={`font-bold ${lic?.status === 'active' ? 'text-emerald-400' : lic?.status === 'revoked' ? 'text-red-400' : 'text-amber-400'}`}>{(lic?.status || 'none').toUpperCase()}</span></div>
+                        <div><span className="text-gray-500 uppercase text-[9px] tracking-wider block mb-0.5">Sessions</span><span className="text-white font-semibold">{lic?.sessions_used ?? 0} / {lic?.sessions_limit === -1 ? '∞' : (lic?.sessions_limit ?? 0)}</span></div>
+                        <div><span className="text-gray-500 uppercase text-[9px] tracking-wider block mb-0.5">Expires</span><span className="text-white">{lic?.expires_at === -1 ? 'Never' : fmtDate(lic?.expires_at)}</span></div>
+                        <div><span className="text-gray-500 uppercase text-[9px] tracking-wider block mb-0.5">Devices</span><span className="text-white font-semibold">{activeDevs} active · {devs.length} total</span></div>
+                        <div><span className="text-gray-500 uppercase text-[9px] tracking-wider block mb-0.5">Last login</span><span className="text-white">{fmtDate(u.last_login_at)}</span></div>
+                        <div><span className="text-gray-500 uppercase text-[9px] tracking-wider block mb-0.5">Payments</span><span className="text-white font-semibold">{searchResult.payments?.length ?? 0}</span></div>
+                        <div><span className="text-gray-500 uppercase text-[9px] tracking-wider block mb-0.5">Conversations</span><span className="text-white font-semibold">{searchResult.conversations?.length ?? 0}</span></div>
+                      </div>
+
+                      {/* Action panel */}
+                      <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
+                        <div className="p-3 rounded-xl border border-white/10 bg-black/30">
+                          <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-2">Change tier</label>
+                          <div className="flex gap-2">
+                            <select value={panelTier} onChange={e => setPanelTier(e.target.value as Tier)} className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-xs focus:outline-none focus:border-blue-500/50">
+                              {TIERS.map(t => <option key={t} value={t}>{t.toUpperCase()}</option>)}
+                            </select>
+                            <button onClick={() => handleChangeTier(u.email, panelTier)} disabled={!!panelBusy || panelTier === u.tier} className="px-3 py-2 rounded-lg bg-indigo-500/20 text-indigo-300 text-xs font-semibold hover:bg-indigo-500/30 border border-indigo-500/30 disabled:opacity-40 transition-all">
+                              Apply
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="p-3 rounded-xl border border-white/10 bg-black/30">
+                          <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-2">Grant credits (+/−)</label>
+                          <div className="flex gap-2">
+                            <input type="number" value={panelCredits} onChange={e => setPanelCredits(e.target.value)} placeholder="e.g. 10" className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-xs focus:outline-none focus:border-emerald-500/50" />
+                            <button onClick={() => handleGrantCredits(u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-emerald-500/20 text-emerald-300 text-xs font-semibold hover:bg-emerald-500/30 border border-emerald-500/30 disabled:opacity-40 transition-all">
+                              Grant
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="p-3 rounded-xl border border-white/10 bg-black/30">
+                          <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-2">Extend expiry (days)</label>
+                          <div className="flex gap-2">
+                            <input type="number" value={panelDays} onChange={e => setPanelDays(e.target.value)} placeholder="e.g. 30" className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-xs focus:outline-none focus:border-cyan-500/50" />
+                            <button onClick={() => handleExtendExpiry(u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-cyan-500/20 text-cyan-300 text-xs font-semibold hover:bg-cyan-500/30 border border-cyan-500/30 disabled:opacity-40 transition-all">
+                              Extend
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Destructive actions */}
+                      <div className="flex flex-wrap gap-2 pt-3 border-t border-white/10">
+                        <button onClick={() => handleResetDevices(u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-amber-500/10 text-amber-300 text-xs font-semibold hover:bg-amber-500/20 border border-amber-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5">
+                          <Monitor size={12} /> Reset Devices ({activeDevs})
+                        </button>
+                        <button onClick={() => handleForceLogout(u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-orange-500/10 text-orange-300 text-xs font-semibold hover:bg-orange-500/20 border border-orange-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5">
+                          <LogOut size={12} /> Force Logout
+                        </button>
+                        {u.is_banned ? (
+                          <button onClick={() => handleUnban(u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-emerald-500/10 text-emerald-300 text-xs font-semibold hover:bg-emerald-500/20 border border-emerald-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5">
+                            <Check size={12} /> Unban
+                          </button>
+                        ) : (
+                          <button onClick={() => handleBan(u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-red-500/10 text-red-300 text-xs font-semibold hover:bg-red-500/20 border border-red-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5">
+                            <X size={12} /> Ban User
+                          </button>
+                        )}
+                        {lic?.key && (
+                          <button onClick={() => { setRevokeKey(lic.key); showMsg('License key loaded into Revoke field'); }} className="ml-auto px-3 py-2 rounded-lg bg-white/[0.04] text-gray-400 text-xs font-semibold hover:text-white hover:bg-white/[0.08] border border-white/[0.08] transition-all">
+                            Stage for Revoke
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Recent login history */}
+                      {loginHist.length > 0 && (
+                        <div className="mt-5 pt-4 border-t border-white/10">
+                          <p className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold mb-2">Recent logins</p>
+                          <div className="space-y-1 max-h-48 overflow-y-auto">
+                            {loginHist.slice(0, 10).map((log: any, i: number) => (
+                              <div key={i} className="flex items-center justify-between gap-3 text-[11px] py-1 px-2 rounded hover:bg-white/[0.03]">
+                                <span className="text-gray-400 whitespace-nowrap">{fmtDate(log.created_at)}</span>
+                                <span className="text-gray-500 font-mono truncate">{log.ip_address || '—'} · {log.country_code || '—'}</span>
+                                <span className={`font-bold ${log.success ? 'text-emerald-400' : 'text-red-400'}`}>{log.success ? 'OK' : 'FAIL'}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Activity metrics */}
+                <div>
+                  <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold mb-3">Activity</h2>
+                  <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
+                    {[
+                      { label: 'Total Users', value: stats?.total_users ?? 0, color: 'text-white', Icon: Users },
+                      { label: 'Active Today', value: stats?.active_today ?? 0, color: 'text-emerald-400', Icon: Zap },
+                      { label: 'Logins Today', value: stats?.logins_today ?? 0, color: 'text-cyan-400', Icon: LogOut },
+                      { label: 'Signups 30d', value: stats?.signups_this_month ?? 0, color: 'text-purple-400', Icon: Sparkles },
+                      { label: 'Conversations', value: stats?.total_conversations ?? 0, color: 'text-indigo-400', Icon: MessageCircle },
+                      { label: 'Messages', value: stats?.total_messages ?? 0, color: 'text-blue-400', Icon: Send },
+                    ].map(({ label, value, color, Icon }, i) => (
+                      <div key={i} className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] transition-colors">
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <Icon size={10} className="text-gray-600" />
+                          <p className="text-[10px] text-gray-500 uppercase tracking-wider">{label}</p>
+                        </div>
+                        <p className={`text-2xl font-bold tracking-tight ${color}`}>{Number(value).toLocaleString()}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Risk signals */}
+                <div>
+                  <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold mb-3">Risk &amp; Trust</h2>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    {[
+                      { label: 'Banned Users', value: stats?.banned_users ?? 0, color: 'text-red-400', Icon: AlertTriangle },
+                      { label: 'Revoked Keys', value: stats?.revoked_licenses ?? 0, color: 'text-orange-400', Icon: Lock },
+                      { label: 'Failed Logins (24h)', value: stats?.failed_logins_today ?? 0, color: 'text-pink-400', Icon: Shield },
+                      { label: 'Active Devices', value: stats?.total_devices ?? 0, color: 'text-amber-400', Icon: Monitor },
+                    ].map(({ label, value, color, Icon }, i) => (
+                      <div key={i} className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02]">
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <Icon size={10} className="text-gray-600" />
+                          <p className="text-[10px] text-gray-500 uppercase tracking-wider">{label}</p>
+                        </div>
+                        <p className={`text-2xl font-bold tracking-tight ${color}`}>{Number(value).toLocaleString()}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Secondary quick actions */}
                 <div className="grid md:grid-cols-3 gap-4">
-                  {/* Revoke License */}
                   <div className="p-5 rounded-xl border border-white/[0.06] bg-white/[0.02]">
-                    <h4 className="text-sm font-semibold text-white mb-2">Revoke License</h4>
+                    <div className="flex items-center gap-2 mb-2"><Lock size={14} className="text-red-400" /><h4 className="text-sm font-semibold text-white">Revoke License</h4></div>
                     <p className="text-xs text-gray-500 mb-3">Invalidate a license key</p>
                     <div className="flex gap-2">
                       <input value={revokeKey} onChange={e => setRevokeKey(e.target.value)} placeholder="MNC-..." className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none focus:border-red-500/50" />
-                      <button onClick={handleRevoke} disabled={actionLoading} className="px-4 py-2 rounded-lg bg-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/30 transition-all border border-red-500/20 disabled:opacity-50">
-                        Revoke
-                      </button>
+                      <button onClick={handleRevoke} disabled={actionLoading} className="px-4 py-2 rounded-lg bg-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/30 transition-all border border-red-500/20 disabled:opacity-50">Revoke</button>
                     </div>
                   </div>
-
-                  {/* Kill Version */}
                   <div className="p-5 rounded-xl border border-white/[0.06] bg-white/[0.02]">
-                    <h4 className="text-sm font-semibold text-white mb-2">Kill App Version</h4>
+                    <div className="flex items-center gap-2 mb-2"><AlertTriangle size={14} className="text-amber-400" /><h4 className="text-sm font-semibold text-white">Kill App Version</h4></div>
                     <p className="text-xs text-gray-500 mb-3">Force-expire old app versions</p>
                     <div className="flex gap-2">
                       <input value={killVersion} onChange={e => setKillVersion(e.target.value)} placeholder="e.g. 2.1.0" className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none focus:border-amber-500/50" />
-                      <button onClick={handleKillVersion} disabled={actionLoading} className="px-4 py-2 rounded-lg bg-amber-500/20 text-amber-400 text-xs font-semibold hover:bg-amber-500/30 transition-all border border-amber-500/20 disabled:opacity-50">
-                        Set
-                      </button>
+                      <button onClick={handleKillVersion} disabled={actionLoading} className="px-4 py-2 rounded-lg bg-amber-500/20 text-amber-400 text-xs font-semibold hover:bg-amber-500/30 transition-all border border-amber-500/20 disabled:opacity-50">Set</button>
                     </div>
                   </div>
-
-                  {/* User Search */}
                   <div className="p-5 rounded-xl border border-white/[0.06] bg-white/[0.02]">
-                    <h4 className="text-sm font-semibold text-white mb-2">User Lookup</h4>
-                    <p className="text-xs text-gray-500 mb-3">Search by email</p>
-                    <div className="flex gap-2">
-                      <input value={searchEmail} onChange={e => setSearchEmail(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSearch()} placeholder="user@email.com" className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none focus:border-blue-500/50" />
-                      <button onClick={handleSearch} disabled={actionLoading} className="px-4 py-2 rounded-lg bg-blue-500/20 text-blue-400 text-xs font-semibold hover:bg-blue-500/30 transition-all border border-blue-500/20 disabled:opacity-50">
-                        Search
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Search Result */}
-                {searchResult && (
-                  <div className="p-5 rounded-xl border border-blue-500/20 bg-blue-500/[0.04]">
-                    <div className="flex items-center justify-between mb-3">
-                      <h4 className="text-sm font-bold text-white">User Found</h4>
-                      <button onClick={() => setSearchResult(null)} className="text-gray-500 hover:text-white"><X size={14} /></button>
-                    </div>
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-                      <div><span className="text-gray-500">Email:</span> <span className="text-white font-medium">{searchResult.user.email}</span></div>
-                      <div><span className="text-gray-500">Name:</span> <span className="text-white">{searchResult.user.name}</span></div>
-                      <div><span className="text-gray-500">Tier:</span> <span className={searchResult.user.tier === 'pro' ? 'text-blue-400 font-bold' : 'text-gray-400'}>{searchResult.user.tier.toUpperCase()}</span></div>
-                      <div><span className="text-gray-500">Country:</span> <span className="text-white">{searchResult.user.country_code}</span></div>
-                      <div><span className="text-gray-500">Created:</span> <span className="text-white">{fmtDate(searchResult.user.created_at)}</span></div>
-                      <div><span className="text-gray-500">Last Login:</span> <span className="text-white">{fmtDate(searchResult.user.last_login_at)}</span></div>
-                      <div><span className="text-gray-500">License:</span> <span className="text-white font-mono text-[10px]">{searchResult.license?.key || '—'}</span></div>
-                      <div><span className="text-gray-500">Devices:</span> <span className="text-white">{searchResult.devices?.length || 0}</span></div>
-                      <div><span className="text-gray-500">Sessions:</span> <span className="text-white">{searchResult.license?.sessions_used ?? 0}/{searchResult.license?.sessions_limit === -1 ? '∞' : searchResult.license?.sessions_limit}</span></div>
-                      <div><span className="text-gray-500">Status:</span> <span className={`font-medium ${searchResult.license?.status === 'active' ? 'text-green-400' : searchResult.license?.status === 'revoked' ? 'text-red-400' : 'text-amber-400'}`}>{searchResult.license?.status || '—'}</span></div>
-                      <div><span className="text-gray-500">Banned:</span> <span className={searchResult.user.is_banned ? 'text-red-400 font-bold' : 'text-green-400'}>{searchResult.user.is_banned ? 'YES' : 'No'}</span></div>
-                    </div>
-                    <div className="flex gap-2 mt-4">
-                      {!searchResult.user.is_banned && (
-                        <button onClick={() => handleBan(searchResult.user.email)} className="px-3 py-1.5 rounded-lg bg-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/30 border border-red-500/20">Ban User</button>
-                      )}
-                      {searchResult.user.tier !== 'pro' && (
-                        <button onClick={() => handleUpgrade(searchResult.user.email)} className="px-3 py-1.5 rounded-lg bg-blue-500/20 text-blue-400 text-xs font-semibold hover:bg-blue-500/30 border border-blue-500/20">Upgrade to Pro</button>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {/* Server status */}
-                <div className="p-4 rounded-xl border border-white/[0.06] bg-white/[0.02]">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                      <span className="text-xs text-gray-400">Server Online</span>
-                    </div>
-                    <span className="text-[10px] text-gray-600">minicaai.com &middot; v{licenseService.getAppVersion()}</span>
+                    <div className="flex items-center gap-2 mb-2"><div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" /><h4 className="text-sm font-semibold text-white">Server</h4></div>
+                    <p className="text-xs text-emerald-400 font-medium mb-0.5">Online</p>
+                    <p className="text-[10px] text-gray-600">minicaai.com · v{licenseService.getAppVersion()}</p>
                   </div>
                 </div>
               </div>
@@ -433,10 +769,21 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
             {/* ── USERS TAB ── */}
             {adminTab === 'users' && (
               <div className="space-y-6">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between flex-wrap gap-3">
                   <div>
                     <h1 className="text-2xl font-bold mb-1">All Users</h1>
                     <p className="text-gray-500 text-sm">{users.length} registered users</p>
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px]">
+                    {TIERS.map(t => {
+                      const c = users.filter(u => u.tier === t).length;
+                      const th = TIER_THEME[t];
+                      return (
+                        <span key={t} className={`px-2 py-1 rounded border ${th.border} ${th.bg} ${th.text} font-semibold`}>
+                          {t.toUpperCase()} · {c}
+                        </span>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -449,7 +796,6 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Name</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Tier</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Country</th>
-                          <th className="text-left px-4 py-3 text-gray-500 font-medium">License</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Sessions</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Devices</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Created</th>
@@ -462,34 +808,24 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                           <tr key={u.id || i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
                             <td className="px-4 py-3 text-white font-medium">{u.email}</td>
                             <td className="px-4 py-3 text-gray-400">{u.name || '—'}</td>
-                            <td className="px-4 py-3">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${u.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : 'bg-gray-500/20 text-gray-400'}`}>
-                                {u.tier}
-                              </span>
-                            </td>
+                            <td className="px-4 py-3"><TierBadge tier={u.tier} /></td>
                             <td className="px-4 py-3 text-gray-400">{u.country_code || '—'}</td>
-                            <td className="px-4 py-3 font-mono text-[10px] text-gray-500">{u.license?.key?.slice(0, 12) || '—'}...</td>
-                            <td className="px-4 py-3 text-gray-400">{u.license?.sessions_used ?? 0}/{u.license?.sessions_limit === -1 ? '∞' : u.license?.sessions_limit ?? 5}</td>
+                            <td className="px-4 py-3 text-gray-400">{u.license?.sessions_used ?? 0}/{u.license?.sessions_limit === -1 ? '∞' : (u.license?.sessions_limit ?? 5)}</td>
                             <td className="px-4 py-3 text-gray-400">{u.device_count ?? 0}</td>
-                            <td className="px-4 py-3 text-gray-500">{fmtDate(u.created_at)}</td>
+                            <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{fmtDate(u.created_at)}</td>
                             <td className="px-4 py-3">
                               {u.is_banned ? (
                                 <span className="text-red-400 font-bold text-[10px]">BANNED</span>
                               ) : (
-                                <span className={`text-[10px] font-medium ${u.license?.status === 'active' ? 'text-green-400' : u.license?.status === 'trial' ? 'text-amber-400' : 'text-gray-500'}`}>
+                                <span className={`text-[10px] font-medium ${u.license?.status === 'active' ? 'text-emerald-400' : u.license?.status === 'trial' ? 'text-amber-400' : 'text-gray-500'}`}>
                                   {u.license?.status?.toUpperCase() || 'NONE'}
                                 </span>
                               )}
                             </td>
                             <td className="px-4 py-3">
-                              <div className="flex gap-1">
-                                {!u.is_banned && (
-                                  <button onClick={() => handleBan(u.email)} className="px-2 py-1 rounded text-[10px] bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-all" title="Ban">Ban</button>
-                                )}
-                                {u.tier !== 'pro' && !u.is_banned && (
-                                  <button onClick={() => handleUpgrade(u.email)} className="px-2 py-1 rounded text-[10px] bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-all" title="Upgrade">Pro</button>
-                                )}
-                              </div>
+                              <button onClick={() => openUserInPanel(u.email)} className="px-2.5 py-1 rounded text-[10px] font-semibold bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 border border-blue-500/20 transition-all">
+                                Manage
+                              </button>
                             </td>
                           </tr>
                         ))}
@@ -534,7 +870,7 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                             <td className="px-4 py-3 text-gray-400">{log.country_code || '—'}</td>
                             <td className="px-4 py-3 text-gray-500 font-mono text-[10px] max-w-[120px] truncate">{log.device_id?.slice(0, 10) || '—'}</td>
                             <td className="px-4 py-3">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${log.success ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${log.success ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
                                 {log.success ? 'OK' : 'FAIL'}
                               </span>
                             </td>
@@ -550,9 +886,121 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                 </div>
               </div>
             )}
+
+            {/* ── AUDIT TAB ── */}
+            {adminTab === 'audit' && (
+              <div className="space-y-6">
+                <div>
+                  <h1 className="text-2xl font-bold mb-1">Audit Log</h1>
+                  <p className="text-gray-500 text-sm">Every admin mutation, timestamped. Last 200 entries.</p>
+                </div>
+
+                <div className="border border-white/[0.06] rounded-xl overflow-hidden">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-white/[0.06] bg-white/[0.02]">
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Time</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Admin</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Action</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Target</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Details</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {auditLog.map((row: any, i: number) => {
+                          let details = '';
+                          if (row.details_json) {
+                            try { details = JSON.stringify(JSON.parse(row.details_json)); }
+                            catch { details = row.details_json; }
+                          }
+                          const actionColor =
+                            row.action === 'ban' ? 'bg-red-500/20 text-red-400' :
+                            row.action === 'unban' ? 'bg-emerald-500/20 text-emerald-400' :
+                            row.action === 'change-tier' ? 'bg-indigo-500/20 text-indigo-400' :
+                            row.action === 'grant-credits' ? 'bg-cyan-500/20 text-cyan-400' :
+                            row.action === 'extend-expiry' ? 'bg-blue-500/20 text-blue-400' :
+                            row.action === 'reset-devices' ? 'bg-amber-500/20 text-amber-400' :
+                            row.action === 'force-logout' ? 'bg-orange-500/20 text-orange-400' :
+                            'bg-white/[0.06] text-gray-400';
+                          return (
+                            <tr key={row.id || i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
+                              <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{fmtDate(row.created_at)}</td>
+                              <td className="px-4 py-3 text-white font-medium">{row.admin_email}</td>
+                              <td className="px-4 py-3">
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${actionColor}`}>{row.action}</span>
+                              </td>
+                              <td className="px-4 py-3 text-gray-300">{row.target_email || '—'}</td>
+                              <td className="px-4 py-3 text-gray-500 font-mono text-[10px] max-w-[320px] truncate" aria-label={details}>{details || '—'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  {auditLog.length === 0 && (
+                    <div className="text-center py-12 text-gray-600 text-sm">No audit entries yet — mutations you make will appear here</div>
+                  )}
+                </div>
+              </div>
+            )}
           </>
         )}
       </div>
+
+      {confirmDialog && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-dialog-title"
+          onClick={() => setConfirmDialog(null)}
+        >
+          <div
+            className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-white/[0.08] shadow-2xl p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className={`shrink-0 p-2 rounded-lg ${confirmDialog.danger ? 'bg-red-500/15 text-red-400' : 'bg-amber-500/15 text-amber-400'}`}>
+                <AlertTriangle size={18} />
+              </div>
+              <div className="flex-1">
+                <h3 id="confirm-dialog-title" className="text-base font-semibold text-white">{confirmDialog.title}</h3>
+                <p className="mt-1.5 text-sm text-gray-400 leading-relaxed">{confirmDialog.body}</p>
+              </div>
+              <button
+                onClick={() => setConfirmDialog(null)}
+                aria-label="Cancel"
+                className="shrink-0 p-1 rounded-md text-gray-500 hover:text-white hover:bg-white/[0.06] transition-colors"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setConfirmDialog(null)}
+                className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  const d = confirmDialog;
+                  setConfirmDialog(null);
+                  d.onConfirm();
+                }}
+                className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all ${
+                  confirmDialog.danger
+                    ? 'bg-red-500/20 text-red-200 hover:bg-red-500/30 border border-red-500/30'
+                    : 'bg-amber-500/20 text-amber-200 hover:bg-amber-500/30 border border-amber-500/30'
+                }`}
+              >
+                {confirmDialog.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -585,12 +1033,84 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   const [selectedProUpgrade, setSelectedProUpgrade] = useState(false);
   const [paymentLoading, setPaymentLoading] = useState(false);
   const [paymentError, setPaymentError] = useState<string | null>(null);
+  // Which tier the user clicked on the pricing card. Persisted across
+  // signup → checkout transitions (otherwise a non-authenticated user
+  // clicking Max would sign up and then get routed through a Pro checkout).
+  const [pendingCheckoutTier, setPendingCheckoutTier] = useState<'basic' | 'pro' | 'max'>('pro');
+  // Flips true after handleSignup resolves so the /download view can show
+  // a first-time welcome banner to Starter users. Cleared when the banner
+  // is dismissed or a successful payment replaces it.
+  const [justSignedUp, setJustSignedUp] = useState(false);
+  // Success banner — replaces native alert() after Razorpay verify. Native
+  // alerts paint outside Electron's setContentProtection and leak on screen
+  // share. Self-clears after 6s; tier chip flips to <Tier> Active independently.
+  const [paymentSuccess, setPaymentSuccess] = useState<string | null>(null);
+  const paymentSuccessTimerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (paymentSuccessTimerRef.current !== null) {
+      window.clearTimeout(paymentSuccessTimerRef.current);
+    }
+  }, []);
+  const surfacePaymentSuccess = (msg: string) => {
+    setPaymentSuccess(msg);
+    if (paymentSuccessTimerRef.current !== null) window.clearTimeout(paymentSuccessTimerRef.current);
+    paymentSuccessTimerRef.current = window.setTimeout(() => {
+      paymentSuccessTimerRef.current = null;
+      setPaymentSuccess(null);
+    }, 6000);
+  };
+
+  // Tier-aware welcome copy. Called from both providers so the message
+  // matches the tier the user actually paid for, not a hardcoded "Pro".
+  const welcomeForTier = (tier: string | undefined | null): string => {
+    switch (tier) {
+      case 'basic':
+        return 'Payment successful — 3 interview credits unlocked (valid 14 days).';
+      case 'pro':
+        return 'Payment successful — Pro activated. Unlimited sessions and all models unlocked.';
+      case 'max':
+        return 'Payment successful — Max activated. Auto-Type plus everything in Pro is now live.';
+      default:
+        return 'Payment successful — your plan is active.';
+    }
+  };
+
+  // Renewal (Basic +1 credit / +1 hour) gets its own banner — saying
+  // "3 credits unlocked (14 days)" after a $6.99 renewal would be a lie.
+  const welcomeForRenewal = (): string =>
+    'Renewal successful — 1 extra interview unlocked (1 hour added to your plan).';
+
+  // "Expires in N days" / "Expires today" / "Expired" subtitle for the
+  // Basic tier chip. Returns null for unlimited (Pro/Max, expires_at=-1)
+  // or missing values.
+  const basicExpiryLabel = (expiresAt: number | undefined | null): string | null => {
+    if (!expiresAt || expiresAt === -1) return null;
+    const msLeft = expiresAt - Date.now();
+    if (msLeft <= 0) return 'Expired — renew to continue';
+    const daysLeft = Math.floor(msLeft / (24 * 60 * 60 * 1000));
+    const hoursLeft = Math.floor(msLeft / (60 * 60 * 1000));
+    if (daysLeft >= 2) return `Expires in ${daysLeft} days`;
+    if (daysLeft === 1) return 'Expires in 1 day';
+    if (hoursLeft >= 2) return `Expires in ${hoursLeft} hours`;
+    if (hoursLeft === 1) return 'Expires in 1 hour';
+    return 'Expires in under 1 hour';
+  };
 
   // Support chat state
   const [chatMessages, setChatMessages] = useState<Array<{ from: 'user' | 'agent'; text: string; time: string }>>([]);
   const [chatInput, setChatInput] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatWsRef = useRef<WebSocket | null>(null);
+
+  // Tracks whether the gate is still mounted. Guards async callbacks (the
+  // Google-OAuth poll in particular) from calling setState after unmount,
+  // which leaks React warnings and — more importantly — would let a stale
+  // poll write user/license state into a torn-down component.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   // ── Initialize ──
   useEffect(() => {
@@ -607,8 +1127,8 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             if (validated && licenseService.isLicenseValid(validated)) {
               onAuthenticated(saved.user, validated);
               return;
-            } else if (saved.license.tier === 'pro') {
-              // Pro users must validate — lock them out
+            } else if (saved.license.tier === 'pro' || saved.license.tier === 'max') {
+              // Paid users must validate — lock them out
               licenseService.logout();
               setIsLoading(false);
               return;
@@ -665,16 +1185,33 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       if (urlParams.get('payment') === 'success') {
         const saved = licenseService.loadAuth();
         if (saved.user) {
-          // Revalidate with server to get updated tier
+          // Revalidate with server to get updated tier. The webhook may not
+          // have landed yet when the user returns from Stripe — fall back to
+          // the tier hint we stamped in the success_url so the banner copy
+          // still matches what they paid for.
           const validated = await licenseService.validateWithServer();
+          const urlTierHint = urlParams.get('tier');
+          // `mode=renewal` is stamped on the success URL by /create-renewal.
+          // Renewal banners don't advertise "3 credits / 14 days" — they
+          // say "1 extra interview / 1 hour" instead.
+          const isRenewal = urlParams.get('mode') === 'renewal';
+          let bannerTier: string | undefined;
           if (validated) {
             setCurrentUser(saved.user);
             setCurrentLicense(validated);
             licenseService.saveAuth({ ...saved.user, tier: validated.tier as any }, validated);
+            // Prefer the server tier; if it's still 'free' (webhook lag),
+            // optimistically use the URL hint.
+            bannerTier = (validated.tier && validated.tier !== 'free')
+              ? validated.tier
+              : (urlTierHint || validated.tier);
           } else {
             setCurrentUser(saved.user);
             setCurrentLicense(saved.license!);
+            bannerTier = urlTierHint || saved.license?.tier;
           }
+          setJustSignedUp(false);
+          surfacePaymentSuccess(isRenewal ? welcomeForRenewal() : welcomeForTier(bannerTier));
           setView('download');
           // Clean up URL
           window.history.replaceState({}, '', window.location.pathname);
@@ -701,15 +1238,19 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
       setCurrentUser(user);
       setCurrentLicense(license);
+      setJustSignedUp(true);
 
       if (isElectron) {
         // In Electron, go straight to app
         onAuthenticated(user, license);
       } else if (selectedProUpgrade) {
-        // User selected Pro plan — go to checkout
+        // User selected a paid plan on the pricing page — go to checkout
+        // with the tier they chose (Basic/Pro/Max). Falls back to Pro if
+        // no selection was persisted (shouldn't happen in practice).
         setSelectedProUpgrade(false);
+        const tier = pendingCheckoutTier;
         // Small delay to let state settle, then initiate checkout
-        setTimeout(() => initiateCheckout(), 300);
+        setTimeout(() => initiateCheckout(tier), 300);
         setView('download');
       } else {
         // In browser, show download page
@@ -781,9 +1322,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       setSelectedProUpgrade(false);
       setView('signup');
     } else {
-      // Pro — if already logged in, go straight to checkout
+      // Paid plan — remember the choice so it survives the signup detour
+      // for not-yet-authenticated users. If already logged in, checkout
+      // immediately with the chosen tier.
+      setPendingCheckoutTier(tier.id);
       if (currentUser) {
-        initiateCheckout();
+        initiateCheckout(tier.id);
       } else {
         setSelectedProUpgrade(true);
         setView('signup');
@@ -792,7 +1336,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   };
 
   // ── Initiate payment checkout (Stripe or Razorpay based on geo) ──
-  const initiateCheckout = async () => {
+  const initiateCheckout = async (tier: 'basic' | 'pro' | 'max' = pendingCheckoutTier) => {
     setPaymentLoading(true);
     setPaymentError(null);
 
@@ -803,20 +1347,37 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         await new Promise(r => setTimeout(r, 500));
         token = licenseService.getToken();
       }
-      if (!token) throw new Error('Please sign in first to upgrade to Pro');
+      if (!token) throw new Error('Please sign in first to continue checkout');
 
       const countryCode = geo?.country_code || 'US';
-      const response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-checkout', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({ country_code: countryCode }),
-      });
+      // 30s abort — Railway cold-starts can take 10-15s; past that the user
+      // has typically already given up and clicked again. Without this the
+      // button spins forever on a stalled socket and users report the app
+      // as "stuck".
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 30000);
+      let response: Response;
+      try {
+        response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-checkout', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({ country_code: countryCode, tier }),
+          signal: controller.signal,
+        });
+      } catch (fetchErr: any) {
+        if (fetchErr?.name === 'AbortError') {
+          throw new Error('Request timed out. Please check your connection and try again.');
+        }
+        throw fetchErr;
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
 
       if (!response.ok) {
-        const err = await response.json();
+        const err = await response.json().catch(() => ({}));
         throw new Error(err.error || 'Failed to create checkout');
       }
 
@@ -836,22 +1397,124 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     }
   };
 
+  // ── Basic-tier renewal (+1 interview, +1 hour) ──────────────────────
+  // Separate from initiateCheckout because the backend routes it to
+  // /create-renewal and grants only a top-up (not a fresh 3/14-day
+  // Basic grant). openRazorpayCheckout reads checkoutData.mode and
+  // /verify-razorpay reads the stamped notes.mode to pick the right
+  // success copy on both ends.
+  const initiateRenewal = async () => {
+    setPaymentLoading(true);
+    setPaymentError(null);
+    try {
+      let token = licenseService.getToken();
+      if (!token) {
+        await new Promise(r => setTimeout(r, 500));
+        token = licenseService.getToken();
+      }
+      if (!token) throw new Error('Please sign in first to continue renewal');
+
+      const countryCode = geo?.country_code || 'US';
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 30000);
+      let response: Response;
+      try {
+        response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-renewal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          body: JSON.stringify({ country_code: countryCode }),
+          signal: controller.signal,
+        });
+      } catch (fetchErr: any) {
+        if (fetchErr?.name === 'AbortError') {
+          throw new Error('Request timed out. Please check your connection and try again.');
+        }
+        throw fetchErr;
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.error || 'Failed to start renewal');
+      }
+      const data = await response.json();
+
+      if (data.provider === 'stripe') {
+        window.location.href = data.checkout_url;
+      } else if (data.provider === 'razorpay') {
+        await openRazorpayCheckout(data);
+      }
+    } catch (err: any) {
+      setPaymentError(err.message || 'Renewal failed');
+    } finally {
+      setPaymentLoading(false);
+    }
+  };
+
+  // ── Stripe Customer Portal (manage/cancel for Pro/Max) ──────────────
+  // Opens Stripe's hosted billing portal in a new tab. If the user has
+  // no Stripe customer on file (e.g. paid via Razorpay, or the webhook
+  // hasn't reconciled yet) the server returns 404 and we surface a
+  // clear message instead of an opaque spinner.
+  const handleManageSubscription = async () => {
+    setPaymentLoading(true);
+    setPaymentError(null);
+    try {
+      const token = licenseService.getToken();
+      if (!token) throw new Error('Please sign in first');
+      const res = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/portal', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'Could not open the billing portal');
+      }
+      const { portal_url } = await res.json();
+      if (portal_url) window.open(portal_url, '_blank', 'noopener');
+      else throw new Error('Billing portal URL missing from server response');
+    } catch (err: any) {
+      setPaymentError(err.message || 'Failed to open billing portal');
+    } finally {
+      setPaymentLoading(false);
+    }
+  };
+
+  // ── Razorpay self-cancel (for India Pro/Max users) ──────────────────
+  // Razorpay has no Customer Portal equivalent. This endpoint looks up
+  // the user's most recent Razorpay subscription and cancels it at the
+  // end of the current billing cycle (user keeps full access until then).
+  // Wrapped in a confirm so a misclick doesn't kill an active sub.
+  const [cancelConfirm, setCancelConfirm] = useState(false);
+  const handleCancelSubscription = async () => {
+    setCancelConfirm(false);
+    setPaymentLoading(true);
+    setPaymentError(null);
+    try {
+      const token = licenseService.getToken();
+      if (!token) throw new Error('Please sign in first');
+      const res = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/cancel-razorpay', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'Could not cancel subscription');
+      }
+      const data = await res.json();
+      surfacePaymentSuccess(data.message || 'Subscription cancellation scheduled for end of cycle.');
+    } catch (err: any) {
+      setPaymentError(err.message || 'Failed to cancel subscription');
+    } finally {
+      setPaymentLoading(false);
+    }
+  };
+
   // ── Razorpay inline checkout ──
   const openRazorpayCheckout = async (checkoutData: any) => {
     return new Promise<void>((resolve, reject) => {
-      // Load Razorpay script if not already loaded
-      const loadScript = (): Promise<void> => {
-        if ((window as any).Razorpay) return Promise.resolve();
-        return new Promise((res, rej) => {
-          const script = document.createElement('script');
-          script.src = 'https://checkout.razorpay.com/v1/checkout.js';
-          script.onload = () => res();
-          script.onerror = () => rej(new Error('Failed to load Razorpay SDK'));
-          document.body.appendChild(script);
-        });
-      };
-
-      loadScript().then(() => {
+      loadRazorpayScript().then(() => {
         const options: any = {
           key: checkoutData.key_id,
           amount: checkoutData.amount,
@@ -888,18 +1551,45 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
               const verifyData = await verifyRes.json();
 
+              // Resolve the tier the server actually granted. Prefer the
+              // server's authoritative response (verifyData.tier) over the
+              // tier the user clicked — they might differ if the server
+              // fell back to a default, and the UI must reflect reality.
+              const grantedTier = (verifyData.tier
+                || verifyData.license?.tier
+                || checkoutData.tier
+                || 'pro') as 'basic' | 'pro' | 'max';
+
+              // Renewal (+1/+1h) vs. fresh tier grant. Server stamps mode
+              // on both /create-renewal (checkoutData.mode) and the verify
+              // response (verifyData.mode) so either can flag it — prefer
+              // the verify response since it's the authoritative record
+              // of what was actually granted.
+              const isRenewal = (verifyData.mode || checkoutData.mode) === 'renewal';
+
               // Update local state
               if (currentUser) {
-                const updatedUser = { ...currentUser, tier: 'pro' as const };
+                const updatedUser = { ...currentUser, tier: grantedTier };
                 setCurrentUser(updatedUser);
-                if (verifyData.license) {
-                  setCurrentLicense(verifyData.license);
+                // Prefer the server's authoritative license. If the server
+                // didn't echo one back, patch the cached license with the
+                // new tier so getEffectiveTier() doesn't snap the user back
+                // to Free on next app load (it reads license.tier, not
+                // user.tier — a stale 'free' there would silently undo the
+                // upgrade the moment the app restarts).
+                const newLicense = verifyData.license
+                  || (currentLicense
+                        ? { ...currentLicense, tier: grantedTier, status: 'active' as const }
+                        : null);
+                if (newLicense) {
+                  setCurrentLicense(newLicense);
+                  licenseService.saveAuth(updatedUser, newLicense);
                 }
-                licenseService.saveAuth(updatedUser, verifyData.license || currentLicense!);
               }
 
               setPaymentError(null);
-              alert('Payment successful! Your account has been upgraded to Pro.');
+              setJustSignedUp(false);
+              surfacePaymentSuccess(isRenewal ? welcomeForRenewal() : welcomeForTier(grantedTier));
               resolve();
             } catch (err: any) {
               setPaymentError(err.message);
@@ -985,10 +1675,16 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       const pollInterval = 2000;
 
       const poll = async (): Promise<void> => {
+        // Abort if the gate unmounted between polls (user navigated away
+        // or auth completed on another code path). Saved auth from the
+        // server is already persisted by /poll handler's saveAuth above,
+        // so dropping this poll does not lose data.
+        if (!mountedRef.current) return;
         attempts++;
         try {
           const res = await fetch(`${serverUrl}/api/v1/auth/google/poll?session_id=${sessionId}`);
           const data = await res.json();
+          if (!mountedRef.current) return;
 
           if (data.status === 'success') {
             // Save auth data
@@ -1022,14 +1718,17 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           // Still pending
           if (attempts < maxAttempts) {
             await new Promise(r => setTimeout(r, pollInterval));
+            if (!mountedRef.current) return;
             return poll();
           } else {
             setAuthError('Sign-in timed out. Please try again.');
             setIsSubmitting(false);
           }
         } catch {
+          if (!mountedRef.current) return;
           if (attempts < maxAttempts) {
             await new Promise(r => setTimeout(r, pollInterval));
+            if (!mountedRef.current) return;
             return poll();
           }
           setAuthError('Connection error. Please try again.');
@@ -1175,7 +1874,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             {currentUser && (
               <>
                 <span className="text-xs text-gray-500">{currentUser.email}</span>
-                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${currentLicense?.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : 'bg-gray-500/20 text-gray-400'}`}>
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${currentLicense?.tier === 'max' ? 'bg-amber-500/20 text-amber-400' : currentLicense?.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : currentLicense?.tier === 'basic' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-500/20 text-gray-400'}`}>
                   {currentLicense?.tier || 'free'}
                 </span>
                 {licenseService.isDeveloper(currentUser.email) && (
@@ -1183,7 +1882,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                     Admin
                   </button>
                 )}
-                <button onClick={handleLogout} className="p-2 text-gray-500 hover:text-red-400 transition-colors" title="Logout">
+                <button onClick={handleLogout} className="p-2 text-gray-500 hover:text-red-400 transition-colors" aria-label="Logout">
                   <LogOut size={16} />
                 </button>
               </>
@@ -1205,6 +1904,31 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             <AlertTriangle size={12} />
             The web version is not available. Please download the desktop app.
           </div>
+
+          {/* First-time welcome for Starter/Free users. Cleared as soon as
+              the user upgrades — a paid success banner replaces it. */}
+          {justSignedUp && (!currentLicense || currentLicense.tier === 'free') && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="max-w-md mx-auto mb-6 flex items-start gap-3 px-4 py-3 rounded-xl bg-blue-500/10 border border-blue-500/30 text-blue-200 text-sm text-left"
+            >
+              <Sparkles size={14} className="mt-0.5 shrink-0 text-blue-400" />
+              <div className="flex-1">
+                <div className="font-semibold">Welcome to minicaai.</div>
+                <div className="text-xs text-blue-300/80 mt-0.5 leading-relaxed">
+                  Your 30-minute free trial is running. Download the desktop app to start your first session.
+                </div>
+              </div>
+              <button
+                onClick={() => setJustSignedUp(false)}
+                aria-label="Dismiss"
+                className="shrink-0 text-blue-400/60 hover:text-blue-200 transition-colors"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
 
           {/* Download buttons */}
           <div className="space-y-3 max-w-md mx-auto mb-12">
@@ -1277,25 +2001,148 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             </div>
           )}
 
-          <div className="flex items-center justify-center gap-4">
+          {paymentSuccess && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="max-w-md mx-auto mb-6 flex items-center gap-2 px-4 py-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-sm"
+            >
+              <Check size={14} /> {paymentSuccess}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center justify-center gap-4">
             <button onClick={() => setView('tutorials')} className="px-6 py-2.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-sm font-medium transition-all flex items-center gap-2">
               <BookOpen size={14} /> View Tutorials
             </button>
-            {currentLicense?.tier !== 'pro' ? (
+            {currentLicense?.tier === 'max' || currentLicense?.tier === 'pro' ? (
+              <>
+                {currentLicense.tier === 'max' ? (
+                  <div className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-amber-500/10 to-purple-500/10 border border-amber-500/30 text-amber-400 text-sm font-semibold flex items-center gap-2">
+                    <Crown size={14} /> Max Active
+                  </div>
+                ) : (
+                  <div className="px-6 py-2.5 rounded-xl bg-green-500/10 border border-green-500/20 text-green-400 text-sm font-semibold flex items-center gap-2">
+                    <Check size={14} /> Pro Active
+                  </div>
+                )}
+                {/* Manage subscription — Stripe Customer Portal opens in a
+                    new tab. Shown for non-India users; India Pro/Max sees
+                    the Cancel button below since Razorpay has no portal. */}
+                {geo?.country_code !== 'IN' && (
+                  <button
+                    onClick={handleManageSubscription}
+                    disabled={paymentLoading}
+                    className="px-4 py-2.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-sm font-medium transition-all flex items-center gap-2 disabled:opacity-50"
+                    aria-label="Manage subscription (opens billing portal)"
+                  >
+                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Settings size={14} />}
+                    Manage subscription <ExternalLink size={12} className="opacity-60" />
+                  </button>
+                )}
+                {geo?.country_code === 'IN' && (
+                  <button
+                    onClick={() => setCancelConfirm(true)}
+                    disabled={paymentLoading}
+                    className="px-4 py-2.5 rounded-xl bg-white/[0.04] hover:bg-red-500/10 hover:border-red-500/30 border border-white/[0.08] text-sm font-medium transition-all flex items-center gap-2 disabled:opacity-50 text-gray-400 hover:text-red-300"
+                    aria-label="Cancel subscription"
+                  >
+                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <XCircle size={14} />}
+                    Cancel subscription
+                  </button>
+                )}
+              </>
+            ) : currentLicense?.tier === 'basic' ? (
+              <>
+                <div className="flex flex-col items-center gap-1.5">
+                  <div className="px-6 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-sm font-semibold flex items-center gap-2">
+                    <Sparkles size={14} /> Basic Active
+                  </div>
+                  {/* Surface the 14-day expiry so Basic users aren't
+                      surprised when their plan lapses silently. */}
+                  {basicExpiryLabel(currentLicense.expires_at) && (
+                    <div className={`flex items-center gap-1 text-[11px] ${
+                      (currentLicense.expires_at ?? 0) - Date.now() <= 0
+                        ? 'text-red-400'
+                        : (currentLicense.expires_at ?? 0) - Date.now() < 2 * 24 * 60 * 60 * 1000
+                          ? 'text-amber-400'
+                          : 'text-gray-400'
+                    }`}>
+                      <Clock size={10} />
+                      {basicExpiryLabel(currentLicense.expires_at)}
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={initiateRenewal}
+                  disabled={paymentLoading}
+                  className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center gap-2 disabled:opacity-50"
+                  aria-label="Renew +1 interview (1 hour)"
+                >
+                  {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+                  {(() => {
+                    const r = pricingService.getBasicRenewalPrice(geo?.country_code || 'US');
+                    return `Renew +1h · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
+                  })()}
+                </button>
+              </>
+            ) : (
               <button
-                onClick={initiateCheckout}
+                onClick={() => initiateCheckout('pro')}
                 disabled={paymentLoading}
                 className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-400 hover:to-purple-400 text-white text-sm font-semibold transition-all shadow-lg shadow-blue-500/20 flex items-center gap-2 disabled:opacity-50"
               >
                 {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Crown size={14} />}
                 Upgrade to Pro
               </button>
-            ) : (
-              <div className="px-6 py-2.5 rounded-xl bg-green-500/10 border border-green-500/20 text-green-400 text-sm font-semibold flex items-center gap-2">
-                <Check size={14} /> Pro Active
-              </div>
             )}
           </div>
+
+          {/* Cancel-subscription confirm (Razorpay/India only) */}
+          {cancelConfirm && (
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="cancel-sub-title"
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+              onClick={() => setCancelConfirm(false)}
+            >
+              <div
+                className="w-full max-w-md rounded-2xl bg-[#0a0a0f] border border-white/[0.08] shadow-2xl"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="p-6 border-b border-white/[0.06] flex items-start justify-between gap-4">
+                  <div>
+                    <h3 id="cancel-sub-title" className="text-base font-semibold text-white">Cancel subscription?</h3>
+                    <p className="text-xs text-gray-400 mt-1.5 leading-relaxed">
+                      Your plan stays active until the end of the current billing cycle. You won't be charged again after that, and you can resubscribe any time.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => setCancelConfirm(false)}
+                    className="p-1 text-gray-500 hover:text-white transition-colors"
+                    aria-label="Close"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+                <div className="p-4 flex items-center justify-end gap-2">
+                  <button
+                    onClick={() => setCancelConfirm(false)}
+                    className="px-4 py-2 rounded-lg text-sm font-medium bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-gray-300 transition-all"
+                  >
+                    Keep subscription
+                  </button>
+                  <button
+                    onClick={handleCancelSubscription}
+                    className="px-4 py-2 rounded-lg text-sm font-semibold bg-red-500/90 hover:bg-red-500 text-white transition-all"
+                  >
+                    Cancel at cycle end
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1415,7 +2262,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             </div>
           )}
           {pricing && (
-            <div className="grid md:grid-cols-2 gap-6 max-w-3xl mx-auto">
+            <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6 max-w-6xl mx-auto">
               {pricing.tiers.map((tier) => (
                 <PricingCard key={tier.id} tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
               ))}
@@ -1914,7 +2761,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           </div>
 
           {pricing && (
-            <div className="grid md:grid-cols-2 gap-6 max-w-3xl mx-auto">
+            <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6 max-w-6xl mx-auto">
               {pricing.tiers.map((tier) => (
                 <PricingCard key={tier.id} tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
               ))}

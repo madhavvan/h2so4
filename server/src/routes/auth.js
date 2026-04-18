@@ -66,23 +66,27 @@ router.post('/signup', async (req, res) => {
       sessions_limit: isDev ? -1 : 5,
     });
 
-    // Register device if provided
+    // Register device if provided. `registerDevice` never rejects — it
+    // auto-deactivates the oldest device when the tier limit is full. The
+    // old `if (deviceResult.error)` branch was dead code.
     if (device_id) {
-      const deviceResult = db.registerDevice(userId, device_id, req.headers['user-agent'] || 'Unknown');
-      if (deviceResult.error) {
-        return res.status(403).json({ error: deviceResult.error });
-      }
+      db.registerDevice(userId, device_id, req.headers['user-agent'] || 'Unknown');
     }
 
-    // Log successful signup
-    db.logLogin({
-      user_id: userId,
-      email: email.toLowerCase(),
-      ip_address: req.ip || req.connection?.remoteAddress,
-      device_id: device_id || '',
-      country_code: country_code || 'US',
-      success: true,
-    });
+    // Log successful signup — non-critical, don't crash the signup flow
+    // if the audit insert fails.
+    try {
+      db.logLogin({
+        user_id: userId,
+        email: email.toLowerCase(),
+        ip_address: req.ip || req.connection?.remoteAddress,
+        device_id: device_id || '',
+        country_code: country_code || 'US',
+        success: true,
+      });
+    } catch (logErr) {
+      console.warn('Failed to log signup:', logErr.message);
+    }
 
     const token = generateToken({ id: userId, email: user.email, tier: user.tier });
 
@@ -131,26 +135,29 @@ router.post('/login', async (req, res) => {
       return res.status(403).json({ error: 'This account has been suspended. Contact support.' });
     }
 
-    // Register/verify device
+    // Register/verify device. `registerDevice` never rejects — it
+    // auto-deactivates the oldest device when the tier limit is full.
+    // The old `deviceResult.error` branch was dead code.
     if (device_id) {
-      const deviceResult = db.registerDevice(user.id, device_id, req.headers['user-agent'] || 'Unknown');
-      if (deviceResult.error) {
-        try { db.logLogin({ user_id: user.id, email: user.email, ip_address: req.ip, device_id, success: false, error_reason: 'device_limit' }); } catch {}
-        return res.status(403).json({ error: deviceResult.error });
-      }
+      db.registerDevice(user.id, device_id, req.headers['user-agent'] || 'Unknown');
     }
 
     const license = db.getLicenseByUserId(user.id);
 
-    // Log successful login
-    db.logLogin({
-      user_id: user.id,
-      email: user.email,
-      ip_address: req.ip || req.connection?.remoteAddress,
-      device_id: device_id || '',
-      country_code: user.country_code,
-      success: true,
-    });
+    // Log successful login — non-critical, don't fail the login if audit
+    // insert throws (disk full, lock contention, etc.).
+    try {
+      db.logLogin({
+        user_id: user.id,
+        email: user.email,
+        ip_address: req.ip || req.connection?.remoteAddress,
+        device_id: device_id || '',
+        country_code: user.country_code,
+        success: true,
+      });
+    } catch (logErr) {
+      console.warn('Failed to log login:', logErr.message);
+    }
 
     const token = generateToken({ id: user.id, email: user.email, tier: user.tier });
 
@@ -248,27 +255,30 @@ router.post('/google', async (req, res) => {
       return res.status(403).json({ error: 'This account has been suspended. Contact support.' });
     }
 
-    // Register device if provided
+    // Register device if provided. `registerDevice` never rejects — it
+    // auto-deactivates the oldest device when the tier limit is full.
+    // The old `deviceResult.error` branch was dead code.
     if (device_id) {
-      const deviceResult = db.registerDevice(user.id, device_id, req.headers['user-agent'] || 'Unknown');
-      if (deviceResult.error) {
-        return res.status(403).json({ error: deviceResult.error });
-      }
+      db.registerDevice(user.id, device_id, req.headers['user-agent'] || 'Unknown');
     }
 
     // Update last login
     const d = db.getDB();
     d.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), user.id);
 
-    // Log login
-    db.logLogin({
-      user_id: user.id,
-      email: user.email,
-      ip_address: req.ip || req.connection?.remoteAddress,
-      device_id: device_id || '',
-      country_code: user.country_code,
-      success: true,
-    });
+    // Log login — non-critical, don't fail the login on audit errors.
+    try {
+      db.logLogin({
+        user_id: user.id,
+        email: user.email,
+        ip_address: req.ip || req.connection?.remoteAddress,
+        device_id: device_id || '',
+        country_code: user.country_code,
+        success: true,
+      });
+    } catch (logErr) {
+      console.warn('Failed to log Google login:', logErr.message);
+    }
 
     const license = db.getLicenseByUserId(user.id);
     const token = generateToken({ id: user.id, email: user.email, tier: user.tier });
@@ -440,14 +450,18 @@ router.get('/google/callback', async (req, res) => {
     const d = db.getDB();
     d.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), user.id);
 
-    db.logLogin({
-      user_id: user.id,
-      email: user.email,
-      ip_address: req.ip || req.connection?.remoteAddress,
-      device_id: '',
-      country_code: user.country_code,
-      success: true,
-    });
+    try {
+      db.logLogin({
+        user_id: user.id,
+        email: user.email,
+        ip_address: req.ip || req.connection?.remoteAddress,
+        device_id: '',
+        country_code: user.country_code,
+        success: true,
+      });
+    } catch (logErr) {
+      console.warn('Failed to log Google callback login:', logErr.message);
+    }
 
     const license = db.getLicenseByUserId(user.id);
     const token = generateToken({ id: user.id, email: user.email, tier: user.tier });
@@ -538,11 +552,18 @@ router.post('/forgot-password', async (req, res) => {
       const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
       const resetUrl = `${serverUrl}/api/v1/auth/reset-password?token=${rawToken}`;
       const { subject, html, text } = renderPasswordResetEmail({ name: user.name, resetUrl });
-      const result = await sendMail({ to: user.email, subject, html, text });
-      console.log('[forgot-password] sendMail result:', JSON.stringify(result));
-      if (!result.ok) {
-        console.error('[forgot-password] email NOT sent:', result.reason, result.error || '');
-      }
+      // Fire-and-forget. The HTTP response must not block on SMTP —
+      // if Gmail is slow the user shouldn't stare at a spinner. Failures
+      // are logged for admin review; the user always sees the same
+      // "link sent" message (anti-enumeration, see res.json below).
+      sendMail({ to: user.email, subject, html, text })
+        .then(result => {
+          console.log('[forgot-password] sendMail result:', JSON.stringify(result));
+          if (!result.ok) {
+            console.error('[forgot-password] email NOT sent:', result.reason, result.error || '');
+          }
+        })
+        .catch(err => console.error('[forgot-password] sendMail threw:', err && err.message));
     } else if (user && !user.password_hash) {
       console.log('[forgot-password] user exists but has no password (Google-only account):', email);
     } else {
