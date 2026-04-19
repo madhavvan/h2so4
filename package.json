@@ -1,7 +1,7 @@
 {
   "name": "interview-copilot-ai",
   "private": true,
-  "version": "3.3.6",
+  "version": "3.3.7",
   "description": "AI-powered real-time interview assistant",
   "author": {
     "name": "Interview Copilot",
@@ -15,6 +15,7 @@
     "preview": "vite preview",
     "lint": "tsc --noEmit",
     "postinstall": "electron-rebuild -f",
+    "icons": "node scripts/build-icons.mjs",
     "electron:start": "concurrently -k \"npm run dev\" \"wait-on tcp:3005 && electron .\"",
     "electron:build": "npm run build && electron-builder",
     "electron:publish": "npm run build && electron-builder --publish=always"
@@ -64,7 +65,8 @@
     },
     "win": {
       "target": "nsis",
-      "artifactName": "InterviewCopilot-Setup.${ext}"
+      "artifactName": "InterviewCopilot-Setup.${ext}",
+      "verifyUpdateCodeSignature": false
     },
     "nsis": {
       "oneClick": true,
@@ -84,6 +86,7 @@
     "@nut-tree-fork/nut-js": "^4.2.6",
     "@react-oauth/google": "^0.13.4",
     "better-sqlite3": "^12.8.0",
+    "electron-log": "^5.4.3",
     "electron-updater": "^6.3.9",
     "groq-sdk": "0.9.1",
     "lucide-react": "^0.562.0",
@@ -99,12 +102,18 @@
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.3",
+    "@tailwindcss/typography": "^0.5.19",
     "@types/node": "^22.14.0",
     "@types/react-syntax-highlighter": "^15.5.13",
     "@vitejs/plugin-react": "^5.0.0",
+    "autoprefixer": "^10.5.0",
     "concurrently": "^9.2.1",
     "electron": "^41.0.3",
     "electron-builder": "^26.8.1",
+    "png2icons": "^2.0.1",
+    "postcss": "^8.5.10",
+    "sharp": "^0.34.5",
+    "tailwindcss": "^3.4.19",
     "typescript": "~5.8.2",
     "vite": "^6.2.0",
     "wait-on": "^9.0.4"

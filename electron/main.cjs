@@ -1,10 +1,36 @@
-const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage, dialog } = require('electron');
 const path = require('path');
 const database = require('./database.cjs');
+
+// ─── Single-instance lock ─────────────────────────────────────────────────
+// Without this, every desktop launch spawns a fresh copy of the OLD binary
+// — so any update sitting cached in %AppData%\Interview Copilot\pending\
+// never gets a chance to install, and the user sees the same "ready to
+// install" prompt every launch. With it, a second launch focuses the
+// existing window instead, and pending updates install at the next quit.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    } else {
+      createMainWindow();
+    }
+  });
+}
 
 let mainWindow = null;
 let popoutWindow = null;
 let tray = null;
+
+// Updater state shared between the auto-update block (set when a download
+// finishes) and the close / before-quit handlers (which install the pending
+// update instead of leaving it stranded in the cache).
+let pendingUpdate = null;          // { version, info } | null
+let installPendingUpdate = null;   // (() => void) | null
 
 const isDev = !app.isPackaged;
 
@@ -52,12 +78,33 @@ function createMainWindow() {
   // INVISIBLE TO SCREEN SHARE
   mainWindow.setContentProtection(true);
 
-  // Hide instead of close — app stays in tray
+  // Hide instead of close — app stays in tray. EXCEPTION: if a downloaded
+  // update is sitting in the cache, give the user the choice to install it
+  // now instead of silently hiding (and never installing on next launch,
+  // since X-close doesn't trigger autoInstallOnAppQuit).
   mainWindow.on('close', (e) => {
-    if (!app.isQuitting) {
-      e.preventDefault();
+    if (app.isQuitting) return;
+    e.preventDefault();
+    if (!pendingUpdate || !installPendingUpdate) {
       mainWindow.hide();
+      return;
     }
+    dialog.showMessageBox(mainWindow, {
+      type: 'question',
+      buttons: ['Install update & quit', 'Stay in tray'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Update ready',
+      message: `Interview Copilot ${pendingUpdate.version} is ready to install.`,
+      detail: 'Install now to upgrade — the app will quit and relaunch on the new version. Or stay in the tray and install later.',
+      noLink: true,
+    }).then(({ response }) => {
+      if (response === 0) {
+        installPendingUpdate();
+      } else {
+        mainWindow.hide();
+      }
+    }).catch(() => mainWindow.hide());
   });
 
   mainWindow.once('ready-to-show', () => {
@@ -1723,7 +1770,8 @@ function createTray() {
       {
         label: 'Quit',
         click: () => {
-          app.isQuitting = true;
+          // Don't pre-set isQuitting — let before-quit decide whether to
+          // install a pending update first or proceed with cleanup.
           app.quit();
         }
       }
@@ -1758,6 +1806,12 @@ function createTray() {
 app.isQuitting = false;
 
 app.whenReady().then(() => {
+  // Bail out if we lost the single-instance lock — a secondary instance can
+  // momentarily reach whenReady before app.quit() settles. Without this guard
+  // it would briefly create a window, register a tray, and start a second
+  // updater check, all of which then fight the primary instance.
+  if (!app.hasSingleInstanceLock()) return;
+
   // Grant all media permissions (screen capture, audio, etc.)
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
     callback(true);
@@ -1781,36 +1835,76 @@ app.whenReady().then(() => {
   createTray();
 
   // ── Auto-Update System ──
-  // Checks GitHub Releases for a newer build. Skipped in dev.
-  // Sends status to all renderer windows so the UI can show
-  // "Update available" / "Downloading" / "Restart to update" in Settings.
+  // Strategy: at launch, race against a 6s window — if a previously
+  // downloaded update is sitting in the cache, electron-updater fires
+  // `update-downloaded` almost immediately (no network download needed),
+  // and we install it silently before the user can do anything else. The
+  // user just sees the app open briefly, then re-open on the new version.
+  // Outside the launch window, normal flow: detect → download → renderer
+  // shows "Restart & Update" prompt. Plus belt-and-suspenders install on
+  // quit + on X-close so a download never gets stranded in the cache.
   if (!isDev) {
     try {
+      const electronLog = require('electron-log');
       const { autoUpdater } = require('electron-updater');
+
+      // File log under %AppData%\Interview Copilot\logs\main.log (Windows)
+      // or ~/Library/Logs/Interview Copilot/main.log (macOS). Future updater
+      // failures leave a trail here instead of disappearing into stdout.
+      electronLog.transports.file.level = 'info';
+      autoUpdater.logger = electronLog;
+
       autoUpdater.autoDownload = true;
       autoUpdater.autoInstallOnAppQuit = true;
 
-      // Broadcast update status to all open windows
       function sendUpdateStatus(status, info) {
         const payload = { status, ...info };
-        BrowserWindow.getAllWindows().forEach(win => {
+        BrowserWindow.getAllWindows().forEach((win) => {
           if (!win.isDestroyed()) win.webContents.send('update-status', payload);
         });
       }
 
+      // Hand off to the installer. quitAndInstall() internally calls
+      // app.quit(), which re-enters before-quit — so we set isQuitting
+      // first to skip the X-close dialog, and clear pendingUpdate so
+      // the before-quit hook doesn't try to install a second time.
+      function performInstall(isSilent) {
+        if (app.isQuitting) return;
+        const target = pendingUpdate;
+        pendingUpdate = null;
+        installPendingUpdate = null;
+        app.isQuitting = true;
+        try {
+          electronLog.info(`[updater] installing ${target && target.version} silent=${isSilent}`);
+          autoUpdater.quitAndInstall(isSilent, true);
+        } catch (err) {
+          electronLog.error('[updater] quitAndInstall threw:', err && err.message);
+          app.quit();
+        }
+      }
+
+      // The 6s launch-install window. If `update-downloaded` fires while
+      // this is still active, it's a cached update from a prior session
+      // → install silently. If it fires later (a fresh download finished
+      // mid-session), we let the renderer prompt the user instead.
+      let launchInstallActive = true;
+      const launchInstallTimer = setTimeout(() => {
+        launchInstallActive = false;
+        electronLog.info('[updater] launch-install window closed');
+      }, 6000);
+
       autoUpdater.on('checking-for-update', () => {
-        console.log('[updater] checking...');
         sendUpdateStatus('checking', {});
       });
 
       autoUpdater.on('update-available', (info) => {
-        console.log('[updater] update available:', info && info.version);
         sendUpdateStatus('available', { version: info.version, releaseNotes: info.releaseNotes });
       });
 
       autoUpdater.on('update-not-available', () => {
-        console.log('[updater] up to date');
         sendUpdateStatus('up-to-date', {});
+        launchInstallActive = false;
+        clearTimeout(launchInstallTimer);
       });
 
       autoUpdater.on('download-progress', (progress) => {
@@ -1822,34 +1916,57 @@ app.whenReady().then(() => {
       });
 
       autoUpdater.on('update-downloaded', (info) => {
-        console.log('[updater] downloaded:', info && info.version);
+        pendingUpdate = { version: info.version, info };
+        installPendingUpdate = () => performInstall(true);
         sendUpdateStatus('ready', { version: info.version });
+
+        if (launchInstallActive) {
+          launchInstallActive = false;
+          clearTimeout(launchInstallTimer);
+          electronLog.info(`[updater] cached update ${info.version} found at launch — installing silently`);
+          // Tiny defer so the renderer can flush the 'ready' status; not
+          // strictly necessary but avoids a hard-cut transition for users
+          // who happen to see the brief flash before relaunch.
+          setTimeout(() => performInstall(true), 200);
+        }
       });
 
       autoUpdater.on('error', (err) => {
-        console.error('[updater] error:', err && err.message);
+        electronLog.error('[updater] error:', err && err.message);
         sendUpdateStatus('error', { message: err && err.message });
+        launchInstallActive = false;
+        clearTimeout(launchInstallTimer);
       });
 
-      // User clicks "Restart & Update" in the UI
+      // User clicks "Restart & Update" in Settings — show the installer
+      // UI (non-silent) so they get visual feedback during the swap. If
+      // no download is ready yet, kick a check; the renderer prompt will
+      // fire again once update-downloaded comes through.
       ipcMain.on('install-update', () => {
-        autoUpdater.quitAndInstall(false, true);
+        if (pendingUpdate) {
+          performInstall(false);
+        } else {
+          autoUpdater.checkForUpdatesAndNotify().catch((e) => {
+            electronLog.error('[updater] install-update check failed:', e && e.message);
+          });
+        }
       });
 
-      // User clicks "Check for Updates" in Settings
       ipcMain.on('check-for-updates', () => {
         autoUpdater.checkForUpdatesAndNotify().catch((e) => {
-          console.error('[updater] manual check failed:', e && e.message);
+          electronLog.error('[updater] manual check failed:', e && e.message);
         });
       });
 
-      // Auto-check 3 seconds after launch, then every 30 minutes
-      setTimeout(() => {
-        autoUpdater.checkForUpdatesAndNotify().catch((e) => {
-          console.error('[updater] check failed:', e && e.message);
-        });
-      }, 3000);
+      // Kick the launch check immediately. Use checkForUpdates (not
+      // ...AndNotify) so we don't show a duplicate native OS notification
+      // alongside our renderer prompt during the brief launch window.
+      autoUpdater.checkForUpdates().catch((e) => {
+        electronLog.error('[updater] launch check failed:', e && e.message);
+      });
 
+      // Periodic re-check for long-running sessions (tray apps stay alive
+      // for days — they need to discover updates without a relaunch).
       setInterval(() => {
         autoUpdater.checkForUpdatesAndNotify().catch(() => {});
       }, 30 * 60 * 1000);
@@ -1872,7 +1989,18 @@ app.on('window-all-closed', () => {
   // Do nothing — app stays in tray
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
+  // If a download is sitting ready, install it now instead of letting
+  // it rot in the cache. autoInstallOnAppQuit is supposed to handle this
+  // automatically but has been observed to silently no-op in some Windows
+  // configs — doing it explicitly is the safe path. performInstall sets
+  // isQuitting=true and re-enters this handler once the installer takes
+  // over, so the cleanup branch below still runs.
+  if (pendingUpdate && installPendingUpdate && !app.isQuitting) {
+    e.preventDefault();
+    installPendingUpdate();
+    return;
+  }
   app.isQuitting = true;
   try { killUIABridge(); } catch (_) {}
   database.closeDB();
