@@ -108,7 +108,7 @@ export const FEATURE_GATES = {
   },
 } as const;
 
-const APP_VERSION = '3.3.1';
+const APP_VERSION = __APP_VERSION__;
 const MIN_VERSION = '2.0.0';
 const REVALIDATION_INTERVAL = 30 * 60 * 1000; // 30 minutes
 
