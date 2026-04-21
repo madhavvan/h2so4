@@ -79,9 +79,9 @@ router.post('/chat/xai', async (req, res) => {
     const client = new OpenAI({ apiKey, baseURL: 'https://api.x.ai/v1' });
 
     const completion = await client.chat.completions.create({
-      model: 'grok-4-1-fast',
+      model: 'grok-4-1-fast-non-reasoning',
       messages,
-      max_tokens: 350,
+      max_tokens: 1600,
       temperature: 0.7,
     });
 
@@ -251,9 +251,9 @@ router.post('/stream/xai', async (req, res) => {
 
     const stream = await client.chat.completions.create(
       {
-        model: 'grok-4-1-fast',
+        model: 'grok-4-1-fast-non-reasoning',
         messages,
-        max_tokens: 350,
+        max_tokens: 1600,
         temperature: 0.7,
         stream: true,
       },

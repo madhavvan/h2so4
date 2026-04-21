@@ -117,7 +117,10 @@ function getDB() {
     );
 
     -- Every admin mutation is recorded here. Read-only from the API surface;
-    -- writes happen through logAdminAction() on the server only.
+    -- writes happen through logAdminAction() on the server only. Append-only
+    -- at the DB level via triggers (below) so a rogue insider with direct DB
+    -- access, or a hypothetical SQL-injection bug, can't silently scrub the
+    -- trail of admin activity. Compliance teams expect this guarantee.
     CREATE TABLE IF NOT EXISTS audit_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       admin_email TEXT NOT NULL,
@@ -128,6 +131,24 @@ function getDB() {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_admin ON audit_log(admin_email);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_target_email ON audit_log(target_email);
+
+    -- Append-only enforcement. SQLite treats these triggers as part of the
+    -- schema, so dropping them requires an explicit DROP TRIGGER — far
+    -- louder than a silent DELETE. Any attempt to rewrite history fails
+    -- the transaction with a clear error string.
+    CREATE TRIGGER IF NOT EXISTS audit_log_block_update
+      BEFORE UPDATE ON audit_log
+      BEGIN
+        SELECT RAISE(ABORT, 'audit_log is append-only; UPDATE is not permitted');
+      END;
+    CREATE TRIGGER IF NOT EXISTS audit_log_block_delete
+      BEFORE DELETE ON audit_log
+      BEGIN
+        SELECT RAISE(ABORT, 'audit_log is append-only; DELETE is not permitted');
+      END;
 
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
@@ -166,6 +187,20 @@ function getDB() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
+    -- Idempotency ledger for incoming webhooks. Both Stripe and Razorpay
+    -- retry deliveries on any non-2xx and sometimes on network hiccups even
+    -- when we return 2xx. Every grant side-effect is gated on a successful
+    -- INSERT OR IGNORE here (via recordWebhookEventOnce) — a duplicate
+    -- delivery loses the race and is skipped. event_id is Stripe's event.id
+    -- or the x-razorpay-event-id header (synthesized from payload fields if
+    -- the header is absent on older Razorpay accounts).
+    CREATE TABLE IF NOT EXISTS webhook_events (
+      event_id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      received_at INTEGER NOT NULL
+    );
+
     -- Index for fast lookups
     CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
     CREATE INDEX IF NOT EXISTS idx_licenses_user ON licenses(user_id);
@@ -177,6 +212,8 @@ function getDB() {
     CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv ON conversation_messages(conversation_id);
     CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
     CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at);
+    CREATE INDEX IF NOT EXISTS idx_payments_provider_payment ON payments(provider, provider_payment_id);
+    CREATE INDEX IF NOT EXISTS idx_webhook_events_received ON webhook_events(received_at);
     CREATE INDEX IF NOT EXISTS idx_reset_tokens_user ON password_reset_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_reset_tokens_expires ON password_reset_tokens(expires_at);
   `);
@@ -201,6 +238,23 @@ function getDB() {
     // Used to force-logout a user without banning them — bump this value and
     // all of their existing sessions die on the next request.
     db.exec('ALTER TABLE users ADD COLUMN tokens_revoked_after INTEGER DEFAULT 0');
+  }
+
+  // Coarse OS label per device — used by AdminDashboard to show whether a
+  // user is on Mac/Windows/Linux without needing to parse the raw UA on the
+  // client side. Captured by the client at signup/login/validate via
+  // licenseService.getPlatform() and persisted on the matching device row.
+  const deviceCols = db.prepare("PRAGMA table_info(devices)").all();
+  if (!deviceCols.find(c => c.name === 'platform')) {
+    db.exec('ALTER TABLE devices ADD COLUMN platform TEXT');
+  }
+
+  // Same field on the per-attempt login_logs row so the admin can see
+  // platform per login attempt (catches the case where a single device
+  // has been re-signed-in across OS reinstalls).
+  const loginCols = db.prepare("PRAGMA table_info(login_logs)").all();
+  if (!loginCols.find(c => c.name === 'platform')) {
+    db.exec('ALTER TABLE login_logs ADD COLUMN platform TEXT');
   }
 
   return db;
@@ -370,7 +424,18 @@ function cleanupExpiredResetTokens() {
 }
 
 function getAllUsers() {
-  return getDB().prepare('SELECT id, email, name, tier, country_code, created_at, last_login_at, is_banned FROM users ORDER BY created_at DESC').all();
+  // Include the columns the admin UI needs to render without a second
+  // round-trip per row: updated_at for recency, stripe_customer_id so the
+  // Users tab can badge Stripe-vs-Razorpay-vs-none at a glance,
+  // oauth_provider so Google-only accounts are visually distinct,
+  // tokens_revoked_after so a force-logged-out user renders as such.
+  return getDB().prepare(`
+    SELECT id, email, name, tier, country_code,
+           created_at, updated_at, last_login_at, is_banned,
+           stripe_customer_id, oauth_provider, avatar_url,
+           tokens_revoked_after
+    FROM users ORDER BY created_at DESC
+  `).all();
 }
 
 function getUserCount() {
@@ -426,14 +491,21 @@ function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_lim
 //  DEVICE OPERATIONS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
 
-function registerDevice(userId, deviceId, deviceName) {
+function registerDevice(userId, deviceId, deviceName, platform) {
   const d = getDB();
   const now = Date.now();
 
   // Check if device already registered
   const existing = d.prepare('SELECT * FROM devices WHERE user_id = ? AND device_id = ?').get(userId, deviceId);
   if (existing) {
-    d.prepare('UPDATE devices SET last_seen_at = ?, is_active = 1 WHERE id = ?').run(now, existing.id);
+    // Update platform if the client now reports one and the row is missing
+    // it — handles devices registered before the platform column existed.
+    if (platform && !existing.platform) {
+      d.prepare('UPDATE devices SET last_seen_at = ?, is_active = 1, platform = ? WHERE id = ?')
+        .run(now, platform, existing.id);
+    } else {
+      d.prepare('UPDATE devices SET last_seen_at = ?, is_active = 1 WHERE id = ?').run(now, existing.id);
+    }
     return existing;
   }
 
@@ -464,8 +536,8 @@ function registerDevice(userId, deviceId, deviceName) {
     }
   }
 
-  d.prepare('INSERT INTO devices (user_id, device_id, device_name, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?)')
-    .run(userId, deviceId, deviceName || 'Unknown Device', now, now);
+  d.prepare('INSERT INTO devices (user_id, device_id, device_name, first_seen_at, last_seen_at, platform) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(userId, deviceId, deviceName || 'Unknown Device', now, now, platform || null);
 
   return d.prepare('SELECT * FROM devices WHERE user_id = ? AND device_id = ?').get(userId, deviceId);
 }
@@ -487,11 +559,21 @@ function isDeviceAuthorized(userId, deviceId) {
 //  LOGIN LOG
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
 
-function logLogin({ user_id, email, ip_address, device_id, country_code, success, error_reason }) {
+function logLogin({ user_id, email, ip_address, device_id, country_code, success, error_reason, platform }) {
   getDB().prepare(`
-    INSERT INTO login_logs (user_id, email, ip_address, device_id, country_code, success, error_reason, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(user_id || null, email, ip_address || null, device_id || null, country_code || null, success ? 1 : 0, error_reason || null, Date.now());
+    INSERT INTO login_logs (user_id, email, ip_address, device_id, country_code, success, error_reason, platform, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    user_id || null,
+    email,
+    ip_address || null,
+    device_id || null,
+    country_code || null,
+    success ? 1 : 0,
+    error_reason || null,
+    platform || null,
+    Date.now(),
+  );
 }
 
 function getRecentLogins(limit = 50) {
@@ -637,6 +719,53 @@ function getPaymentStats() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
+//  WEBHOOK IDEMPOTENCY
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// INSERT OR IGNORE on the PK (event_id). Returns true on first-ever delivery,
+// false on any duplicate. Every side-effect-producing webhook handler MUST
+// gate on this returning true, otherwise a retried delivery (Stripe retries
+// on non-2xx for up to 3 days; Razorpay retries up to 24h) will re-grant
+// credits, extend expiry again, or fire a second confirmation email.
+function recordWebhookEventOnce(eventId, provider, eventType) {
+  if (!eventId) return true; // No id → can't dedup; fall through (caller should log).
+  const result = getDB().prepare(`
+    INSERT OR IGNORE INTO webhook_events (event_id, provider, event_type, received_at)
+    VALUES (?, ?, ?, ?)
+  `).run(eventId, provider, eventType || 'unknown', Date.now());
+  return result.changes > 0;
+}
+
+// Roll back the dedup row so a later retry can reprocess the event. Called
+// only when the handler threw AFTER recording the event but BEFORE finishing
+// the grant — without this, the retry would silently no-op and the user
+// would never get their credits.
+function clearWebhookEvent(eventId) {
+  if (!eventId) return;
+  getDB().prepare('DELETE FROM webhook_events WHERE event_id = ?').run(eventId);
+}
+
+// Have we already recorded a completed renewal top-up for this exact
+// provider_payment_id? Used to dedup across /verify-razorpay (client
+// success callback) and the webhook (server-side), which BOTH fire for
+// Razorpay renewals and race each other on fast networks. The LIKE on
+// metadata filters to renewal mode so a prior subscription-cycle charge
+// with the same order id (shouldn't happen, but defense-in-depth) can't
+// mask a legitimate renewal grant.
+function isRenewalPaymentProcessed(userId, providerPaymentId) {
+  if (!userId || !providerPaymentId) return false;
+  const row = getDB().prepare(`
+    SELECT id FROM payments
+    WHERE user_id = ?
+      AND provider_payment_id = ?
+      AND status = 'completed'
+      AND metadata LIKE '%"mode":"renewal"%'
+    LIMIT 1
+  `).get(userId, providerPaymentId);
+  return !!row;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
 //  ADMIN ACTIONS (audit-logged mutations)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -775,8 +904,472 @@ function unbanUser(userId) {
   getDB().prepare('UPDATE users SET is_banned = 0, updated_at = ? WHERE id = ?').run(Date.now(), userId);
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━
-//  ADMIN STATS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ADMIN: PROFILE / DEVICE / CONVERSATION MUTATIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Admin edit of a user's profile. Only whitelisted columns — name and
+// country_code — are writable here. Email changes are off-limits from
+// this helper: they affect auth identity, license email, and payment
+// receipts, and must go through a dedicated "change email" flow that
+// re-verifies the new address. Country code is normalized to the
+// 2-letter uppercase ISO-3166-1 alpha-2 form so downstream geo checks
+// stay consistent.
+function updateUserProfile(userId, { name, country_code }) {
+  const updates = [];
+  const values = [];
+  if (name !== undefined && name !== null) {
+    const n = String(name).trim();
+    if (n.length > 0) { updates.push('name = ?'); values.push(n); }
+  }
+  if (country_code !== undefined && country_code !== null) {
+    const cc = String(country_code).trim().toUpperCase().slice(0, 2);
+    if (/^[A-Z]{2}$/.test(cc)) { updates.push('country_code = ?'); values.push(cc); }
+  }
+  if (updates.length === 0) return getUserById(userId);
+  updates.push('updated_at = ?'); values.push(Date.now());
+  values.push(userId);
+  getDB().prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+  return getUserById(userId);
+}
+
+// Deactivate a single device row (not all of them). Validates that the
+// device actually belongs to the given user so an admin can't accidentally
+// kill a different user's device by typing the wrong device row id. Returns
+// the number of rows affected so the caller can 404 on no-match.
+function revokeSingleDevice(deviceRowId, userId) {
+  const result = getDB()
+    .prepare('UPDATE devices SET is_active = 0 WHERE id = ? AND user_id = ? AND is_active = 1')
+    .run(deviceRowId, userId);
+  return result.changes;
+}
+
+// Admin-initiated conversation delete. Requires (convId, userId) so the
+// admin can't accidentally wipe a conversation belonging to someone else
+// by guessing an id — the conversation must belong to the user the admin
+// is currently viewing. Messages cascade-delete via FK, but we do it
+// explicitly in a transaction for clarity and to keep both tables in
+// lock-step even if the FK pragma is ever disabled.
+function deleteConversationByAdmin(convId, userId) {
+  const d = getDB();
+  const conv = d.prepare('SELECT * FROM conversations WHERE id = ? AND user_id = ?').get(convId, userId);
+  if (!conv) return null;
+  const tx = d.transaction(() => {
+    d.prepare('DELETE FROM conversation_messages WHERE conversation_id = ?').run(convId);
+    d.prepare('DELETE FROM conversations WHERE id = ?').run(convId);
+  });
+  tx();
+  return conv;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ADMIN: DSAR EXPORT + ACCOUNT DELETION (GDPR)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Full export of everything we store about a user. Used for a GDPR
+// DSAR "right of access" request or as a pre-deletion snapshot so the
+// admin can hand the user their data before we wipe it. Intentionally
+// strips password_hash — we don't want even the user to receive a
+// salted hash of their own password (no value to them, grindable if
+// the file leaks).
+function getUserDataExport(userId) {
+  const d = getDB();
+  const user = d.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user) return null;
+  const { password_hash, ...safeUser } = user; // eslint-disable-line no-unused-vars
+  const conversations = d.prepare('SELECT * FROM conversations WHERE user_id = ?').all(userId);
+  return {
+    exported_at: Date.now(),
+    exported_at_iso: new Date().toISOString(),
+    user: safeUser,
+    licenses: d.prepare('SELECT * FROM licenses WHERE user_id = ?').all(userId),
+    devices: d.prepare('SELECT * FROM devices WHERE user_id = ?').all(userId),
+    conversations: conversations.map(c => ({
+      ...c,
+      messages: d.prepare('SELECT * FROM conversation_messages WHERE conversation_id = ? ORDER BY timestamp ASC').all(c.id),
+    })),
+    payments: d.prepare('SELECT * FROM payments WHERE user_id = ?').all(userId),
+    login_logs: d.prepare('SELECT * FROM login_logs WHERE user_id = ? ORDER BY created_at DESC').all(userId),
+    // audit_log rows where this user was the TARGET of an admin action —
+    // the user has a right to see the history of moderation decisions
+    // taken against their account.
+    audit_log_as_target: d.prepare('SELECT * FROM audit_log WHERE target_user_id = ? ORDER BY created_at DESC').all(userId),
+  };
+}
+
+// Hard-delete a user and all their owned rows. FK ON DELETE CASCADE is
+// configured so licenses/devices/conversations/messages/payments/
+// reset-tokens clean themselves up when the users row goes away, but:
+//   • login_logs.user_id is a nullable reference (no FK), so we wipe
+//     those explicitly.
+//   • We revoke the license key first so it can't be reused if the
+//     same email signs up again after deletion.
+// Wrapped in a transaction so a partial failure leaves the user intact
+// rather than orphaned (e.g. users row deleted but login_logs still
+// reference a gone id).
+function deleteUser(userId) {
+  const d = getDB();
+  const user = d.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user) return false;
+  const tx = d.transaction(() => {
+    const licenses = d.prepare('SELECT key FROM licenses WHERE user_id = ?').all(userId);
+    for (const lic of licenses) {
+      d.prepare('INSERT OR REPLACE INTO revoked_keys (key, revoked_by, reason, revoked_at) VALUES (?, ?, ?, ?)')
+        .run(lic.key, 'system', 'user account deleted', Date.now());
+    }
+    d.prepare('DELETE FROM login_logs WHERE user_id = ?').run(userId);
+    d.prepare('DELETE FROM users WHERE id = ?').run(userId);
+  });
+  tx();
+  return true;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ADMIN: COMP-PAYMENT (zero-dollar tier grant w/ audit row)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Issue a comp (complimentary) license: a $0 payments row tagged
+// admin-comp + mode=admin_comp, plus the actual tier flip on the
+// user + license rows. Revenue reports filter `amount > 0` so these
+// don't inflate MRR/ARR. The payments row survives even after a
+// future upgrade, giving admin a clean "why does this user have Pro
+// without paying" answer.
+const DAY_MS_CONST = 24 * 60 * 60 * 1000;
+function recordCompPayment(userId, tier, note) {
+  const d = getDB();
+  const user = d.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user) return null;
+  const grantConfig = {
+    basic: { sessions_limit: 3, expires_at: Date.now() + 14 * DAY_MS_CONST },
+    pro:   { sessions_limit: -1, expires_at: -1 },
+    max:   { sessions_limit: -1, expires_at: -1 },
+  }[tier];
+  if (!grantConfig) return null;
+  const tx = d.transaction(() => {
+    d.prepare('UPDATE users SET tier = ?, updated_at = ? WHERE id = ?').run(tier, Date.now(), userId);
+    d.prepare('UPDATE licenses SET tier = ?, status = ?, expires_at = ?, sessions_limit = ? WHERE user_id = ?')
+      .run(tier, 'active', grantConfig.expires_at, grantConfig.sessions_limit, userId);
+    d.prepare(`
+      INSERT INTO payments (user_id, email, provider, provider_payment_id, provider_subscription_id, amount, currency, status, tier_granted, metadata, created_at)
+      VALUES (?, ?, 'admin-comp', ?, NULL, 0, 'USD', 'completed', ?, ?, ?)
+    `).run(
+      userId,
+      user.email,
+      `comp_${userId}_${Date.now()}`,
+      tier,
+      JSON.stringify({ mode: 'admin_comp', note: note || null }),
+      Date.now(),
+    );
+  });
+  tx();
+  return d.prepare('SELECT * FROM licenses WHERE user_id = ?').get(userId);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ADMIN: PAYMENT LOOKUP + FILTERED QUERIES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function getPaymentById(paymentId) {
+  return getDB().prepare('SELECT * FROM payments WHERE id = ?').get(paymentId) || null;
+}
+
+// Has this payment been refunded already? We look for a second payments
+// row with the same provider_payment_id and status='refunded' (that's the
+// shape the webhook handler writes). Lets the admin refund endpoint
+// short-circuit a double-refund click.
+function hasPaymentBeenRefunded(provider, providerPaymentId) {
+  if (!provider || !providerPaymentId) return false;
+  const row = getDB().prepare(`
+    SELECT id FROM payments
+    WHERE provider = ? AND provider_payment_id = ?
+      AND status IN ('refunded', 'partially_refunded')
+    LIMIT 1
+  `).get(provider, providerPaymentId);
+  return !!row;
+}
+
+// Record a refund row that we initiated from the admin console. Kept
+// separate from recordPayment so the shape (negative amount, status,
+// metadata.refund_id) is consistent and harder to get wrong inline.
+// The provider webhook may fire next with the same refund_id; the
+// webhook idempotency gate (webhook_events dedup) protects against
+// a double-apply of the license downgrade.
+function recordAdminRefund({ originalPayment, refundId, amount, reason, initiatedBy }) {
+  if (!originalPayment) return null;
+  const d = getDB();
+  d.prepare(`
+    INSERT INTO payments (user_id, email, provider, provider_payment_id, provider_subscription_id, amount, currency, status, tier_granted, metadata, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    originalPayment.user_id,
+    originalPayment.email,
+    originalPayment.provider,
+    originalPayment.provider_payment_id,
+    originalPayment.provider_subscription_id,
+    -(Math.abs(amount) || 0),
+    originalPayment.currency || 'USD',
+    'refunded',
+    null,
+    JSON.stringify({
+      mode: 'admin_refund',
+      refund_id: refundId || null,
+      original_payment_id: originalPayment.id,
+      reason: reason || null,
+      initiated_by: initiatedBy || null,
+    }),
+    Date.now(),
+  );
+}
+
+// Filtered payment query for the admin Payments tab. All filters are
+// optional; applied in AND. Returns the payment rows + a matching stats
+// snapshot (count, gross, net-after-refunds) so the UI doesn't need a
+// second round-trip.
+function queryPayments({ provider, status, email, tier, from, to, limit }) {
+  const d = getDB();
+  let where = 'WHERE 1=1';
+  const args = [];
+  if (provider) { where += ' AND provider = ?'; args.push(String(provider)); }
+  if (status)   { where += ' AND status = ?';   args.push(String(status)); }
+  if (tier)     { where += ' AND tier_granted = ?'; args.push(String(tier)); }
+  if (email)    { where += ' AND LOWER(email) LIKE ?'; args.push(`%${String(email).toLowerCase()}%`); }
+  if (from)     { where += ' AND created_at >= ?'; args.push(Number(from)); }
+  if (to)       { where += ' AND created_at <= ?'; args.push(Number(to)); }
+
+  const lim = Math.min(Math.max(Number(limit) || 200, 1), 2000);
+  const rows = d.prepare(`SELECT * FROM payments ${where} ORDER BY created_at DESC LIMIT ?`).all(...args, lim);
+
+  const stats = d.prepare(`
+    SELECT
+      COUNT(*) as count,
+      COALESCE(SUM(CASE WHEN amount > 0 AND status = 'completed' THEN amount ELSE 0 END), 0) as gross,
+      COALESCE(SUM(CASE WHEN status IN ('refunded','partially_refunded','disputed') THEN amount ELSE 0 END), 0) as refunded_or_disputed
+    FROM payments ${where}
+  `).get(...args);
+
+  return { payments: rows, stats };
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ADMIN: AUDIT LOG — FILTERED QUERY + DISTINCT DROPDOWNS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function queryAuditLog({ admin, action, target, from, to, limit }) {
+  let sql = 'SELECT * FROM audit_log WHERE 1=1';
+  const args = [];
+  if (admin)  { sql += ' AND LOWER(admin_email) = ?'; args.push(String(admin).toLowerCase()); }
+  if (action) { sql += ' AND action = ?'; args.push(String(action)); }
+  if (target) { sql += ' AND LOWER(target_email) LIKE ?'; args.push(`%${String(target).toLowerCase()}%`); }
+  if (from)   { sql += ' AND created_at >= ?'; args.push(Number(from)); }
+  if (to)     { sql += ' AND created_at <= ?'; args.push(Number(to)); }
+  sql += ' ORDER BY created_at DESC LIMIT ?';
+  args.push(Math.min(Math.max(Number(limit) || 200, 1), 2000));
+  return getDB().prepare(sql).all(...args);
+}
+
+function getAuditActions() {
+  return getDB().prepare('SELECT DISTINCT action FROM audit_log ORDER BY action ASC')
+    .all().map(r => r.action);
+}
+
+function getAuditAdmins() {
+  return getDB().prepare('SELECT DISTINCT admin_email FROM audit_log ORDER BY admin_email ASC')
+    .all().map(r => r.admin_email);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ADMIN: ENTERPRISE ANALYTICS (trends, top customers, engagement)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Daily time-series for the last N days, filled with zeros for days
+// that had no activity. Returns signups, successful logins, and gross
+// revenue (amount > 0 completed payments) per day. Used by the
+// Analytics tab's sparkline charts.
+//
+// SQLite idiom: strftime('%Y-%m-%d', ms/1000, 'unixepoch') converts our
+// ms-epoch created_at into a YYYY-MM-DD bucket. We fill the full date
+// range on the JS side so a day with zero signups still shows as 0 in
+// the chart (otherwise a 7-day sparkline might only have 4 points).
+function getTrends(days) {
+  const d = getDB();
+  const now = Date.now();
+  const n = Math.min(Math.max(Number(days) || 30, 1), 365);
+  const startMs = now - n * DAY_MS_CONST;
+
+  const signups = d.prepare(`
+    SELECT strftime('%Y-%m-%d', created_at/1000, 'unixepoch') as day, COUNT(*) as c
+    FROM users WHERE created_at >= ? GROUP BY day
+  `).all(startMs);
+
+  const logins = d.prepare(`
+    SELECT strftime('%Y-%m-%d', created_at/1000, 'unixepoch') as day, COUNT(*) as c
+    FROM login_logs WHERE created_at >= ? AND success = 1 GROUP BY day
+  `).all(startMs);
+
+  const revenue = d.prepare(`
+    SELECT strftime('%Y-%m-%d', created_at/1000, 'unixepoch') as day,
+           COALESCE(SUM(amount), 0) as total
+    FROM payments WHERE status = 'completed' AND amount > 0 AND created_at >= ? GROUP BY day
+  `).all(startMs);
+
+  const byDay = new Map();
+  for (let i = n - 1; i >= 0; i--) {
+    const iso = new Date(now - i * DAY_MS_CONST).toISOString().slice(0, 10);
+    byDay.set(iso, { day: iso, signups: 0, logins: 0, revenue: 0 });
+  }
+  for (const r of signups) if (byDay.has(r.day)) byDay.get(r.day).signups = r.c;
+  for (const r of logins)  if (byDay.has(r.day)) byDay.get(r.day).logins  = r.c;
+  for (const r of revenue) if (byDay.has(r.day)) byDay.get(r.day).revenue = r.total;
+  return Array.from(byDay.values());
+}
+
+// Top customers by lifetime spend. LEFT JOIN to users so a deleted
+// user's payment history still surfaces (with a null email) — useful
+// when reconciling a refund against a now-deleted account. Excludes
+// admin-comp rows and refunds so the ranking reflects real revenue.
+function getTopCustomers(limit) {
+  const n = Math.min(Math.max(Number(limit) || 10, 1), 100);
+  return getDB().prepare(`
+    SELECT p.user_id,
+           u.email, u.name, u.tier, u.country_code,
+           u.created_at as user_created_at,
+           u.last_login_at,
+           COUNT(p.id) as payment_count,
+           COALESCE(SUM(p.amount), 0) as lifetime_value,
+           MAX(p.created_at) as last_payment_at
+    FROM payments p
+    LEFT JOIN users u ON u.id = p.user_id
+    WHERE p.status = 'completed' AND p.amount > 0 AND p.provider != 'admin-comp'
+    GROUP BY p.user_id
+    ORDER BY lifetime_value DESC
+    LIMIT ?
+  `).all(n);
+}
+
+// Recurring revenue proxy, split by currency (we store amounts in
+// provider-native units — cents for Stripe/USD, paise for Razorpay/INR —
+// so you can't just SUM them). UI renders the two side-by-side.
+//
+// MRR proxy = sum of completed payments in the last 30 days. For true
+// MRR you'd want a subscription state machine (active plans × plan price);
+// that needs more bookkeeping than the current schema supports. This
+// proxy is close enough for weekly trend-watching.
+function getMRRBreakdown() {
+  const monthAgo = Date.now() - 30 * DAY_MS_CONST;
+  const rows = getDB().prepare(`
+    SELECT currency, COALESCE(SUM(amount), 0) as total, COUNT(*) as c
+    FROM payments
+    WHERE status = 'completed' AND amount > 0 AND provider != 'admin-comp' AND created_at >= ?
+    GROUP BY currency
+  `).all(monthAgo);
+  const out = { USD: { amount: 0, count: 0 }, INR: { amount: 0, count: 0 } };
+  for (const r of rows) {
+    const cur = (r.currency || 'USD').toUpperCase();
+    if (cur in out) out[cur] = { amount: r.total, count: r.c };
+  }
+  return out;
+}
+
+// ARPU — lifetime revenue divided by the count of distinct paying users.
+// Returned per-currency so mixed USD/INR stays honest. A user appears
+// in both buckets if they paid on both providers (rare but possible
+// after country relocation); that's acceptable approximation.
+function getARPUBreakdown() {
+  const d = getDB();
+  const rows = d.prepare(`
+    SELECT currency,
+           COALESCE(SUM(amount), 0) as total,
+           COUNT(DISTINCT user_id) as payers
+    FROM payments
+    WHERE status = 'completed' AND amount > 0 AND provider != 'admin-comp'
+    GROUP BY currency
+  `).all();
+  const out = { USD: { arpu: 0, payers: 0 }, INR: { arpu: 0, payers: 0 } };
+  for (const r of rows) {
+    const cur = (r.currency || 'USD').toUpperCase();
+    if (cur in out) {
+      const payers = r.payers || 0;
+      out[cur] = { arpu: payers > 0 ? Math.round(r.total / payers) : 0, payers };
+    }
+  }
+  return out;
+}
+
+// Churn proxy: distinct users with a refund/dispute/cancellation in the
+// last 30 days, divided by distinct paying users who paid BEFORE the
+// window started. A user who refunded the same month they paid counts
+// as churn — the denominator uses the older cohort, which is the
+// standard churn-rate shape.
+function getChurnRate() {
+  const d = getDB();
+  const monthAgo = Date.now() - 30 * DAY_MS_CONST;
+  const churned = d.prepare(`
+    SELECT COUNT(DISTINCT user_id) as c FROM payments
+    WHERE status IN ('refunded', 'partially_refunded', 'disputed', 'cancelled')
+      AND created_at >= ?
+  `).get(monthAgo).c;
+  const existing = d.prepare(`
+    SELECT COUNT(DISTINCT user_id) as c FROM payments
+    WHERE status = 'completed' AND amount > 0
+      AND provider != 'admin-comp' AND created_at < ?
+  `).get(monthAgo).c;
+  if (existing === 0) return 0;
+  // Percent, 2 decimal places.
+  return Math.round((churned / existing) * 10000) / 100;
+}
+
+// DAU / WAU / MAU — distinct user_ids with a successful login in the
+// last 24h / 7d / 30d. Login is our best proxy for "active" because
+// the API doesn't log every request per user. If a user has a live
+// JWT and never re-authenticates (valid for 30d), they won't appear
+// here — that's a known limitation of this proxy.
+function getEngagement() {
+  const d = getDB();
+  const now = Date.now();
+  const q = (windowMs) => d.prepare(
+    'SELECT COUNT(DISTINCT user_id) as c FROM login_logs WHERE success = 1 AND created_at >= ?'
+  ).get(now - windowMs).c;
+  return {
+    dau: q(1 * DAY_MS_CONST),
+    wau: q(7 * DAY_MS_CONST),
+    mau: q(30 * DAY_MS_CONST),
+  };
+}
+
+// Simple suspicious-activity digest for the admin dashboard.
+// • multi_country_users — users seen logging in from 2+ countries in
+//   the last 7 days (potential credential stuffing or account sharing)
+// • high_fail_ips — IPs with 10+ failed logins in the last 24h (brute
+//   force signals)
+// • rapid_signup_ips — IPs that created 5+ accounts in the last 24h
+//   (spam/abuse signals)
+function getSuspiciousActivity() {
+  const d = getDB();
+  const now = Date.now();
+  const weekAgo = now - 7 * DAY_MS_CONST;
+  const dayAgo = now - 1 * DAY_MS_CONST;
+
+  const multiCountry = d.prepare(`
+    SELECT user_id, email, GROUP_CONCAT(DISTINCT country_code) as countries, COUNT(DISTINCT country_code) as n
+    FROM login_logs
+    WHERE user_id IS NOT NULL AND country_code IS NOT NULL AND created_at >= ? AND success = 1
+    GROUP BY user_id HAVING n >= 2
+    ORDER BY n DESC, email ASC LIMIT 20
+  `).all(weekAgo);
+
+  const highFailIps = d.prepare(`
+    SELECT ip_address, COUNT(*) as attempts,
+           MAX(created_at) as last_seen,
+           GROUP_CONCAT(DISTINCT email) as emails_tried
+    FROM login_logs
+    WHERE ip_address IS NOT NULL AND success = 0 AND created_at >= ?
+    GROUP BY ip_address HAVING attempts >= 10
+    ORDER BY attempts DESC LIMIT 20
+  `).all(dayAgo);
+
+  return { multi_country_users: multiCountry, high_fail_ips: highFailIps };
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
 
 function getStats() {
@@ -820,6 +1413,21 @@ function getStats() {
     if (row.tier in signupsByTier) signupsByTier[row.tier] = row.c;
   }
 
+  // Enterprise SaaS metrics — computed here so the Overview tab shows a
+  // single, consistent snapshot. These helpers each return structured
+  // per-currency objects because INR (paise) and USD (cents) cannot be summed.
+  const mrr = getMRRBreakdown();
+  const arpu = getARPUBreakdown();
+  const churn = getChurnRate();
+  const engagement = getEngagement();
+  const suspicious = getSuspiciousActivity();
+
+  // Quick-look counts for the audit/security surface.
+  const pendingRefunds30d = d.prepare(`
+    SELECT COUNT(*) as c FROM payments
+    WHERE status IN ('refunded','disputed','cancelled') AND created_at > ?
+  `).get(monthAgo).c;
+
   return {
     total_users: d.prepare('SELECT COUNT(*) as c FROM users').get().c,
     // Legacy flat fields — kept so older client builds keep working.
@@ -841,6 +1449,17 @@ function getStats() {
     failed_logins_today: d.prepare('SELECT COUNT(*) as c FROM login_logs WHERE created_at > ? AND success = 0').get(dayAgo).c,
     total_conversations: d.prepare('SELECT COUNT(*) as c FROM conversations').get().c,
     total_messages: d.prepare('SELECT COUNT(*) as c FROM conversation_messages').get().c,
+    // Enterprise metrics — per-currency. Frontend must render separately.
+    mrr_by_currency: mrr,
+    arpu_by_currency: arpu,
+    churn_rate_30d: churn,
+    dau: engagement.dau,
+    wau: engagement.wau,
+    mau: engagement.mau,
+    dau_wau_ratio: engagement.dau_wau_ratio,
+    dau_mau_ratio: engagement.dau_mau_ratio,
+    suspicious_activity: suspicious,
+    pending_refunds_30d: pendingRefunds30d,
     ...getPaymentStats(),
   };
 }
@@ -858,6 +1477,7 @@ module.exports = {
   // Users
   createUser, getUserByEmail, getUserById, getUserByGoogleId, linkGoogleAccount, verifyUserPassword,
   updateUserTier, updateUserPassword, banUser, unbanUser, getAllUsers, getUserCount, getProUserCount, getActiveToday,
+  updateUserProfile, deleteUser, getUserDataExport,
   // Password reset
   createPasswordResetToken, getPasswordResetToken, getRawPasswordResetToken, consumePasswordResetToken, cleanupExpiredResetTokens,
   // Licenses
@@ -867,11 +1487,16 @@ module.exports = {
   getLatestRazorpaySubscriptionId,
   // Devices
   registerDevice, getUserDevices, deactivateDevice, isDeviceAuthorized, resetUserDevices,
+  revokeSingleDevice,
   // Conversations
   createConversation, getConversationsByUser, getConversationById, updateConversation, deleteConversation,
   addConversationMessage, addConversationMessages, getConversationMessages, clearConversationMessages,
+  deleteConversationByAdmin,
   // Payments
   recordPayment, getPaymentsByUser, getAllPayments, getPaymentStats,
+  getPaymentById, hasPaymentBeenRefunded, recordAdminRefund, recordCompPayment, queryPayments,
+  // Webhook idempotency
+  recordWebhookEventOnce, clearWebhookEvent, isRenewalPaymentProcessed,
   // Login logs
   logLogin, getRecentLogins,
   // Revoked keys
@@ -880,8 +1505,10 @@ module.exports = {
   getConfig, setConfig,
   // Stats
   getStats,
+  getTrends, getTopCustomers, getMRRBreakdown, getARPUBreakdown, getChurnRate, getEngagement, getSuspiciousActivity,
   // Admin actions / audit
   logAdminAction, getAuditLog, forceLogoutUser, getTokensRevokedAfter,
+  queryAuditLog, getAuditActions, getAuditAdmins,
   // Cleanup
   closeDB,
   // Password utils (for testing)

@@ -245,7 +245,7 @@ return next((ch for ch in s if c[ch] == 1), None)
 === LENGTH BY QUESTION TYPE (STRICT — length must differ) ===
 - Concept/definition: 1-2 sentences, ~15-25s spoken.
 - Behavioral / "tell me about a time": 4-6 sentences, ~45-70s spoken.
-- System design: 3-5 sentences. Shape → trade-off → one thing you'd defer.
+- System design: 3-5 sentences TOTAL (sentences, not paragraphs). Shape → trade-off → one thing you'd defer. If you have more, cut. A design answer is never multi-paragraph in a live interview.
 - Coding: 1-2 sentences of approach + complexity, then code block.
 - Clarifier / follow-up: 1-2 sentences max. Match their length.
 - Opinion / preference: 2-3 sentences. Pick a side first.
@@ -277,7 +277,7 @@ About 1 answer in 4-5 should contain one small correction: "— we used Redis, w
 
 === STRUCTURE KILLS — DO NOT DO ===
 - No sandwich: don't preview → answer → restate.
-- No tricolons ("efficient, scalable, and maintainable"). At most one adjective per noun.
+- No tricolons. If you find yourself writing a three-part list ("X, Y, and Z"), two of those are usually the same idea — collapse to two. This applies to adjective lists ("efficient, scalable, and maintainable") AND noun/concept lists ("joins, auditability, and clean transactional behavior"). Pick the two strongest, drop the third. At most one adjective per noun.
 - No spoken "firstly / secondly / thirdly". Say "one thing is... the other piece is..."
 - No "to summarize", no "in conclusion", no "to wrap up". Just stop.
 - No balanced pros-and-cons unless asked. Pick a side, one-clause trade-off.
@@ -312,12 +312,296 @@ If any check fails, rewrite before emitting.
 `;
 }
 
-function buildGeminiSystemInstruction(textContext: string, generalMode: boolean): string {
-  return buildSystemInstruction(textContext, generalMode);
+// ─────────────────────────────────────────────────────────────
+//  IDENTITY-AWARE PROMPTING (NEW path)
+//
+//  Rather than pasting the raw resume + JD and hoping the model
+//  recalls the right memory, we:
+//    1. Extract a compact "WHO YOU ARE" + "WHAT THIS ROLE REWARDS"
+//       briefing card in a one-time preflight LLM call.
+//    2. Inject the card into the system prompt as memory the model
+//       treats as its own, not a document to quote.
+//    3. Layer THE THREE MOVES + SHOW SCARS + CODING OVERRIDE on
+//       top of the existing VOICE_RULES block in the user message.
+//
+//  If extraction fails (proxy error, malformed response), we
+//  silently fall back to the OLD grounded-in-resume prompt path.
+//  The interview must never break because of a preflight glitch.
+// ─────────────────────────────────────────────────────────────
+
+const SUBSTANCE_PREPEND = `=== THE THREE MOVES (every answer, quietly) ===
+Every answer does three things at once, without calling attention to any of them:
+1. TASTE — a position rooted in experience, not a definition. "X, almost always — because in practice Y" beats "X is a technique for…"
+2. HOOK — ONE recalled specific from your life: a tool+version, a number, a team size, a failure, the week it went sideways. Hedge numbers ("ballpark 3M/day", "maybe closer to three months in"). The specific must sound recalled, not recited.
+3. ROOM — your word choice and example choice lean toward what the role rewards. Never mention the JD.
+
+Routing by question type:
+- Conceptual → lead with TASTE, land with HOOK.
+- Behavioral → lead with HOOK (situation in one line), then the move, then the result with ONE number, then one line of what you took from it.
+- Design → TASTE on the shape, HOOK on the trade-off, one sentence on what you'd defer.
+- Preference → pick a side in the first clause, one sentence why, one exception.
+- Role-fit ("why this role") → 1 thing the role rewards → 1 specific from your life → 1 line of what you'd want to build there. Never name the JD.
+- Weakness → honest, short, one line of what you're doing about it. No humble-brag.
+- Coding → THE THREE MOVES IS SUPPRESSED. No lived-project HOOK. No "I used this at X." Approach + complexity + function body only. See CODING OVERRIDE below.
+
+=== CODING OVERRIDE (HARD RULE) ===
+If the question is a coding problem, THE THREE MOVES does NOT apply. Do not add TASTE. Do not add a HOOK. Do not anchor to a past project or mention any past company. Output only: 1-2 sentences of approach + complexity, then the function body. Every extra word is typed live into the interviewer's editor — prose beyond approach + complexity is noise that ends the interview.
+
+=== SHOW SCARS ===
+At least 1 in 5 answers should surface something that didn't work: a bug, a decision that flipped, "I used to think X, now I think Y." Exceptional engineers have visible battle damage. Never invent a scar that contradicts your real experience.
+
+=== KILL "IT DEPENDS" ===
+"It depends" alone is lazy. Always follow with what it depends on AND your default. Name the default first, then the exception. "Postgres by default. Mongo if the data is genuinely document-shaped and joins stay rare — rarer than people think."
+
+=== SILENT ROUTINE — BEFORE EVERY ANSWER ===
+1. What is the question probing — skill, fit, character, or thinking?
+2. Which ONE memory from WHO YOU ARE fits this probe best?
+3. Which thing the role rewards should this answer telegraph (unnamed)?
+4. Your TAKE — what do you actually think is true here?
+Then speak once. Don't preview, don't restate.
+
+=== CONTRAST — WHAT EXCEPTIONAL LOOKS LIKE ===
+Q: "How do you think about caching?"
+Weak: "Caching stores frequently-accessed data for fast retrieval. Common patterns include cache-aside and write-through. I've used Redis for this."
+Exceptional: "Cache-aside for stuff I own, almost always. We ran Redis in front of Postgres on the last project — write-through sounds clean on paper but invalidation becomes a second source of truth you have to keep honest, and that's bitten me twice. The one exception is session data — that actually lives in Redis as its home."
+
+Q: "Why are you interested in this role?"
+Weak: "I'm passionate about building scalable systems and I'm excited by your mission."
+Exceptional: "Honestly, it's the streaming-to-anomaly-detection piece. Closest I've gotten is a Kafka ingestion flow handling a few million events a day — but we never got to close the loop with a real model flagging things. Feels like unfinished business."
+
+`;
+
+function buildSystemInstructionNew(
+  identity: string,
+  jdPriorities: string,
+  resume: string,
+  jd: string,
+): string {
+  return `
+You are the candidate in a live interview. You are not an AI assistant — you are the specific person described below, answering in real time. Your reply is either spoken out loud or typed into the interviewer's editor character-by-character.
+
+=== WHO YOU ARE (internalize — these are YOUR memories, not a resume to quote) ===
+${identity}
+
+=== WHAT THIS ROLE REWARDS (silently shape answers toward this — NEVER mention the JD) ===
+${jdPriorities}
+
+=== FULL CONTEXT (reference only if you need a detail not in the card above) ===
+RESUME:
+${resume}
+
+JOB DESCRIPTION:
+${jd}
+
+=== THE BLEND — HOW EVERY ANSWER WORKS ===
+Every answer combines three things, without calling attention to any of them:
+- TASTE: a position rooted in experience, not a definition. You have opinions — say them.
+- HOOK: ONE recalled specific from your life — a tool+version, a number, a team size, a failure, the week it went sideways. Hedge numbers. The specific must sound recalled, not recited.
+- ROOM: word choice and example choice lean toward what the role rewards, silently.
+
+Never give a textbook-only answer. Never quote the resume verbatim. The resume is your memory — recall it the way you'd recall last week, not the way you'd read a CV.
+
+=== KNOWLEDGE BOUNDARIES (CRITICAL — READ CAREFULLY) ===
+You know ONLY what's in the resume and identity card above. You do NOT know:
+- Specific outages or failures you "handled" that aren't described above.
+- Specific tuning choices (HPA targets, query plans, config values, retry paths, dedupe keys) unless the resume explicitly says so.
+- What companies did or who their clients were, beyond what's stated.
+- Technical mechanics of projects listed only as a one-line item.
+
+The HOOK rule asks for lived specifics. But FABRICATED specifics destroy the answer — the interviewer will follow up, and you will backpedal. A fabricated specific is worse than no specific.
+
+When the resume is thin on a topic, NARROW the answer instead of inventing:
+- "Used K8s mostly for resource tuning and CI/CD at [place] — honestly not something I've had to rebuild from scratch."
+- "Didn't go deep on Neptune — closest I've done is OpenSearch work."
+- "Haven't owned that end-to-end — what I know is from [adjacent lived work]."
+
+When a company's business is asked and not in the resume, redirect to the work you did rather than invent what the company does.
+
+A thin honest slice beats a polished fabricated one every time. Interviewers reward self-aware gaps over smooth fiction.
+
+=== NOISE GATE ===
+If the input is silence, background noise, or meaningless acknowledgments ("mm", "okay", "right", "got it"), output EXACTLY: ...
+Otherwise answer. When in doubt, answer. Never say "listening...".
+
+The user message contains RESPONSE RULES and VOICE EXAMPLES. Those rules are highest-priority and override anything here that conflicts. Obey them literally.
+
+Output format: emit ONLY the answer text. No preamble, no "Here's my response:", no reasoning, no meta.
+`;
 }
 
-function buildOpenAISystemInstruction(textContext: string, generalMode: boolean): string {
-  return buildSystemInstruction(textContext, generalMode);
+function buildUserRulesBlockNew(): string {
+  return buildUserRulesBlock().replace(
+    '=== VOICE EXAMPLES',
+    SUBSTANCE_PREPEND + '=== VOICE EXAMPLES',
+  );
+}
+
+function buildExtractionPrompt(resume: string, jd: string): string {
+  return `You are preparing an interview candidate for a specific role. Extract two compact briefing documents that will be injected into the candidate's live-interview prompt.
+
+RESUME:
+${resume}
+
+JOB DESCRIPTION:
+${jd}
+
+Produce exactly two sections with the exact headers shown:
+
+=== WHO YOU ARE ===
+(max 14 lines — terse bullet points, not prose)
+- Name / current role / years of experience
+- Seniority register (junior / mid / senior / staff) — decide from scope + years
+- Top 3 technical strengths, ranked by relevance to THIS JD (not by depth alone). Format per line: "skill — best evidence from resume"
+- Flagship projects (2-3), ranked by relevance to THIS JD. Format per line: "Name — what it was (1 phrase) — metric — the hardest part"
+- Domains known cold (1-2)
+- Plausible scars / hard-won lessons (1-2) — small failures or flipped beliefs a person with this CV would credibly have, inferable from the work described
+
+=== WHAT THIS ROLE REWARDS ===
+(max 10 lines)
+- Top 5 capabilities the JD screens for, ranked by frequency + emphasis in the JD
+- Register they want (hands-on IC / tech lead / architect / etc)
+- Domain emphasis (e.g. payments, merchant funding, healthcare, etc.)
+- 1-2 short phrases from the JD that reveal their specific pain or what they'll push on most in interviews
+- One-line "resume x JD" summary: where THIS candidate's strongest fit lies
+
+Output only the two sections with exact headers. No preamble, no meta, no closing remarks.`;
+}
+
+// ── Context hashing + resume/JD splitting for extraction cache ──
+
+interface ExtractedCards {
+  identity: string;
+  jdPriorities: string;
+  resume: string;
+  jd: string;
+}
+
+const identityCache = new Map<string, Promise<ExtractedCards | null>>();
+
+function hashContextFiles(contextFiles: ContextFile[]): string {
+  const content = contextFiles
+    .filter(f => !f.base64)
+    .map(f => `${f.name}:${f.content}`)
+    .sort()
+    .join('|');
+  // Simple non-cryptographic hash keyed on exact string equality.
+  let h = 0;
+  for (let i = 0; i < content.length; i++) {
+    h = ((h << 5) - h) + content.charCodeAt(i);
+    h |= 0;
+  }
+  return h.toString(36);
+}
+
+function splitResumeAndJd(contextFiles: ContextFile[]): { resume: string; jd: string } {
+  let resume = '';
+  let jd = '';
+  for (const f of contextFiles) {
+    if (f.base64) continue;
+    const name = (f.name || '').toLowerCase();
+    const content = f.content || '';
+    const looksLikeJd = name.includes('jd') || name.includes('job')
+      || /\b(qualifications|skills required|responsibilities|job description)\b/i.test(content);
+    const looksLikeResume = name.includes('resume') || name.includes('cv')
+      || /\b(professional summary|work experience|education|certifications)\b/i.test(content);
+    if (looksLikeJd && !looksLikeResume) {
+      jd = jd ? `${jd}\n\n${content}` : content;
+    } else if (looksLikeResume) {
+      resume = resume ? `${resume}\n\n${content}` : content;
+    } else {
+      // Default to resume — more common case, safer fallback.
+      resume = resume ? `${resume}\n\n${content}` : content;
+    }
+  }
+  return { resume, jd };
+}
+
+async function getExtractedCards(contextFiles: ContextFile[]): Promise<ExtractedCards | null> {
+  const hash = hashContextFiles(contextFiles);
+  const cached = identityCache.get(hash);
+  if (cached) return cached;
+
+  const promise = (async (): Promise<ExtractedCards | null> => {
+    const { resume, jd } = splitResumeAndJd(contextFiles);
+    if (!resume && !jd) return null;
+    try {
+      const prompt = buildExtractionPrompt(resume, jd);
+      const text = await proxyRequest('/chat/openai', {
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const splitIdx = text.indexOf('=== WHAT THIS ROLE REWARDS ===');
+      if (splitIdx === -1) return null;
+      const identity = text
+        .slice(0, splitIdx)
+        .replace(/^===\s*WHO YOU ARE\s*===/m, '')
+        .trim();
+      const jdPriorities = text
+        .slice(splitIdx)
+        .replace(/^===\s*WHAT THIS ROLE REWARDS\s*===/m, '')
+        .trim();
+      if (!identity || !jdPriorities) return null;
+      return { identity, jdPriorities, resume, jd };
+    } catch {
+      // Silent fallback — stream function handles null by using OLD path.
+      // Never break the interview because of a preflight failure.
+      return null;
+    }
+  })();
+
+  identityCache.set(hash, promise);
+  // Drop rejected/null promises so the next call retries instead of
+  // serving stale null indefinitely.
+  promise.then(cards => {
+    if (cards === null) identityCache.delete(hash);
+  });
+  return promise;
+}
+
+// ── Prewarm: fire extraction the moment context files are loaded, so
+// the first interview question doesn't pay the ~2-5s preflight cost.
+// Fire-and-forget; safe to call repeatedly (hits the cache after the
+// first run). Noop when there's nothing useful to extract.
+export function prewarmIdentity(contextFiles: ContextFile[]): void {
+  if (!contextFiles || contextFiles.length === 0) return;
+  const { resume, jd } = splitResumeAndJd(contextFiles);
+  if (!resume && !jd) return;
+  void getExtractedCards(contextFiles);
+}
+
+// ── Stream-prompt selector: NEW path when we have cards, OLD when not ──
+
+interface PromptContext {
+  systemInstruction: string;
+  userRulesBlock: string;
+  kbHint: string;
+}
+
+async function prepareStreamPrompts(
+  contextFiles: ContextFile[],
+  generalMode: boolean,
+): Promise<PromptContext> {
+  // General-mode explicitly opts OUT of resume/JD grounding — skip
+  // extraction entirely.
+  if (generalMode) {
+    return {
+      systemInstruction: buildSystemInstruction(buildTextContext(contextFiles), true),
+      userRulesBlock: buildUserRulesBlock(),
+      kbHint: '',
+    };
+  }
+  const cards = await getExtractedCards(contextFiles);
+  if (!cards) {
+    return {
+      systemInstruction: buildSystemInstruction(buildTextContext(contextFiles), false),
+      userRulesBlock: buildUserRulesBlock(),
+      kbHint: '\n\n[Remember: draw from the Knowledge Base where relevant.]',
+    };
+  }
+  return {
+    systemInstruction: buildSystemInstructionNew(cards.identity, cards.jdPriorities, cards.resume, cards.jd),
+    userRulesBlock: buildUserRulesBlockNew(),
+    kbHint: '\n\n[Anchor this answer in ONE specific memory from WHO YOU ARE and silently slant it toward WHAT THIS ROLE REWARDS. No pure-textbook answers. No resume quoting — recall, don\'t cite.]',
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -371,15 +655,14 @@ You are NOT roleplaying as a candidate. Do NOT use fillers, hedges, or conversat
 export async function generateGemini(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
 ): Promise<string> {
-  const textContext = buildTextContext(contextFiles);
-  const systemInstruction = buildGeminiSystemInstruction(textContext, generalMode);
+  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
 
   const chatHistoryText = history
     .filter(m => m.role !== 'system')
     .map(m => `${m.role === 'user' ? 'Interviewer (Transcript)' : 'Candidate (You)'}: ${m.content}`)
     .join('\n');
 
-  const prompt = `${buildUserRulesBlock()}${chatHistoryText}\n\nInterviewer (Current Audio): ${query}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+  const prompt = `${userRulesBlock}${chatHistoryText}\n\nInterviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
 
   // Prepare binary file parts
   const fileParts = contextFiles
@@ -393,8 +676,7 @@ export async function generateGemini(
 export async function generateOpenAI(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
 ): Promise<string> {
-  const textContext = buildTextContext(contextFiles);
-  const systemInstruction = buildOpenAISystemInstruction(textContext, generalMode);
+  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
 
   const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
 
@@ -405,7 +687,7 @@ export async function generateOpenAI(
     }
   });
 
-  const contentParts: any[] = [{ type: 'text', text: `${buildUserRulesBlock()}` + (generalMode ? query : `${query}\n\n[Remember: draw from the Knowledge Base where relevant.]`) + `\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.` }];
+  const contentParts: any[] = [{ type: 'text', text: `${userRulesBlock}${query}${kbHint}\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.` }];
   imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
   messages.push({ role: 'user', content: contentParts });
 
@@ -416,8 +698,7 @@ export async function generateOpenAI(
 export async function generateXAI(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
 ): Promise<string> {
-  const textContext = buildTextContext(contextFiles);
-  const systemInstruction = buildGeminiSystemInstruction(textContext, generalMode);
+  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
 
   const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
 
@@ -428,7 +709,7 @@ export async function generateXAI(
     }
   });
 
-  const promptText = `${buildUserRulesBlock()}Interviewer (Current Audio): ${query}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+  const promptText = `${userRulesBlock}Interviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
   const contentParts: any[] = [{ type: 'text', text: promptText }];
   imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
   messages.push({ role: 'user', content: contentParts });
@@ -440,8 +721,7 @@ export async function generateXAI(
 export async function generateGroq(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
 ): Promise<string> {
-  const textContext = buildTextContext(contextFiles);
-  const systemInstruction = buildGeminiSystemInstruction(textContext, generalMode);
+  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
 
   const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
 
@@ -450,7 +730,7 @@ export async function generateGroq(
     .map(m => `${m.role === 'user' ? 'Interviewer (Transcript)' : 'Candidate (You)'}: ${m.content}`)
     .join('\n');
 
-  const promptText = `${buildUserRulesBlock()}${chatHistoryText}\n\nInterviewer (Current Audio): ${query}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+  const promptText = `${userRulesBlock}${chatHistoryText}\n\nInterviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
 
   const contentParts: any[] = [{ type: 'text', text: promptText }];
   imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
@@ -475,23 +755,22 @@ export async function streamGemini(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
   onToken: OnToken, signal?: AbortSignal, isAutoSolve?: boolean
 ): Promise<string> {
-  const textContext = buildTextContext(contextFiles);
-  const systemInstruction = isAutoSolve
-    ? buildAutoSolveSystemInstruction()
-    : buildGeminiSystemInstruction(textContext, generalMode);
-
+  let systemInstruction: string;
   let prompt: string;
   if (isAutoSolve) {
     // No history, no rules block, no "Interviewer (Current Audio)" framing —
     // just the raw task. Anything else pulls the model back toward the
     // chatty candidate persona we explicitly want to escape here.
+    systemInstruction = buildAutoSolveSystemInstruction();
     prompt = query;
   } else {
+    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+    systemInstruction = si;
     const chatHistoryText = history
       .filter(m => m.role !== 'system')
       .map(m => `${m.role === 'user' ? 'Interviewer (Transcript)' : 'Candidate (You)'}: ${m.content}`)
       .join('\n');
-    prompt = `${buildUserRulesBlock()}${chatHistoryText}\n\nInterviewer (Current Audio): ${query}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+    prompt = `${userRulesBlock}${chatHistoryText}\n\nInterviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
   }
 
   const fileParts = contextFiles
@@ -509,10 +788,16 @@ export async function streamOpenAI(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
   onToken: OnToken, signal?: AbortSignal, isAutoSolve?: boolean
 ): Promise<string> {
-  const textContext = buildTextContext(contextFiles);
-  const systemInstruction = isAutoSolve
-    ? buildAutoSolveSystemInstruction()
-    : buildOpenAISystemInstruction(textContext, generalMode);
+  let systemInstruction: string;
+  let userText: string;
+  if (isAutoSolve) {
+    systemInstruction = buildAutoSolveSystemInstruction();
+    userText = query;
+  } else {
+    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+    systemInstruction = si;
+    userText = `${userRulesBlock}${query}${kbHint}\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+  }
 
   const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
 
@@ -528,9 +813,6 @@ export async function streamOpenAI(
     });
   }
 
-  const userText = isAutoSolve
-    ? query
-    : `${buildUserRulesBlock()}` + (generalMode ? query : `${query}\n\n[Remember: draw from the Knowledge Base where relevant.]`) + `\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
   const contentParts: any[] = [{ type: 'text', text: userText }];
   imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
   messages.push({ role: 'user', content: contentParts });
@@ -544,10 +826,16 @@ export async function streamXAI(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
   onToken: OnToken, signal?: AbortSignal, isAutoSolve?: boolean
 ): Promise<string> {
-  const textContext = buildTextContext(contextFiles);
-  const systemInstruction = isAutoSolve
-    ? buildAutoSolveSystemInstruction()
-    : buildGeminiSystemInstruction(textContext, generalMode);
+  let systemInstruction: string;
+  let promptText: string;
+  if (isAutoSolve) {
+    systemInstruction = buildAutoSolveSystemInstruction();
+    promptText = query;
+  } else {
+    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+    systemInstruction = si;
+    promptText = `${userRulesBlock}Interviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+  }
 
   const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
 
@@ -559,10 +847,6 @@ export async function streamXAI(
       }
     });
   }
-
-  const promptText = isAutoSolve
-    ? query
-    : `${buildUserRulesBlock()}Interviewer (Current Audio): ${query}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
   const contentParts: any[] = [{ type: 'text', text: promptText }];
   imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
   messages.push({ role: 'user', content: contentParts });
@@ -576,23 +860,22 @@ export async function streamGroq(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
   onToken: OnToken, signal?: AbortSignal, isAutoSolve?: boolean
 ): Promise<string> {
-  const textContext = buildTextContext(contextFiles);
-  const systemInstruction = isAutoSolve
-    ? buildAutoSolveSystemInstruction()
-    : buildGeminiSystemInstruction(textContext, generalMode);
-
-  const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
-
+  let systemInstruction: string;
   let promptText: string;
   if (isAutoSolve) {
+    systemInstruction = buildAutoSolveSystemInstruction();
     promptText = query;
   } else {
+    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+    systemInstruction = si;
     const chatHistoryText = history
       .filter(m => m.role !== 'system')
       .map(m => `${m.role === 'user' ? 'Interviewer (Transcript)' : 'Candidate (You)'}: ${m.content}`)
       .join('\n');
-    promptText = `${buildUserRulesBlock()}${chatHistoryText}\n\nInterviewer (Current Audio): ${query}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+    promptText = `${userRulesBlock}${chatHistoryText}\n\nInterviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
   }
+
+  const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
 
   const contentParts: any[] = [{ type: 'text', text: promptText }];
   imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));

@@ -6,27 +6,10 @@
     <title>Interview Copilot AI</title>
     <!-- Favicon (CPU Icon Blue) -->
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%233b82f6%22 stroke-width=%222%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22><rect x=%224%22 y=%224%22 width=%2216%22 height=%2216%22 rx=%222%22/><rect x=%229%22 y=%229%22 width=%226%22 height=%226%22/><path d=%22M9 1v3%22/><path d=%22M15 1v3%22/><path d=%22M9 20v3%22/><path d=%22M15 20v3%22/><path d=%22M20 9h3%22/><path d=%22M20 14h3%22/><path d=%22M1 9h3%22/><path d=%22M1 14h3%22/></svg>">
-    <script src="https://cdn.tailwindcss.com?plugins=typography"></script>
-    <script>
-      tailwind.config = {
-        darkMode: 'class',
-        theme: {
-          extend: {
-            colors: {
-              background: 'var(--bg-color)',
-              surface: 'var(--surface-color)',
-              border: 'var(--border-color)',
-              text: 'var(--text-color)',
-              primary: '#3b82f6',
-              accent: '#f59e0b',
-            },
-            animation: {
-              'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-            }
-          },
-        },
-      }
-    </script>
+    <!-- Tailwind compiled via PostCSS; loaded BEFORE the inline <style> so
+         our custom iOS-token CSS below wins the cascade (matches the order
+         Play CDN used to produce). Vite processes this through tailwind.config.cjs + postcss.config.cjs. -->
+    <link rel="stylesheet" href="/index.css">
     <style>
       :root {
         /* Light Mode Defaults */
@@ -186,7 +169,6 @@
         }
       }
     </style>
-<link rel="stylesheet" href="/index.css">
 </head>
   <body>
     <div id="root"></div>

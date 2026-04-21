@@ -9,6 +9,16 @@ const db = require('../database');
 
 const router = express.Router();
 
+// Mirror of the same env var used by admin.js / license.js. Lower-cased for
+// case-insensitive comparison against req.user.email. Used to short-circuit
+// the payment flow for admins so they can self-grant any tier without
+// burning real money against Stripe/Razorpay.
+const DEVELOPER_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+function isAdminEmail(email) {
+  return !!email && DEVELOPER_EMAILS.includes(String(email).toLowerCase());
+}
+
 // ── Initialize payment providers (graceful if keys missing) ──
 let stripe = null;
 let razorpay = null;
@@ -64,6 +74,17 @@ router.post('/create-checkout', authMiddleware, async (req, res) => {
   try {
     const { country_code } = req.body;
     const tier = normalizeTier(req.body.tier);
+
+    // ── Admin bypass ──
+    // Admins can self-grant any tier without going through Stripe/Razorpay.
+    // Returning provider='admin-grant' tells the client to skip the
+    // checkout redirect and update local state from the returned license.
+    // Without this branch, an admin clicking "Start Pro" on the pricing
+    // card would land on a real Stripe page and have to abort.
+    if (isAdminEmail(req.user.email)) {
+      return await grantAdminTier(req, res, tier);
+    }
+
     const provider = getPaymentProvider(country_code || req.user.country_code || 'US');
 
     if (provider === 'razorpay') {
@@ -76,6 +97,244 @@ router.post('/create-checkout', authMiddleware, async (req, res) => {
     res.status(500).json({ error: err.message || 'Failed to create checkout. Please try again.' });
   }
 });
+
+// ── Admin self-grant ──
+// Skips the payment provider entirely. Writes the tier to the user + license
+// rows directly, audit-logs the action, and returns a synthetic checkout
+// response the client recognizes via provider='admin-grant'. Mirrors the
+// success path of /verify-razorpay so the client's local-state update can
+// reuse the same code path.
+async function grantAdminTier(req, res, tier) {
+  const cfg = grantConfigForTier(tier);
+  db.updateUserTier(req.user.id, cfg.tier);
+  db.updateLicenseOnPayment(req.user.id, {
+    tier: cfg.tier,
+    status: 'active',
+    expires_at: cfg.expires_at,
+    sessions_limit: cfg.sessions_limit,
+  });
+  try {
+    db.logAdminAction(
+      req.user.email,
+      'admin-grant-tier',
+      req.user.id,
+      req.user.email,
+      { tier: cfg.tier, self_grant: true },
+    );
+  } catch (auditErr) {
+    console.warn('[admin-grant] audit log failed:', auditErr.message);
+  }
+  const license = db.getLicenseByUserId(req.user.id);
+  return res.json({
+    provider: 'admin-grant',
+    tier: cfg.tier,
+    license: license ? { ...license, last_validated: Date.now() } : null,
+    message: `Admin tier granted: ${cfg.tier.toUpperCase()}`,
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  UPGRADE TIER — in-place plan swap (Pro ↔ Max)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Distinct from /create-checkout because we update the EXISTING
+// subscription instead of creating a new one. Without this endpoint, a
+// Pro user clicking "Upgrade to Max" would create a second subscription
+// alongside the first — they'd be billed for both until they noticed.
+//
+// Scope: Pro ↔ Max only. Basic is a one-time purchase (no subscription
+// to swap), and downgrades to Basic / cancels go through the existing
+// portal/cancel routes. Anyone on free or basic who picks Pro/Max still
+// goes through /create-checkout (no existing sub to update).
+//
+// Both providers prorate. Stripe charges the diff on the next invoice
+// via proration_behavior='create_prorations'. Razorpay charges the diff
+// today via schedule_change_at='now' for upgrades; downgrades wait for
+// cycle_end so the user keeps the tier they paid for through the cycle.
+router.post('/upgrade-tier', authMiddleware, async (req, res) => {
+  try {
+    const targetTier = normalizeTier(req.body.tier);
+
+    // Admin bypass — same shape as /create-checkout. Lets admins flip
+    // their own tier to test UI on a new badge without a payment round-trip.
+    if (isAdminEmail(req.user.email)) {
+      return await grantAdminTier(req, res, targetTier);
+    }
+
+    if (targetTier === 'basic') {
+      return res.status(400).json({
+        error: 'Switching to Basic from a paid subscription is not supported. Cancel your current subscription first.',
+      });
+    }
+
+    const user = db.getUserById(req.user.id);
+    const currentLicense = db.getLicenseByUserId(req.user.id);
+    if (!user || !currentLicense) {
+      return res.status(400).json({
+        error: 'No active subscription found. Start a new subscription instead.',
+      });
+    }
+    const currentTier = currentLicense.tier;
+    if (currentTier === targetTier) {
+      return res.status(400).json({
+        error: `You're already on the ${targetTier.toUpperCase()} plan.`,
+      });
+    }
+    if (currentTier !== 'pro' && currentTier !== 'max') {
+      return res.status(400).json({
+        error: 'In-place plan change is only available for Pro and Max subscribers. Use the regular checkout instead.',
+      });
+    }
+    if (currentLicense.status !== 'active') {
+      return res.status(400).json({
+        error: 'Your subscription is not currently active. Renew or restart it from the billing page.',
+      });
+    }
+
+    // Provider is encoded in the stripe_customer_id prefix. We don't
+    // store provider explicitly — same convention as /subscription.
+    const customerId = user.stripe_customer_id || '';
+    const isRazorpay = customerId.startsWith('rzp_');
+    const isStripe = customerId.startsWith('cus_');
+
+    if (isRazorpay) {
+      return await upgradeRazorpaySubscription(req, res, { user, currentTier, targetTier });
+    }
+    if (isStripe) {
+      return await upgradeStripeSubscription(req, res, { user, currentTier, targetTier });
+    }
+
+    return res.status(400).json({
+      error: 'No payment provider on file for this account. Start a new subscription to switch tiers.',
+    });
+  } catch (err) {
+    console.error('Upgrade-tier error:', err.message, err.stack);
+    res.status(500).json({ error: err.message || 'Failed to change plan. Please try again.' });
+  }
+});
+
+async function upgradeStripeSubscription(req, res, { user, currentTier, targetTier }) {
+  if (!stripe) {
+    return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
+  }
+  const newPriceId = process.env[STRIPE_PRICE_ENV[targetTier]]
+    || (targetTier === 'pro' ? process.env.STRIPE_PRICE_USD : null);
+  if (!newPriceId) {
+    return res.status(503).json({
+      error: `Pricing for ${targetTier.toUpperCase()} is not configured yet. Contact support.`,
+    });
+  }
+
+  // Stripe customers can in theory have multiple active subscriptions.
+  // We pick the most recent — the upgrade flow only makes sense against
+  // the current paid tier and that's what /subscription reports.
+  const subs = await stripe.subscriptions.list({
+    customer: user.stripe_customer_id,
+    status: 'active',
+    limit: 1,
+  });
+  if (subs.data.length === 0) {
+    return res.status(404).json({
+      error: 'No active Stripe subscription found. Start a new subscription instead.',
+    });
+  }
+  const subscription = subs.data[0];
+  const itemId = subscription.items.data[0]?.id;
+  if (!itemId) {
+    return res.status(500).json({ error: 'Subscription has no line items to update. Contact support.' });
+  }
+
+  // The metadata.tier override is critical — customer.subscription.updated
+  // reads it back to grant the right tier. Without it, the webhook would
+  // fall through to the existing license tier (no change), and the upgrade
+  // would silently revert on the next webhook tick.
+  await stripe.subscriptions.update(subscription.id, {
+    items: [{ id: itemId, price: newPriceId }],
+    proration_behavior: 'create_prorations',
+    metadata: {
+      ...(subscription.metadata || {}),
+      tier: targetTier,
+      user_email: user.email,
+      user_id: String(user.id),
+    },
+  });
+
+  // Optimistic local update so the UI flips immediately. The webhook will
+  // confirm seconds later; if anything goes wrong server-side, the next
+  // /subscription poll will re-sync from Stripe via the webhook history.
+  const grant = grantConfigForTier(targetTier);
+  db.updateUserTier(user.id, grant.tier);
+  db.updateLicenseOnPayment(user.id, {
+    tier: grant.tier,
+    status: 'active',
+    expires_at: grant.expires_at,
+    sessions_limit: grant.sessions_limit,
+  });
+  const license = db.getLicenseByUserId(user.id);
+
+  return res.json({
+    provider: 'stripe-upgrade',
+    tier: targetTier,
+    previous_tier: currentTier,
+    license: license ? { ...license, last_validated: Date.now() } : null,
+    message: `Plan changed to ${targetTier.toUpperCase()}. The prorated difference will appear on your next invoice.`,
+  });
+}
+
+async function upgradeRazorpaySubscription(req, res, { user, currentTier, targetTier }) {
+  if (!razorpay) {
+    return res.status(503).json({ error: 'Razorpay is not configured. Contact support.' });
+  }
+  const newPlanId = process.env[RAZORPAY_PLAN_ENV[targetTier]]
+    || (targetTier === 'pro' ? process.env.RAZORPAY_PLAN_ID : null);
+  if (!newPlanId) {
+    return res.status(503).json({
+      error: `Pricing for ${targetTier.toUpperCase()} is not configured yet. Contact support.`,
+    });
+  }
+
+  const subId = db.getLatestRazorpaySubscriptionId(user.id);
+  if (!subId) {
+    return res.status(404).json({
+      error: 'No active Razorpay subscription found. Start a new subscription instead.',
+    });
+  }
+
+  // Upgrade now (charge the diff today, give Max access immediately).
+  // Downgrade waits for cycle_end so the user keeps the tier they paid
+  // for through the rest of the billing cycle.
+  const isUpgrade = (currentTier === 'pro' && targetTier === 'max');
+  await razorpay.subscriptions.update(subId, {
+    plan_id: newPlanId,
+    schedule_change_at: isUpgrade ? 'now' : 'cycle_end',
+    customer_notify: 1,
+  });
+
+  // For upgrades we apply optimistically; subscription.charged webhook
+  // will reconcile the next billing cycle. For downgrades we keep the
+  // current tier in DB — webhook will downgrade when the new cycle starts.
+  if (isUpgrade) {
+    const grant = grantConfigForTier(targetTier);
+    db.updateUserTier(user.id, grant.tier);
+    db.updateLicenseOnPayment(user.id, {
+      tier: grant.tier,
+      status: 'active',
+      expires_at: grant.expires_at,
+      sessions_limit: grant.sessions_limit,
+    });
+  }
+  const license = db.getLicenseByUserId(user.id);
+
+  return res.json({
+    provider: 'razorpay-upgrade',
+    tier: isUpgrade ? targetTier : currentTier,
+    previous_tier: currentTier,
+    pending_tier: isUpgrade ? null : targetTier,
+    license: license ? { ...license, last_validated: Date.now() } : null,
+    message: isUpgrade
+      ? `Plan upgraded to ${targetTier.toUpperCase()}. The prorated difference has been charged today.`
+      : `Plan will switch to ${targetTier.toUpperCase()} at the end of your current billing cycle. You keep ${currentTier.toUpperCase()} access until then.`,
+  });
+}
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  CREATE RENEWAL — Basic top-up only
@@ -398,14 +657,53 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Payment verification failed. Invalid signature.' });
     }
 
+    // Idempotency: the client calls /verify-razorpay on success, AND the
+    // webhook handler independently processes the same payment. Both paths
+    // race, and a double-click / client retry can trigger /verify twice for
+    // the same payment. If we already recorded a completed payment with
+    // this provider_payment_id, short-circuit and return the current
+    // license state — re-running grantBasicRenewal adds +1 credit +1h on
+    // every duplicate call (verified: grantBasicRenewal is additive).
+    {
+      const d = db.getDB();
+      const existing = d.prepare(`
+        SELECT * FROM payments
+        WHERE user_id = ? AND provider = 'razorpay'
+          AND provider_payment_id = ? AND status = 'completed'
+        LIMIT 1
+      `).get(req.user.id, razorpay_payment_id);
+      if (existing) {
+        const license = db.getLicenseByUserId(req.user.id);
+        const existingMeta = (() => { try { return JSON.parse(existing.metadata || '{}'); } catch { return {}; } })();
+        return res.json({
+          success: true,
+          duplicate: true,
+          message: existingMeta.mode === 'renewal'
+            ? 'Renewal already applied.'
+            : 'Payment already verified.',
+          tier: existing.tier_granted,
+          mode: existingMeta.mode || 'tier',
+          license: license ? { ...license, last_validated: Date.now() } : null,
+        });
+      }
+    }
+
     // Signature verified — resolve which tier (or renewal) was actually
     // purchased by fetching the original subscription/order from Razorpay
     // and reading the `notes` we stamped at create time. Trusting client-
-    // sent values is unsafe (a free user could POST tier=max). Falls back
-    // to 'pro' if the fetch fails, matching the legacy behavior.
-    let grantedTier = 'pro';
-    let grantedAmount = RAZORPAY_TIER_CONFIG.pro.amountPaise;
+    // sent values is unsafe (a free user could POST tier=max).
+    //
+    // CRITICAL: do NOT default to 'pro' on fetch failure — that silently
+    // grants Pro to anyone whose verify lands during a Razorpay outage,
+    // including someone who paid for Max (downgrade) or Basic (upgrade).
+    // If the fetch fails we surface a "verification pending" response and
+    // let the signature-verified webhook (which carries the full payload)
+    // reconcile the tier authoritatively. The client polls /subscription,
+    // so the upgrade lands within seconds either way.
+    let grantedTier = null;
+    let grantedAmount = null;
     let isRenewal = false;
+    let lookupFailed = false;
     try {
       if (razorpay_subscription_id) {
         const sub = await razorpay.subscriptions.fetch(razorpay_subscription_id);
@@ -423,61 +721,109 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
           isRenewal = true;
         }
       }
-      if (!isRenewal && RAZORPAY_TIER_CONFIG[grantedTier]) {
+      if (!isRenewal && grantedTier && RAZORPAY_TIER_CONFIG[grantedTier]) {
         grantedAmount = RAZORPAY_TIER_CONFIG[grantedTier].amountPaise;
       }
     } catch (fetchErr) {
-      console.error('[verify-razorpay] tier lookup failed, defaulting to pro:', fetchErr.message);
+      lookupFailed = true;
+      console.error('━'.repeat(60));
+      console.error('[verify-razorpay] CRITICAL: tier lookup failed for verified payment');
+      console.error('  payment_id:     ', razorpay_payment_id);
+      console.error('  subscription_id:', razorpay_subscription_id || '(none)');
+      console.error('  order_id:       ', razorpay_order_id || '(none)');
+      console.error('  user_email:     ', req.user.email);
+      console.error('  error:          ', fetchErr.message);
+      console.error('  → returning pending; webhook will reconcile authoritatively');
+      console.error('━'.repeat(60));
     }
 
-    // Payment verified — grant the tier (or renewal top-up).
+    // If we couldn't determine the tier, the safe move is to NOT touch the
+    // license/tier in the DB. We record the payment as 'pending' (audit
+    // trail) and return success-with-pending so the client shows a friendly
+    // message. The signature-verified webhook will land within seconds and
+    // grant the right tier from the full payload.
+    if (lookupFailed || !grantedTier) {
+      try {
+        db.recordPayment({
+          user_id: req.user.id,
+          email: req.user.email,
+          provider: 'razorpay',
+          provider_payment_id: razorpay_payment_id,
+          provider_subscription_id: razorpay_subscription_id || null,
+          amount: 0,
+          currency: 'INR',
+          status: 'pending',
+          tier_granted: null,
+          metadata: {
+            order_id: razorpay_order_id || null,
+            verified_client_side: true,
+            tier_lookup_failed: lookupFailed,
+            note: 'Awaiting webhook reconciliation',
+          },
+        });
+      } catch (recErr) {
+        console.warn('[verify-razorpay] failed to record pending payment:', recErr.message);
+      }
+      const license = db.getLicenseByUserId(req.user.id);
+      return res.status(202).json({
+        success: true,
+        pending: true,
+        message: 'Payment received. Your account will activate momentarily.',
+        tier: license ? license.tier : null,
+        license: license ? { ...license, last_validated: Date.now() } : null,
+      });
+    }
+
+    // Payment verified — grant the tier (or renewal top-up). Wrapped in a
+    // SQLite transaction so a partial failure (grant succeeds, recordPayment
+    // throws) can't leave the user paid-but-not-recorded or, on a client
+    // retry, double-apply the additive renewal top-up.
     const user = db.getUserById(req.user.id);
     let grantedTierLabel = grantedTier;
     if (user) {
-      if (isRenewal) {
-        // Renewal: +1 session, +1 hour — no tier reset, no expiry overwrite.
-        db.grantBasicRenewal(user.id);
-        // Basic renewal doesn't change the tier; keep whatever the user
-        // already had (almost always 'basic', occasionally 'free' if they
-        // let it lapse and are topping up). getLicenseByUserId below
-        // reflects the post-renewal state.
-        const post = db.getLicenseByUserId(user.id);
-        grantedTierLabel = (post && post.tier) || 'basic';
-      } else {
-        const grant = grantConfigForTier(grantedTier);
-        grantedTierLabel = grant.tier;
-        db.updateUserTier(user.id, grant.tier);
-        db.updateLicenseOnPayment(user.id, {
-          tier: grant.tier,
-          status: 'active',
-          expires_at: grant.expires_at,
-          sessions_limit: grant.sessions_limit,
+      const sqlite = db.getDB();
+      const applyGrant = sqlite.transaction(() => {
+        if (isRenewal) {
+          // Renewal: +1 session, +1 hour — no tier reset, no expiry overwrite.
+          db.grantBasicRenewal(user.id);
+          const post = db.getLicenseByUserId(user.id);
+          grantedTierLabel = (post && post.tier) || 'basic';
+        } else {
+          const grant = grantConfigForTier(grantedTier);
+          grantedTierLabel = grant.tier;
+          db.updateUserTier(user.id, grant.tier);
+          db.updateLicenseOnPayment(user.id, {
+            tier: grant.tier,
+            status: 'active',
+            expires_at: grant.expires_at,
+            sessions_limit: grant.sessions_limit,
+          });
+        }
+
+        // Store payment reference
+        sqlite.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
+          .run(`rzp_${razorpay_payment_id}`, Date.now(), user.id);
+
+        // Record payment in history
+        db.recordPayment({
+          user_id: user.id,
+          email: user.email,
+          provider: 'razorpay',
+          provider_payment_id: razorpay_payment_id,
+          provider_subscription_id: razorpay_subscription_id || null,
+          amount: isRenewal ? RENEWAL_INR_PAISE : grantedAmount,
+          currency: 'INR',
+          status: 'completed',
+          tier_granted: grantedTierLabel,
+          metadata: {
+            order_id: razorpay_order_id,
+            verified_client_side: true,
+            tier: grantedTierLabel,
+            mode: isRenewal ? 'renewal' : 'tier',
+          },
         });
-      }
-
-      // Store payment reference
-      const d = db.getDB();
-      d.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
-        .run(`rzp_${razorpay_payment_id}`, Date.now(), user.id);
-
-      // Record payment in history
-      db.recordPayment({
-        user_id: user.id,
-        email: user.email,
-        provider: 'razorpay',
-        provider_payment_id: razorpay_payment_id,
-        provider_subscription_id: razorpay_subscription_id || null,
-        amount: isRenewal ? RENEWAL_INR_PAISE : grantedAmount,
-        currency: 'INR',
-        status: 'completed',
-        tier_granted: grantedTierLabel,
-        metadata: {
-          order_id: razorpay_order_id,
-          verified_client_side: true,
-          tier: grantedTierLabel,
-          mode: isRenewal ? 'renewal' : 'tier',
-        },
       });
+      applyGrant();
     }
 
     const license = db.getLicenseByUserId(req.user.id);

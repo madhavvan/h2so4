@@ -4,7 +4,7 @@ import { Message, ContextFile } from "../types";
 export class XAIService {
   private openai: OpenAI | null = null;
   // User specified model
-  private modelName = "grok-4-1-fast";
+  private modelName = "grok-4-1-fast-non-reasoning";
 
   public init(apiKey: string) {
     this.openai = new OpenAI({

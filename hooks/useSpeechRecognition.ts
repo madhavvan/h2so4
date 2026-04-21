@@ -170,7 +170,7 @@ export const useSpeechRecognition = ({
     }
 
     const socket = new WebSocket(
-      'wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&punctuate=true',
+      'wss://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&interim_results=true&punctuate=true',
       ['token', cleanKey]
     );
 

@@ -5,20 +5,21 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "stripe:setup": "node --env-file=.env scripts/stripe-setup.mjs"
   },
   "dependencies": {
-    "@google/genai": "^1.36.0",
+    "@google/genai": "^1.48.0",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
     "google-auth-library": "^10.6.2",
-    "groq-sdk": "^0.9.1",
+    "groq-sdk": "^1.1.2",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^6.9.15",
-    "openai": "^4.24.1",
+    "openai": "^6.34.0",
     "rate-limiter-flexible": "^5.0.3",
     "razorpay": "^2.9.6",
     "resend": "^4.8.0",
