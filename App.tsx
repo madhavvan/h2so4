@@ -5,7 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT } from './services/aiProxyService';
+import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT, prewarmIdentity } from './services/aiProxyService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
 import { extractTextFromDocx } from './services/docxService';
@@ -1930,9 +1930,13 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       messagesRef.current = messages;
   }, [messages]);
 
-  // Keep contextFilesRef in sync with db.contextFiles
+  // Keep contextFilesRef in sync with db.contextFiles. Also fire the
+  // identity-extraction preflight here so the first interview question
+  // doesn't pay the ~2-5s round-trip — by the time the user starts, the
+  // WHO-YOU-ARE + WHAT-THIS-ROLE-REWARDS cards are already cached.
   useEffect(() => {
       contextFilesRef.current = db.contextFiles;
+      prewarmIdentity(db.contextFiles);
   }, [db.contextFiles]);
   const [inputText, setInputText] = useState("");
   const [interimText, setInterimText] = useState("");

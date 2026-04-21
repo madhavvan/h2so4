@@ -50,6 +50,11 @@ app.use(cors({
 app.use('/api/v1/webhooks', webhookRoutes);
 
 app.use(express.json({ limit: '10mb' }));
+// Native HTML form submissions (e.g. the server-rendered password reset
+// form in /api/v1/auth/reset-password) post application/x-www-form-urlencoded.
+// Without this middleware req.body would be undefined and the POST handler
+// would treat every form submission as "missing token".
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 
 // ── Rate limiting ──
 const { RateLimiterMemory } = require('rate-limiter-flexible');
@@ -61,6 +66,38 @@ const authLimiter = new RateLimiterMemory({ points: 10, duration: 300 }); // 10 
 // Very strict forgot-password limiter — prevents mass email spam and
 // bill-bombing on transactional mail providers. 5 requests / 15 min / IP.
 const forgotPasswordLimiter = new RateLimiterMemory({ points: 5, duration: 900 });
+// Checkout creation limiter — every hit creates a real Stripe/Razorpay
+// session/order, so a tight window matters. 20 attempts / 5 min / IP
+// covers double-click frustration and switch-tier exploration without
+// allowing scripted abuse of the provider create-session APIs (which
+// also have account-wide rate limits we'd rather not hit).
+const checkoutLimiter = new RateLimiterMemory({ points: 20, duration: 300 });
+
+// Admin surface limiters. Two tiers:
+//   • adminLimiter — generous cap on read-heavy admin browsing (listing
+//     users, paging through audit log, pulling stats). 120/min means an
+//     admin can grind through the UI without friction.
+//   • adminDestructiveLimiter — tight cap on POST/PATCH/DELETE that mutates
+//     state. 30/5min is enough for a burst of support actions but stops
+//     a compromised token from doing thousands of refunds in a row.
+const adminLimiter = new RateLimiterMemory({ points: 120, duration: 60 });
+const adminDestructiveLimiter = new RateLimiterMemory({ points: 30, duration: 300 });
+
+// Optional IP allowlist for admin endpoints. Comma-separated CIDR-free list
+// (single IPs and IPv4/IPv6 exact match). Empty string = no restriction
+// (this is the default for dev). In prod we strongly recommend setting
+// ADMIN_IP_ALLOWLIST to the office VPN range so a leaked admin JWT alone
+// cannot be replayed from the open internet.
+const ADMIN_IP_ALLOWLIST = (process.env.ADMIN_IP_ALLOWLIST || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+function isAdminIpAllowed(ip) {
+  if (ADMIN_IP_ALLOWLIST.length === 0) return true; // disabled → allow all
+  if (!ip) return false;
+  // Normalize IPv6-mapped IPv4 (::ffff:1.2.3.4 → 1.2.3.4) for easy matches.
+  const normalized = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+  return ADMIN_IP_ALLOWLIST.includes(ip) || ADMIN_IP_ALLOWLIST.includes(normalized);
+}
 
 app.use(async (req, res, next) => {
   try {
@@ -82,6 +119,57 @@ app.use(async (req, res, next) => {
         await forgotPasswordLimiter.consume(key);
       } catch {
         return res.status(429).json({ error: 'Too many reset requests. Please wait 15 minutes.' });
+      }
+    }
+
+    // Tighter limit on the three checkout-creating endpoints. Each request
+    // creates a real Stripe/Razorpay artifact (session/order/subscription)
+    // so we need to back-pressure scripted abuse before we hit the
+    // provider's own account-wide rate ceilings.
+    if (
+      req.method === 'POST' &&
+      (req.path === '/api/v1/payments/create-checkout' ||
+       req.path === '/api/v1/payments/create-renewal' ||
+       req.path === '/api/v1/payments/upgrade-tier')
+    ) {
+      try {
+        await checkoutLimiter.consume(key);
+      } catch {
+        return res.status(429).json({ error: 'Too many checkout attempts. Please wait a few minutes and try again.' });
+      }
+    }
+
+    // Admin surface. Enforce IP allowlist first (if configured), then
+    // apply read/write rate limits. Only active for /api/v1/admin/**; all
+    // other traffic is unaffected.
+    if (req.path.startsWith('/api/v1/admin/')) {
+      if (!isAdminIpAllowed(key)) {
+        // Audit the attempt before we drop the connection. We don't yet
+        // know WHICH admin — no JWT is checked at this layer — but we do
+        // know the IP and target path.
+        try {
+          require('./database').logAdminAction(
+            'unknown',
+            'admin-ip-blocked',
+            null,
+            null,
+            { path: req.path, method: req.method, ip: key },
+          );
+        } catch { /* best-effort */ }
+        return res.status(403).json({ error: 'Admin access not allowed from this network' });
+      }
+      try {
+        await adminLimiter.consume(key);
+      } catch {
+        return res.status(429).json({ error: 'Admin rate limit exceeded. Wait a minute and retry.' });
+      }
+      // Destructive verbs get an extra tighter bucket.
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+        try {
+          await adminDestructiveLimiter.consume(key);
+        } catch {
+          return res.status(429).json({ error: 'Too many admin mutations. Wait 5 minutes and retry.' });
+        }
       }
     }
 
@@ -274,6 +362,22 @@ const server = app.listen(PORT, () => {
   console.log(`minicaai API running on port ${PORT}`);
   console.log(`Database initialized`);
 });
+
+// ── Periodic chores ──
+// Reset tokens expire after 1 hour but the row sticks around indefinitely
+// until something cleans it up. We were leaking thousands of stale rows
+// per month. Run once at boot then every 24h. Wrapped in try/catch so a
+// transient DB blip can't kill the interval.
+const RESET_TOKEN_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+function runResetTokenCleanup() {
+  try {
+    database.cleanupExpiredResetTokens();
+  } catch (err) {
+    console.warn('[cleanup] reset-token sweep failed:', err && err.message);
+  }
+}
+runResetTokenCleanup();
+setInterval(runResetTokenCleanup, RESET_TOKEN_CLEANUP_INTERVAL_MS).unref();
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  LIVE SUPPORT CHAT (WebSocket)

@@ -185,4 +185,63 @@ function renderPasswordResetEmail({ name, resetUrl }) {
   return { subject: 'Reset your minicaai password', html, text };
 }
 
-module.exports = { sendMail, renderPasswordResetEmail };
+// Sent from webhook handlers when Stripe/Razorpay reports a failed
+// charge against an active subscription. We deliberately keep the body
+// short and action-oriented because most failures are recoverable
+// (expired card, declined CVC, insufficient funds) and the user just
+// needs a one-click path back to billing.
+//
+// `manageUrl` should be the FRONTEND_URL — the SubscriptionGate UI on
+// that page already exposes the right portal/cancel/upgrade controls
+// based on the user's provider and tier.
+function renderPaymentFailedEmail({ name, tier, manageUrl, reason }) {
+  const safeName = (name || 'there').replace(/</g, '&lt;');
+  const safeTier = (tier || 'your plan').toString().toUpperCase().replace(/</g, '&lt;');
+  const safeReason = reason ? String(reason).replace(/</g, '&lt;').slice(0, 200) : '';
+  const url = manageUrl || 'https://minicaai.com';
+
+  const text = [
+    `Hi ${safeName},`,
+    '',
+    `We weren't able to process the most recent payment for your minicaai ${safeTier} subscription.`,
+    safeReason ? `Reason from your bank/card: ${safeReason}` : '',
+    '',
+    "Most failures are quick fixes — an expired card, a declined CVC, or a temporary hold. Open your billing page to update your payment method:",
+    '',
+    url,
+    '',
+    "We'll automatically retry over the next few days. If we still can't collect, your subscription will lapse and your account will downgrade to the free tier — no action needed if you'd prefer that outcome.",
+    '',
+    '— The minicaai team',
+  ].filter(Boolean).join('\n');
+
+  const html = `<!doctype html>
+<html><body style="margin:0;padding:0;background:#050507;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e5e7eb">
+  <div style="max-width:560px;margin:0 auto;padding:40px 24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:32px">
+      <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:inline-block"></div>
+      <div style="font-weight:700;font-size:18px;color:#fff">minicaai</div>
+    </div>
+    <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 16px">Payment couldn't be processed</h1>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 16px">
+      Hi ${safeName}, we weren't able to process the most recent payment for your minicaai <strong style="color:#e5e7eb">${safeTier}</strong> subscription.
+    </p>
+    ${safeReason ? `<p style="font-size:13px;line-height:1.6;color:#fca5a5;background:#1f1416;border:1px solid #4c1d24;border-radius:8px;padding:10px 14px;margin:0 0 24px">Reason from your bank/card: ${safeReason}</p>` : ''}
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 24px">
+      Most failures are quick fixes — an expired card, a declined CVC, or a temporary hold. Update your payment method below:
+    </p>
+    <div style="margin:24px 0">
+      <a href="${url}" style="display:inline-block;padding:14px 28px;border-radius:12px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;font-weight:600;font-size:14px;text-decoration:none">
+        Update payment method
+      </a>
+    </div>
+    <div style="border-top:1px solid #1f2937;padding-top:16px;font-size:12px;color:#6b7280;line-height:1.6">
+      We'll automatically retry over the next few days. If we still can't collect, your subscription will lapse and your account will downgrade to the free tier — no action needed if you'd prefer that.
+    </div>
+  </div>
+</body></html>`;
+
+  return { subject: `Payment failed for your minicaai ${safeTier} subscription`, html, text };
+}
+
+module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail };

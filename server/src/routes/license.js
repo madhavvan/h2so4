@@ -77,7 +77,7 @@ router.post('/validate', async (req, res) => {
         sessions_used: license.sessions_used,
         sessions_limit: license.sessions_limit,
         sessions_exhausted: true,
-        message: 'Session limit reached. Upgrade to Pro for unlimited sessions.',
+        message: 'Session limit reached. Upgrade your plan for more interviews.',
       });
     }
 
@@ -103,8 +103,10 @@ router.post('/session', authMiddleware, async (req, res) => {
     const license = db.getLicenseByUserId(req.user.id);
     if (!license) return res.status(404).json({ error: 'No license found' });
 
-    if (license.sessions_limit > 0 && license.sessions_used >= license.sessions_limit) {
-      return res.status(403).json({ error: 'Session limit reached. Upgrade to Pro.' });
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+
+    if (!isAdmin && license.sessions_limit > 0 && license.sessions_used >= license.sessions_limit) {
+      return res.status(403).json({ error: 'Session limit reached. Upgrade your plan to continue.' });
     }
 
     db.incrementSessionCount(license.key);
@@ -112,8 +114,8 @@ router.post('/session', authMiddleware, async (req, res) => {
 
     res.json({
       sessions_used: updated.sessions_used,
-      sessions_limit: updated.sessions_limit,
-      remaining: updated.sessions_limit === -1 ? -1 : updated.sessions_limit - updated.sessions_used,
+      sessions_limit: isAdmin ? -1 : updated.sessions_limit,
+      remaining: (isAdmin || updated.sessions_limit === -1) ? -1 : updated.sessions_limit - updated.sessions_used,
     });
   } catch (err) {
     console.error('Session increment error:', err);

@@ -44,7 +44,17 @@ function authMiddleware(req, res, next) {
       }
     }
 
-    req.user = decoded;
+    // Expose step-up + impersonation metadata on req.user so downstream
+    // middleware (stepUpOnly in admin.js) and route handlers can enforce
+    // additional constraints. These claims are set by /admin/reauth and
+    // /admin/users/:id/impersonate; missing → defaults to false/null.
+    req.user = {
+      ...decoded,
+      stepUp: !!decoded.stepUp,
+      stepUpAt: decoded.stepUpAt || 0,
+      impersonatedBy: decoded.impersonatedBy || null,
+      impersonatedAt: decoded.impersonatedAt || 0,
+    };
     next();
   } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });

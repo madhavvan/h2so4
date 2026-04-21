@@ -20,7 +20,7 @@ function isStrongPassword(password) {
 // ── Sign Up ──
 router.post('/signup', async (req, res) => {
   try {
-    const { email, name, password, country_code, device_id, app_version } = req.body;
+    const { email, name, password, country_code, device_id, platform, app_version } = req.body;
 
     // Validation
     if (!email || !password) {
@@ -70,7 +70,7 @@ router.post('/signup', async (req, res) => {
     // auto-deactivates the oldest device when the tier limit is full. The
     // old `if (deviceResult.error)` branch was dead code.
     if (device_id) {
-      db.registerDevice(userId, device_id, req.headers['user-agent'] || 'Unknown');
+      db.registerDevice(userId, device_id, req.headers['user-agent'] || 'Unknown', platform);
     }
 
     // Log successful signup — non-critical, don't crash the signup flow
@@ -83,6 +83,7 @@ router.post('/signup', async (req, res) => {
         device_id: device_id || '',
         country_code: country_code || 'US',
         success: true,
+        platform,
       });
     } catch (logErr) {
       console.warn('Failed to log signup:', logErr.message);
@@ -104,7 +105,7 @@ router.post('/signup', async (req, res) => {
 // ── Login ──
 router.post('/login', async (req, res) => {
   try {
-    const { email, password, device_id, app_version } = req.body;
+    const { email, password, device_id, platform, app_version } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
@@ -122,6 +123,7 @@ router.post('/login', async (req, res) => {
           device_id: device_id || null,
           success: false,
           error_reason: 'invalid_credentials',
+          platform,
         });
       } catch (logErr) {
         console.warn('Failed to log login attempt:', logErr.message);
@@ -131,7 +133,7 @@ router.post('/login', async (req, res) => {
 
     // Check if banned
     if (user.is_banned) {
-      try { db.logLogin({ user_id: user.id, email: user.email, ip_address: req.ip, device_id: device_id || null, success: false, error_reason: 'account_banned' }); } catch {}
+      try { db.logLogin({ user_id: user.id, email: user.email, ip_address: req.ip, device_id: device_id || null, success: false, error_reason: 'account_banned', platform }); } catch {}
       return res.status(403).json({ error: 'This account has been suspended. Contact support.' });
     }
 
@@ -139,7 +141,7 @@ router.post('/login', async (req, res) => {
     // auto-deactivates the oldest device when the tier limit is full.
     // The old `deviceResult.error` branch was dead code.
     if (device_id) {
-      db.registerDevice(user.id, device_id, req.headers['user-agent'] || 'Unknown');
+      db.registerDevice(user.id, device_id, req.headers['user-agent'] || 'Unknown', platform);
     }
 
     const license = db.getLicenseByUserId(user.id);
@@ -154,6 +156,7 @@ router.post('/login', async (req, res) => {
         device_id: device_id || '',
         country_code: user.country_code,
         success: true,
+        platform,
       });
     } catch (logErr) {
       console.warn('Failed to log login:', logErr.message);
@@ -175,7 +178,7 @@ router.post('/login', async (req, res) => {
 // ── Google OAuth ──
 router.post('/google', async (req, res) => {
   try {
-    const { credential, device_id, country_code } = req.body;
+    const { credential, device_id, platform, country_code } = req.body;
 
     if (!credential) {
       return res.status(400).json({ error: 'Google credential required' });
@@ -259,7 +262,7 @@ router.post('/google', async (req, res) => {
     // auto-deactivates the oldest device when the tier limit is full.
     // The old `deviceResult.error` branch was dead code.
     if (device_id) {
-      db.registerDevice(user.id, device_id, req.headers['user-agent'] || 'Unknown');
+      db.registerDevice(user.id, device_id, req.headers['user-agent'] || 'Unknown', platform);
     }
 
     // Update last login
@@ -275,6 +278,7 @@ router.post('/google', async (req, res) => {
         device_id: device_id || '',
         country_code: user.country_code,
         success: true,
+        platform,
       });
     } catch (logErr) {
       console.warn('Failed to log Google login:', logErr.message);
@@ -584,19 +588,57 @@ router.post('/forgot-password', async (req, res) => {
   }
 });
 
-// Server-rendered "choose a new password" form. Keeps the frontend
-// simple — the email link lands here in the system browser and the
-// user never has to bounce back into the app.
+// HTML escape for safe interpolation into both text content and
+// attribute values. Used by the server-rendered password reset pages.
+// helmet's default CSP blocks inline <script> blocks AND inline event
+// handlers (script-src 'self'; script-src-attr 'none'), so the form
+// must work without any JavaScript at all — that means real action+
+// method+name attrs and rock-solid HTML escaping on everything we
+// interpolate into the page.
+function htmlEscape(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Shared brand shell: gradient background + minicaai header. Inline CSS
+// only — the reset link opens in whatever browser the user has (possibly
+// mobile webmail), so nothing from /dist is reachable here. Inline
+// styles are allowed by helmet's default CSP (style-src 'unsafe-inline').
+function resetPagePageShell(body, title) {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${htmlEscape(title)}</title></head><body style="margin:0;padding:24px;min-height:100vh;background:radial-gradient(circle at 50% 0%,#0a0a12 0%,#050507 70%);color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;box-sizing:border-box"><div style="max-width:440px;width:100%"><div style="display:flex;align-items:center;gap:10px;margin-bottom:24px;justify-content:center"><div style="width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);box-shadow:0 4px 16px rgba(59,130,246,0.3)"></div><div style="font-weight:700;font-size:15px;letter-spacing:-0.01em">minicaai</div></div>${body}</div></body></html>`;
+}
+
+function renderResetExpiredPage(frontendUrl) {
+  const safeFrontend = htmlEscape(frontendUrl);
+  const body = `<div style="border-radius:20px;border:1px solid rgba(255,255,255,0.08);background:linear-gradient(to bottom,rgba(255,255,255,0.06),rgba(255,255,255,0.02));padding:36px 28px;backdrop-filter:blur(12px);text-align:center"><div style="width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,rgba(239,68,68,0.15),rgba(239,68,68,0.05));border:1px solid rgba(239,68,68,0.25);display:flex;align-items:center;justify-content:center;margin:0 auto 20px"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#f87171" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></div><h2 style="margin:0 0 10px;font-size:22px;font-weight:700">Link expired</h2><p style="margin:0 0 28px;font-size:14px;line-height:1.6;color:#9ca3af">This reset link has already been used or has expired. Links are valid for 1 hour — request a fresh one below.</p><a href="${safeFrontend}/?view=forgot_password" style="display:block;width:100%;box-sizing:border-box;padding:13px 20px;border-radius:11px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;font-weight:600;font-size:14px;text-decoration:none;text-align:center;box-shadow:0 4px 16px rgba(59,130,246,0.25)">Request a new reset link</a></div>`;
+  return resetPagePageShell(body, 'Link expired — minicaai');
+}
+
+function renderResetSuccessPage(frontendUrl) {
+  const safeFrontend = htmlEscape(frontendUrl);
+  const body = `<div style="border-radius:20px;border:1px solid rgba(255,255,255,0.08);background:linear-gradient(to bottom,rgba(255,255,255,0.06),rgba(255,255,255,0.02));padding:36px 28px;backdrop-filter:blur(12px);text-align:center"><div style="width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,rgba(74,222,128,0.15),rgba(74,222,128,0.05));border:1px solid rgba(74,222,128,0.3);display:flex;align-items:center;justify-content:center;margin:0 auto 20px"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div><h2 style="margin:0 0 10px;color:#4ade80;font-size:22px;font-weight:700">Password updated</h2><p style="margin:0 0 28px;font-size:14px;line-height:1.6;color:#9ca3af">Your password has been changed. You can sign in with your new password now.</p><a href="${safeFrontend}/?view=login" style="display:block;width:100%;box-sizing:border-box;padding:13px 20px;border-radius:11px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;font-weight:600;font-size:14px;text-decoration:none;text-align:center;box-shadow:0 4px 16px rgba(59,130,246,0.25)">Continue to sign in</a></div>`;
+  return resetPagePageShell(body, 'Password updated — minicaai');
+}
+
+// Server-rendered "choose a new password" form. The email link lands
+// here and the user never has to bounce back into the app.
+//
+// CSP-SAFE: NO inline <script> blocks, NO inline event handlers. The
+// form submits as a real HTML POST (action+method+hidden token+named
+// password fields) so it works in every browser — including in-app
+// email browsers and any environment where helmet's CSP blocks JS.
 router.get('/reset-password', (req, res) => {
-  const { token } = req.query;
+  const { token, error } = req.query;
   // Tokens are 64-char hex from crypto.randomBytes(32) — reject anything
   // else before it reaches the DB or the rendered HTML.
   const isValidFormat = typeof token === 'string' && /^[a-f0-9]{64}$/i.test(token);
 
   // Look the row up raw (used/expired tokens included) so we can log the
   // *specific* rejection reason when the page ends up showing "Link expired".
-  // Without this the logs say nothing and the user + support can't tell
-  // "wrong token shape" from "token consumed" from "expired by 3 minutes".
   let row = null;
   let rejectReason = null;
   if (!isValidFormat) {
@@ -618,34 +660,65 @@ router.get('/reset-password', (req, res) => {
     console.log(`[reset-password] GET rejected token=${prefix}... reason=${rejectReason}`);
   }
 
-  // Brand URL for the "Request a new link" CTA on the error page. Falls
-  // back to the public domain so the page never ships a dead link even
-  // if the env var is absent in a new environment.
   const frontendUrl = process.env.FRONTEND_URL || 'https://minicaai.com';
 
-  // Shared shell: gradient background + minicaai brand header. Inline CSS
-  // only — the reset link opens in whatever browser the user has (possibly
-  // mobile webmail), so nothing from /dist is reachable here.
-  const pageShell = (body, title) => `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head><body style="margin:0;padding:24px;min-height:100vh;background:radial-gradient(circle at 50% 0%,#0a0a12 0%,#050507 70%);color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;box-sizing:border-box"><div style="max-width:440px;width:100%"><div style="display:flex;align-items:center;gap:10px;margin-bottom:24px;justify-content:center"><div style="width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);box-shadow:0 4px 16px rgba(59,130,246,0.3)"></div><div style="font-weight:700;font-size:15px;letter-spacing:-0.01em">minicaai</div></div>${body}</div></body></html>`;
-
   if (!row) {
-    const body = `<div style="border-radius:20px;border:1px solid rgba(255,255,255,0.08);background:linear-gradient(to bottom,rgba(255,255,255,0.06),rgba(255,255,255,0.02));padding:36px 28px;backdrop-filter:blur(12px);text-align:center"><div style="width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,rgba(239,68,68,0.15),rgba(239,68,68,0.05));border:1px solid rgba(239,68,68,0.25);display:flex;align-items:center;justify-content:center;margin:0 auto 20px"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#f87171" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></div><h2 style="margin:0 0 10px;font-size:22px;font-weight:700">Link expired</h2><p style="margin:0 0 28px;font-size:14px;line-height:1.6;color:#9ca3af">This reset link has already been used or has expired. Links are valid for 1 hour — request a fresh one below.</p><a href="${frontendUrl}/?view=forgot_password" style="display:block;width:100%;box-sizing:border-box;padding:13px 20px;border-radius:11px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;font-weight:600;font-size:14px;text-decoration:none;text-align:center;box-shadow:0 4px 16px rgba(59,130,246,0.25)">Request a new reset link</a></div>`;
-    return res.status(400).send(pageShell(body, 'Link expired — minicaai'));
+    return res.status(400).send(renderResetExpiredPage(frontendUrl));
   }
 
-  const safeEmail = row.email.replace(/</g, '&lt;');
-  const body = `<div style="border-radius:20px;border:1px solid rgba(255,255,255,0.08);background:linear-gradient(to bottom,rgba(255,255,255,0.06),rgba(255,255,255,0.02));padding:32px 28px;backdrop-filter:blur(12px)"><h2 style="margin:0 0 6px;font-size:22px;font-weight:700">Choose a new password</h2><p style="margin:0 0 24px;font-size:13px;color:#9ca3af">Resetting for <strong style="color:#e5e7eb;font-weight:500">${safeEmail}</strong></p><form id="f" onsubmit="return submitForm(event)"><label style="display:block;font-size:11px;color:#9ca3af;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;font-weight:500">New password</label><div style="position:relative;margin-bottom:10px"><input id="p1" type="password" minlength="8" required placeholder="At least 8 characters" oninput="updateStrength()" style="width:100%;box-sizing:border-box;padding:12px 44px 12px 14px;border-radius:10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);color:#fff;font-size:14px;outline:none"/><button type="button" onclick="togglePwd('p1')" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);width:32px;height:32px;border:none;background:transparent;color:#9ca3af;cursor:pointer;display:flex;align-items:center;justify-content:center;border-radius:6px" aria-label="Show password"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div><div style="display:flex;gap:3px;margin-bottom:16px"><div id="s1" style="flex:1;height:3px;border-radius:2px;background:rgba(255,255,255,0.08);transition:background 150ms"></div><div id="s2" style="flex:1;height:3px;border-radius:2px;background:rgba(255,255,255,0.08);transition:background 150ms"></div><div id="s3" style="flex:1;height:3px;border-radius:2px;background:rgba(255,255,255,0.08);transition:background 150ms"></div><div id="s4" style="flex:1;height:3px;border-radius:2px;background:rgba(255,255,255,0.08);transition:background 150ms"></div></div><label style="display:block;font-size:11px;color:#9ca3af;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;font-weight:500">Confirm password</label><div style="position:relative;margin-bottom:16px"><input id="p2" type="password" minlength="8" required placeholder="Re-enter password" style="width:100%;box-sizing:border-box;padding:12px 44px 12px 14px;border-radius:10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);color:#fff;font-size:14px;outline:none"/><button type="button" onclick="togglePwd('p2')" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);width:32px;height:32px;border:none;background:transparent;color:#9ca3af;cursor:pointer;display:flex;align-items:center;justify-content:center;border-radius:6px" aria-label="Show password"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div><div id="err" style="display:none;padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:12px;margin-bottom:14px"></div><button id="btn" type="submit" style="width:100%;padding:13px;border-radius:11px;background:linear-gradient(135deg,#3b82f6,#6366f1);border:none;color:#fff;font-weight:600;font-size:14px;cursor:pointer;box-shadow:0 4px 16px rgba(59,130,246,0.25)">Update password</button></form><div id="done" style="display:none;text-align:center;padding:12px 0"><div style="width:56px;height:56px;border-radius:14px;background:linear-gradient(135deg,rgba(74,222,128,0.15),rgba(74,222,128,0.05));border:1px solid rgba(74,222,128,0.3);display:flex;align-items:center;justify-content:center;margin:0 auto 16px"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div><h3 style="margin:0 0 6px;color:#4ade80;font-size:17px;font-weight:700">Password updated</h3><p style="margin:0;font-size:13px;color:#9ca3af">You can close this tab and sign in with your new password.</p></div></div><script>function togglePwd(id){var el=document.getElementById(id);el.type=el.type==='password'?'text':'password';}function updateStrength(){var p=document.getElementById('p1').value;var bars=[document.getElementById('s1'),document.getElementById('s2'),document.getElementById('s3'),document.getElementById('s4')];var score=0;if(p.length>=8)score++;if(p.length>=12)score++;if(/[A-Z]/.test(p)&&/[a-z]/.test(p))score++;if(/\\d/.test(p)&&/[^\\w]/.test(p))score++;var colors=['#ef4444','#f59e0b','#3b82f6','#10b981'];bars.forEach(function(b,i){b.style.background=i<score?colors[Math.min(score-1,3)]:'rgba(255,255,255,0.08)';});}async function submitForm(e){e.preventDefault();var p1=document.getElementById('p1').value;var p2=document.getElementById('p2').value;var err=document.getElementById('err');var btn=document.getElementById('btn');err.style.display='none';if(p1!==p2){err.textContent='Passwords do not match.';err.style.display='block';return false;}if(p1.length<8){err.textContent='Password must be at least 8 characters.';err.style.display='block';return false;}btn.disabled=true;btn.textContent='Updating...';btn.style.opacity='0.7';try{var r=await fetch('/api/v1/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:${JSON.stringify(token)},password:p1})});var d=await r.json();if(!r.ok){throw new Error(d.error||'Reset failed');}document.getElementById('f').style.display='none';document.getElementById('done').style.display='block';}catch(ex){err.textContent=ex.message||'Something went wrong. Try again.';err.style.display='block';btn.disabled=false;btn.textContent='Update password';btn.style.opacity='1';}return false;}</script>`;
-  res.send(pageShell(body, 'Reset your password — minicaai'));
+  const safeEmail = htmlEscape(row.email);
+  const safeToken = htmlEscape(token);
+
+  // Banner shown when a previous POST attempt was bounced back here
+  // with a validation error. The form re-renders with the SAME token
+  // so the user can retry without re-clicking the email link.
+  let errorBanner = '';
+  if (error === 'mismatch') {
+    errorBanner = `<div style="padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:12px;margin-bottom:14px">Passwords do not match. Please try again.</div>`;
+  } else if (error === 'short') {
+    errorBanner = `<div style="padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:12px;margin-bottom:14px">Password must be at least 8 characters.</div>`;
+  } else if (error === 'missing') {
+    errorBanner = `<div style="padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:12px;margin-bottom:14px">Please fill in both password fields.</div>`;
+  }
+
+  const body = `<div style="border-radius:20px;border:1px solid rgba(255,255,255,0.08);background:linear-gradient(to bottom,rgba(255,255,255,0.06),rgba(255,255,255,0.02));padding:32px 28px;backdrop-filter:blur(12px)"><h2 style="margin:0 0 6px;font-size:22px;font-weight:700">Choose a new password</h2><p style="margin:0 0 24px;font-size:13px;color:#9ca3af">Resetting for <strong style="color:#e5e7eb;font-weight:500">${safeEmail}</strong></p>${errorBanner}<form action="/api/v1/auth/reset-password" method="POST"><input type="hidden" name="token" value="${safeToken}"/><label style="display:block;font-size:11px;color:#9ca3af;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;font-weight:500">New password</label><input name="password" type="password" minlength="8" required autocomplete="new-password" placeholder="At least 8 characters" style="width:100%;box-sizing:border-box;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);color:#fff;font-size:14px;outline:none;margin-bottom:16px"/><label style="display:block;font-size:11px;color:#9ca3af;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;font-weight:500">Confirm password</label><input name="password_confirm" type="password" minlength="8" required autocomplete="new-password" placeholder="Re-enter password" style="width:100%;box-sizing:border-box;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);color:#fff;font-size:14px;outline:none;margin-bottom:18px"/><button type="submit" style="width:100%;padding:13px;border-radius:11px;background:linear-gradient(135deg,#3b82f6,#6366f1);border:none;color:#fff;font-weight:600;font-size:14px;cursor:pointer;box-shadow:0 4px 16px rgba(59,130,246,0.25)">Update password</button></form></div>`;
+  res.send(resetPagePageShell(body, 'Reset your password — minicaai'));
 });
 
 router.post('/reset-password', async (req, res) => {
+  // Content-negotiate: native HTML form submissions arrive with
+  // Accept: text/html and Content-Type: x-www-form-urlencoded;
+  // programmatic callers send Accept: application/json. Same endpoint,
+  // two response shapes — HTML pages for browsers, JSON for AJAX.
+  const accept = req.headers.accept || '';
+  const wantsHtml = accept.includes('text/html') && !accept.startsWith('application/json');
+  const frontendUrl = process.env.FRONTEND_URL || 'https://minicaai.com';
+
+  // Bounce a failed validation back to the GET form (re-renders with
+  // the same token + an error banner). 303 forces the browser to GET
+  // even if it just POST'd here.
+  const bounceToForm = (errKey, tok) => {
+    const t = encodeURIComponent(tok || '');
+    return res.redirect(303, `/api/v1/auth/reset-password?token=${t}&error=${errKey}`);
+  };
+
   try {
-    const { token, password } = req.body || {};
+    const { token, password, password_confirm } = req.body || {};
+
     if (!token || !password) {
+      if (wantsHtml) return bounceToForm('missing', token);
       return res.status(400).json({ error: 'Missing token or password' });
     }
     if (!isStrongPassword(password)) {
+      if (wantsHtml) return bounceToForm('short', token);
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+    // Server-side match check. The HTML form sends both fields and the
+    // browser does no live matching (no JS allowed by CSP). JSON callers
+    // can omit password_confirm and we trust the single password field.
+    if (typeof password_confirm === 'string' && password !== password_confirm) {
+      if (wantsHtml) return bounceToForm('mismatch', token);
+      return res.status(400).json({ error: 'Passwords do not match' });
     }
 
     const row = db.consumePasswordResetToken(token);
@@ -661,14 +734,18 @@ router.post('/reset-password', async (req, res) => {
       else reason = 'consume_race';
       const prefix = typeof token === 'string' ? token.slice(0, 8) : '(missing)';
       console.log(`[reset-password] POST rejected token=${prefix}... reason=${reason}`);
+      if (wantsHtml) return res.status(400).send(renderResetExpiredPage(frontendUrl));
       return res.status(400).json({ error: 'This reset link has expired or already been used. Please request a new one.' });
     }
 
     db.updateUserPassword(row.user_id, password);
     console.log(`[reset-password] POST success user_id=${row.user_id}`);
+
+    if (wantsHtml) return res.send(renderResetSuccessPage(frontendUrl));
     res.json({ ok: true });
   } catch (err) {
     console.error('Reset password error:', err);
+    if (wantsHtml) return res.status(500).send(renderResetExpiredPage(frontendUrl));
     res.status(500).json({ error: 'Failed to reset password. Please try again.' });
   }
 });

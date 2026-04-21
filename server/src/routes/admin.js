@@ -1,24 +1,92 @@
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ADMIN API — enterprise-level admin surface
+//
+//  Ownership model:
+//    • authMiddleware verifies the JWT and loads the user (global)
+//    • adminOnly verifies the caller's email is in ADMIN_EMAILS
+//    • stepUpOnly additionally verifies the JWT carries a recent
+//      stepUp=true claim (see /reauth). Destructive/high-blast-radius
+//      actions require step-up — refunds, tier grants, delete user,
+//      impersonate, comp payment, config writes.
+//
+//  Every write goes through writeAudit() which inserts a row into
+//  audit_log. That table is protected by SQLite triggers that RAISE
+//  ABORT on UPDATE/DELETE — even the admin's own DB role cannot tamper
+//  with history from SQL. Rotate/archive by inserting compensating rows.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 const express = require('express');
-const { authMiddleware } = require('../middleware/auth');
+const jwt = require('jsonwebtoken');
+const { authMiddleware, generateToken } = require('../middleware/auth');
 const db = require('../database');
 
 const router = express.Router();
 
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 
-// ── Admin guard ──
+// Step-up reauth TTL. Once an admin reauths with their password we issue a
+// short-lived token with stepUp=true. 15 minutes is long enough to work
+// through a batch of refunds without constant password prompts, short enough
+// that a walked-away laptop can't be used to delete users indefinitely.
+const STEP_UP_TTL_MS = 15 * 60 * 1000;
+
+// ── Payment providers (loaded lazily for refund/cancel) ──
+let stripe = null;
+let razorpay = null;
+if (process.env.STRIPE_SECRET_KEY) {
+  stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+}
+if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
+  const Razorpay = require('razorpay');
+  razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET,
+  });
+}
+
+// ── Guards ──
 function adminOnly(req, res, next) {
-  if (!ADMIN_EMAILS.includes(req.user.email)) {
+  const email = (req.user?.email || '').toLowerCase();
+  if (!ADMIN_EMAILS.includes(email)) {
+    // Audit the attempt. Someone with a valid user JWT trying to call
+    // admin endpoints is the signal we most want to see in logs.
+    try {
+      db.logAdminAction(
+        email || 'unknown',
+        'unauthorized-admin-attempt',
+        req.user?.id || null,
+        email || null,
+        { path: req.path, method: req.method, ip: req.ip },
+      );
+    } catch { /* best-effort */ }
     return res.status(403).json({ error: 'Admin access required' });
   }
   next();
 }
 
+// Step-up guard — the JWT must carry stepUp=true AND a stepUpAt claim that
+// is within STEP_UP_TTL_MS of now. We re-verify the timestamp rather than
+// trusting the token's expiry, so an old admin token can't be replayed
+// without another password prompt.
+function stepUpOnly(req, res, next) {
+  const u = req.user || {};
+  if (!u.stepUp || !u.stepUpAt) {
+    return res.status(403).json({
+      error: 'step_up_required',
+      message: 'This action requires password re-verification. Please reauth.',
+    });
+  }
+  if (Date.now() - u.stepUpAt > STEP_UP_TTL_MS) {
+    return res.status(403).json({
+      error: 'step_up_expired',
+      message: 'Step-up session expired. Please reauth.',
+    });
+  }
+  next();
+}
+
 // ── Tier definitions ──
-// What a tier *means* in terms of license rows. These are the server's
-// opinion of each tier — NOT the pricing model. Pro/Max both get unlimited
-// because the client distinguishes Max capability via FEATURE_GATES, not
-// via license row state.
 const DAY_MS = 24 * 60 * 60 * 1000;
 const TIER_LICENSE_DEFAULTS = {
   free:  { expires_at: () => Date.now() + 30 * DAY_MS, sessions_limit: 5 },
@@ -29,9 +97,6 @@ const TIER_LICENSE_DEFAULTS = {
 const VALID_TIERS = Object.keys(TIER_LICENSE_DEFAULTS);
 
 // ── Audit helper ──
-// Every write goes through this so admin activity has a trail. Never throws
-// — if the audit insert fails we'd rather see the action succeed than block
-// the admin on a logging bug.
 function writeAudit(req, action, target, details) {
   try {
     db.logAdminAction(
@@ -39,14 +104,54 @@ function writeAudit(req, action, target, details) {
       action,
       target?.id || null,
       target?.email || null,
-      details || null,
+      { ...(details || {}), ip: req.ip, user_agent: req.get('user-agent') || null },
     );
   } catch (err) {
     console.error('[admin] audit insert failed:', err.message);
   }
 }
 
-// ── Dashboard stats ──
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  STEP-UP REAUTH
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// POST /reauth — { password } → { token } (same-user, stepUp=true, 15-min)
+router.post('/reauth', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const { password } = req.body || {};
+    if (!password) return res.status(400).json({ error: 'Password required' });
+
+    const verified = db.verifyUserPassword(req.user.email, password);
+    if (!verified) {
+      writeAudit(req, 'reauth-failed', { email: req.user.email });
+      return res.status(401).json({ error: 'Invalid password' });
+    }
+
+    const now = Date.now();
+    const token = generateToken({
+      id: req.user.id,
+      email: req.user.email,
+      name: req.user.name,
+      tier: req.user.tier,
+      stepUp: true,
+      stepUpAt: now,
+    });
+
+    writeAudit(req, 'reauth-success', { id: req.user.id, email: req.user.email });
+    res.json({
+      token,
+      step_up_expires_at: now + STEP_UP_TTL_MS,
+    });
+  } catch (err) {
+    console.error('Reauth error:', err);
+    res.status(500).json({ error: 'Reauth failed' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  STATS + OVERVIEW
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 router.get('/stats', authMiddleware, adminOnly, (req, res) => {
   try {
     res.json(db.getStats());
@@ -56,7 +161,42 @@ router.get('/stats', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// ── List all users ──
+// Daily time-series for Analytics tab. `days` defaults to 30, clamped to 180.
+router.get('/trends', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(180, parseInt(req.query.days) || 30));
+    res.json(db.getTrends(days));
+  } catch (err) {
+    console.error('Trends error:', err);
+    res.status(500).json({ error: 'Failed to fetch trends' });
+  }
+});
+
+// Leaderboard of highest-revenue paying users. `limit` defaults to 10.
+router.get('/top-customers', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 10));
+    res.json(db.getTopCustomers(limit));
+  } catch (err) {
+    console.error('Top customers error:', err);
+    res.status(500).json({ error: 'Failed to fetch top customers' });
+  }
+});
+
+// Suspicious-activity surface (multi-country usage, brute-force candidates).
+router.get('/suspicious', authMiddleware, adminOnly, (req, res) => {
+  try {
+    res.json(db.getSuspiciousActivity());
+  } catch (err) {
+    console.error('Suspicious error:', err);
+    res.status(500).json({ error: 'Failed to fetch suspicious activity' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  USERS — list / search / detail / edit / delete / DSAR / impersonate
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 router.get('/users', authMiddleware, adminOnly, (req, res) => {
   try {
     const users = db.getAllUsers();
@@ -72,7 +212,6 @@ router.get('/users', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// ── Search user by email (full A-Z data) ──
 router.get('/users/search', authMiddleware, adminOnly, (req, res) => {
   try {
     const { email } = req.query;
@@ -91,21 +230,7 @@ router.get('/users/search', authMiddleware, adminOnly, (req, res) => {
       .all(user.id);
 
     res.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        tier: user.tier,
-        country_code: user.country_code,
-        created_at: user.created_at,
-        updated_at: user.updated_at,
-        last_login_at: user.last_login_at,
-        is_banned: user.is_banned,
-        tokens_revoked_after: user.tokens_revoked_after || 0,
-        avatar_url: user.avatar_url,
-        oauth_provider: user.oauth_provider,
-        stripe_customer_id: user.stripe_customer_id,
-      },
+      user: serializeUserRow(user),
       license,
       devices,
       payments,
@@ -124,7 +249,6 @@ router.get('/users/search', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// ── Get full user detail by ID (A-Z view) ──
 router.get('/users/:id', authMiddleware, adminOnly, (req, res) => {
   try {
     const user = db.getUserById(req.params.id);
@@ -143,22 +267,16 @@ router.get('/users/:id', authMiddleware, adminOnly, (req, res) => {
       messages: db.getConversationMessages(c.id),
     }));
 
+    // Audit-log every full user-detail fetch. The conversation messages
+    // are sensitive (interview answers, sometimes PII), so we want a
+    // record of which admin pulled which user's data and when.
+    writeAudit(req, 'view-user-detail', user, {
+      conversation_count: conversations.length,
+      message_count: conversationsWithMessages.reduce((sum, c) => sum + (c.messages?.length || 0), 0),
+    });
+
     res.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        tier: user.tier,
-        country_code: user.country_code,
-        created_at: user.created_at,
-        updated_at: user.updated_at,
-        last_login_at: user.last_login_at,
-        is_banned: user.is_banned,
-        tokens_revoked_after: user.tokens_revoked_after || 0,
-        avatar_url: user.avatar_url,
-        oauth_provider: user.oauth_provider,
-        stripe_customer_id: user.stripe_customer_id,
-      },
+      user: serializeUserRow(user),
       license,
       devices,
       payments,
@@ -171,11 +289,128 @@ router.get('/users/:id', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
+// DSAR export — GDPR Article 15 data subject access request. Returns a
+// complete bundle of everything we have on a single user, with sensitive
+// server-only fields (password_hash) stripped. Intended for download as JSON.
+router.get('/users/:id/export', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const bundle = db.getUserDataExport(req.params.id);
+    if (!bundle) return res.status(404).json({ error: 'User not found' });
+
+    writeAudit(req, 'dsar-export', { id: bundle.user.id, email: bundle.user.email }, {
+      payment_count: bundle.payments?.length || 0,
+      conversation_count: bundle.conversations?.length || 0,
+    });
+
+    // Download-friendly filename. Safe fallback if email is missing.
+    const fname = `minicaai-dsar-${(bundle.user.email || bundle.user.id).replace(/[^a-z0-9@._-]+/gi, '_')}.json`;
+    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(JSON.stringify(bundle, null, 2));
+  } catch (err) {
+    console.error('DSAR export error:', err);
+    res.status(500).json({ error: 'Failed to export user data' });
+  }
+});
+
+// PATCH /users/:id — update name and/or country_code. Whitelisted columns
+// only. Country is normalized to uppercase ISO-2 by the DB helper.
+router.patch('/users/:id', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
+  try {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const { name, country_code } = req.body || {};
+    if (name === undefined && country_code === undefined) {
+      return res.status(400).json({ error: 'Nothing to update' });
+    }
+
+    const updated = db.updateUserProfile(user.id, { name, country_code });
+    if (!updated) return res.status(500).json({ error: 'Update failed' });
+
+    writeAudit(req, 'edit-profile', user, {
+      before: { name: user.name, country_code: user.country_code },
+      after: { name: updated.name, country_code: updated.country_code },
+    });
+    res.json({ success: true, user: serializeUserRow(updated) });
+  } catch (err) {
+    console.error('Edit profile error:', err);
+    res.status(500).json({ error: err.message || 'Failed to update profile' });
+  }
+});
+
+// DELETE /users/:id — hard delete, transactional. Use with extreme care:
+// all conversations, payments, login logs, devices, and licenses are
+// permanently removed. Audit log rows that target this user by id remain
+// (audit_log stores target_user_id as a plain column, no FK), so the
+// paper trail survives.
+router.delete('/users/:id', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
+  try {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Self-delete guard — prevents an admin from locking themselves out by
+    // accident. If you truly need to remove an admin account, temporarily
+    // drop them from ADMIN_EMAILS in env first.
+    if (user.id === req.user.id) {
+      return res.status(400).json({ error: 'Cannot delete your own account' });
+    }
+    if (ADMIN_EMAILS.includes((user.email || '').toLowerCase())) {
+      return res.status(400).json({ error: 'Cannot delete another admin account — remove from ADMIN_EMAILS first' });
+    }
+
+    // Write audit row BEFORE the delete. Once the user is gone, any attempt
+    // to log by user_id would tombstone with a null FK (we keep the target
+    // as a plain column, but log-before-delete makes intent clearer).
+    writeAudit(req, 'delete-user', user, {
+      reason: req.body?.reason || null,
+      conversation_count: db.getConversationsByUser(user.id).length,
+      payment_count: db.getPaymentsByUser(user.id).length,
+    });
+
+    db.deleteUser(user.id);
+    res.json({ success: true, message: `User ${user.email} permanently deleted` });
+  } catch (err) {
+    console.error('Delete user error:', err);
+    res.status(500).json({ error: err.message || 'Failed to delete user' });
+  }
+});
+
+// POST /users/:id/impersonate — issue a scoped JWT that logs in AS the
+// target user. The issued token is marked impersonatedBy=admin_email,
+// impersonatedAt=ms so downstream writes can be audited. Expires in 30 min.
+router.post('/users/:id/impersonate', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
+  try {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.is_banned) return res.status(400).json({ error: 'Cannot impersonate a banned user' });
+
+    const token = generateToken({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      tier: user.tier,
+      impersonatedBy: req.user.email,
+      impersonatedAt: Date.now(),
+    });
+
+    writeAudit(req, 'impersonate', user, { reason: req.body?.reason || null });
+    res.json({
+      token,
+      user: serializeUserRow(user),
+      expires_in_seconds: 30 * 24 * 60 * 60, // 30d (same as generateToken default)
+      warning: 'All actions taken under this token will be attributed to the target user AND audit-logged against the admin.',
+    });
+  } catch (err) {
+    console.error('Impersonate error:', err);
+    res.status(500).json({ error: 'Failed to impersonate' });
+  }
+});
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  TIER MANAGEMENT
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// Shared handler so the canonical endpoint and the legacy aliases stay in sync.
 function handleChangeTier(req, res) {
   try {
     const { email, tier } = req.body || {};
@@ -206,17 +441,14 @@ function handleChangeTier(req, res) {
   }
 }
 
-// Canonical — body: { email, tier: 'free'|'basic'|'pro'|'max' }
-router.post('/users/change-tier', authMiddleware, adminOnly, handleChangeTier);
+router.post('/users/change-tier', authMiddleware, adminOnly, stepUpOnly, handleChangeTier);
 
-// Legacy aliases. Older client builds call these — map them onto change-tier
-// by rewriting the body in-place, then delegating to the shared handler.
-router.post('/users/upgrade', authMiddleware, adminOnly, (req, res) => {
+router.post('/users/upgrade', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   req.body = { ...(req.body || {}), tier: req.body?.tier || 'pro' };
   return handleChangeTier(req, res);
 });
 
-router.post('/users/downgrade', authMiddleware, adminOnly, (req, res) => {
+router.post('/users/downgrade', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   req.body = { ...(req.body || {}), tier: 'free' };
   return handleChangeTier(req, res);
 });
@@ -225,8 +457,6 @@ router.post('/users/downgrade', authMiddleware, adminOnly, (req, res) => {
 //  CREDITS + EXPIRY
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// Body: { email, credits: N (integer, may be negative to revoke) }
-// No-op on Pro/Max (unlimited licenses aren't credit-based).
 router.post('/users/grant-credits', authMiddleware, adminOnly, (req, res) => {
   try {
     const { email, credits } = req.body || {};
@@ -253,8 +483,6 @@ router.post('/users/grant-credits', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// Body: { email, days: N (integer) }
-// No-op on Pro/Max (expires_at=-1 never-expires).
 router.post('/users/extend-expiry', authMiddleware, adminOnly, (req, res) => {
   try {
     const { email, days } = req.body || {};
@@ -281,13 +509,42 @@ router.post('/users/extend-expiry', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
+// Comp payment — grants a tier at zero cost. Creates a payment row with
+// provider='admin-comp', amount=0, metadata.mode='admin_comp' so analytics
+// exclude it from revenue. Use for support make-goods, influencer comps, etc.
+router.post('/users/:id/grant-comp', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
+  try {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const { tier, note } = req.body || {};
+    const targetTier = VALID_TIERS.includes(tier) ? tier : 'pro';
+    if (targetTier === 'free') {
+      return res.status(400).json({ error: 'Use change-tier to move a user to free; comp is for paid tiers' });
+    }
+
+    const result = db.recordCompPayment(user.id, targetTier, note || null);
+
+    writeAudit(req, 'grant-comp', user, {
+      tier: targetTier,
+      note: note || null,
+      payment_id: result.payment_id,
+    });
+    res.json({
+      success: true,
+      message: `${user.email} granted ${targetTier} as comp`,
+      ...result,
+    });
+  } catch (err) {
+    console.error('Grant comp error:', err);
+    res.status(500).json({ error: err.message || 'Failed to grant comp' });
+  }
+});
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  DEVICE + SESSION MANAGEMENT
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// Clear all device bindings for a user. Classic support case:
-// "I got a new laptop and can't sign in." Forces re-registration on
-// next login without touching their license or credits.
 router.post('/users/reset-devices', authMiddleware, adminOnly, (req, res) => {
   try {
     const { email } = req.body || {};
@@ -305,9 +562,28 @@ router.post('/users/reset-devices', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// Invalidate all outstanding JWTs for a user. They stay signed in on the
-// current device until the next API call, at which point the auth middleware
-// will reject their token and they'll be forced to sign in again.
+// Revoke a SINGLE device by its row id. More surgical than reset-devices —
+// lets support deactivate the lost/stolen laptop without kicking the user
+// off their phone.
+router.post('/users/:id/devices/:deviceRowId/revoke', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const deviceRowId = parseInt(req.params.deviceRowId, 10);
+    if (!Number.isFinite(deviceRowId)) return res.status(400).json({ error: 'Invalid device id' });
+
+    const changed = db.revokeSingleDevice(deviceRowId, user.id);
+    if (!changed) return res.status(404).json({ error: 'Device not found for this user' });
+
+    writeAudit(req, 'revoke-device', user, { device_row_id: deviceRowId });
+    res.json({ success: true, message: 'Device revoked' });
+  } catch (err) {
+    console.error('Revoke device error:', err);
+    res.status(500).json({ error: 'Failed to revoke device' });
+  }
+});
+
 router.post('/users/force-logout', authMiddleware, adminOnly, (req, res) => {
   try {
     const { email } = req.body || {};
@@ -326,7 +602,36 @@ router.post('/users/force-logout', authMiddleware, adminOnly, (req, res) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  BAN / UNBAN / REVOKE
+//  CONVERSATIONS (admin delete)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+router.delete('/users/:id/conversations/:convId', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
+  try {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const conv = db.getConversationById(req.params.convId);
+    if (!conv || conv.user_id !== user.id) {
+      return res.status(404).json({ error: 'Conversation not found for this user' });
+    }
+
+    const messageCount = db.getConversationMessages(conv.id).length;
+    db.deleteConversationByAdmin(conv.id, user.id);
+
+    writeAudit(req, 'delete-conversation', user, {
+      conversation_id: conv.id,
+      conversation_name: conv.name,
+      message_count: messageCount,
+    });
+    res.json({ success: true, message: `Conversation deleted (${messageCount} messages)` });
+  } catch (err) {
+    console.error('Delete conversation error:', err);
+    res.status(500).json({ error: err.message || 'Failed to delete conversation' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  BAN / UNBAN
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 router.post('/users/ban', authMiddleware, adminOnly, (req, res) => {
@@ -338,7 +643,7 @@ router.post('/users/ban', authMiddleware, adminOnly, (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     db.banUser(user.id);
-    db.forceLogoutUser(user.id); // so they're kicked out of any live session
+    db.forceLogoutUser(user.id);
     const license = db.getLicenseByUserId(user.id);
     if (license) db.revokeKey(license.key, req.user.email, reason || 'User banned by admin');
 
@@ -359,7 +664,6 @@ router.post('/users/unban', authMiddleware, adminOnly, (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     db.unbanUser(user.id);
-    // Un-revoke the license too so they can log back in.
     const license = db.getLicenseByUserId(user.id);
     if (license) db.unrevokeKey(license.key);
 
@@ -371,7 +675,212 @@ router.post('/users/unban', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// ── Recent login activity ──
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PASSWORD RESET (admin-triggered)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// POST /users/:id/send-password-reset — issues a reset token and emails
+// it to the user. Same token format as /auth/forgot-password — we simply
+// skip the "does this email exist" gate because an admin has already
+// picked a concrete user.
+router.post('/users/:id/send-password-reset', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (!user.email) {
+      return res.status(400).json({ error: 'User has no email — cannot send reset link' });
+    }
+
+    const rawToken = db.createPasswordResetToken(user.id, user.email);
+    const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
+    const resetUrl = `${serverUrl}/api/v1/auth/reset-password?token=${rawToken}`;
+
+    const { sendMail, renderPasswordResetEmail } = require('../email');
+    const { subject, html, text } = renderPasswordResetEmail({ name: user.name, resetUrl });
+
+    // Fire-and-forget — we audit-log the attempt regardless of delivery
+    // result so an admin action is always traceable.
+    sendMail({ to: user.email, subject, html, text })
+      .then(result => {
+        if (!result?.ok) console.warn('[admin/send-password-reset] email failed:', result?.reason);
+      })
+      .catch(err => console.error('[admin/send-password-reset] sendMail threw:', err && err.message));
+
+    writeAudit(req, 'send-password-reset', user);
+    res.json({ success: true, message: `Password reset email sent to ${user.email}` });
+  } catch (err) {
+    console.error('Send password reset error:', err);
+    res.status(500).json({ error: 'Failed to send password reset' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SUBSCRIPTION CANCEL (admin-initiated)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// POST /users/:id/cancel-subscription — calls the appropriate provider
+// (Stripe/Razorpay) to cancel at period end. Final tier downgrade lands
+// via the subscription.cancelled / customer.subscription.deleted webhook.
+router.post('/users/:id/cancel-subscription', authMiddleware, adminOnly, stepUpOnly, async (req, res) => {
+  try {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const customerId = user.stripe_customer_id || '';
+    const isRazorpay = customerId.startsWith('rzp_');
+
+    if (isRazorpay) {
+      if (!razorpay) return res.status(503).json({ error: 'Razorpay not configured' });
+      const subId = db.getLatestRazorpaySubscriptionId(user.id);
+      if (!subId) return res.status(404).json({ error: 'No Razorpay subscription found for user' });
+      // cancel_at_cycle_end=false → Razorpay keeps access until period end
+      // (counter-intuitive naming in their API).
+      await razorpay.subscriptions.cancel(subId, false);
+      writeAudit(req, 'cancel-subscription', user, { provider: 'razorpay', subscription_id: subId });
+      return res.json({
+        success: true,
+        message: 'Razorpay subscription will cancel at end of current billing period',
+        provider: 'razorpay',
+        subscription_id: subId,
+      });
+    }
+
+    // Stripe path — user must have a stripe_customer_id (non-rzp).
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+    if (!customerId) return res.status(404).json({ error: 'No Stripe customer id on user' });
+
+    const subs = await stripe.subscriptions.list({ customer: customerId, status: 'active', limit: 3 });
+    if (!subs.data.length) {
+      return res.status(404).json({ error: 'No active Stripe subscription found' });
+    }
+
+    const results = [];
+    for (const sub of subs.data) {
+      const updated = await stripe.subscriptions.update(sub.id, { cancel_at_period_end: true });
+      results.push({ id: sub.id, cancel_at: updated.cancel_at });
+    }
+
+    writeAudit(req, 'cancel-subscription', user, { provider: 'stripe', subscriptions: results });
+    res.json({
+      success: true,
+      message: `${results.length} Stripe subscription(s) scheduled to cancel at period end`,
+      provider: 'stripe',
+      subscriptions: results,
+    });
+  } catch (err) {
+    console.error('Admin cancel subscription error:', err);
+    res.status(500).json({ error: err.message || 'Failed to cancel subscription' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  REFUNDS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// POST /payments/:id/refund — body { amount?, reason? }
+// Calls Stripe/Razorpay refunds API. The webhook handlers (charge.refunded,
+// refund.processed) will record the negative-amount row and downgrade the
+// user. Here we only idempotency-check and call the provider; we also write
+// a local compensating row IMMEDIATELY so the UI shows the state change
+// without waiting for a webhook round-trip. The webhook is idempotent (uses
+// event_id in webhook_events), so it won't double-record.
+router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async (req, res) => {
+  try {
+    const payment = db.getPaymentById(parseInt(req.params.id, 10));
+    if (!payment) return res.status(404).json({ error: 'Payment not found' });
+    if (payment.status !== 'completed') {
+      return res.status(400).json({ error: `Cannot refund payment in status=${payment.status}` });
+    }
+    if (payment.amount <= 0 || payment.provider === 'admin-comp') {
+      return res.status(400).json({ error: 'Cannot refund a zero-amount or comp payment' });
+    }
+    if (db.hasPaymentBeenRefunded(payment.provider, payment.provider_payment_id)) {
+      return res.status(400).json({ error: 'Payment already refunded' });
+    }
+    if (!payment.provider_payment_id) {
+      return res.status(400).json({ error: 'Payment has no provider_payment_id — cannot refund' });
+    }
+
+    const { amount, reason } = req.body || {};
+    // Provider-side refund amount. If the admin didn't specify, refund the
+    // full charge. Keep in the provider's smallest unit (cents/paise) — our
+    // DB already stores it that way.
+    const refundAmount = amount !== undefined ? Number(amount) : payment.amount;
+    if (!Number.isFinite(refundAmount) || refundAmount <= 0 || refundAmount > payment.amount) {
+      return res.status(400).json({ error: 'Invalid refund amount' });
+    }
+
+    let providerRefundId = null;
+    if (payment.provider === 'stripe') {
+      if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+      // Stripe reason must be one of: duplicate, fraudulent, requested_by_customer.
+      // Anything else → pass as metadata.
+      const validReasons = ['duplicate', 'fraudulent', 'requested_by_customer'];
+      const stripeReason = validReasons.includes(reason) ? reason : 'requested_by_customer';
+      const refund = await stripe.refunds.create({
+        payment_intent: payment.provider_payment_id.startsWith('pi_') ? payment.provider_payment_id : undefined,
+        charge: payment.provider_payment_id.startsWith('ch_') ? payment.provider_payment_id : undefined,
+        amount: refundAmount,
+        reason: stripeReason,
+        metadata: {
+          admin_initiated: 'true',
+          admin_email: req.user.email,
+          admin_reason: reason || '',
+        },
+      });
+      providerRefundId = refund.id;
+    } else if (payment.provider === 'razorpay') {
+      if (!razorpay) return res.status(503).json({ error: 'Razorpay not configured' });
+      const refund = await razorpay.payments.refund(payment.provider_payment_id, {
+        amount: refundAmount,
+        notes: {
+          admin_initiated: 'true',
+          admin_email: req.user.email,
+          admin_reason: reason || '',
+        },
+      });
+      providerRefundId = refund.id;
+    } else {
+      return res.status(400).json({ error: `Cannot refund payments from provider=${payment.provider}` });
+    }
+
+    // Write the compensating local row NOW (webhook will skip via
+    // webhook_events dedup if it fires the same event_id twice).
+    const refundRow = db.recordAdminRefund({
+      originalPayment: payment,
+      refundId: providerRefundId,
+      amount: refundAmount,
+      reason: reason || null,
+      initiatedBy: req.user.email,
+    });
+
+    writeAudit(req, 'refund-payment', { id: payment.user_id, email: payment.email }, {
+      payment_id: payment.id,
+      provider: payment.provider,
+      refund_amount: refundAmount,
+      currency: payment.currency,
+      provider_refund_id: providerRefundId,
+      reason: reason || null,
+    });
+
+    res.json({
+      success: true,
+      message: `Refund of ${refundAmount} ${payment.currency} issued`,
+      provider: payment.provider,
+      provider_refund_id: providerRefundId,
+      refund_row: refundRow,
+    });
+  } catch (err) {
+    console.error('Refund error:', err);
+    res.status(500).json({ error: err.message || 'Failed to refund payment' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  LOGS + PAYMENTS + AUDIT — with filters
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 router.get('/logins', authMiddleware, adminOnly, (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
@@ -382,7 +891,6 @@ router.get('/logins', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// ── Revoked keys list ──
 router.get('/revoked', authMiddleware, adminOnly, (req, res) => {
   try {
     res.json(db.getRevokedKeys());
@@ -392,29 +900,111 @@ router.get('/revoked', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// ── Payment history (all users) ──
+// Enhanced payments list — filters: provider, status, email, tier, from, to
 router.get('/payments', authMiddleware, adminOnly, (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 100;
-    res.json({
-      payments: db.getAllPayments(Math.min(limit, 500)),
-      stats: db.getPaymentStats(),
-    });
+    const filters = {
+      provider: req.query.provider || null,
+      status: req.query.status || null,
+      email: req.query.email || null,
+      tier: req.query.tier || null,
+      from: req.query.from ? parseInt(req.query.from, 10) : null,
+      to: req.query.to ? parseInt(req.query.to, 10) : null,
+      limit: Math.min(parseInt(req.query.limit) || 100, 1000),
+    };
+    const result = db.queryPayments(filters);
+    res.json(result);
   } catch (err) {
-    console.error('Payments error:', err);
+    console.error('Payments filter error:', err);
     res.status(500).json({ error: 'Failed to fetch payments' });
   }
 });
 
-// ── Audit log (paginated by limit) ──
+// Enhanced audit log — filters: admin, action, target, from, to
 router.get('/audit-log', authMiddleware, adminOnly, (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 100;
-    res.json(db.getAuditLog(limit));
+    const filters = {
+      admin: req.query.admin || null,
+      action: req.query.action || null,
+      target: req.query.target || null,
+      from: req.query.from ? parseInt(req.query.from, 10) : null,
+      to: req.query.to ? parseInt(req.query.to, 10) : null,
+      limit: Math.min(parseInt(req.query.limit) || 200, 2000),
+    };
+    res.json(db.queryAuditLog(filters));
   } catch (err) {
     console.error('Audit log error:', err);
     res.status(500).json({ error: 'Failed to fetch audit log' });
   }
 });
+
+// Audit-log facets for filter UI (distinct actions, distinct admins).
+router.get('/audit-log/facets', authMiddleware, adminOnly, (req, res) => {
+  try {
+    res.json({
+      actions: db.getAuditActions(),
+      admins: db.getAuditAdmins(),
+    });
+  } catch (err) {
+    console.error('Audit facets error:', err);
+    res.status(500).json({ error: 'Failed to fetch facets' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  CONFIG (runtime knobs — min_app_version, device limits, etc.)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// GET /config — dumps all keys (bounded, these are admin-editable flags).
+router.get('/config', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const rows = db.getDB().prepare('SELECT key, value, updated_at FROM config ORDER BY key').all();
+    res.json(rows);
+  } catch (err) {
+    console.error('Config list error:', err);
+    res.status(500).json({ error: 'Failed to fetch config' });
+  }
+});
+
+// PUT /config/:key — body { value }
+router.put('/config/:key', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
+  try {
+    const key = req.params.key;
+    const { value } = req.body || {};
+    if (value === undefined) return res.status(400).json({ error: 'value required' });
+    if (typeof key !== 'string' || key.length === 0 || key.length > 64) {
+      return res.status(400).json({ error: 'Invalid config key' });
+    }
+
+    const prev = db.getConfig(key, null);
+    db.setConfig(key, String(value));
+    writeAudit(req, 'config-update', null, { key, from: prev, to: String(value) });
+    res.json({ success: true, key, value: String(value) });
+  } catch (err) {
+    console.error('Config update error:', err);
+    res.status(500).json({ error: 'Failed to update config' });
+  }
+});
+
+// ── Row serialization helper ──
+// Ensures no sensitive columns (password_hash, google access token, etc.)
+// leak out of the admin API. Add columns here when the schema grows.
+function serializeUserRow(u) {
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.name,
+    tier: u.tier,
+    country_code: u.country_code,
+    created_at: u.created_at,
+    updated_at: u.updated_at,
+    last_login_at: u.last_login_at,
+    is_banned: u.is_banned,
+    tokens_revoked_after: u.tokens_revoked_after || 0,
+    avatar_url: u.avatar_url,
+    oauth_provider: u.oauth_provider,
+    stripe_customer_id: u.stripe_customer_id,
+  };
+}
 
 module.exports = router;

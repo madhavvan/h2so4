@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock } from 'lucide-react';
+import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search } from 'lucide-react';
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import { geoService, GeoData } from './services/geoService';
 import { pricingService, RegionPricing, PricingTier } from './services/pricingService';
@@ -45,7 +45,9 @@ const loadRazorpayScript = (): Promise<void> => {
 };
 
 // ── Animated background ──
-const AnimatedBackground = () => (
+// Memoized: mounted ~13× across views; re-evaluates 3 infinite CSS keyframes
+// on every parent render if not memoized. No props → never needs to re-render.
+const AnimatedBackground = React.memo(() => (
   <div className="fixed inset-0 overflow-hidden pointer-events-none" style={{ zIndex: 0 }}>
     <div className="absolute -top-40 -right-40 w-[500px] h-[500px] rounded-full opacity-[0.07]"
       style={{ background: 'radial-gradient(circle, #3b82f6 0%, transparent 70%)', animation: 'float1 20s ease-in-out infinite' }} />
@@ -59,11 +61,11 @@ const AnimatedBackground = () => (
       @keyframes float3 { 0%, 100% { transform: translate(-50%, -50%) scale(1); } 50% { transform: translate(-50%, -50%) scale(1.2); } }
     `}</style>
   </div>
-);
+));
 
-const NoiseOverlay = () => (
+const NoiseOverlay = React.memo(() => (
   <div className="fixed inset-0 pointer-events-none opacity-[0.015]" style={{ zIndex: 1, backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E")` }} />
-);
+));
 
 const Logo = ({ size = 'md' }: { size?: 'sm' | 'md' | 'lg' }) => {
   const sizes = { sm: 'w-8 h-8', md: 'w-10 h-10', lg: 'w-14 h-14' };
@@ -223,6 +225,217 @@ const TierBadge = ({ tier }: { tier?: string }) => {
   );
 };
 
+// ── Per-user conversation viewer (admin only) ──
+// Lazy-loads /admin/users/:id when first expanded. The /users/search
+// payload only carries message_count per conversation; the full message
+// thread requires the heavier endpoint (which also writes an audit log
+// entry on the server side, so we don't fire it eagerly).
+const ConversationsViewer = ({
+  searchResult,
+  token,
+  onDeleteConversation,
+}: {
+  searchResult: any;
+  token: string | null;
+  onDeleteConversation?: (userId: string, convId: string, convName: string, messageCount: number) => void;
+}) => {
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<any[] | null>(null);
+  const [openConvId, setOpenConvId] = useState<string | null>(null);
+
+  const userId = searchResult?.user?.id;
+  const stubCount = (searchResult?.conversations || []).length;
+  const fmt = (ts: number) => (ts ? new Date(ts).toLocaleString() : '—');
+
+  const loadFull = async () => {
+    if (!userId || !token) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/admin/users/${userId}`, {
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to load conversations');
+      setConversations(Array.isArray(data.conversations) ? data.conversations : []);
+    } catch (err: any) {
+      setError(err.message || 'Failed to load conversations');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Reset view when the searched user changes. Auto-expand for users with
+  // few conversations (<=3) — the previous collapsed-by-default UX was
+  // frequently missed, which was the reported "admin can't see conversations"
+  // issue. For heavy users we still collapse to keep the panel manageable.
+  useEffect(() => {
+    setConversations(null);
+    setOpenConvId(null);
+    setError(null);
+    const shouldAutoExpand = stubCount > 0 && stubCount <= 3;
+    setExpanded(shouldAutoExpand);
+    if (shouldAutoExpand) loadFull();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, stubCount]);
+
+  // Sync local list if the parent mutates the conversations array (e.g.
+  // after an admin deletes one). Guard against empty arrays overwriting
+  // a valid full-load on every parent re-render.
+  useEffect(() => {
+    const parentConvs = searchResult?.conversations;
+    if (!Array.isArray(parentConvs) || !conversations) return;
+    const parentIds = new Set(parentConvs.map((c: any) => c.id));
+    const currentIds = new Set(conversations.map(c => c.id));
+    const removed = [...currentIds].filter(id => !parentIds.has(id));
+    if (removed.length > 0) {
+      setConversations(cs => (cs || []).filter(c => parentIds.has(c.id)));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchResult?.conversations]);
+
+  const handleToggle = () => {
+    if (!expanded && !conversations) loadFull();
+    setExpanded(!expanded);
+  };
+
+  if (stubCount === 0) {
+    return (
+      <div className="mt-5 pt-4 border-t border-white/10">
+        <p className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold mb-2">Conversations</p>
+        <p className="text-[11px] text-gray-500 italic">No conversations on record.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-5 pt-4 border-t border-white/10">
+      <button
+        onClick={handleToggle}
+        className="w-full flex items-center justify-between gap-2 mb-2 text-left"
+        aria-expanded={expanded}
+      >
+        <span className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold">
+          Conversations ({stubCount})
+        </span>
+        <span className="flex items-center gap-1.5 text-[11px] text-gray-400 hover:text-white transition-colors">
+          {loading ? <Loader2 size={11} className="animate-spin" /> : <ChevronDown size={11} className={`transition-transform ${expanded ? 'rotate-180' : ''}`} />}
+          {expanded ? 'Hide' : 'View messages'}
+        </span>
+      </button>
+
+      {error && (
+        <div className="text-[11px] text-red-400 mb-2 px-2 py-1.5 bg-red-500/10 rounded border border-red-500/20">
+          {error}
+        </div>
+      )}
+
+      {expanded && conversations && (
+        <div className="space-y-1.5 max-h-96 overflow-y-auto">
+          {conversations.length === 0 && (
+            <p className="text-[11px] text-gray-500 italic px-2">No messages found.</p>
+          )}
+          {conversations.map((conv: any) => {
+            const isOpen = openConvId === conv.id;
+            const msgs = Array.isArray(conv.messages) ? conv.messages : [];
+            return (
+              <div key={conv.id} className="rounded-lg border border-white/[0.06] bg-black/20 overflow-hidden">
+                <div className="flex items-stretch">
+                  <button
+                    onClick={() => setOpenConvId(isOpen ? null : conv.id)}
+                    className="flex-1 flex items-center justify-between gap-2 p-2.5 hover:bg-white/[0.03] text-left min-w-0"
+                  >
+                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                      <MessageCircle size={11} className="text-blue-400 shrink-0" />
+                      <span className="text-[11px] font-semibold text-gray-200 truncate" title={conv.name}>
+                        {conv.name || '(untitled)'}
+                      </span>
+                      <span className="text-[10px] text-gray-500 shrink-0">· {msgs.length} msg</span>
+                    </div>
+                    <span className="text-[10px] text-gray-500 whitespace-nowrap">{fmt(conv.updated_at || conv.created_at)}</span>
+                    <ChevronDown size={10} className={`text-gray-500 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+                  </button>
+                  {onDeleteConversation && userId && (
+                    <button
+                      onClick={() => onDeleteConversation(userId, conv.id, conv.name || '(untitled)', msgs.length)}
+                      className="px-2 text-gray-500 hover:text-red-300 hover:bg-red-500/10 border-l border-white/[0.06] transition-all"
+                      title="Delete this conversation (admin)"
+                      aria-label="Delete conversation"
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                  )}
+                </div>
+                {isOpen && (
+                  <div className="px-2.5 pb-2.5 space-y-1.5 border-t border-white/[0.04] pt-2 max-h-72 overflow-y-auto">
+                    {msgs.length === 0 && (
+                      <p className="text-[11px] text-gray-500 italic">(empty conversation)</p>
+                    )}
+                    {msgs.map((m: any) => {
+                      const isUser = m.role === 'user';
+                      return (
+                        <div key={m.id} className={`flex flex-col gap-0.5 ${isUser ? 'items-end' : 'items-start'}`}>
+                          <div className="flex items-center gap-2 text-[9px] uppercase tracking-wider text-gray-500">
+                            <span className={isUser ? 'text-blue-400 font-semibold' : 'text-purple-400 font-semibold'}>
+                              {m.role || 'unknown'}
+                            </span>
+                            <span>{fmt(m.timestamp)}</span>
+                          </div>
+                          <div className={`max-w-[85%] px-2.5 py-1.5 rounded-lg text-[11px] whitespace-pre-wrap break-words ${
+                            isUser
+                              ? 'bg-blue-500/10 border border-blue-500/20 text-blue-100'
+                              : 'bg-white/[0.04] border border-white/[0.06] text-gray-200'
+                          }`}>
+                            {m.content}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Admin tabs. Ordered to match the nav bar layout. "overview" is the
+// command center, then user-focused (users), then money (payments, revoked),
+// then security (logins, audit, analytics), then platform (settings).
+type AdminTab = 'overview' | 'users' | 'payments' | 'revoked' | 'logins' | 'audit' | 'analytics' | 'settings';
+const ADMIN_TABS: AdminTab[] = ['overview', 'users', 'payments', 'revoked', 'logins', 'audit', 'analytics', 'settings'];
+
+// CSV encoder — escapes cells per RFC 4180. Arrays/objects become JSON strings
+// so they survive the round-trip; Excel and Google Sheets import this fine.
+function toCsv(headers: string[], rows: any[][]): string {
+  const esc = (v: any) => {
+    if (v == null) return '';
+    const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const head = headers.map(esc).join(',');
+  const body = rows.map(r => r.map(esc).join(',')).join('\n');
+  return `${head}\n${body}`;
+}
+
+function downloadCsv(filename: string, csv: string) {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUser: UserProfile }) => {
   const [stats, setStats] = useState<any>(null);
   const [users, setUsers] = useState<any[]>([]);
@@ -231,7 +444,7 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
   const [loading, setLoading] = useState(true);
   const [adminError, setAdminError] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [adminTab, setAdminTab] = useState<'overview' | 'users' | 'logins' | 'audit'>('overview');
+  const [adminTab, setAdminTab] = useState<AdminTab>('overview');
 
   // Quick-action form state
   const [revokeKey, setRevokeKey] = useState('');
@@ -246,6 +459,61 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
   const [panelDays, setPanelDays] = useState('');
   const [panelBusy, setPanelBusy] = useState<string | null>(null);
 
+  // Users tab filter state
+  const [userFilterTier, setUserFilterTier] = useState<'all' | Tier>('all');
+  const [userFilterStatus, setUserFilterStatus] = useState<'all' | 'active' | 'banned'>('all');
+  const [userSearch, setUserSearch] = useState('');
+
+  // Payments tab
+  const [payments, setPayments] = useState<any[]>([]);
+  const [paymentStats, setPaymentStats] = useState<any>(null);
+  const [paymentsLoading, setPaymentsLoading] = useState(false);
+  const [paymentFilters, setPaymentFilters] = useState<{
+    provider: string;
+    status: string;
+    email: string;
+    tier: string;
+    from: string;
+    to: string;
+  }>({ provider: '', status: '', email: '', tier: '', from: '', to: '' });
+
+  // Revoked keys tab
+  const [revokedKeys, setRevokedKeys] = useState<any[]>([]);
+
+  // Audit tab — filters
+  const [auditFilters, setAuditFilters] = useState<{
+    admin: string;
+    action: string;
+    target: string;
+    from: string;
+    to: string;
+  }>({ admin: '', action: '', target: '', from: '', to: '' });
+  const [auditFacets, setAuditFacets] = useState<{ actions: string[]; admins: string[] }>({ actions: [], admins: [] });
+  const [auditLoading, setAuditLoading] = useState(false);
+
+  // Analytics tab
+  const [trends, setTrends] = useState<any[]>([]);
+  const [topCustomers, setTopCustomers] = useState<any[]>([]);
+  const [suspicious, setSuspicious] = useState<{ multi_country_users: any[]; high_fail_ips: any[] } | null>(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
+
+  // Settings / config tab
+  const [configRows, setConfigRows] = useState<any[]>([]);
+  const [configDraft, setConfigDraft] = useState<Record<string, string>>({});
+  const [configLoading, setConfigLoading] = useState(false);
+
+  // Step-up reauth state. stepUpToken takes precedence over the base token
+  // for destructive admin calls. stepUpExpiresAt is a client-side clock we
+  // use to hide the "reauth" badge — the backend enforces the real TTL.
+  const [stepUpToken, setStepUpToken] = useState<string | null>(null);
+  const [stepUpExpiresAt, setStepUpExpiresAt] = useState<number>(0);
+  const [reauthPrompt, setReauthPrompt] = useState<{
+    password: string;
+    busy: boolean;
+    error: string;
+    pending: (() => void) | null;
+  } | null>(null);
+
   // Reusable confirm modal for destructive admin actions. We can't use the
   // native confirm() — it paints outside Electron's setContentProtection and
   // leaks the target email during a screen-shared interview.
@@ -257,7 +525,25 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
     onConfirm: () => void;
   } | null>(null);
 
-  const token = licenseService.getToken();
+  // Per-user action modals (edit profile, delete user, comp grant, refund).
+  const [editProfileFor, setEditProfileFor] = useState<{ id: string; email: string; name: string; country_code: string } | null>(null);
+  const [compGrantFor, setCompGrantFor] = useState<{ id: string; email: string } | null>(null);
+  const [refundFor, setRefundFor] = useState<{ payment: any } | null>(null);
+
+  const baseToken = licenseService.getToken();
+  // `activeToken` picks the step-up token when it's still valid, otherwise the
+  // base token. Pushed into a helper so every fetch uses the latest.
+  const activeToken = () => {
+    if (stepUpToken && Date.now() < stepUpExpiresAt) return stepUpToken;
+    return baseToken;
+  };
+  const authHeaders = () => ({
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${activeToken()}`,
+  });
+  // Stable header object for the initial fetch useEffect — avoids linter
+  // complaints about headers changing identity.
+  const token = baseToken;
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` };
 
   const showMsg = (text: string, type: 'success' | 'error' = 'success') => {
@@ -290,6 +576,9 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
     loadAdmin();
   }, []);
 
+  // Legacy audit lazy-load — now superseded by loadAudit() which also
+  // supplies filter support. Kept for the initial open of the tab so
+  // the table has something to render before the user touches filters.
   useEffect(() => {
     if (adminTab !== 'audit' || auditLog.length > 0) return;
     fetch(`${API_BASE}/api/v1/admin/audit-log?limit=200`, { headers })
@@ -299,24 +588,95 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adminTab]);
 
+  // Step-up reauth helper. Returns a promise that resolves once the admin
+  // has re-entered their password (or rejects on cancel). Used by any action
+  // guarded by stepUpOnly on the server. Keeps a single password prompt in
+  // flight at a time — callers wait on `pending`.
+  const requireStepUp = (): Promise<void> => {
+    if (stepUpToken && Date.now() < stepUpExpiresAt) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      setReauthPrompt({
+        password: '',
+        busy: false,
+        error: '',
+        pending: () => resolve(),
+      });
+      // Reject if the modal is dismissed. We detect dismissal by a null
+      // pending in a later setter. The cancel button calls reject directly
+      // via its onClick; no leak.
+      (reauthPrompt as any)?.reject?.(); // no-op; retained for clarity
+      // We stash reject on the window so the cancel button can invoke it.
+      (window as any).__reauthReject = () => reject(new Error('Reauth cancelled'));
+    });
+  };
+
   // Shared POST-mutation path. Handles fetch, JSON parse, error toast,
   // busy-state, and returns the parsed body (or null on error) so callers
-  // can update local state only on success.
-  async function callMutation(path: string, body: any, successMsg: string) {
-    setPanelBusy(path);
+  // can update local state only on success. Retries once after a fresh
+  // step-up if the server responds with step_up_required / step_up_expired.
+  async function callMutation(path: string, body: any, successMsg: string, opts: { method?: string } = {}) {
+    const method = opts.method || 'POST';
+    setPanelBusy(`${method}:${path}`);
     try {
-      const res = await fetch(`${API_BASE}${path}`, {
-        method: 'POST', headers, body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Request failed');
-      showMsg(successMsg);
+      const attempt = async () => {
+        const res = await fetch(`${API_BASE}${path}`, {
+          method, headers: authHeaders(), body: method === 'GET' ? undefined : JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        return { res, data };
+      };
+
+      let { res, data } = await attempt();
+      if (!res.ok && (data?.error === 'step_up_required' || data?.error === 'step_up_expired')) {
+        try {
+          await requireStepUp();
+        } catch {
+          showMsg('Reauth cancelled', 'error');
+          return null;
+        }
+        ({ res, data } = await attempt());
+      }
+      if (!res.ok) throw new Error(data?.error || data?.message || 'Request failed');
+      if (successMsg) showMsg(successMsg);
       return data;
     } catch (err: any) {
       showMsg(`Error: ${err.message}`, 'error');
       return null;
     } finally {
       setPanelBusy(null);
+    }
+  }
+
+  async function callGet(path: string): Promise<any | null> {
+    try {
+      const res = await fetch(`${API_BASE}${path}`, { headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
+      return await res.json();
+    } catch (err: any) {
+      showMsg(`Error: ${err.message}`, 'error');
+      return null;
+    }
+  }
+
+  // POST to /admin/reauth. Called by the step-up modal.
+  async function submitReauth(password: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/admin/reauth`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${baseToken}` },
+        body: JSON.stringify({ password }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Reauth failed');
+      setStepUpToken(data.token);
+      setStepUpExpiresAt(data.step_up_expires_at);
+      return true;
+    } catch (err: any) {
+      showMsg(`Reauth failed: ${err.message}`, 'error');
+      return false;
     }
   }
 
@@ -375,13 +735,28 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
   };
 
   const handleChangeTier = async (email: string, tier: Tier) => {
-    const data = await callMutation('/api/v1/admin/users/change-tier', { email, tier }, `${email} → ${tier.toUpperCase()}`);
-    if (!data) return;
-    patchUserEverywhere(email, u => ({ ...u, tier }));
-    // Bump license in search result too — backend reset expires_at + sessions_limit.
-    if (searchResult?.user.email === email) {
-      setSearchResult((sr: any) => ({ ...sr, license: { ...sr.license, tier, status: 'active' } }));
-    }
+    const currentUserRow = searchResult?.user?.email === email
+      ? searchResult.user
+      : users.find(u => u.email === email);
+    const fromTier = currentUserRow?.tier || '?';
+
+    // Always confirm — tier change resets license state (sessions + expiry),
+    // so accidental downgrades during a live interview would kick a paying
+    // user out. Include from→to in the body so the admin can double-check.
+    setConfirmDialog({
+      title: `Change tier for ${email}?`,
+      body: `Move ${email} from ${String(fromTier).toUpperCase()} → ${tier.toUpperCase()}. This resets sessions_limit and expires_at to the new tier's defaults. A step-up password prompt will appear.`,
+      confirmLabel: `Move to ${tier.toUpperCase()}`,
+      danger: tier === 'free',
+      onConfirm: async () => {
+        const data = await callMutation('/api/v1/admin/users/change-tier', { email, tier }, `${email} → ${tier.toUpperCase()}`);
+        if (!data) return;
+        patchUserEverywhere(email, u => ({ ...u, tier }));
+        if (searchResult?.user.email === email) {
+          setSearchResult((sr: any) => ({ ...sr, license: { ...sr.license, tier, status: 'active' } }));
+        }
+      },
+    });
   };
 
   const handleGrantCredits = async (email: string) => {
@@ -453,9 +828,354 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
     patchUserEverywhere(email, u => ({ ...u, is_banned: 0 }));
   };
 
+  // ── Enterprise actions — all route through callMutation and reload local state. ──
+
+  const handleSendPasswordReset = (userId: string, email: string) => {
+    setConfirmDialog({
+      title: `Send password reset to ${email}?`,
+      body: `A reset link will be emailed to ${email}. The link expires in 1 hour. Existing sessions stay active until they actually change the password.`,
+      confirmLabel: 'Send reset email',
+      onConfirm: async () => {
+        await callMutation(`/api/v1/admin/users/${userId}/send-password-reset`, {}, `Password reset sent to ${email}`);
+      },
+    });
+  };
+
+  const handleCancelSubscription = (userId: string, email: string) => {
+    setConfirmDialog({
+      title: `Cancel subscription for ${email}?`,
+      body: `Stripe/Razorpay will stop billing at end of the current period. The user keeps access until then. Requires step-up password.`,
+      confirmLabel: 'Cancel at period end',
+      onConfirm: async () => {
+        await callMutation(`/api/v1/admin/users/${userId}/cancel-subscription`, {}, `Subscription cancellation scheduled for ${email}`);
+      },
+    });
+  };
+
+  const handleRevokeDevice = (userId: string, deviceRowId: number, deviceName: string) => {
+    setConfirmDialog({
+      title: `Revoke device?`,
+      body: `Device "${deviceName || 'unnamed'}" will be deactivated. The user can re-bind on next login (subject to device limit).`,
+      confirmLabel: 'Revoke this device',
+      onConfirm: async () => {
+        const data = await callMutation(`/api/v1/admin/users/${userId}/devices/${deviceRowId}/revoke`, {}, 'Device revoked');
+        if (!data) return;
+        // Mark inactive locally so the UI updates without a full reload.
+        setSearchResult((sr: any) => sr && sr.user?.id === userId
+          ? { ...sr, devices: (sr.devices || []).map((d: any) => d.id === deviceRowId ? { ...d, is_active: 0 } : d) }
+          : sr);
+      },
+    });
+  };
+
+  const handleDeleteConversation = (userId: string, convId: string, convName: string, messageCount: number) => {
+    setConfirmDialog({
+      title: `Delete conversation?`,
+      body: `"${convName || 'Untitled'}" (${messageCount} messages) will be permanently deleted for this user. This cannot be undone. Requires step-up.`,
+      confirmLabel: 'Delete conversation',
+      danger: true,
+      onConfirm: async () => {
+        const data = await callMutation(`/api/v1/admin/users/${userId}/conversations/${convId}`, {}, 'Conversation deleted', { method: 'DELETE' });
+        if (!data) return;
+        setSearchResult((sr: any) => sr && sr.user?.id === userId
+          ? { ...sr, conversations: (sr.conversations || []).filter((c: any) => c.id !== convId) }
+          : sr);
+      },
+    });
+  };
+
+  const handleDeleteUser = (userId: string, email: string) => {
+    setConfirmDialog({
+      title: `Permanently delete ${email}?`,
+      body: `ALL data for ${email} will be wiped: conversations, payments, licenses, devices, login history. This CANNOT be undone. The audit log row stays. Requires step-up password.`,
+      confirmLabel: 'Delete user forever',
+      danger: true,
+      onConfirm: async () => {
+        const data = await callMutation(`/api/v1/admin/users/${userId}`, {}, `${email} deleted`, { method: 'DELETE' });
+        if (!data) return;
+        setUsers(prev => prev.filter(u => u.id !== userId));
+        if (searchResult?.user?.id === userId) setSearchResult(null);
+      },
+    });
+  };
+
+  const handleImpersonate = (userId: string, email: string) => {
+    setConfirmDialog({
+      title: `Impersonate ${email}?`,
+      body: `A scoped JWT for ${email} will be shown. All actions taken under this token are attributed to the target user AND audit-logged against you. Copy and paste into a separate client — DO NOT replace your own admin token.`,
+      confirmLabel: 'Generate impersonation token',
+      danger: true,
+      onConfirm: async () => {
+        const data = await callMutation(`/api/v1/admin/users/${userId}/impersonate`, {}, 'Impersonation token generated');
+        if (!data) return;
+        // Drop the token into a quick prompt modal for copy.
+        setConfirmDialog({
+          title: 'Impersonation token',
+          body: `Expires in 30 days. DO NOT replace your own session.\n\n${data.token}`,
+          confirmLabel: 'Copy to clipboard',
+          onConfirm: async () => {
+            try {
+              await navigator.clipboard.writeText(data.token);
+              showMsg('Token copied — handle with care', 'success');
+            } catch {
+              showMsg('Failed to copy — select and copy manually', 'error');
+            }
+          },
+        });
+      },
+    });
+  };
+
+  const handleEditProfile = (user: any) => {
+    setEditProfileFor({
+      id: user.id,
+      email: user.email,
+      name: user.name || '',
+      country_code: user.country_code || '',
+    });
+  };
+
+  const submitEditProfile = async () => {
+    if (!editProfileFor) return;
+    const data = await callMutation(
+      `/api/v1/admin/users/${editProfileFor.id}`,
+      { name: editProfileFor.name, country_code: editProfileFor.country_code },
+      'Profile updated',
+      { method: 'PATCH' },
+    );
+    if (!data) return;
+    patchUserEverywhere(editProfileFor.email, u => ({
+      ...u,
+      name: editProfileFor.name,
+      country_code: (editProfileFor.country_code || '').toUpperCase(),
+    }));
+    setEditProfileFor(null);
+  };
+
+  const handleGrantComp = (user: any) => {
+    setCompGrantFor({ id: user.id, email: user.email });
+  };
+
+  const submitGrantComp = async (tier: Tier, note: string) => {
+    if (!compGrantFor) return;
+    const data = await callMutation(
+      `/api/v1/admin/users/${compGrantFor.id}/grant-comp`,
+      { tier, note },
+      `${compGrantFor.email} granted ${tier.toUpperCase()} (comp)`,
+    );
+    if (!data) return;
+    patchUserEverywhere(compGrantFor.email, u => ({ ...u, tier }));
+    setCompGrantFor(null);
+  };
+
+  const handleRefund = (payment: any) => {
+    setRefundFor({ payment });
+  };
+
+  const submitRefund = async (amount: number, reason: string) => {
+    if (!refundFor) return;
+    const data = await callMutation(
+      `/api/v1/admin/payments/${refundFor.payment.id}/refund`,
+      { amount, reason },
+      `Refund of ${amount} ${refundFor.payment.currency} issued`,
+    );
+    if (!data) return;
+    // Reload payments so the refund row appears. Keep user context untouched
+    // — webhook will land the downgrade momentarily.
+    setRefundFor(null);
+    loadPayments();
+  };
+
+  const handleDsarExport = async (userId: string, email: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/admin/users/${userId}/export`, { headers: authHeaders() });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `minicaai-dsar-${email.replace(/[^a-z0-9@._-]+/gi, '_')}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      showMsg(`DSAR export downloaded for ${email}`);
+    } catch (err: any) {
+      showMsg(`Export failed: ${err.message}`, 'error');
+    }
+  };
+
+  // ── Loaders for new tabs ──
+
+  async function loadPayments() {
+    setPaymentsLoading(true);
+    const qs = new URLSearchParams();
+    if (paymentFilters.provider) qs.set('provider', paymentFilters.provider);
+    if (paymentFilters.status) qs.set('status', paymentFilters.status);
+    if (paymentFilters.email) qs.set('email', paymentFilters.email);
+    if (paymentFilters.tier) qs.set('tier', paymentFilters.tier);
+    if (paymentFilters.from) {
+      const ms = new Date(paymentFilters.from).getTime();
+      if (Number.isFinite(ms)) qs.set('from', String(ms));
+    }
+    if (paymentFilters.to) {
+      const ms = new Date(paymentFilters.to).getTime();
+      if (Number.isFinite(ms)) qs.set('to', String(ms + 86_400_000 - 1)); // end of day
+    }
+    qs.set('limit', '500');
+    const data = await callGet(`/api/v1/admin/payments?${qs.toString()}`);
+    if (data) {
+      setPayments(data.payments || []);
+      setPaymentStats(data.stats || null);
+    }
+    setPaymentsLoading(false);
+  }
+
+  async function loadRevoked() {
+    const data = await callGet('/api/v1/admin/revoked');
+    if (data) setRevokedKeys(Array.isArray(data) ? data : []);
+  }
+
+  async function loadAudit() {
+    setAuditLoading(true);
+    const qs = new URLSearchParams();
+    if (auditFilters.admin) qs.set('admin', auditFilters.admin);
+    if (auditFilters.action) qs.set('action', auditFilters.action);
+    if (auditFilters.target) qs.set('target', auditFilters.target);
+    if (auditFilters.from) {
+      const ms = new Date(auditFilters.from).getTime();
+      if (Number.isFinite(ms)) qs.set('from', String(ms));
+    }
+    if (auditFilters.to) {
+      const ms = new Date(auditFilters.to).getTime();
+      if (Number.isFinite(ms)) qs.set('to', String(ms + 86_400_000 - 1));
+    }
+    qs.set('limit', '500');
+    const data = await callGet(`/api/v1/admin/audit-log?${qs.toString()}`);
+    if (Array.isArray(data)) setAuditLog(data);
+    setAuditLoading(false);
+  }
+
+  async function loadAuditFacets() {
+    const data = await callGet('/api/v1/admin/audit-log/facets');
+    if (data) setAuditFacets({ actions: data.actions || [], admins: data.admins || [] });
+  }
+
+  async function loadAnalytics() {
+    setAnalyticsLoading(true);
+    const [tr, top, sus] = await Promise.all([
+      callGet('/api/v1/admin/trends?days=30'),
+      callGet('/api/v1/admin/top-customers?limit=20'),
+      callGet('/api/v1/admin/suspicious'),
+    ]);
+    if (Array.isArray(tr)) setTrends(tr);
+    if (Array.isArray(top)) setTopCustomers(top);
+    if (sus) setSuspicious(sus);
+    setAnalyticsLoading(false);
+  }
+
+  async function loadConfig() {
+    setConfigLoading(true);
+    const data = await callGet('/api/v1/admin/config');
+    if (Array.isArray(data)) {
+      setConfigRows(data);
+      const draft: Record<string, string> = {};
+      for (const row of data) draft[row.key] = row.value;
+      setConfigDraft(draft);
+    }
+    setConfigLoading(false);
+  }
+
+  // Tab-triggered lazy loads. Each tab loads its data the first time it
+  // opens and on subsequent opens if the data is stale (we keep it simple
+  // and only reload on first entry — user can hit a manual refresh button).
+  useEffect(() => {
+    if (adminTab === 'payments' && payments.length === 0) loadPayments();
+    if (adminTab === 'revoked' && revokedKeys.length === 0) loadRevoked();
+    if (adminTab === 'audit' && auditFacets.actions.length === 0) loadAuditFacets();
+    if (adminTab === 'analytics' && trends.length === 0) loadAnalytics();
+    if (adminTab === 'settings' && configRows.length === 0) loadConfig();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminTab]);
+
   const fmtDate = (ts: number) => ts ? new Date(ts).toLocaleString() : '—';
   const fmtMoney = (n: number | null | undefined) => n == null ? '$0' : `$${Math.round(n).toLocaleString()}`;
+  // Currency-aware formatter. Stripe stores USD in cents (divide by 100);
+  // Razorpay stores INR in paise (divide by 100). Other currencies follow
+  // ISO 4217 minor-unit convention, so /100 works for the common cases.
+  const fmtAmount = (amount: number | null | undefined, currency: string | null | undefined) => {
+    if (amount == null) return '—';
+    const sign = amount < 0 ? '-' : '';
+    const abs = Math.abs(amount);
+    const major = abs / 100;
+    const c = (currency || 'USD').toUpperCase();
+    const symbol = c === 'INR' ? '₹' : c === 'USD' ? '$' : c === 'EUR' ? '€' : c === 'GBP' ? '£' : '';
+    return `${sign}${symbol}${major.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${symbol ? '' : ' ' + c}`;
+  };
   const openUserInPanel = (email: string) => { setAdminTab('overview'); handleSearch(email); };
+
+  // Filtered users for the Users tab — applied at render time so tier/status
+  // filters don't refetch. Avoids a roundtrip for a trivial client-side filter.
+  const filteredUsers = users.filter(u => {
+    if (userFilterTier !== 'all' && u.tier !== userFilterTier) return false;
+    if (userFilterStatus === 'banned' && !u.is_banned) return false;
+    if (userFilterStatus === 'active' && u.is_banned) return false;
+    if (userSearch) {
+      const q = userSearch.toLowerCase();
+      if (!(u.email || '').toLowerCase().includes(q) && !(u.name || '').toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+
+  // CSV exporters. Delegates to toCsv + downloadCsv defined above. All three
+  // follow the same column order as the admin tables.
+  const exportUsersCsv = () => {
+    const headers = ['email', 'name', 'tier', 'country', 'sessions_used', 'sessions_limit', 'devices', 'created_at', 'last_login_at', 'status', 'stripe_customer_id'];
+    const rows = filteredUsers.map(u => [
+      u.email,
+      u.name || '',
+      u.tier,
+      u.country_code || '',
+      u.license?.sessions_used ?? 0,
+      u.license?.sessions_limit ?? 0,
+      u.device_count ?? 0,
+      u.created_at ? new Date(u.created_at).toISOString() : '',
+      u.last_login_at ? new Date(u.last_login_at).toISOString() : '',
+      u.is_banned ? 'banned' : (u.license?.status || 'none'),
+      u.stripe_customer_id || '',
+    ]);
+    downloadCsv(`minicaai-users-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(headers, rows));
+  };
+
+  const exportPaymentsCsv = () => {
+    const headers = ['id', 'created_at', 'email', 'provider', 'provider_payment_id', 'amount', 'currency', 'status', 'tier_granted'];
+    const rows = payments.map(p => [
+      p.id,
+      p.created_at ? new Date(p.created_at).toISOString() : '',
+      p.email || '',
+      p.provider,
+      p.provider_payment_id || '',
+      p.amount,
+      p.currency,
+      p.status,
+      p.tier_granted || '',
+    ]);
+    downloadCsv(`minicaai-payments-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(headers, rows));
+  };
+
+  const exportAuditCsv = () => {
+    const headers = ['id', 'created_at', 'admin_email', 'action', 'target_user_id', 'target_email', 'details'];
+    const rows = auditLog.map(r => [
+      r.id,
+      r.created_at ? new Date(r.created_at).toISOString() : '',
+      r.admin_email,
+      r.action,
+      r.target_user_id || '',
+      r.target_email || '',
+      r.details_json || '',
+    ]);
+    downloadCsv(`minicaai-audit-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(headers, rows));
+  };
 
   return (
     <div className="fixed inset-0 bg-[#050507] text-white overflow-y-auto">
@@ -467,12 +1187,17 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
           <span className="px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-gradient-to-r from-red-500/20 to-purple-500/20 text-red-300 border border-red-500/30 flex items-center gap-1.5">
             <Shield size={10} /> Admin Console
           </span>
-          {(['overview', 'users', 'logins', 'audit'] as const).map(tab => (
+          {ADMIN_TABS.map(tab => (
             <button key={tab} onClick={() => setAdminTab(tab)}
               className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${adminTab === tab ? 'bg-white/[0.1] text-white border border-white/[0.15]' : 'text-gray-500 hover:text-gray-300 border border-transparent'}`}>
               {tab.charAt(0).toUpperCase() + tab.slice(1)}
             </button>
           ))}
+          {stepUpToken && Date.now() < stepUpExpiresAt && (
+            <span className="px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1" title={`Step-up active until ${new Date(stepUpExpiresAt).toLocaleTimeString()}`}>
+              <UserCheck size={10} /> Step-up
+            </span>
+          )}
           <button onClick={onBack} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1.5">
             <ArrowLeft size={14} /> Back
           </button>
@@ -652,7 +1377,12 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                         </div>
                       </div>
 
-                      {/* Destructive actions */}
+                      {/* Session & access controls — reversible operations
+                          that bring a user back to a clean state without
+                          destroying their account. Grouped separately from
+                          the account-lifecycle actions below so the admin
+                          can't accidentally confuse "reset their devices"
+                          with "delete their account". */}
                       <div className="flex flex-wrap gap-2 pt-3 border-t border-white/10">
                         <button onClick={() => handleResetDevices(u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-amber-500/10 text-amber-300 text-xs font-semibold hover:bg-amber-500/20 border border-amber-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5">
                           <Monitor size={12} /> Reset Devices ({activeDevs})
@@ -676,7 +1406,92 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                         )}
                       </div>
 
-                      {/* Recent login history */}
+                      {/* Account lifecycle & support actions. All of these
+                          hit /api/v1/admin/users/:id/* endpoints that
+                          require step-up reauth on the backend — the UI
+                          layer will transparently prompt for password on
+                          first click via callMutation's retry loop. The
+                          Delete button is last + red for muscle-memory
+                          safety. Impersonate opens a modal with the scoped
+                          JWT and a copy-to-clipboard button; DO NOT
+                          replace your own token in this session. */}
+                      <div className="flex flex-wrap gap-2 pt-3 border-t border-white/10">
+                        <button onClick={() => handleEditProfile(u)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-white/[0.04] text-gray-300 text-xs font-semibold hover:bg-white/[0.08] border border-white/[0.08] disabled:opacity-40 transition-all flex items-center gap-1.5" title="Edit name / country_code">
+                          <Edit2 size={12} /> Edit Profile
+                        </button>
+                        <button onClick={() => handleSendPasswordReset(u.id, u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-blue-500/10 text-blue-300 text-xs font-semibold hover:bg-blue-500/20 border border-blue-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5" title="Email a reset link to the user">
+                          <Key size={12} /> Send Password Reset
+                        </button>
+                        {u.stripe_customer_id ? (
+                          <button onClick={() => handleCancelSubscription(u.id, u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-rose-500/10 text-rose-300 text-xs font-semibold hover:bg-rose-500/20 border border-rose-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5" title="Cancel active subscription with payment provider">
+                            <XCircle size={12} /> Cancel Subscription
+                          </button>
+                        ) : null}
+                        <button onClick={() => handleGrantComp(u)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-emerald-500/10 text-emerald-300 text-xs font-semibold hover:bg-emerald-500/20 border border-emerald-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5" title="Grant complimentary tier (zero-cost)">
+                          <Gift size={12} /> Grant Comp
+                        </button>
+                        <button onClick={() => handleDsarExport(u.id, u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-cyan-500/10 text-cyan-300 text-xs font-semibold hover:bg-cyan-500/20 border border-cyan-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5" title="Download GDPR data subject access export (JSON)">
+                          <Database size={12} /> DSAR Export
+                        </button>
+                        <button onClick={() => handleImpersonate(u.id, u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-yellow-500/10 text-yellow-300 text-xs font-semibold hover:bg-yellow-500/20 border border-yellow-500/20 disabled:opacity-40 transition-all flex items-center gap-1.5" title="Generate a scoped JWT to debug as this user (DO NOT paste into your own tab)">
+                          <UserCheck size={12} /> Impersonate
+                        </button>
+                        <button onClick={() => handleDeleteUser(u.id, u.email)} disabled={!!panelBusy} className="ml-auto px-3 py-2 rounded-lg bg-red-500/20 text-red-300 text-xs font-semibold hover:bg-red-500/30 border border-red-500/40 disabled:opacity-40 transition-all flex items-center gap-1.5" title="Permanently delete user + all data (irreversible)">
+                          <Trash2 size={12} /> Delete User
+                        </button>
+                      </div>
+
+                      {/* Devices — per-device platform/OS so the admin can
+                          tell whether the user is on Mac, Windows, or Linux
+                          without having to ask them. Platform may be null
+                          for rows registered before the platform-tracking
+                          migration shipped — those render as "Unknown". */}
+                      {devs.length > 0 && (
+                        <div className="mt-5 pt-4 border-t border-white/10">
+                          <p className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold mb-2">
+                            Devices ({activeDevs} active · {devs.length} total)
+                          </p>
+                          <div className="space-y-1 max-h-48 overflow-y-auto">
+                            {devs.map((dev: any, i: number) => (
+                              <div key={i} className={`flex items-center justify-between gap-3 text-[11px] py-1.5 px-2 rounded ${dev.is_active ? 'bg-white/[0.02]' : 'opacity-50'}`}>
+                                <div className="flex items-center gap-2 min-w-0 flex-1">
+                                  <Monitor size={11} className={dev.is_active ? 'text-emerald-400' : 'text-gray-600'} />
+                                  <span className="px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/20 text-blue-300 text-[10px] font-semibold uppercase tracking-wider shrink-0">
+                                    {dev.platform || 'Unknown'}
+                                  </span>
+                                  <span className="text-gray-400 truncate font-mono text-[10px]" title={dev.device_name}>
+                                    {dev.device_name || '—'}
+                                  </span>
+                                </div>
+                                <span className="text-gray-500 whitespace-nowrap text-[10px]">{fmtDate(dev.last_seen_at)}</span>
+                                <span className={`font-bold text-[10px] ${dev.is_active ? 'text-emerald-400' : 'text-gray-500'}`}>
+                                  {dev.is_active ? 'ACTIVE' : 'INACTIVE'}
+                                </span>
+                                {/* Per-device revoke. Only meaningful for
+                                    rows still marked ACTIVE — revoking an
+                                    already-inactive device is a no-op on
+                                    the backend, so hide the button entirely
+                                    to keep the row uncluttered. Confirms
+                                    via handleRevokeDevice so the admin can
+                                    back out if they clicked the wrong row. */}
+                                {dev.is_active && dev.id ? (
+                                  <button
+                                    onClick={() => handleRevokeDevice(u.id, dev.id, dev.device_name || dev.platform || 'device')}
+                                    disabled={!!panelBusy}
+                                    className="px-2 py-0.5 rounded bg-red-500/10 text-red-300 text-[10px] font-bold uppercase tracking-wider hover:bg-red-500/20 border border-red-500/20 disabled:opacity-40 transition-all flex items-center gap-1"
+                                    title="Revoke this device only — other devices keep their sessions"
+                                    aria-label="Revoke this device"
+                                  >
+                                    <Ban size={10} /> Revoke
+                                  </button>
+                                ) : null}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Recent login history — now includes platform */}
                       {loginHist.length > 0 && (
                         <div className="mt-5 pt-4 border-t border-white/10">
                           <p className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold mb-2">Recent logins</p>
@@ -684,6 +1499,9 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                             {loginHist.slice(0, 10).map((log: any, i: number) => (
                               <div key={i} className="flex items-center justify-between gap-3 text-[11px] py-1 px-2 rounded hover:bg-white/[0.03]">
                                 <span className="text-gray-400 whitespace-nowrap">{fmtDate(log.created_at)}</span>
+                                <span className="px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/20 text-blue-300 text-[10px] font-semibold uppercase tracking-wider shrink-0">
+                                  {log.platform || '—'}
+                                </span>
                                 <span className="text-gray-500 font-mono truncate">{log.ip_address || '—'} · {log.country_code || '—'}</span>
                                 <span className={`font-bold ${log.success ? 'text-emerald-400' : 'text-red-400'}`}>{log.success ? 'OK' : 'FAIL'}</span>
                               </div>
@@ -691,6 +1509,21 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                           </div>
                         </div>
                       )}
+
+                      {/* Conversations + messages viewer. The /admin/users/:id
+                          endpoint already returns conversationsWithMessages
+                          (full role/content/timestamp). Each conversation
+                          collapses by default; click to expand and read the
+                          message thread. Admin delete is wired via
+                          onDeleteConversation — handleDeleteConversation
+                          shows a confirm dialog with the message count so
+                          the admin doesn't nuke someone's thread by
+                          accident. */}
+                      <ConversationsViewer
+                        searchResult={searchResult}
+                        token={token}
+                        onDeleteConversation={handleDeleteConversation}
+                      />
                     </div>
                   );
                 })()}
@@ -772,7 +1605,9 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                 <div className="flex items-center justify-between flex-wrap gap-3">
                   <div>
                     <h1 className="text-2xl font-bold mb-1">All Users</h1>
-                    <p className="text-gray-500 text-sm">{users.length} registered users</p>
+                    <p className="text-gray-500 text-sm">
+                      Showing {filteredUsers.length.toLocaleString()} of {users.length.toLocaleString()} users
+                    </p>
                   </div>
                   <div className="flex items-center gap-2 text-[10px]">
                     {TIERS.map(t => {
@@ -784,7 +1619,35 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                         </span>
                       );
                     })}
+                    <button onClick={exportUsersCsv} className="ml-2 px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all">
+                      <FileDown size={11} /> Export CSV
+                    </button>
                   </div>
+                </div>
+
+                {/* Filters bar */}
+                <div className="flex flex-wrap items-center gap-2 p-3 rounded-xl border border-white/[0.06] bg-white/[0.02]">
+                  <Filter size={12} className="text-gray-500" />
+                  <input
+                    value={userSearch}
+                    onChange={e => setUserSearch(e.target.value)}
+                    placeholder="Search email or name…"
+                    className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none focus:border-blue-500/50 w-56"
+                  />
+                  <select value={userFilterTier} onChange={e => setUserFilterTier(e.target.value as any)} className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none">
+                    <option value="all">All tiers</option>
+                    {TIERS.map(t => <option key={t} value={t}>{t.toUpperCase()}</option>)}
+                  </select>
+                  <select value={userFilterStatus} onChange={e => setUserFilterStatus(e.target.value as any)} className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none">
+                    <option value="all">All status</option>
+                    <option value="active">Active only</option>
+                    <option value="banned">Banned only</option>
+                  </select>
+                  {(userSearch || userFilterTier !== 'all' || userFilterStatus !== 'all') && (
+                    <button onClick={() => { setUserSearch(''); setUserFilterTier('all'); setUserFilterStatus('all'); }} className="px-2 py-1 rounded text-[10px] text-gray-400 hover:text-white hover:bg-white/[0.04] transition-all">
+                      Clear
+                    </button>
+                  )}
                 </div>
 
                 <div className="border border-white/[0.06] rounded-xl overflow-hidden">
@@ -799,41 +1662,81 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Sessions</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Devices</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Created</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Last Login</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Status</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Provider</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Actions</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {users.map((u: any, i: number) => (
-                          <tr key={u.id || i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
-                            <td className="px-4 py-3 text-white font-medium">{u.email}</td>
-                            <td className="px-4 py-3 text-gray-400">{u.name || '—'}</td>
-                            <td className="px-4 py-3"><TierBadge tier={u.tier} /></td>
-                            <td className="px-4 py-3 text-gray-400">{u.country_code || '—'}</td>
-                            <td className="px-4 py-3 text-gray-400">{u.license?.sessions_used ?? 0}/{u.license?.sessions_limit === -1 ? '∞' : (u.license?.sessions_limit ?? 5)}</td>
-                            <td className="px-4 py-3 text-gray-400">{u.device_count ?? 0}</td>
-                            <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{fmtDate(u.created_at)}</td>
-                            <td className="px-4 py-3">
-                              {u.is_banned ? (
-                                <span className="text-red-400 font-bold text-[10px]">BANNED</span>
-                              ) : (
-                                <span className={`text-[10px] font-medium ${u.license?.status === 'active' ? 'text-emerald-400' : u.license?.status === 'trial' ? 'text-amber-400' : 'text-gray-500'}`}>
-                                  {u.license?.status?.toUpperCase() || 'NONE'}
-                                </span>
-                              )}
-                            </td>
-                            <td className="px-4 py-3">
-                              <button onClick={() => openUserInPanel(u.email)} className="px-2.5 py-1 rounded text-[10px] font-semibold bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 border border-blue-500/20 transition-all">
-                                Manage
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
+                        {filteredUsers.map((u: any, i: number) => {
+                          // Sessions display: show the real backing license state
+                          // when there is one, or an honest "no license" label
+                          // when there isn't. The prior `?? 5` fallback made
+                          // license-less users look like they had free-tier
+                          // credits, which was misleading.
+                          const lic = u.license;
+                          const sessionsDisplay = !lic
+                            ? '— / —'
+                            : `${lic.sessions_used ?? 0} / ${lic.sessions_limit === -1 ? '∞' : lic.sessions_limit}`;
+                          const providerBadge = u.stripe_customer_id
+                            ? (u.stripe_customer_id.startsWith('rzp_') ? 'Razorpay' : 'Stripe')
+                            : (u.oauth_provider ? 'Google' : '—');
+                          return (
+                            <tr key={u.id || i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
+                              <td className="px-4 py-3 text-white font-medium">{u.email}</td>
+                              <td className="px-4 py-3 text-gray-400">{u.name || '—'}</td>
+                              <td className="px-4 py-3"><TierBadge tier={u.tier} /></td>
+                              <td className="px-4 py-3 text-gray-400">{u.country_code || '—'}</td>
+                              <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{sessionsDisplay}</td>
+                              <td className="px-4 py-3 text-gray-400">{u.device_count ?? 0}</td>
+                              <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{fmtDate(u.created_at)}</td>
+                              <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{fmtDate(u.last_login_at)}</td>
+                              <td className="px-4 py-3">
+                                {u.is_banned ? (
+                                  <span className="text-red-400 font-bold text-[10px]">BANNED</span>
+                                ) : (
+                                  <span className={`text-[10px] font-medium ${u.license?.status === 'active' ? 'text-emerald-400' : u.license?.status === 'expired' ? 'text-gray-500' : u.license?.status === 'revoked' ? 'text-red-400' : 'text-gray-500'}`}>
+                                    {u.license?.status?.toUpperCase() || 'NONE'}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-gray-400 text-[10px]">{providerBadge}</td>
+                              <td className="px-4 py-3">
+                                <div className="flex items-center gap-1 flex-wrap">
+                                  <button onClick={() => openUserInPanel(u.email)} className="px-2 py-1 rounded text-[10px] font-semibold bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 border border-blue-500/20 transition-all" title="Manage user">
+                                    Manage
+                                  </button>
+                                  <button onClick={() => handleEditProfile(u)} className="p-1 rounded text-[10px] text-gray-400 hover:text-white hover:bg-white/[0.05] transition-all" title="Edit profile">
+                                    <Edit2 size={11} />
+                                  </button>
+                                  <button onClick={() => handleSendPasswordReset(u.id, u.email)} className="p-1 rounded text-[10px] text-gray-400 hover:text-blue-300 hover:bg-white/[0.05] transition-all" title="Send password reset">
+                                    <Key size={11} />
+                                  </button>
+                                  <button onClick={() => handleGrantComp(u)} className="p-1 rounded text-[10px] text-gray-400 hover:text-emerald-300 hover:bg-white/[0.05] transition-all" title="Grant comp tier">
+                                    <Gift size={11} />
+                                  </button>
+                                  <button onClick={() => handleDsarExport(u.id, u.email)} className="p-1 rounded text-[10px] text-gray-400 hover:text-cyan-300 hover:bg-white/[0.05] transition-all" title="DSAR data export (JSON)">
+                                    <Database size={11} />
+                                  </button>
+                                  <button onClick={() => handleImpersonate(u.id, u.email)} className="p-1 rounded text-[10px] text-gray-400 hover:text-amber-300 hover:bg-white/[0.05] transition-all" title="Impersonate user">
+                                    <UserCheck size={11} />
+                                  </button>
+                                  <button onClick={() => handleDeleteUser(u.id, u.email)} className="p-1 rounded text-[10px] text-gray-400 hover:text-red-300 hover:bg-red-500/10 transition-all" title="Permanently delete user">
+                                    <Trash2 size={11} />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
-                  {users.length === 0 && (
-                    <div className="text-center py-12 text-gray-600 text-sm">No users yet</div>
+                  {filteredUsers.length === 0 && (
+                    <div className="text-center py-12 text-gray-600 text-sm">
+                      {users.length === 0 ? 'No users yet' : 'No users match current filters'}
+                    </div>
                   )}
                 </div>
               </div>
@@ -856,6 +1759,7 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Email</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">IP</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Country</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Platform</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Device</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Status</th>
                           <th className="text-left px-4 py-3 text-gray-500 font-medium">Reason</th>
@@ -868,6 +1772,15 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                             <td className="px-4 py-3 text-white font-medium">{log.email || '—'}</td>
                             <td className="px-4 py-3 text-gray-500 font-mono text-[10px]">{log.ip_address || '—'}</td>
                             <td className="px-4 py-3 text-gray-400">{log.country_code || '—'}</td>
+                            <td className="px-4 py-3">
+                              {log.platform ? (
+                                <span className="px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/20 text-blue-300 text-[10px] font-semibold uppercase tracking-wider">
+                                  {log.platform}
+                                </span>
+                              ) : (
+                                <span className="text-gray-600 text-[10px]">—</span>
+                              )}
+                            </td>
                             <td className="px-4 py-3 text-gray-500 font-mono text-[10px] max-w-[120px] truncate">{log.device_id?.slice(0, 10) || '—'}</td>
                             <td className="px-4 py-3">
                               <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${log.success ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
@@ -890,9 +1803,61 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
             {/* ── AUDIT TAB ── */}
             {adminTab === 'audit' && (
               <div className="space-y-6">
-                <div>
-                  <h1 className="text-2xl font-bold mb-1">Audit Log</h1>
-                  <p className="text-gray-500 text-sm">Every admin mutation, timestamped. Last 200 entries.</p>
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <h1 className="text-2xl font-bold mb-1">Audit Log</h1>
+                    <p className="text-gray-500 text-sm">
+                      Every admin mutation, timestamped. Append-only (enforced by DB triggers). Showing {auditLog.length.toLocaleString()} entries.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button onClick={loadAudit} disabled={auditLoading} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all disabled:opacity-50">
+                      <RefreshCw size={11} className={auditLoading ? 'animate-spin' : ''} /> Refresh
+                    </button>
+                    <button onClick={exportAuditCsv} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all">
+                      <FileDown size={11} /> Export CSV
+                    </button>
+                  </div>
+                </div>
+
+                {/* Filters */}
+                <div className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] flex flex-wrap items-center gap-2">
+                  <Filter size={12} className="text-gray-500" />
+                  <select value={auditFilters.admin} onChange={e => setAuditFilters(f => ({ ...f, admin: e.target.value }))} className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none">
+                    <option value="">All admins</option>
+                    {auditFacets.admins.map(a => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                  <select value={auditFilters.action} onChange={e => setAuditFilters(f => ({ ...f, action: e.target.value }))} className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none">
+                    <option value="">All actions</option>
+                    {auditFacets.actions.map(a => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                  <input
+                    value={auditFilters.target}
+                    onChange={e => setAuditFilters(f => ({ ...f, target: e.target.value }))}
+                    placeholder="Target email contains…"
+                    className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none focus:border-blue-500/50 w-52"
+                  />
+                  <input
+                    type="date"
+                    value={auditFilters.from}
+                    onChange={e => setAuditFilters(f => ({ ...f, from: e.target.value }))}
+                    className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none"
+                  />
+                  <span className="text-gray-500 text-xs">→</span>
+                  <input
+                    type="date"
+                    value={auditFilters.to}
+                    onChange={e => setAuditFilters(f => ({ ...f, to: e.target.value }))}
+                    className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none"
+                  />
+                  <button onClick={loadAudit} disabled={auditLoading} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 border border-blue-500/30 transition-all disabled:opacity-50">
+                    Apply
+                  </button>
+                  {(auditFilters.admin || auditFilters.action || auditFilters.target || auditFilters.from || auditFilters.to) && (
+                    <button onClick={() => { setAuditFilters({ admin: '', action: '', target: '', from: '', to: '' }); setTimeout(loadAudit, 0); }} className="px-2 py-1 rounded text-[10px] text-gray-400 hover:text-white hover:bg-white/[0.04] transition-all">
+                      Clear
+                    </button>
+                  )}
                 </div>
 
                 <div className="border border-white/[0.06] rounded-xl overflow-hidden">
@@ -922,6 +1887,12 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                             row.action === 'extend-expiry' ? 'bg-blue-500/20 text-blue-400' :
                             row.action === 'reset-devices' ? 'bg-amber-500/20 text-amber-400' :
                             row.action === 'force-logout' ? 'bg-orange-500/20 text-orange-400' :
+                            row.action === 'refund-payment' ? 'bg-pink-500/20 text-pink-400' :
+                            row.action === 'delete-user' ? 'bg-red-500/20 text-red-400' :
+                            row.action === 'impersonate' ? 'bg-yellow-500/20 text-yellow-400' :
+                            row.action === 'grant-comp' ? 'bg-emerald-500/20 text-emerald-400' :
+                            row.action === 'dsar-export' ? 'bg-cyan-500/20 text-cyan-400' :
+                            row.action === 'reauth-success' || row.action === 'reauth-failed' ? 'bg-purple-500/20 text-purple-400' :
                             'bg-white/[0.06] text-gray-400';
                           return (
                             <tr key={row.id || i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
@@ -931,7 +1902,7 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                                 <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${actionColor}`}>{row.action}</span>
                               </td>
                               <td className="px-4 py-3 text-gray-300">{row.target_email || '—'}</td>
-                              <td className="px-4 py-3 text-gray-500 font-mono text-[10px] max-w-[320px] truncate" aria-label={details}>{details || '—'}</td>
+                              <td className="px-4 py-3 text-gray-500 font-mono text-[10px] max-w-[420px] truncate" title={details}>{details || '—'}</td>
                             </tr>
                           );
                         })}
@@ -939,8 +1910,425 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                     </table>
                   </div>
                   {auditLog.length === 0 && (
-                    <div className="text-center py-12 text-gray-600 text-sm">No audit entries yet — mutations you make will appear here</div>
+                    <div className="text-center py-12 text-gray-600 text-sm">No audit entries match your filters</div>
                   )}
+                </div>
+              </div>
+            )}
+
+            {/* ── PAYMENTS TAB ── */}
+            {adminTab === 'payments' && (
+              <div className="space-y-6">
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <h1 className="text-2xl font-bold mb-1">Payments</h1>
+                    <p className="text-gray-500 text-sm">
+                      {paymentStats ? `${(paymentStats.count ?? 0).toLocaleString()} rows · gross ${(paymentStats.gross / 100).toFixed(2)} · refunded/disputed ${(paymentStats.refunded_or_disputed / 100).toFixed(2)}` : 'Filter, inspect, refund.'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button onClick={loadPayments} disabled={paymentsLoading} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all disabled:opacity-50">
+                      <RefreshCw size={11} className={paymentsLoading ? 'animate-spin' : ''} /> Refresh
+                    </button>
+                    <button onClick={exportPaymentsCsv} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all">
+                      <FileDown size={11} /> Export CSV
+                    </button>
+                  </div>
+                </div>
+
+                {/* Filters */}
+                <div className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] flex flex-wrap items-center gap-2">
+                  <Filter size={12} className="text-gray-500" />
+                  <select value={paymentFilters.provider} onChange={e => setPaymentFilters(f => ({ ...f, provider: e.target.value }))} className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none">
+                    <option value="">All providers</option>
+                    <option value="stripe">Stripe</option>
+                    <option value="razorpay">Razorpay</option>
+                    <option value="admin-comp">Admin Comp</option>
+                  </select>
+                  <select value={paymentFilters.status} onChange={e => setPaymentFilters(f => ({ ...f, status: e.target.value }))} className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none">
+                    <option value="">All statuses</option>
+                    <option value="completed">Completed</option>
+                    <option value="refunded">Refunded</option>
+                    <option value="disputed">Disputed</option>
+                    <option value="cancelled">Cancelled</option>
+                    <option value="pending">Pending</option>
+                    <option value="failed">Failed</option>
+                  </select>
+                  <select value={paymentFilters.tier} onChange={e => setPaymentFilters(f => ({ ...f, tier: e.target.value }))} className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none">
+                    <option value="">All tiers</option>
+                    {TIERS.map(t => <option key={t} value={t}>{t.toUpperCase()}</option>)}
+                  </select>
+                  <input
+                    value={paymentFilters.email}
+                    onChange={e => setPaymentFilters(f => ({ ...f, email: e.target.value }))}
+                    placeholder="Email contains…"
+                    className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none focus:border-blue-500/50 w-48"
+                  />
+                  <input type="date" value={paymentFilters.from} onChange={e => setPaymentFilters(f => ({ ...f, from: e.target.value }))} className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none" />
+                  <span className="text-gray-500 text-xs">→</span>
+                  <input type="date" value={paymentFilters.to} onChange={e => setPaymentFilters(f => ({ ...f, to: e.target.value }))} className="px-3 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none" />
+                  <button onClick={loadPayments} disabled={paymentsLoading} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 border border-blue-500/30 transition-all disabled:opacity-50">
+                    Apply
+                  </button>
+                  {(paymentFilters.provider || paymentFilters.status || paymentFilters.email || paymentFilters.tier || paymentFilters.from || paymentFilters.to) && (
+                    <button onClick={() => { setPaymentFilters({ provider: '', status: '', email: '', tier: '', from: '', to: '' }); setTimeout(loadPayments, 0); }} className="px-2 py-1 rounded text-[10px] text-gray-400 hover:text-white hover:bg-white/[0.04] transition-all">
+                      Clear
+                    </button>
+                  )}
+                </div>
+
+                <div className="border border-white/[0.06] rounded-xl overflow-hidden">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-white/[0.06] bg-white/[0.02]">
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">When</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Email</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Provider</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Amount</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Status</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Tier</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Provider ID</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {payments.map(p => {
+                          const statusColor =
+                            p.status === 'completed' ? 'text-emerald-400' :
+                            p.status === 'refunded' ? 'text-pink-400' :
+                            p.status === 'disputed' ? 'text-red-400' :
+                            p.status === 'cancelled' ? 'text-gray-500' :
+                            p.status === 'pending' ? 'text-amber-400' :
+                            p.status === 'failed' ? 'text-red-400' :
+                            'text-gray-400';
+                          const canRefund = p.status === 'completed' && p.amount > 0 && p.provider !== 'admin-comp';
+                          return (
+                            <tr key={p.id} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
+                              <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{fmtDate(p.created_at)}</td>
+                              <td className="px-4 py-3 text-white font-medium">
+                                <button onClick={() => openUserInPanel(p.email)} className="hover:text-blue-300 transition-colors">{p.email}</button>
+                              </td>
+                              <td className="px-4 py-3 text-gray-400">
+                                <span className="px-1.5 py-0.5 rounded bg-white/[0.04] border border-white/[0.08] text-[10px] font-semibold uppercase tracking-wider">{p.provider}</span>
+                              </td>
+                              <td className={`px-4 py-3 font-mono whitespace-nowrap ${p.amount < 0 ? 'text-pink-400' : 'text-white'}`}>{fmtAmount(p.amount, p.currency)}</td>
+                              <td className={`px-4 py-3 font-bold uppercase text-[10px] ${statusColor}`}>{p.status}</td>
+                              <td className="px-4 py-3"><TierBadge tier={p.tier_granted} /></td>
+                              <td className="px-4 py-3 text-gray-500 font-mono text-[10px] truncate max-w-[220px]" title={p.provider_payment_id}>{p.provider_payment_id || '—'}</td>
+                              <td className="px-4 py-3">
+                                {canRefund ? (
+                                  <button onClick={() => handleRefund(p)} className="px-2 py-1 rounded text-[10px] font-semibold bg-pink-500/10 text-pink-300 hover:bg-pink-500/20 border border-pink-500/20 transition-all flex items-center gap-1">
+                                    <RefreshCw size={10} /> Refund
+                                  </button>
+                                ) : (
+                                  <span className="text-gray-600 text-[10px]">—</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  {payments.length === 0 && !paymentsLoading && (
+                    <div className="text-center py-12 text-gray-600 text-sm">No payments match your filters</div>
+                  )}
+                  {paymentsLoading && (
+                    <div className="text-center py-12 text-gray-600 text-sm flex items-center justify-center gap-2">
+                      <Loader2 size={14} className="animate-spin" /> Loading payments…
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ── REVOKED KEYS TAB ── */}
+            {adminTab === 'revoked' && (
+              <div className="space-y-6">
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <h1 className="text-2xl font-bold mb-1">Revoked Licenses</h1>
+                    <p className="text-gray-500 text-sm">{revokedKeys.length} revoked keys on file.</p>
+                  </div>
+                  <button onClick={loadRevoked} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all">
+                    <RefreshCw size={11} /> Refresh
+                  </button>
+                </div>
+
+                <div className="border border-white/[0.06] rounded-xl overflow-hidden">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-white/[0.06] bg-white/[0.02]">
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Key</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Revoked by</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Reason</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">When</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {revokedKeys.map((row, i) => (
+                          <tr key={row.key || i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
+                            <td className="px-4 py-3 text-white font-mono text-[11px]">{row.key}</td>
+                            <td className="px-4 py-3 text-gray-400">{row.revoked_by || '—'}</td>
+                            <td className="px-4 py-3 text-gray-500">{row.reason || '—'}</td>
+                            <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{fmtDate(row.revoked_at)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {revokedKeys.length === 0 && (
+                    <div className="text-center py-12 text-gray-600 text-sm">No revoked keys</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ── ANALYTICS TAB ── */}
+            {adminTab === 'analytics' && (
+              <div className="space-y-8">
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <h1 className="text-2xl font-bold mb-1">Analytics</h1>
+                    <p className="text-gray-500 text-sm">MRR · churn · engagement · trends · top customers · risk</p>
+                  </div>
+                  <button onClick={loadAnalytics} disabled={analyticsLoading} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all disabled:opacity-50">
+                    <RefreshCw size={11} className={analyticsLoading ? 'animate-spin' : ''} /> Refresh
+                  </button>
+                </div>
+
+                {/* Enterprise metrics — MRR, ARPU, churn, engagement */}
+                <div>
+                  <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold mb-3">Recurring Revenue</h2>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    {Object.entries(stats?.mrr_by_currency || {}).map(([cur, mrr]: any) => (
+                      <div key={cur} className="p-4 rounded-xl border border-emerald-500/20 bg-emerald-500/[0.04]">
+                        <p className="text-[10px] text-emerald-400 uppercase tracking-wider font-semibold mb-1">MRR · {cur}</p>
+                        <p className="text-2xl font-bold text-white tracking-tight">{fmtAmount(mrr, cur)}</p>
+                        <p className="text-[10px] text-gray-500 mt-1">ARR: {fmtAmount((mrr as number) * 12, cur)}</p>
+                      </div>
+                    ))}
+                    {Object.entries(stats?.arpu_by_currency || {}).map(([cur, arpu]: any) => (
+                      <div key={`arpu-${cur}`} className="p-4 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04]">
+                        <p className="text-[10px] text-cyan-400 uppercase tracking-wider font-semibold mb-1">ARPU · {cur}</p>
+                        <p className="text-2xl font-bold text-white tracking-tight">{fmtAmount(arpu, cur)}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold mb-3">Engagement &amp; Churn</h2>
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                    <div className="p-4 rounded-xl border border-white/[0.06] bg-white/[0.02]">
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">DAU</p>
+                      <p className="text-2xl font-bold text-cyan-400 tracking-tight">{(stats?.dau ?? 0).toLocaleString()}</p>
+                    </div>
+                    <div className="p-4 rounded-xl border border-white/[0.06] bg-white/[0.02]">
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">WAU</p>
+                      <p className="text-2xl font-bold text-blue-400 tracking-tight">{(stats?.wau ?? 0).toLocaleString()}</p>
+                    </div>
+                    <div className="p-4 rounded-xl border border-white/[0.06] bg-white/[0.02]">
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">MAU</p>
+                      <p className="text-2xl font-bold text-indigo-400 tracking-tight">{(stats?.mau ?? 0).toLocaleString()}</p>
+                    </div>
+                    <div className="p-4 rounded-xl border border-white/[0.06] bg-white/[0.02]">
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">DAU/MAU</p>
+                      <p className="text-2xl font-bold text-purple-400 tracking-tight">{stats?.dau_mau_ratio != null ? `${(stats.dau_mau_ratio * 100).toFixed(1)}%` : '—'}</p>
+                      <p className="text-[10px] text-gray-500 mt-0.5">stickiness</p>
+                    </div>
+                    <div className="p-4 rounded-xl border border-red-500/20 bg-red-500/[0.04]">
+                      <p className="text-[10px] text-red-400 uppercase tracking-wider mb-1">30d Churn</p>
+                      <p className="text-2xl font-bold text-red-400 tracking-tight">{stats?.churn_rate_30d != null ? `${(stats.churn_rate_30d * 100).toFixed(1)}%` : '—'}</p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Daily trends sparkline (text table — enough signal for now) */}
+                <div>
+                  <div className="flex items-center justify-between mb-3">
+                    <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold">30-Day Trends</h2>
+                    <p className="text-[10px] text-gray-600">Signups · Logins · Revenue (all currencies summed in their native minor units — see tooltip for breakdown)</p>
+                  </div>
+                  <div className="border border-white/[0.06] rounded-xl overflow-hidden">
+                    <div className="overflow-x-auto max-h-[420px]">
+                      <table className="w-full text-xs">
+                        <thead className="sticky top-0 bg-[#0b0b0f]">
+                          <tr className="border-b border-white/[0.06] bg-white/[0.02]">
+                            <th className="text-left px-4 py-3 text-gray-500 font-medium">Date</th>
+                            <th className="text-right px-4 py-3 text-gray-500 font-medium">Signups</th>
+                            <th className="text-right px-4 py-3 text-gray-500 font-medium">Logins</th>
+                            <th className="text-right px-4 py-3 text-gray-500 font-medium">USD Revenue</th>
+                            <th className="text-right px-4 py-3 text-gray-500 font-medium">INR Revenue</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {trends.map((day: any) => (
+                            <tr key={day.date} className="border-b border-white/[0.03]">
+                              <td className="px-4 py-2 text-gray-400 whitespace-nowrap">{day.date}</td>
+                              <td className="px-4 py-2 text-right text-purple-300 font-semibold">{(day.signups ?? 0).toLocaleString()}</td>
+                              <td className="px-4 py-2 text-right text-cyan-300 font-semibold">{(day.logins ?? 0).toLocaleString()}</td>
+                              <td className="px-4 py-2 text-right text-emerald-300 font-semibold">{day.revenue_by_currency?.USD ? fmtAmount(day.revenue_by_currency.USD, 'USD') : '—'}</td>
+                              <td className="px-4 py-2 text-right text-emerald-300 font-semibold">{day.revenue_by_currency?.INR ? fmtAmount(day.revenue_by_currency.INR, 'INR') : '—'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    {trends.length === 0 && !analyticsLoading && (
+                      <div className="text-center py-10 text-gray-600 text-sm">No trend data yet</div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Top customers */}
+                <div>
+                  <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold mb-3">Top Customers (all-time revenue)</h2>
+                  <div className="border border-white/[0.06] rounded-xl overflow-hidden">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-white/[0.06] bg-white/[0.02]">
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">#</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Email</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Tier</th>
+                          <th className="text-right px-4 py-3 text-gray-500 font-medium">Total Paid</th>
+                          <th className="text-right px-4 py-3 text-gray-500 font-medium">Payments</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {topCustomers.map((c: any, i: number) => (
+                          <tr key={c.email + i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
+                            <td className="px-4 py-3 text-gray-500">{i + 1}</td>
+                            <td className="px-4 py-3 text-white font-medium">
+                              <button onClick={() => openUserInPanel(c.email)} className="hover:text-blue-300 transition-colors">{c.email}</button>
+                            </td>
+                            <td className="px-4 py-3"><TierBadge tier={c.tier} /></td>
+                            <td className="px-4 py-3 text-right text-emerald-400 font-semibold font-mono">{fmtAmount(c.total_amount, c.currency)}</td>
+                            <td className="px-4 py-3 text-right text-gray-400">{c.payment_count}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {topCustomers.length === 0 && !analyticsLoading && (
+                      <div className="text-center py-10 text-gray-600 text-sm">No paying customers yet</div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Suspicious activity */}
+                {suspicious && (suspicious.multi_country_users.length > 0 || suspicious.high_fail_ips.length > 0) && (
+                  <div>
+                    <h2 className="text-xs text-red-400 uppercase tracking-widest font-semibold mb-3">Suspicious Activity</h2>
+                    <div className="grid md:grid-cols-2 gap-4">
+                      <div className="p-4 rounded-xl border border-red-500/20 bg-red-500/[0.04]">
+                        <h3 className="text-sm font-semibold text-white mb-2 flex items-center gap-2"><Globe size={14} className="text-red-400" /> Multi-country logins (7d)</h3>
+                        {suspicious.multi_country_users.length === 0 ? (
+                          <p className="text-gray-500 text-xs">None</p>
+                        ) : (
+                          <div className="space-y-1 max-h-48 overflow-y-auto">
+                            {suspicious.multi_country_users.map((u: any, i: number) => (
+                              <div key={i} className="flex items-center justify-between text-[11px] py-1">
+                                <button onClick={() => openUserInPanel(u.email)} className="text-white font-medium hover:text-blue-300 truncate">{u.email}</button>
+                                <span className="text-red-300 font-mono">{u.country_count} countries</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="p-4 rounded-xl border border-orange-500/20 bg-orange-500/[0.04]">
+                        <h3 className="text-sm font-semibold text-white mb-2 flex items-center gap-2"><Shield size={14} className="text-orange-400" /> High-fail-login IPs (24h)</h3>
+                        {suspicious.high_fail_ips.length === 0 ? (
+                          <p className="text-gray-500 text-xs">None</p>
+                        ) : (
+                          <div className="space-y-1 max-h-48 overflow-y-auto">
+                            {suspicious.high_fail_ips.map((x: any, i: number) => (
+                              <div key={i} className="flex items-center justify-between text-[11px] py-1">
+                                <span className="text-white font-mono">{x.ip_address}</span>
+                                <span className="text-orange-300 font-mono">{x.fail_count} fails</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── SETTINGS TAB ── */}
+            {adminTab === 'settings' && (
+              <div className="space-y-6">
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <h1 className="text-2xl font-bold mb-1">Runtime Configuration</h1>
+                    <p className="text-gray-500 text-sm">Admin-editable knobs. Changes apply immediately. Requires step-up password.</p>
+                  </div>
+                  <button onClick={loadConfig} disabled={configLoading} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all disabled:opacity-50">
+                    <RefreshCw size={11} className={configLoading ? 'animate-spin' : ''} /> Refresh
+                  </button>
+                </div>
+
+                <div className="border border-white/[0.06] rounded-xl overflow-hidden">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b border-white/[0.06] bg-white/[0.02]">
+                        <th className="text-left px-4 py-3 text-gray-500 font-medium">Key</th>
+                        <th className="text-left px-4 py-3 text-gray-500 font-medium">Value</th>
+                        <th className="text-left px-4 py-3 text-gray-500 font-medium">Last Updated</th>
+                        <th className="text-left px-4 py-3 text-gray-500 font-medium">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {configRows.map(row => {
+                        const draft = configDraft[row.key] ?? row.value;
+                        const dirty = draft !== row.value;
+                        return (
+                          <tr key={row.key} className="border-b border-white/[0.03] hover:bg-white/[0.02]">
+                            <td className="px-4 py-3 text-white font-mono text-[11px]">{row.key}</td>
+                            <td className="px-4 py-3">
+                              <input
+                                value={draft}
+                                onChange={e => setConfigDraft(d => ({ ...d, [row.key]: e.target.value }))}
+                                className="w-full px-2 py-1 rounded bg-white/[0.04] border border-white/[0.08] text-white text-[11px] focus:outline-none focus:border-blue-500/50 font-mono"
+                              />
+                            </td>
+                            <td className="px-4 py-3 text-gray-500 whitespace-nowrap text-[10px]">{fmtDate(row.updated_at)}</td>
+                            <td className="px-4 py-3">
+                              <button
+                                disabled={!dirty || !!panelBusy}
+                                onClick={async () => {
+                                  const updated = await callMutation(`/api/v1/admin/config/${encodeURIComponent(row.key)}`, { value: draft }, `${row.key} updated`, { method: 'PUT' });
+                                  if (updated) loadConfig();
+                                }}
+                                className="px-3 py-1 rounded text-[10px] font-semibold bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 border border-blue-500/30 disabled:opacity-40 transition-all"
+                              >
+                                Save
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  {configRows.length === 0 && (
+                    <div className="text-center py-12 text-gray-600 text-sm">
+                      {configLoading ? 'Loading…' : 'No config keys set. Use /license/set-min-version or other admin endpoints to seed values.'}
+                    </div>
+                  )}
+                </div>
+
+                <div className="p-4 rounded-xl border border-amber-500/20 bg-amber-500/[0.04] text-amber-200 text-xs">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                    <div>
+                      Known keys: <span className="font-mono">min_app_version</span>, <span className="font-mono">latest_app_version</span>.
+                      Other keys can be introduced by the server — they'll appear here automatically.
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
@@ -966,7 +2354,7 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
               </div>
               <div className="flex-1">
                 <h3 id="confirm-dialog-title" className="text-base font-semibold text-white">{confirmDialog.title}</h3>
-                <p className="mt-1.5 text-sm text-gray-400 leading-relaxed">{confirmDialog.body}</p>
+                <p className="mt-1.5 text-sm text-gray-400 leading-relaxed whitespace-pre-wrap break-all">{confirmDialog.body}</p>
               </div>
               <button
                 onClick={() => setConfirmDialog(null)}
@@ -1001,6 +2389,188 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
           </div>
         </div>
       )}
+
+      {/* ── STEP-UP REAUTH MODAL ── */}
+      {reauthPrompt && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 backdrop-blur-sm" role="dialog" aria-modal="true">
+          <div className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-purple-500/30 shadow-2xl p-6">
+            <div className="flex items-start gap-3 mb-4">
+              <div className="shrink-0 p-2 rounded-lg bg-purple-500/15 text-purple-300">
+                <Shield size={18} />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-base font-semibold text-white">Confirm your password</h3>
+                <p className="mt-1 text-sm text-gray-400">
+                  This action requires step-up verification. Your session stays elevated for 15 minutes.
+                </p>
+              </div>
+            </div>
+            <input
+              type="password"
+              autoFocus
+              value={reauthPrompt.password}
+              onChange={e => setReauthPrompt(p => p ? { ...p, password: e.target.value, error: '' } : null)}
+              onKeyDown={async (e) => {
+                if (e.key === 'Enter' && !reauthPrompt.busy) {
+                  setReauthPrompt(p => p ? { ...p, busy: true } : null);
+                  const ok = await submitReauth(reauthPrompt.password);
+                  if (ok && reauthPrompt.pending) {
+                    reauthPrompt.pending();
+                    setReauthPrompt(null);
+                  } else {
+                    setReauthPrompt(p => p ? { ...p, busy: false, error: 'Invalid password' } : null);
+                  }
+                }
+              }}
+              placeholder={`Password for ${currentUser.email}`}
+              className="w-full px-4 py-2.5 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-purple-500/60"
+            />
+            {reauthPrompt.error && (
+              <p className="mt-2 text-xs text-red-400">{reauthPrompt.error}</p>
+            )}
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                onClick={() => {
+                  (window as any).__reauthReject?.();
+                  setReauthPrompt(null);
+                }}
+                className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={!reauthPrompt.password || reauthPrompt.busy}
+                onClick={async () => {
+                  setReauthPrompt(p => p ? { ...p, busy: true } : null);
+                  const ok = await submitReauth(reauthPrompt.password);
+                  if (ok && reauthPrompt.pending) {
+                    reauthPrompt.pending();
+                    setReauthPrompt(null);
+                  } else {
+                    setReauthPrompt(p => p ? { ...p, busy: false, error: 'Invalid password' } : null);
+                  }
+                }}
+                className="px-4 py-2 rounded-lg text-sm font-semibold bg-purple-500/20 text-purple-200 hover:bg-purple-500/30 border border-purple-500/30 disabled:opacity-40 transition-all flex items-center gap-2"
+              >
+                {reauthPrompt.busy && <Loader2 size={14} className="animate-spin" />}
+                Verify
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── EDIT PROFILE MODAL ── */}
+      {editProfileFor && (
+        <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/70 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={() => setEditProfileFor(null)}>
+          <div className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-white/[0.08] shadow-2xl p-6" onClick={e => e.stopPropagation()}>
+            <h3 className="text-base font-semibold text-white mb-1">Edit Profile</h3>
+            <p className="text-xs text-gray-500 mb-4">{editProfileFor.email}</p>
+            <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Name</label>
+            <input
+              value={editProfileFor.name}
+              onChange={e => setEditProfileFor(p => p ? { ...p, name: e.target.value } : null)}
+              className="w-full px-3 py-2 mb-3 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-blue-500/50"
+            />
+            <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Country (ISO-2)</label>
+            <input
+              value={editProfileFor.country_code}
+              onChange={e => setEditProfileFor(p => p ? { ...p, country_code: e.target.value.toUpperCase().slice(0, 2) } : null)}
+              maxLength={2}
+              placeholder="US"
+              className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-blue-500/50 uppercase font-mono"
+            />
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button onClick={() => setEditProfileFor(null)} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Cancel</button>
+              <button onClick={submitEditProfile} className="px-4 py-2 rounded-lg text-sm font-semibold bg-blue-500/20 text-blue-200 hover:bg-blue-500/30 border border-blue-500/30 transition-all">Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── GRANT COMP MODAL ── */}
+      {compGrantFor && (() => {
+        let localTier: Tier = 'pro';
+        let localNote = '';
+        return (
+          <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/70 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={() => setCompGrantFor(null)}>
+            <div className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-emerald-500/20 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
+              <div className="flex items-start gap-3 mb-4">
+                <div className="shrink-0 p-2 rounded-lg bg-emerald-500/15 text-emerald-400"><Gift size={18} /></div>
+                <div>
+                  <h3 className="text-base font-semibold text-white">Grant Comp Tier</h3>
+                  <p className="text-xs text-gray-500">{compGrantFor.email} · $0 payment, excluded from revenue metrics</p>
+                </div>
+              </div>
+              <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Tier</label>
+              <select
+                defaultValue="pro"
+                onChange={e => { localTier = e.target.value as Tier; }}
+                className="w-full px-3 py-2 mb-3 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-emerald-500/50"
+              >
+                <option value="basic">Basic</option>
+                <option value="pro">Pro</option>
+                <option value="max">Max</option>
+              </select>
+              <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Reason / note (audit trail)</label>
+              <textarea
+                onChange={e => { localNote = e.target.value; }}
+                placeholder="e.g. refund for outage; influencer comp; support make-good"
+                rows={3}
+                className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-emerald-500/50 resize-none"
+              />
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button onClick={() => setCompGrantFor(null)} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Cancel</button>
+                <button onClick={() => submitGrantComp(localTier, localNote)} className="px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30 border border-emerald-500/30 transition-all">Grant</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── REFUND MODAL ── */}
+      {refundFor && (() => {
+        const p = refundFor.payment;
+        let amount = p.amount;
+        let reason = 'requested_by_customer';
+        return (
+          <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/70 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={() => setRefundFor(null)}>
+            <div className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-pink-500/20 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
+              <div className="flex items-start gap-3 mb-4">
+                <div className="shrink-0 p-2 rounded-lg bg-pink-500/15 text-pink-400"><RefreshCw size={18} /></div>
+                <div>
+                  <h3 className="text-base font-semibold text-white">Issue Refund</h3>
+                  <p className="text-xs text-gray-500">{p.email} · {p.provider.toUpperCase()} · {fmtAmount(p.amount, p.currency)}</p>
+                </div>
+              </div>
+              <p className="text-xs text-gray-400 mb-4 p-3 rounded-lg bg-amber-500/[0.04] border border-amber-500/20">
+                Refund hits the provider immediately. A webhook will downgrade this user's tier shortly after. Partial refunds are supported — enter a smaller amount to refund less than the full charge. Requires step-up password.
+              </p>
+              <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Amount ({p.currency.toUpperCase()} · minor units, e.g. cents/paise)</label>
+              <input
+                type="number"
+                defaultValue={p.amount}
+                onChange={e => { amount = parseInt(e.target.value, 10) || 0; }}
+                className="w-full px-3 py-2 mb-3 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-pink-500/50 font-mono"
+              />
+              <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Reason</label>
+              <select
+                defaultValue="requested_by_customer"
+                onChange={e => { reason = e.target.value; }}
+                className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-pink-500/50"
+              >
+                <option value="requested_by_customer">Requested by customer</option>
+                <option value="duplicate">Duplicate charge</option>
+                <option value="fraudulent">Fraudulent</option>
+              </select>
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button onClick={() => setRefundFor(null)} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Cancel</button>
+                <button onClick={() => submitRefund(amount, reason)} className="px-4 py-2 rounded-lg text-sm font-semibold bg-pink-500/20 text-pink-200 hover:bg-pink-500/30 border border-pink-500/30 transition-all">Issue refund</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };
@@ -1037,6 +2607,15 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // signup → checkout transitions (otherwise a non-authenticated user
   // clicking Max would sign up and then get routed through a Pro checkout).
   const [pendingCheckoutTier, setPendingCheckoutTier] = useState<'basic' | 'pro' | 'max'>('pro');
+  // What the user just paid for / was just granted. Survives webhook lag:
+  // when the Stripe webhook hasn't landed by the time we render /download,
+  // currentLicense.tier may still be 'free' — we'd otherwise drop the user
+  // onto the generic "Upgrade to Pro" card immediately after they bought
+  // Max. Hydrated at boot from localStorage('justPurchasedTier') so a
+  // refresh of the success page also lands on the right card.
+  const [lastSuccessfulTier, setLastSuccessfulTier] = useState<string | null>(() => {
+    try { return typeof localStorage !== 'undefined' ? localStorage.getItem('justPurchasedTier') : null; } catch { return null; }
+  });
   // Flips true after handleSignup resolves so the /download view can show
   // a first-time welcome banner to Starter users. Cleared when the banner
   // is dismissed or a successful payment replaces it.
@@ -1219,6 +2798,16 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             bannerTier = urlTierHint || saved.license?.tier;
           }
           setJustSignedUp(false);
+          // Persist the tier the user just paid for BEFORE we strip the URL.
+          // Without this, a refresh after the URL clean-up loses the hint
+          // and the download view falls back to currentLicense.tier — which
+          // is still 'free' until the webhook lands, so the user sees
+          // "Upgrade to Pro" right after buying Max. Cleared by the user
+          // closing the success banner or by a tier-change being confirmed.
+          if (!isRenewal && bannerTier && bannerTier !== 'free') {
+            try { localStorage.setItem('justPurchasedTier', bannerTier); } catch {}
+            setLastSuccessfulTier(bannerTier);
+          }
           surfacePaymentSuccess(isRenewal ? welcomeForRenewal() : welcomeForTier(bannerTier));
           setView('download');
           // Clean up URL
@@ -1358,6 +2947,35 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       if (!token) throw new Error('Please sign in first to continue checkout');
 
       const countryCode = geo?.country_code || 'US';
+
+      // ── In-place tier swap on an existing recurring subscription ──
+      // If the user is already actively subscribed to Pro or Max and is
+      // switching to the OTHER recurring tier, we must update the existing
+      // subscription instead of creating a second one. Without this branch
+      // a Pro→Max click would spin up a new Stripe sub alongside the old
+      // one and the user would be billed twice until support intervened.
+      // Anything else (free→paid, expired→paid, basic→paid, same tier)
+      // falls through to /create-checkout's normal new-subscription flow.
+      const liveTier = currentLicense?.tier;
+      const isLiveActive = currentLicense?.status === 'active';
+      const isRecurringTier = (t: string | undefined | null): boolean =>
+        t === 'pro' || t === 'max';
+      const isInPlaceUpgrade =
+        isLiveActive &&
+        isRecurringTier(liveTier) &&
+        isRecurringTier(tier) &&
+        liveTier !== tier;
+
+      const endpointPath = isInPlaceUpgrade
+        ? '/api/v1/payments/upgrade-tier'
+        : '/api/v1/payments/create-checkout';
+      // /upgrade-tier doesn't need country_code (provider is determined
+      // from the existing subscription's customer record). Sending it
+      // anyway is harmless but cleaner to omit.
+      const requestBody = isInPlaceUpgrade
+        ? { tier }
+        : { country_code: countryCode, tier };
+
       // 30s abort — Railway cold-starts can take 10-15s; past that the user
       // has typically already given up and clicked again. Without this the
       // button spins forever on a stalled socket and users report the app
@@ -1366,13 +2984,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       const timeoutId = window.setTimeout(() => controller.abort(), 30000);
       let response: Response;
       try {
-        response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-checkout', {
+        response = await fetch(`https://h2so4-production.up.railway.app${endpointPath}`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${token}`,
           },
-          body: JSON.stringify({ country_code: countryCode, tier }),
+          body: JSON.stringify(requestBody),
           signal: controller.signal,
         });
       } catch (fetchErr: any) {
@@ -1386,12 +3004,41 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
       if (!response.ok) {
         const err = await response.json().catch(() => ({}));
-        throw new Error(err.error || 'Failed to create checkout');
+        throw new Error(err.error || (isInPlaceUpgrade ? 'Failed to change plan' : 'Failed to create checkout'));
       }
 
       const data = await response.json();
 
-      if (data.provider === 'stripe') {
+      // Server-completed grant (no provider redirect needed). Three flavors
+      // share this local-state update path: admin self-grant (bypass), and
+      // the two in-place plan swaps which already mutated the subscription
+      // server-side and updated the license row optimistically.
+      const SYNC_GRANT_PROVIDERS = ['admin-grant', 'stripe-upgrade', 'razorpay-upgrade'];
+      if (SYNC_GRANT_PROVIDERS.includes(data.provider)) {
+        const grantedTier = data.tier || 'pro';
+        const saved = licenseService.loadAuth();
+        const baseUser = currentUser || saved.user;
+        if (baseUser) {
+          const updatedUser: UserProfile = { ...baseUser, tier: grantedTier as UserProfile['tier'] };
+          const updatedLicense: LicenseData = data.license
+            ? { ...(data.license as LicenseData), last_validated: Date.now() }
+            : { ...(saved.license || currentLicense)!, tier: grantedTier as LicenseData['tier'], last_validated: Date.now() };
+          setCurrentUser(updatedUser);
+          setCurrentLicense(updatedLicense);
+          licenseService.saveAuth(updatedUser, updatedLicense);
+          // Mirror the post-payment redirect path so the user lands on
+          // the tier-specific "X Active" card instead of the "Upgrade" CTA.
+          try { localStorage.setItem('justPurchasedTier', grantedTier); } catch {}
+          setLastSuccessfulTier(grantedTier);
+        }
+        // Server provides a tailored message for upgrades (mentions
+        // proration / cycle-end timing). Fall back to the generic
+        // welcome copy for admin-grant and any future sync provider.
+        surfacePaymentSuccess(data.message || welcomeForTier(grantedTier));
+        setPendingCheckoutTier('pro');
+        setSelectedProUpgrade(false);
+        setView('download');
+      } else if (data.provider === 'stripe') {
         // Stripe — redirect to hosted checkout
         window.location.href = data.checkout_url;
       } else if (data.provider === 'razorpay') {
@@ -1597,6 +3244,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
               setPaymentError(null);
               setJustSignedUp(false);
+              // Same persistence as the Stripe success-redirect path: stash
+              // the granted tier so a refresh of /download doesn't fall back
+              // to "Upgrade to Pro" while the webhook catches up.
+              if (!isRenewal && grantedTier && grantedTier !== ('free' as any)) {
+                try { localStorage.setItem('justPurchasedTier', grantedTier); } catch {}
+                setLastSuccessfulTier(grantedTier);
+              }
               surfacePaymentSuccess(isRenewal ? welcomeForRenewal() : welcomeForTier(grantedTier));
               resolve();
             } catch (err: any) {
@@ -2023,87 +3677,116 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             <button onClick={() => setView('tutorials')} className="px-6 py-2.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-sm font-medium transition-all flex items-center gap-2">
               <BookOpen size={14} /> View Tutorials
             </button>
-            {currentLicense?.tier === 'max' || currentLicense?.tier === 'pro' ? (
-              <>
-                {currentLicense.tier === 'max' ? (
-                  <div className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-amber-500/10 to-purple-500/10 border border-amber-500/30 text-amber-400 text-sm font-semibold flex items-center gap-2">
-                    <Crown size={14} /> Max Active
-                  </div>
-                ) : (
-                  <div className="px-6 py-2.5 rounded-xl bg-green-500/10 border border-green-500/20 text-green-400 text-sm font-semibold flex items-center gap-2">
-                    <Check size={14} /> Pro Active
-                  </div>
-                )}
-                {/* Manage subscription — Stripe Customer Portal opens in a
-                    new tab. Shown for non-India users; India Pro/Max sees
-                    the Cancel button below since Razorpay has no portal. */}
-                {geo?.country_code !== 'IN' && (
-                  <button
-                    onClick={handleManageSubscription}
-                    disabled={paymentLoading}
-                    className="px-4 py-2.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-sm font-medium transition-all flex items-center gap-2 disabled:opacity-50"
-                    aria-label="Manage subscription (opens billing portal)"
-                  >
-                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Settings size={14} />}
-                    Manage subscription <ExternalLink size={12} className="opacity-60" />
-                  </button>
-                )}
-                {geo?.country_code === 'IN' && (
-                  <button
-                    onClick={() => setCancelConfirm(true)}
-                    disabled={paymentLoading}
-                    className="px-4 py-2.5 rounded-xl bg-white/[0.04] hover:bg-red-500/10 hover:border-red-500/30 border border-white/[0.08] text-sm font-medium transition-all flex items-center gap-2 disabled:opacity-50 text-gray-400 hover:text-red-300"
-                    aria-label="Cancel subscription"
-                  >
-                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <XCircle size={14} />}
-                    Cancel subscription
-                  </button>
-                )}
-              </>
-            ) : currentLicense?.tier === 'basic' ? (
-              <>
-                <div className="flex flex-col items-center gap-1.5">
-                  <div className="px-6 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-sm font-semibold flex items-center gap-2">
-                    <Sparkles size={14} /> Basic Active
-                  </div>
-                  {/* Surface the 14-day expiry so Basic users aren't
-                      surprised when their plan lapses silently. */}
-                  {basicExpiryLabel(currentLicense.expires_at) && (
-                    <div className={`flex items-center gap-1 text-[11px] ${
-                      (currentLicense.expires_at ?? 0) - Date.now() <= 0
-                        ? 'text-red-400'
-                        : (currentLicense.expires_at ?? 0) - Date.now() < 2 * 24 * 60 * 60 * 1000
-                          ? 'text-amber-400'
-                          : 'text-gray-400'
-                    }`}>
-                      <Clock size={10} />
-                      {basicExpiryLabel(currentLicense.expires_at)}
+            {(() => {
+              // Resolve which "X Active" / "Upgrade" CTA to render. Priority:
+              // 1) Admin → always Max (server bypasses Stripe; UI mirrors that).
+              // 2) Server-confirmed paid tier on the license itself.
+              // 3) Tier the user just paid for (lastSuccessfulTier) — covers
+              //    the post-payment window where the webhook hasn't landed
+              //    yet and currentLicense.tier is still 'free'.
+              // 4) Fall through to "Upgrade to Pro" only when none of the
+              //    above identify a paid tier.
+              const isAdminUser = !!currentUser && licenseService.isDeveloper(currentUser.email);
+              const licenseTier = currentLicense?.tier;
+              const paidLicense =
+                licenseTier === 'max' || licenseTier === 'pro' || licenseTier === 'basic'
+                  ? licenseTier
+                  : null;
+              const fallbackTier = paidLicense
+                ? paidLicense
+                : (lastSuccessfulTier === 'max' || lastSuccessfulTier === 'pro' || lastSuccessfulTier === 'basic'
+                    ? lastSuccessfulTier
+                    : null);
+              const effectiveTier = isAdminUser ? 'max' : fallbackTier;
+
+              if (effectiveTier === 'max' || effectiveTier === 'pro') {
+                return (
+                  <>
+                    {effectiveTier === 'max' ? (
+                      <div className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-amber-500/10 to-purple-500/10 border border-amber-500/30 text-amber-400 text-sm font-semibold flex items-center gap-2">
+                        <Crown size={14} /> {isAdminUser ? 'Admin · Max Active' : 'Max Active'}
+                      </div>
+                    ) : (
+                      <div className="px-6 py-2.5 rounded-xl bg-green-500/10 border border-green-500/20 text-green-400 text-sm font-semibold flex items-center gap-2">
+                        <Check size={14} /> Pro Active
+                      </div>
+                    )}
+                    {/* Hide subscription-management buttons for admins — there
+                        is no real Stripe/Razorpay subscription to manage when
+                        the tier was self-granted via /create-checkout. */}
+                    {!isAdminUser && geo?.country_code !== 'IN' && (
+                      <button
+                        onClick={handleManageSubscription}
+                        disabled={paymentLoading}
+                        className="px-4 py-2.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-sm font-medium transition-all flex items-center gap-2 disabled:opacity-50"
+                        aria-label="Manage subscription (opens billing portal)"
+                      >
+                        {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Settings size={14} />}
+                        Manage subscription <ExternalLink size={12} className="opacity-60" />
+                      </button>
+                    )}
+                    {!isAdminUser && geo?.country_code === 'IN' && (
+                      <button
+                        onClick={() => setCancelConfirm(true)}
+                        disabled={paymentLoading}
+                        className="px-4 py-2.5 rounded-xl bg-white/[0.04] hover:bg-red-500/10 hover:border-red-500/30 border border-white/[0.08] text-sm font-medium transition-all flex items-center gap-2 disabled:opacity-50 text-gray-400 hover:text-red-300"
+                        aria-label="Cancel subscription"
+                      >
+                        {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <XCircle size={14} />}
+                        Cancel subscription
+                      </button>
+                    )}
+                  </>
+                );
+              }
+
+              if (effectiveTier === 'basic') {
+                return (
+                  <>
+                    <div className="flex flex-col items-center gap-1.5">
+                      <div className="px-6 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-sm font-semibold flex items-center gap-2">
+                        <Sparkles size={14} /> Basic Active
+                      </div>
+                      {currentLicense && basicExpiryLabel(currentLicense.expires_at) && (
+                        <div className={`flex items-center gap-1 text-[11px] ${
+                          (currentLicense.expires_at ?? 0) - Date.now() <= 0
+                            ? 'text-red-400'
+                            : (currentLicense.expires_at ?? 0) - Date.now() < 2 * 24 * 60 * 60 * 1000
+                              ? 'text-amber-400'
+                              : 'text-gray-400'
+                        }`}>
+                          <Clock size={10} />
+                          {basicExpiryLabel(currentLicense.expires_at)}
+                        </div>
+                      )}
                     </div>
-                  )}
-                </div>
+                    <button
+                      onClick={initiateRenewal}
+                      disabled={paymentLoading}
+                      className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center gap-2 disabled:opacity-50"
+                      aria-label="Renew +1 interview (1 hour)"
+                    >
+                      {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+                      {(() => {
+                        const r = pricingService.getBasicRenewalPrice(geo?.country_code || 'US');
+                        return `Renew +1h · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
+                      })()}
+                    </button>
+                  </>
+                );
+              }
+
+              return (
                 <button
-                  onClick={initiateRenewal}
+                  onClick={() => initiateCheckout('pro')}
                   disabled={paymentLoading}
-                  className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center gap-2 disabled:opacity-50"
-                  aria-label="Renew +1 interview (1 hour)"
+                  className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-400 hover:to-purple-400 text-white text-sm font-semibold transition-all shadow-lg shadow-blue-500/20 flex items-center gap-2 disabled:opacity-50"
                 >
-                  {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
-                  {(() => {
-                    const r = pricingService.getBasicRenewalPrice(geo?.country_code || 'US');
-                    return `Renew +1h · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
-                  })()}
+                  {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Crown size={14} />}
+                  Upgrade to Pro
                 </button>
-              </>
-            ) : (
-              <button
-                onClick={() => initiateCheckout('pro')}
-                disabled={paymentLoading}
-                className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-400 hover:to-purple-400 text-white text-sm font-semibold transition-all shadow-lg shadow-blue-500/20 flex items-center gap-2 disabled:opacity-50"
-              >
-                {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Crown size={14} />}
-                Upgrade to Pro
-              </button>
-            )}
+              );
+            })()}
           </div>
 
           {/* Cancel-subscription confirm (Razorpay/India only) */}

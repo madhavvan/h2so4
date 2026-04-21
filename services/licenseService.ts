@@ -173,6 +173,35 @@ class LicenseService {
     return DEVELOPER_EMAILS.includes(email.toLowerCase());
   }
 
+  // ── Admin short-circuit gate ──
+  // Used by every feature/tier/balance check below to grant Max-equivalent
+  // access to admins regardless of what tier is stored on their license.
+  // Source of truth is the server-set `user.is_admin` flag (computed at
+  // login/signup from the ADMIN_EMAILS env var). Self-managed `is_admin`
+  // is impossible because the field is overwritten on every /me, login,
+  // and signup response.
+  private isAdmin(): boolean {
+    const { user } = this.loadAuth();
+    return !!user?.is_admin;
+  }
+
+  // ── Coarse OS detection from the UA ──
+  // Used by AdminDashboard to display per-device platform. Sent alongside
+  // device_id on signup/login/google/validate so the server can populate
+  // devices.platform and login_logs.platform. Returns one of:
+  // 'macOS' | 'Windows' | 'Linux' | 'iOS' | 'Android' | 'Unknown'.
+  getPlatform(): string {
+    if (typeof navigator === 'undefined') return 'Unknown';
+    const ua = (navigator.userAgent || '').toLowerCase();
+    const platform = (navigator.platform || '').toLowerCase();
+    if (/iphone|ipad|ipod/.test(ua)) return 'iOS';
+    if (/android/.test(ua)) return 'Android';
+    if (/mac/.test(platform) || /mac os x/.test(ua)) return 'macOS';
+    if (/win/.test(platform) || /windows/.test(ua)) return 'Windows';
+    if (/linux/.test(platform) || /linux/.test(ua)) return 'Linux';
+    return 'Unknown';
+  }
+
   isVersionValid(): boolean {
     const [minMaj, minMin, minPatch] = MIN_VERSION.split('.').map(Number);
     const [curMaj, curMin, curPatch] = APP_VERSION.split('.').map(Number);
@@ -188,6 +217,8 @@ class LicenseService {
   // trial are treated as Basic for this window so they can experience the
   // full product before the wall comes up.
   canUseFeature(license: LicenseData | null, feature: keyof typeof FEATURE_GATES.free): boolean {
+    // Admin gets every gate (incl. Max-only Auto-Type) regardless of stored tier.
+    if (this.isAdmin()) return true;
     if (!license) return false;
     const tier = this.getEffectiveTier(license);
     const gates = FEATURE_GATES[tier];
@@ -198,6 +229,8 @@ class LicenseService {
   }
 
   canUseModel(license: LicenseData | null, model: string): boolean {
+    // Admin can use any model (mirrors Max's `models` whitelist).
+    if (this.isAdmin()) return true;
     if (!license) return false;
     const tier = this.getEffectiveTier(license);
     return FEATURE_GATES[tier].models.includes(model);
@@ -207,6 +240,10 @@ class LicenseService {
   // Free user inside their 30-min trial window gets Basic features.
   // Basic user with expired credits falls back to Free features.
   getEffectiveTier(license: LicenseData | null): 'free' | 'basic' | 'pro' | 'max' {
+    // Admin always renders + gates as Max so the UI shows "Max Active" and
+    // Auto-Type is unlocked even if the stored tier is 'free' (e.g. before
+    // any /create-checkout self-grant fires).
+    if (this.isAdmin()) return 'max';
     if (!license) return 'free';
     if (license.tier === 'max') return 'max';
     if (license.tier === 'pro') return 'pro';
@@ -296,6 +333,10 @@ class LicenseService {
   // Used by the timer service to pick which bucket to consume.
   // Returns { seconds, source } where source indicates which bucket.
   getLiveTimeBalance(license: LicenseData | null): { seconds: number; source: 'trial' | 'credits' | 'unlimited' | 'none' } {
+    // Admin always has unlimited live-session time. Mirrors Pro/Max so the
+    // timer service never blocks an admin mid-interview, even if the
+    // stored tier hasn't been upgraded yet.
+    if (this.isAdmin()) return { seconds: Infinity, source: 'unlimited' };
     if (!license) return { seconds: 0, source: 'none' };
     if (license.tier === 'pro' || license.tier === 'max') {
       return { seconds: Infinity, source: 'unlimited' };
@@ -346,6 +387,8 @@ class LicenseService {
   }
 
   canStartSession(license: LicenseData | null): boolean {
+    // Admin can always start a new session regardless of sessions_used.
+    if (this.isAdmin()) return true;
     if (!license) return false;
     if (license.sessions_limit === -1) return true;
     return license.sessions_used < license.sessions_limit;
@@ -369,6 +412,7 @@ class LicenseService {
         email, password, name,
         country_code: countryCode,
         device_id: deviceId,
+        platform: this.getPlatform(),
         app_version: APP_VERSION,
       }),
     });
@@ -397,7 +441,7 @@ class LicenseService {
     const response = await fetch(`${this.API_BASE}/api/v1/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, device_id: deviceId, app_version: APP_VERSION }),
+      body: JSON.stringify({ email, password, device_id: deviceId, platform: this.getPlatform(), app_version: APP_VERSION }),
     });
 
     if (!response.ok) {
@@ -419,7 +463,7 @@ class LicenseService {
     const response = await fetch(`${this.API_BASE}/api/v1/auth/google`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ credential, device_id: deviceId, country_code: countryCode }),
+      body: JSON.stringify({ credential, device_id: deviceId, platform: this.getPlatform(), country_code: countryCode }),
     });
 
     if (!response.ok) {
@@ -461,6 +505,7 @@ class LicenseService {
         body: JSON.stringify({
           key: license.key,
           device_id: license.device_id,
+          platform: this.getPlatform(),
           app_version: APP_VERSION,
         }),
       });
