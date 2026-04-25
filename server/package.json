@@ -9,6 +9,7 @@
     "stripe:setup": "node --env-file=.env scripts/stripe-setup.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.90.0",
     "@google/genai": "^1.48.0",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.5",

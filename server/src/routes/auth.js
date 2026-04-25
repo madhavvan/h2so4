@@ -618,9 +618,16 @@ function renderResetExpiredPage(frontendUrl) {
   return resetPagePageShell(body, 'Link expired — minicaai');
 }
 
-function renderResetSuccessPage(frontendUrl) {
+function renderResetSuccessPage(frontendUrl, email) {
   const safeFrontend = htmlEscape(frontendUrl);
-  const body = `<div style="border-radius:20px;border:1px solid rgba(255,255,255,0.08);background:linear-gradient(to bottom,rgba(255,255,255,0.06),rgba(255,255,255,0.02));padding:36px 28px;backdrop-filter:blur(12px);text-align:center"><div style="width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,rgba(74,222,128,0.15),rgba(74,222,128,0.05));border:1px solid rgba(74,222,128,0.3);display:flex;align-items:center;justify-content:center;margin:0 auto 20px"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div><h2 style="margin:0 0 10px;color:#4ade80;font-size:22px;font-weight:700">Password updated</h2><p style="margin:0 0 28px;font-size:14px;line-height:1.6;color:#9ca3af">Your password has been changed. You can sign in with your new password now.</p><a href="${safeFrontend}/?view=login" style="display:block;width:100%;box-sizing:border-box;padding:13px 20px;border-radius:11px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;font-weight:600;font-size:14px;text-decoration:none;text-align:center;box-shadow:0 4px 16px rgba(59,130,246,0.25)">Continue to sign in</a></div>`;
+  // Pass the email back on the query string so the login form can prefill
+  // it — the user just types their new password and signs in. ?view=login
+  // also tells the frontend to clear any stale localStorage auth so the
+  // revoked-session from this reset doesn't ghost-sign-in the returning tab.
+  const loginHref = email
+    ? `${safeFrontend}/?view=login&email=${encodeURIComponent(email)}`
+    : `${safeFrontend}/?view=login`;
+  const body = `<div style="border-radius:20px;border:1px solid rgba(255,255,255,0.08);background:linear-gradient(to bottom,rgba(255,255,255,0.06),rgba(255,255,255,0.02));padding:36px 28px;backdrop-filter:blur(12px);text-align:center"><div style="width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,rgba(74,222,128,0.15),rgba(74,222,128,0.05));border:1px solid rgba(74,222,128,0.3);display:flex;align-items:center;justify-content:center;margin:0 auto 20px"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div><h2 style="margin:0 0 10px;color:#4ade80;font-size:22px;font-weight:700">Password updated</h2><p style="margin:0 0 28px;font-size:14px;line-height:1.6;color:#9ca3af">Your password has been changed and any other sessions on your account have been signed out. You can sign in with your new password now.</p><a href="${htmlEscape(loginHref)}" style="display:block;width:100%;box-sizing:border-box;padding:13px 20px;border-radius:11px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;font-weight:600;font-size:14px;text-decoration:none;text-align:center;box-shadow:0 4px 16px rgba(59,130,246,0.25)">Continue to sign in</a></div>`;
   return resetPagePageShell(body, 'Password updated — minicaai');
 }
 
@@ -739,9 +746,19 @@ router.post('/reset-password', async (req, res) => {
     }
 
     db.updateUserPassword(row.user_id, password);
-    console.log(`[reset-password] POST success user_id=${row.user_id}`);
+    // SECURITY — invalidate every JWT issued before "now" for this user.
+    // The most common reason people reset their password is suspected
+    // compromise; leaving old sessions live would let an attacker keep
+    // access on every device they already have. authMiddleware enforces
+    // this via the tokens_revoked_after gate.
+    db.forceLogoutUser(row.user_id);
+    // Also mark any sibling unused tokens (e.g. the user clicked "Forgot
+    // password" twice) as used, so the spare can't be replayed in the
+    // 1-hour window that follows.
+    const killed = db.invalidatePendingResetTokensForUser(row.user_id);
+    console.log(`[reset-password] POST success user_id=${row.user_id} siblings_invalidated=${killed}`);
 
-    if (wantsHtml) return res.send(renderResetSuccessPage(frontendUrl));
+    if (wantsHtml) return res.send(renderResetSuccessPage(frontendUrl, row.email));
     res.json({ ok: true });
   } catch (err) {
     console.error('Reset password error:', err);

@@ -1,6 +1,6 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  AI PROXY — Server-side AI calls so API keys stay hidden
-//  Supports: Gemini, OpenAI, xAI (Grok), Groq
+//  Supports: Gemini, OpenAI, xAI (Grok), Groq, Claude
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const express = require('express');
@@ -111,6 +111,69 @@ router.post('/chat/groq', async (req, res) => {
     res.json({ text: completion.choices[0]?.message?.content || '' });
   } catch (err) {
     console.error('Groq proxy error:', err.message);
+    res.status(500).json({ error: 'AI request failed', detail: err.message });
+  }
+});
+
+// ── Claude (Anthropic) — Sonnet 4.6 with hosted web_search tool ──
+// The model decides on its own whether to invoke search. Most questions
+// skip it and answer from memory in 1.5-3s; recent/niche questions
+// search and answer in 3-5s. The system prompt is wrapped in a
+// cache_control block so the long voice-rules + identity card pays
+// for itself once per 5-minute window instead of per call.
+//
+// `web_search_20260209` is the current (Feb 2026) tool version, which
+// supports dynamic filtering — Claude writes code to filter results
+// before they hit the context window. ~24% fewer tokens, ~11% better
+// accuracy than the older `web_search_20250305` according to Anthropic.
+//
+// CommonJS interop: the SDK ships dual ESM+CJS but the default-export
+// landing differs by Node version, so normalize via (.default || mod)
+// before instantiation. Storing the constructor at module scope avoids
+// repeating the dance on every request.
+const _AnthropicMod = (() => {
+  try { return require('@anthropic-ai/sdk'); } catch { return null; }
+})();
+const Anthropic = _AnthropicMod && (_AnthropicMod.default || _AnthropicMod);
+
+router.post('/chat/claude', async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
+
+  try {
+    const { messages, systemInstruction, enableWebSearch } = req.body;
+    const client = new Anthropic({ apiKey });
+
+    const tools = [];
+    if (enableWebSearch !== false) {
+      tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 2 });
+    }
+
+    const system = systemInstruction
+      ? [{ type: 'text', text: systemInstruction, cache_control: { type: 'ephemeral' } }]
+      : undefined;
+
+    const completion = await client.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1500,
+      system,
+      messages,
+      tools: tools.length ? tools : undefined,
+      temperature: 0.7,
+    });
+
+    // Anthropic returns a content array of blocks. server_tool_use and
+    // web_search_tool_result blocks describe internal search activity —
+    // concatenate only `text` blocks so the candidate sees only the final
+    // answer, not "Searching the web…" markers or raw tool-call JSON.
+    const text = (completion.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('');
+
+    res.json({ text });
+  } catch (err) {
+    console.error('Claude proxy error:', err.message);
     res.status(500).json({ error: 'AI request failed', detail: err.message });
   }
 });
@@ -304,6 +367,59 @@ router.post('/stream/groq', async (req, res) => {
   } catch (err) {
     if (err?.name === 'AbortError' || sse.closed) { sse.done(); return; }
     console.error('Groq stream error:', err.message);
+    sse.error(err.message || 'AI request failed');
+    sse.done();
+  }
+});
+
+// ── Claude (stream) — Sonnet 4.6 with web_search ──
+// Anthropic's `messages.stream(...)` returns a MessageStream helper with
+// a `.on('text', cb)` event that fires for every text delta, hiding the
+// raw content_block_delta filtering. Web-search activity (server_tool_use,
+// web_search_tool_result, partial input_json_delta) is silently filtered
+// out by the helper, so the candidate sees only the final answer text.
+// Web search runs server-side on Anthropic's infra during a single API
+// call — no extra round-trip on our end.
+router.post('/stream/claude', async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
+
+  const sse = openSseStream(req, res);
+  try {
+    const { messages, systemInstruction, enableWebSearch } = req.body;
+    const client = new Anthropic({ apiKey });
+
+    const tools = [];
+    if (enableWebSearch !== false) {
+      tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 2 });
+    }
+
+    const system = systemInstruction
+      ? [{ type: 'text', text: systemInstruction, cache_control: { type: 'ephemeral' } }]
+      : undefined;
+
+    const stream = client.messages.stream({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1500,
+      system,
+      messages,
+      tools: tools.length ? tools : undefined,
+      temperature: 0.7,
+    }, { signal: sse.signal });
+
+    stream.on('text', (textDelta) => {
+      if (sse.closed) return;
+      if (textDelta) sse.send(textDelta);
+    });
+
+    // .done() resolves when the stream completes (or rejects on error).
+    // Awaiting here keeps the request open for the SSE relay; sse.done()
+    // closes the response only after the model is fully finished.
+    await stream.done();
+    sse.done();
+  } catch (err) {
+    if (err?.name === 'AbortError' || sse.closed) { sse.done(); return; }
+    console.error('Claude stream error:', err.message);
     sse.error(err.message || 'AI request failed');
     sse.done();
   }
