@@ -53,3 +53,7 @@ build/*
 # OS files
 Thumbs.db
 Desktop.ini
+
+# Local backup snapshots created by tooling — never commit
+.claude-revert-backup-*/
+.sixth/

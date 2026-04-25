@@ -5,7 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT, prewarmIdentity } from './services/aiProxyService';
+import { generateGemini, generateOpenAI, generateXAI, generateGroq, generateClaude, streamGemini, streamOpenAI, streamXAI, streamGroq, streamClaude, AUTO_SOLVE_PROMPT, prewarmIdentity } from './services/aiProxyService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
 import { extractTextFromDocx } from './services/docxService';
@@ -684,7 +684,7 @@ const ChatInterface = ({
 }: any) => {
 
     const handleModelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-        const newModel = e.target.value as 'gemini' | 'groq' | 'openai' | 'xai';
+        const newModel = e.target.value as 'gemini' | 'groq' | 'openai' | 'xai' | 'claude';
         // ── Feature Gate: Block model switch for free users ──
         if (!gate.canUseModel(newModel)) return;
         // Immediate optimistic update in whichever window this runs in
@@ -799,6 +799,7 @@ const ChatInterface = ({
                               <option value="groq" disabled={!gate.canUseModel('groq')} className="text-black">Groq{!gate.canUseModel('groq') ? ' — PRO' : ''}</option>
                               <option value="openai" disabled={!gate.canUseModel('openai')} className="text-black">GPT{!gate.canUseModel('openai') ? ' — PRO' : ''}</option>
                               <option value="xai" disabled={!gate.canUseModel('xai')} className="text-black">Grok{!gate.canUseModel('xai') ? ' — PRO' : ''}</option>
+                              <option value="claude" disabled={!gate.canUseModel('claude')} className="text-black">Claude{!gate.canUseModel('claude') ? ' — PRO' : ''}</option>
                           </select>
                           <ChevronDown size={10} className="absolute right-1 top-1/2 -translate-y-1/2 pointer-events-none opacity-70" />
                         </div>
@@ -1248,6 +1249,7 @@ const ChatInterface = ({
                                             <option value="groq" disabled={!gate.canUseModel('groq')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Groq{!gate.canUseModel('groq') ? ' — PRO' : ''}</option>
                                             <option value="openai" disabled={!gate.canUseModel('openai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">GPT-5.4 Mini{!gate.canUseModel('openai') ? ' — PRO' : ''}</option>
                                             <option value="xai" disabled={!gate.canUseModel('xai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Grok (xAI){!gate.canUseModel('xai') ? ' — PRO' : ''}</option>
+                                            <option value="claude" disabled={!gate.canUseModel('claude')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Claude Sonnet 4.6{!gate.canUseModel('claude') ? ' — PRO' : ''}</option>
                                         </select>
                                         <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500">
                                             <ChevronDown size={10} />
@@ -2099,8 +2101,8 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // Settings State
   const [settings, setSettings] = useState<AppSettings>({
     selectedModel: (() => {
-      const saved = (localStorage.getItem("SELECTED_MODEL") as 'gemini'|'groq'|'openai'|'xai') || 'gemini';
-      if (!gate.canUseModel(saved)) return gate.getDefaultModel() as 'gemini'|'groq'|'openai'|'xai';
+      const saved = (localStorage.getItem("SELECTED_MODEL") as 'gemini'|'groq'|'openai'|'xai'|'claude') || 'gemini';
+      if (!gate.canUseModel(saved)) return gate.getDefaultModel() as 'gemini'|'groq'|'openai'|'xai'|'claude';
       return saved;
     })(),
     autoSend: false,
@@ -2111,7 +2113,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   });
 
   // Settings Modal Local State
-  const [tempModel, setTempModel] = useState<'gemini'|'groq'|'openai'|'xai'>('gemini');
+  const [tempModel, setTempModel] = useState<'gemini'|'groq'|'openai'|'xai'|'claude'>('gemini');
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved'>('idle');
   // Timer for the post-save "saved" → "idle" flash; cleared on unmount so a
   // pending revert can't fire into a torn-down component (and cancelled on
@@ -2666,7 +2668,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         // Every token arriving from the server is appended to `streamingMsg`
         // AND relayed to the popout so BOTH windows render character-by-
         // character instead of the popout seeing one final pop.
-        const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini };
+        const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini, claude: streamClaude };
         const gen = streamers[currentSettings.selectedModel] || streamGemini;
         setStreamingMsg({ id: pendingId, role: 'model', content: '', timestamp: Date.now() });
         if (!inPopout) {
@@ -3156,7 +3158,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         case 'cmd-set-model': {
           // Popout picked a model — validate against main's gate, persist, and
           // let the push effect echo selectedModel back to popout for confirmation.
-          const requested = data.model as 'gemini' | 'groq' | 'openai' | 'xai';
+          const requested = data.model as 'gemini' | 'groq' | 'openai' | 'xai' | 'claude';
           if (!requested || !gateRef.current.canUseModel(requested)) break;
           setSettings(prev => prev.selectedModel === requested ? prev : { ...prev, selectedModel: requested });
           localStorage.setItem("SELECTED_MODEL", requested);
@@ -3282,7 +3284,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         const contextFiles = contextFilesRef.current;
         let responseText = "";
 
-        const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini };
+        const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini, claude: streamClaude };
         const gen = streamers[currentSettings.selectedModel] || streamGemini;
         setStreamingMsg({ id: pendingId, role: 'model', content: '', timestamp: Date.now() });
         if (!inPopout) {
@@ -3831,6 +3833,24 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                             Grok (xAI)
                         </span>
                         {!gate.canUseModel('xai') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
+                    </button>
+
+                    <button
+                        onClick={() => gate.canUseModel('claude') && setTempModel('claude')}
+                        disabled={!gate.canUseModel('claude')}
+                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all flex items-center gap-2 ${
+                            !gate.canUseModel('claude')
+                            ? 'bg-background border-border opacity-40 cursor-not-allowed'
+                            : tempModel === 'claude'
+                            ? 'bg-purple-500/10 border-purple-500 shadow-sm'
+                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100 hover:shadow-md'
+                        }`}
+                    >
+                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'claude' ? 'bg-purple-500' : 'bg-gray-400'}`}></div>
+                        <span className={`font-bold text-xs ${tempModel === 'claude' ? 'text-purple-500' : 'text-text'}`}>
+                            Claude Sonnet 4.6 {gate.canUseModel('claude') && <span className="ml-1 text-[9px] bg-purple-500 text-white px-1.5 py-0.5 rounded-full">Web Search</span>}
+                        </span>
+                        {!gate.canUseModel('claude') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
                     </button>
                 </div>
             </div>

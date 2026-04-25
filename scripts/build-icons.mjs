@@ -105,6 +105,17 @@ async function main() {
   await writeFile(path.join(PUBLIC, 'apple-touch-icon.png'), appleTouch);
   console.log('  ✓ public/favicon.ico, favicon-32.png, apple-touch-icon.png');
 
+  // Tray icons. Electron's Tray expects a small PNG (16px on Win/Linux,
+  // template PNG on Mac). Vite copies public/ → dist/ at build time, so
+  // in a packaged build these ship as dist/tray-icon.png. Electron's
+  // nativeImage auto-picks the @2x variant on HiDPI displays when both
+  // are co-located. Reusing the already-rendered 16/32 sizes from the
+  // master downsample so the tray matches the rest of the brand output
+  // pixel-for-pixel.
+  await writeFile(path.join(PUBLIC, 'tray-icon.png'), pngs[16]);
+  await writeFile(path.join(PUBLIC, 'tray-icon@2x.png'), pngs[32]);
+  console.log('  ✓ public/tray-icon.png, tray-icon@2x.png');
+
   console.log('\nDone.');
 }
 

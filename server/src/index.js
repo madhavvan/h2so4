@@ -38,13 +38,30 @@ app.use(cors({
     // Allow configured frontend URL
     const frontendUrl = process.env.FRONTEND_URL;
     if (frontendUrl && origin === frontendUrl) return callback(null, true);
-    // Block everything else in production
-    if (process.env.NODE_ENV === 'production') return callback(new Error('CORS blocked'));
+    // Allow the API server's own origin — browsers attach Origin on the
+    // same-origin POST from our server-rendered password reset form, and
+    // without this the middleware rejects its own form submission.
+    const serverUrl = process.env.SERVER_URL;
+    if (serverUrl && origin === serverUrl) return callback(null, true);
+    const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
+    if (railwayDomain && origin === `https://${railwayDomain}`) return callback(null, true);
+    // Disallowed origin in production: return false (no CORS headers) rather
+    // than throw — throwing surfaces as HTTP 500 to the client and floods
+    // logs. The browser still blocks cross-origin reads when headers are
+    // absent, which is the correct CORS enforcement path.
+    if (process.env.NODE_ENV === 'production') return callback(null, false);
     // Allow all in development
     callback(null, true);
   },
   credentials: true,
 }));
+
+// DEV-ONLY: log every incoming request so we can see what the renderer
+// is hitting. Remove or guard before production.
+app.use((req, res, next) => {
+  console.log(`[req] ${req.method} ${req.originalUrl}`);
+  next();
+});
 
 // Stripe webhooks need raw body — must be BEFORE express.json()
 app.use('/api/v1/webhooks', webhookRoutes);
@@ -337,6 +354,7 @@ function compareVersions(a, b) {
 
 // ── 404 ──
 app.use((req, res) => {
+  console.warn(`[404] ${req.method} ${req.originalUrl}`);
   res.status(404).json({ error: 'Not found' });
 });
 

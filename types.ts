@@ -12,7 +12,7 @@ declare global {
 }
 
 export interface AppSettings {
-  selectedModel: 'gemini' | 'groq' | 'openai' | 'xai';
+  selectedModel: 'gemini' | 'groq' | 'openai' | 'xai' | 'claude';
   autoSend: boolean;
   contextFiles: ContextFile[];
   theme: 'light' | 'dark';

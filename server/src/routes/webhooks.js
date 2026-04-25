@@ -665,10 +665,16 @@ async function handleRazorpayEvent(body) {
       if (!user) return;
 
       // Race with /verify-razorpay: both this webhook and the client's
-      // success callback grant the same renewal. Skip if the prior
-      // completed renewal for this payment id is already recorded.
-      if (isRenewal && db.isRenewalPaymentProcessed(user.id, payment.id)) {
-        console.log('[RZP WEBHOOK] Renewal already processed by /verify-razorpay — skipping:', payment.id);
+      // success callback record a completed payment AND grant the same
+      // tier/renewal on the same razorpay_payment_id. Skip if the client
+      // already won the race — license state is applied idempotently by
+      // updateLicenseOnPayment / grantBasicRenewal, so the only thing at
+      // risk here is a duplicate payments row (inflating admin revenue
+      // stats and confusing refund lookups). Dedup applies to BOTH tier
+      // grants and renewals — the renewal-only guard that lived here
+      // previously missed the tier-grant collision entirely.
+      if (db.isPaymentAlreadyRecorded(user.id, payment.id)) {
+        console.log('[RZP WEBHOOK] Payment already recorded by /verify-razorpay — skipping:', payment.id);
         return;
       }
 

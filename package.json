@@ -1,7 +1,7 @@
 {
   "name": "interview-copilot-ai",
   "private": true,
-  "version": "3.3.8",
+  "version": "3.3.9",
   "description": "AI-powered real-time interview assistant",
   "author": {
     "name": "Interview Copilot",
@@ -37,6 +37,7 @@
     },
     "mac": {
       "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
       "target": [
         {
           "target": "dmg",
@@ -65,18 +66,23 @@
     },
     "win": {
       "target": "nsis",
+      "icon": "build/icon.ico",
       "artifactName": "InterviewCopilot-Setup.${ext}",
       "verifyUpdateCodeSignature": false
     },
     "nsis": {
       "oneClick": true,
-      "allowToChangeInstallationDirectory": false
+      "allowToChangeInstallationDirectory": false,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico"
     },
     "linux": {
       "target": [
         "AppImage",
         "deb"
       ],
+      "icon": "build/icon.png",
       "artifactName": "InterviewCopilot-Linux.${ext}",
       "category": "Utility"
     }

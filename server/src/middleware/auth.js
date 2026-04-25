@@ -13,8 +13,10 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 
-function generateToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+// Default 30d for regular user sessions. Callers that need a shorter-lived
+// scoped token (e.g. admin impersonation) pass an explicit expiresIn.
+function generateToken(payload, expiresIn = '30d') {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn });
 }
 
 function verifyToken(token) {

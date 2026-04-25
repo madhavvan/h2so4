@@ -209,6 +209,7 @@ function getDB() {
     CREATE INDEX IF NOT EXISTS idx_login_logs_user ON login_logs(user_id);
     CREATE INDEX IF NOT EXISTS idx_login_logs_created ON login_logs(created_at);
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
+    CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
     CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv ON conversation_messages(conversation_id);
     CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
     CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at);
@@ -421,6 +422,17 @@ function consumePasswordResetToken(rawToken) {
 
 function cleanupExpiredResetTokens() {
   getDB().prepare('DELETE FROM password_reset_tokens WHERE expires_at < ?').run(Date.now());
+}
+
+// Called immediately after a successful password reset. Sibling tokens —
+// ones issued for the same user but not yet redeemed — stop being useful
+// the moment the password changes, and if the reset was triggered by a
+// suspected compromise they become pure blast-radius. Mark them used so
+// the unhappy twin can't be replayed within the 1-hour TTL window.
+function invalidatePendingResetTokensForUser(userId) {
+  return getDB()
+    .prepare('UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL')
+    .run(Date.now(), userId).changes;
 }
 
 function getAllUsers() {
@@ -688,6 +700,56 @@ function clearConversationMessages(conversationId) {
   getDB().prepare('DELETE FROM conversation_messages WHERE conversation_id = ?').run(conversationId);
 }
 
+// Admin-only: recent conversations across ALL users, joined with user identity
+// and the latest message preview. Powers the Conversations tab — lets an
+// admin spot users who might be stuck/frustrated without having to guess
+// which email to search. Orders by conversations.updated_at DESC (the row
+// is touched on every new message, see addConversationMessage).
+// `q` filters on email or conversation name (LIKE, case-insensitive). The
+// last-message correlated subquery uses the (conversation_id, timestamp)
+// index via idx_conversation_messages_conv — fine at our scale.
+function getRecentConversationsAcrossUsers({ limit = 50, q = null } = {}) {
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  let where = 'WHERE 1=1';
+  const args = [];
+  if (q) {
+    where += ' AND (LOWER(u.email) LIKE ? OR LOWER(c.name) LIKE ?)';
+    const like = `%${String(q).toLowerCase()}%`;
+    args.push(like, like);
+  }
+  const sql = `
+    SELECT
+      c.id           AS conv_id,
+      c.user_id      AS user_id,
+      c.name         AS conv_name,
+      c.created_at   AS created_at,
+      c.updated_at   AS updated_at,
+      u.email        AS user_email,
+      u.name         AS user_name,
+      u.tier         AS user_tier,
+      u.is_banned    AS user_is_banned,
+      (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id) AS message_count,
+      (SELECT m.role    FROM conversation_messages m WHERE m.conversation_id = c.id ORDER BY m.timestamp DESC LIMIT 1) AS last_role,
+      (SELECT m.content FROM conversation_messages m WHERE m.conversation_id = c.id ORDER BY m.timestamp DESC LIMIT 1) AS last_content,
+      (SELECT m.timestamp FROM conversation_messages m WHERE m.conversation_id = c.id ORDER BY m.timestamp DESC LIMIT 1) AS last_ts
+    FROM conversations c
+    JOIN users u ON u.id = c.user_id
+    ${where}
+    ORDER BY c.updated_at DESC
+    LIMIT ?
+  `;
+  const rows = getDB().prepare(sql).all(...args, lim);
+  // Truncate message previews so the admin table stays readable and we don't
+  // ship huge LLM answers across the wire on every refresh.
+  return rows.map(r => ({
+    ...r,
+    last_preview: r.last_content
+      ? (r.last_content.length > 240 ? r.last_content.slice(0, 240) + '…' : r.last_content)
+      : null,
+    last_content: undefined,
+  }));
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
 //  PAYMENT OPERATIONS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -760,6 +822,28 @@ function isRenewalPaymentProcessed(userId, providerPaymentId) {
       AND provider_payment_id = ?
       AND status = 'completed'
       AND metadata LIKE '%"mode":"renewal"%'
+    LIMIT 1
+  `).get(userId, providerPaymentId);
+  return !!row;
+}
+
+// Have we already recorded ANY completed payment row for this exact
+// provider_payment_id? Used to dedup BOTH tier grants and renewals between
+// /verify-razorpay (client success callback) and the payment.captured
+// webhook, which race on the same razorpay_payment_id. Unlike
+// isRenewalPaymentProcessed this does not filter on metadata mode — a
+// tier-grant completion from /verify-razorpay must block a second
+// tier-grant from the webhook even though they share the same payment id.
+// License state is applied idempotently via updateLicenseOnPayment, so
+// skipping the second grant is safe — only the payment row is duplicated
+// without this guard.
+function isPaymentAlreadyRecorded(userId, providerPaymentId) {
+  if (!userId || !providerPaymentId) return false;
+  const row = getDB().prepare(`
+    SELECT id FROM payments
+    WHERE user_id = ?
+      AND provider_payment_id = ?
+      AND status = 'completed'
     LIMIT 1
   `).get(userId, providerPaymentId);
   return !!row;
@@ -1045,11 +1129,16 @@ function recordCompPayment(userId, tier, note) {
     max:   { sessions_limit: -1, expires_at: -1 },
   }[tier];
   if (!grantConfig) return null;
+  // Capture the inserted payment row id so the admin audit entry can
+  // reference it. Previously this function returned only the license row,
+  // so `result.payment_id` in the grant-comp audit was always undefined
+  // and the audit log column was blank for comp grants.
+  let paymentId = null;
   const tx = d.transaction(() => {
     d.prepare('UPDATE users SET tier = ?, updated_at = ? WHERE id = ?').run(tier, Date.now(), userId);
     d.prepare('UPDATE licenses SET tier = ?, status = ?, expires_at = ?, sessions_limit = ? WHERE user_id = ?')
       .run(tier, 'active', grantConfig.expires_at, grantConfig.sessions_limit, userId);
-    d.prepare(`
+    const info = d.prepare(`
       INSERT INTO payments (user_id, email, provider, provider_payment_id, provider_subscription_id, amount, currency, status, tier_granted, metadata, created_at)
       VALUES (?, ?, 'admin-comp', ?, NULL, 0, 'USD', 'completed', ?, ?, ?)
     `).run(
@@ -1060,9 +1149,13 @@ function recordCompPayment(userId, tier, note) {
       JSON.stringify({ mode: 'admin_comp', note: note || null }),
       Date.now(),
     );
+    paymentId = info.lastInsertRowid;
   });
   tx();
-  return d.prepare('SELECT * FROM licenses WHERE user_id = ?').get(userId);
+  const license = d.prepare('SELECT * FROM licenses WHERE user_id = ?').get(userId);
+  // Spread preserves the prior return shape (admin.js uses `...result` in
+  // the response body); the new payment_id field is additive.
+  return license ? { ...license, payment_id: paymentId } : null;
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1480,6 +1573,7 @@ module.exports = {
   updateUserProfile, deleteUser, getUserDataExport,
   // Password reset
   createPasswordResetToken, getPasswordResetToken, getRawPasswordResetToken, consumePasswordResetToken, cleanupExpiredResetTokens,
+  invalidatePendingResetTokensForUser,
   // Licenses
   createLicense, getLicenseByKey, getLicenseByUserId,
   incrementSessionCount, updateLicenseStatus, updateLicenseOnPayment,
@@ -1491,12 +1585,13 @@ module.exports = {
   // Conversations
   createConversation, getConversationsByUser, getConversationById, updateConversation, deleteConversation,
   addConversationMessage, addConversationMessages, getConversationMessages, clearConversationMessages,
-  deleteConversationByAdmin,
+  deleteConversationByAdmin, getRecentConversationsAcrossUsers,
   // Payments
   recordPayment, getPaymentsByUser, getAllPayments, getPaymentStats,
   getPaymentById, hasPaymentBeenRefunded, recordAdminRefund, recordCompPayment, queryPayments,
   // Webhook idempotency
   recordWebhookEventOnce, clearWebhookEvent, isRenewalPaymentProcessed,
+  isPaymentAlreadyRecorded,
   // Login logs
   logLogin, getRecentLogins,
   // Revoked keys

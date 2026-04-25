@@ -890,6 +890,84 @@ export async function streamGroq(
   return full.trim() === '...' ? 'Listening...' : full;
 }
 
+// ─────────────────────────────────────────────────────────────
+//  CLAUDE (Anthropic) — Sonnet 4.6 with hosted web_search
+//
+//  Different from the OpenAI-shaped clients above because Anthropic uses:
+//    • a separate `system` field instead of a system-role message
+//    • `{ type: 'image', source: { type: 'base64', media_type, data } }`
+//      for image content blocks (not OpenAI's image_url shape)
+//    • a server-managed `web_search_20250305` tool that the MODEL decides
+//      to invoke. The tool runs on Anthropic's infra; from our side it's
+//      a single API call that may take a bit longer when search triggers.
+//      Web search is OFF for auto-solve (the screenshot is the question;
+//      a search call would be both wrong and slow).
+// ─────────────────────────────────────────────────────────────
+
+function buildClaudeMessages(
+  history: Message[],
+  userText: string,
+  imageFiles: ContextFile[],
+  isAutoSolve: boolean,
+): any[] {
+  const messages: any[] = [];
+  if (!isAutoSolve) {
+    history.forEach(m => {
+      if (m.role !== 'system') {
+        messages.push({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content });
+      }
+    });
+  }
+  const contentBlocks: any[] = [{ type: 'text', text: userText }];
+  imageFiles.forEach(f => contentBlocks.push({
+    type: 'image',
+    source: { type: 'base64', media_type: f.mimeType, data: f.base64 },
+  }));
+  messages.push({ role: 'user', content: contentBlocks });
+  return messages;
+}
+
+export async function generateClaude(
+  query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
+): Promise<string> {
+  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+
+  const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
+  const userText = `${userRulesBlock}Interviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+
+  const messages = buildClaudeMessages(history, userText, imageFiles, false);
+
+  const text = await proxyRequest('/chat/claude', { messages, systemInstruction, enableWebSearch: true });
+  return (text.trim() === '...' || text.trim().toLowerCase() === 'listening...') ? 'Listening...' : text;
+}
+
+export async function streamClaude(
+  query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
+  onToken: OnToken, signal?: AbortSignal, isAutoSolve?: boolean
+): Promise<string> {
+  let systemInstruction: string;
+  let userText: string;
+  if (isAutoSolve) {
+    systemInstruction = buildAutoSolveSystemInstruction();
+    userText = query;
+  } else {
+    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+    systemInstruction = si;
+    userText = `${userRulesBlock}Interviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+  }
+
+  const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
+  const messages = buildClaudeMessages(history, userText, imageFiles, !!isAutoSolve);
+
+  // Auto-solve: web search would steal latency on a question whose answer
+  // is purely the screenshot in front of the model. Disable it explicitly.
+  const enableWebSearch = !isAutoSolve;
+
+  const full = await proxyStream('/stream/claude', { messages, systemInstruction, enableWebSearch }, onToken, signal);
+  if (isAutoSolve) return full;
+  return (full.trim() === '...' || full.trim().toLowerCase() === 'listening...') ? 'Listening...' : full;
+}
+
 export async function getDeepgramKey(): Promise<string> {
   const token = licenseService.getToken();
   if (!token) throw new Error('Not authenticated');

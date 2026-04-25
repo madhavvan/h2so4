@@ -244,6 +244,18 @@ const ConversationsViewer = ({
   const [error, setError] = useState<string | null>(null);
   const [conversations, setConversations] = useState<any[] | null>(null);
   const [openConvId, setOpenConvId] = useState<string | null>(null);
+  // Tracks the conversation id we've already auto-opened for this user,
+  // so the auto-open effect below runs exactly once per (user, list) —
+  // without this, the admin clicking the header to close the thread
+  // would immediately be undone by the effect re-firing on the null
+  // openConvId state change. Cleared on user-swap below.
+  const autoOpenedForRef = useRef<string | null>(null);
+  // Monotonic request id. Each loadFull() stamps its invocation; responses
+  // that arrive after a newer request started (or after the component
+  // moved on to a different user) are discarded. Without this, a slow
+  // fetch for user A could resolve after the admin switched to user B
+  // and overwrite B's conversations list with A's — the stale-rows bug.
+  const requestIdRef = useRef(0);
 
   const userId = searchResult?.user?.id;
   const stubCount = (searchResult?.conversations || []).length;
@@ -251,35 +263,62 @@ const ConversationsViewer = ({
 
   const loadFull = async () => {
     if (!userId || !token) return;
+    const myRequestId = ++requestIdRef.current;
+    const myUserId = userId;
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/users/${userId}`, {
+      const res = await fetch(`${API_BASE}/api/v1/admin/users/${myUserId}`, {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       });
       const data = await res.json();
+      // Superseded — another loadFull fired after this one, or the admin
+      // switched users. Either way, this response no longer represents
+      // the current view. Drop it silently.
+      if (myRequestId !== requestIdRef.current) return;
       if (!res.ok) throw new Error(data.error || 'Failed to load conversations');
       setConversations(Array.isArray(data.conversations) ? data.conversations : []);
     } catch (err: any) {
+      if (myRequestId !== requestIdRef.current) return;
       setError(err.message || 'Failed to load conversations');
     } finally {
-      setLoading(false);
+      if (myRequestId === requestIdRef.current) setLoading(false);
     }
   };
 
-  // Reset view when the searched user changes. Auto-expand for users with
-  // few conversations (<=3) — the previous collapsed-by-default UX was
-  // frequently missed, which was the reported "admin can't see conversations"
-  // issue. For heavy users we still collapse to keep the panel manageable.
+  // Reset view when the searched user changes. Always auto-expand if the
+  // user has any conversations at all — the old <=3 threshold meant heavy
+  // users appeared empty unless the admin thought to click "View messages".
+  // The outer list has max-h-96 + scroll so a long list stays contained.
   useEffect(() => {
+    // Bump the request id so any in-flight loadFull for the previous user
+    // drops its response on arrival instead of writing it into state.
+    requestIdRef.current++;
     setConversations(null);
     setOpenConvId(null);
+    autoOpenedForRef.current = null;
     setError(null);
-    const shouldAutoExpand = stubCount > 0 && stubCount <= 3;
+    const shouldAutoExpand = stubCount > 0;
     setExpanded(shouldAutoExpand);
     if (shouldAutoExpand) loadFull();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId, stubCount]);
+
+  // When the full thread finishes loading and there's exactly one conversation,
+  // open it automatically — saves the admin an extra click for the common
+  // "one user, one session" case. Guard via the ref so that once the admin
+  // manually collapses it, we don't re-open on the next render pass.
+  useEffect(() => {
+    if (
+      expanded &&
+      conversations &&
+      conversations.length === 1 &&
+      autoOpenedForRef.current !== conversations[0].id
+    ) {
+      autoOpenedForRef.current = conversations[0].id;
+      setOpenConvId(conversations[0].id);
+    }
+  }, [expanded, conversations]);
 
   // Sync local list if the parent mutates the conversations array (e.g.
   // after an admin deletes one). Guard against empty arrays overwriting
@@ -407,8 +446,8 @@ const ConversationsViewer = ({
 // Admin tabs. Ordered to match the nav bar layout. "overview" is the
 // command center, then user-focused (users), then money (payments, revoked),
 // then security (logins, audit, analytics), then platform (settings).
-type AdminTab = 'overview' | 'users' | 'payments' | 'revoked' | 'logins' | 'audit' | 'analytics' | 'settings';
-const ADMIN_TABS: AdminTab[] = ['overview', 'users', 'payments', 'revoked', 'logins', 'audit', 'analytics', 'settings'];
+type AdminTab = 'overview' | 'users' | 'conversations' | 'payments' | 'revoked' | 'logins' | 'audit' | 'analytics' | 'settings';
+const ADMIN_TABS: AdminTab[] = ['overview', 'users', 'conversations', 'payments', 'revoked', 'logins', 'audit', 'analytics', 'settings'];
 
 // CSV encoder — escapes cells per RFC 4180. Arrays/objects become JSON strings
 // so they survive the round-trip; Excel and Google Sheets import this fine.
@@ -501,6 +540,14 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
   const [configRows, setConfigRows] = useState<any[]>([]);
   const [configDraft, setConfigDraft] = useState<Record<string, string>>({});
   const [configLoading, setConfigLoading] = useState(false);
+
+  // Conversations tab — cross-user recent-activity feed. `q` is a client-held
+  // filter (email or conv name) applied server-side on refresh. The admin
+  // uses this tab to triage which users might need help without having to
+  // guess an email first.
+  const [recentConvs, setRecentConvs] = useState<any[]>([]);
+  const [recentConvsLoading, setRecentConvsLoading] = useState(false);
+  const [recentConvsQuery, setRecentConvsQuery] = useState('');
 
   // Step-up reauth state. stepUpToken takes precedence over the base token
   // for destructive admin calls. stepUpExpiresAt is a client-side clock we
@@ -1086,6 +1133,19 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
     setConfigLoading(false);
   }
 
+  // Cross-user recent conversations. Pulls latest 50 by default; optional
+  // server-side filter on email or conversation name. Safe to re-run on
+  // every refresh — limit is capped server-side.
+  async function loadRecentConversations() {
+    setRecentConvsLoading(true);
+    const qs = new URLSearchParams();
+    qs.set('limit', '50');
+    if (recentConvsQuery.trim()) qs.set('q', recentConvsQuery.trim());
+    const data = await callGet(`/api/v1/admin/conversations/recent?${qs.toString()}`);
+    if (Array.isArray(data)) setRecentConvs(data);
+    setRecentConvsLoading(false);
+  }
+
   // Tab-triggered lazy loads. Each tab loads its data the first time it
   // opens and on subsequent opens if the data is stale (we keep it simple
   // and only reload on first entry — user can hit a manual refresh button).
@@ -1095,6 +1155,7 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
     if (adminTab === 'audit' && auditFacets.actions.length === 0) loadAuditFacets();
     if (adminTab === 'analytics' && trends.length === 0) loadAnalytics();
     if (adminTab === 'settings' && configRows.length === 0) loadConfig();
+    if (adminTab === 'conversations' && recentConvs.length === 0) loadRecentConversations();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adminTab]);
 
@@ -1911,6 +1972,112 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                   </div>
                   {auditLog.length === 0 && (
                     <div className="text-center py-12 text-gray-600 text-sm">No audit entries match your filters</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ── CONVERSATIONS TAB ── */}
+            {/* Cross-user recent-activity feed. Clicking a row jumps to
+                Overview → searches that user, which auto-expands the thread
+                via ConversationsViewer (with full messages). This is the
+                support-triage entry point. */}
+            {adminTab === 'conversations' && (
+              <div className="space-y-6">
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <h1 className="text-2xl font-bold mb-1">Conversations</h1>
+                    <p className="text-gray-500 text-sm">
+                      Latest activity across every user. Click a row to open the full thread.
+                      {recentConvs.length > 0 && ` Showing ${recentConvs.length}.`}
+                    </p>
+                  </div>
+                  <button onClick={loadRecentConversations} disabled={recentConvsLoading} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all disabled:opacity-50">
+                    <RefreshCw size={11} className={recentConvsLoading ? 'animate-spin' : ''} /> Refresh
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 relative">
+                    <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+                    <input
+                      value={recentConvsQuery}
+                      onChange={e => setRecentConvsQuery(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') loadRecentConversations(); }}
+                      placeholder="Filter by email or conversation name…"
+                      className="w-full pl-8 pr-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white text-xs focus:outline-none focus:border-blue-500/50"
+                    />
+                  </div>
+                  <button onClick={loadRecentConversations} disabled={recentConvsLoading} className="px-3 py-2 rounded-lg text-[11px] font-semibold bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 border border-blue-500/30 transition-all disabled:opacity-50">
+                    Apply
+                  </button>
+                  {recentConvsQuery && (
+                    <button onClick={() => { setRecentConvsQuery(''); setTimeout(loadRecentConversations, 0); }} className="px-2 py-1 rounded text-[10px] text-gray-400 hover:text-white hover:bg-white/[0.04] transition-all">
+                      Clear
+                    </button>
+                  )}
+                </div>
+
+                <div className="border border-white/[0.06] rounded-xl overflow-hidden">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-white/[0.06] bg-white/[0.02]">
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">User</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Conversation</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Msgs</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Last activity</th>
+                          <th className="text-left px-4 py-3 text-gray-500 font-medium">Last message</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {recentConvs.map((row: any) => (
+                          <tr
+                            key={row.conv_id}
+                            onClick={() => row.user_email && openUserInPanel(row.user_email)}
+                            className="border-b border-white/[0.03] hover:bg-white/[0.03] cursor-pointer transition-colors"
+                            title="Open this user's full thread"
+                          >
+                            <td className="px-4 py-3 align-top">
+                              <div className="flex flex-col gap-0.5 min-w-[180px]">
+                                <span className="text-white font-medium truncate">{row.user_email || '—'}</span>
+                                <span className="text-[10px] text-gray-500 flex items-center gap-1.5">
+                                  <span className="uppercase tracking-wider">{row.user_tier || 'free'}</span>
+                                  {row.user_is_banned ? <span className="text-red-400 font-semibold">· banned</span> : null}
+                                </span>
+                              </div>
+                            </td>
+                            <td className="px-4 py-3 text-gray-200 align-top">
+                              <div className="flex items-center gap-2 max-w-[260px]">
+                                <MessageCircle size={11} className="text-blue-400 shrink-0" />
+                                <span className="truncate" title={row.conv_name}>{row.conv_name || '(untitled)'}</span>
+                              </div>
+                            </td>
+                            <td className="px-4 py-3 align-top">
+                              <span className="inline-flex items-center justify-center min-w-[24px] px-1.5 py-0.5 rounded bg-white/[0.04] border border-white/[0.08] text-[10px] text-gray-300 font-mono">
+                                {row.message_count ?? 0}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-gray-400 whitespace-nowrap align-top">{fmtDate(row.updated_at)}</td>
+                            <td className="px-4 py-3 text-gray-400 max-w-[420px] align-top">
+                              {row.last_preview ? (
+                                <div className="flex items-start gap-2">
+                                  <span className={`text-[9px] uppercase tracking-wider font-semibold shrink-0 mt-0.5 ${row.last_role === 'user' ? 'text-blue-400' : 'text-purple-400'}`}>
+                                    {row.last_role || '—'}
+                                  </span>
+                                  <span className="truncate" title={row.last_preview}>{row.last_preview}</span>
+                                </div>
+                              ) : <span className="text-gray-600 italic">(no messages yet)</span>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {recentConvs.length === 0 && (
+                    <div className="text-center py-12 text-gray-600 text-sm">
+                      {recentConvsLoading ? 'Loading…' : 'No conversations match your filter'}
+                    </div>
                   )}
                 </div>
               </div>
@@ -2769,6 +2936,29 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         setView('forgot_password');
       }
 
+      // Deep-link from the reset-password success page. The server has
+      // already revoked every existing JWT for this user (forceLogoutUser),
+      // so any saved auth in this tab's localStorage is now a zombie token.
+      // Clear it before we render the login form, otherwise the effect
+      // above would leave the user on /download with a dead token until
+      // the next API call 401s. `?email=` pre-fills the field so the user
+      // just types their new password.
+      if (urlParams.get('view') === 'login') {
+        licenseService.logout();
+        setCurrentUser(null);
+        setCurrentLicense(null);
+        const prefillEmail = urlParams.get('email');
+        if (prefillEmail) setEmail(prefillEmail);
+        setView('login');
+        // Strip ?view=login&email=… from the address bar. Without this,
+        // the email stays visible in the URL (privacy/shareable-link
+        // leak), and a refresh re-triggers this block — clobbering any
+        // login-in-progress with a fresh logout.
+        try {
+          window.history.replaceState({}, '', window.location.pathname);
+        } catch {}
+      }
+
       if (urlParams.get('payment') === 'success') {
         const saved = licenseService.loadAuth();
         if (saved.user) {
@@ -2776,12 +2966,29 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           // have landed yet when the user returns from Stripe — fall back to
           // the tier hint we stamped in the success_url so the banner copy
           // still matches what they paid for.
-          const validated = await licenseService.validateWithServer();
+          let validated = await licenseService.validateWithServer();
           const urlTierHint = urlParams.get('tier');
           // `mode=renewal` is stamped on the success URL by /create-renewal.
           // Renewal banners don't advertise "3 credits / 14 days" — they
           // say "1 extra interview / 1 hour" instead.
           const isRenewal = urlParams.get('mode') === 'renewal';
+          // Client-side renewal credit grant. Keyed by Stripe session_id so
+          // a refresh of the success URL can't grant the same credit twice.
+          // Has to happen AFTER validateWithServer (which picks up the
+          // server-bumped license.expires_at) so credits_expire_at lines up
+          // with the new license window.
+          if (isRenewal && validated) {
+            const sessionId = urlParams.get('session_id') || '';
+            const appliedKey = sessionId ? `mc_renewal_applied_${sessionId}` : '';
+            let alreadyApplied = false;
+            try { alreadyApplied = !!appliedKey && !!localStorage.getItem(appliedKey); } catch {}
+            if (!alreadyApplied) {
+              validated = licenseService.grantRenewalCredit(validated);
+              if (appliedKey) {
+                try { localStorage.setItem(appliedKey, String(Date.now())); } catch {}
+              }
+            }
+          }
           let bannerTier: string | undefined;
           if (validated) {
             setCurrentUser(saved.user);
@@ -3020,9 +3227,28 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         const baseUser = currentUser || saved.user;
         if (baseUser) {
           const updatedUser: UserProfile = { ...baseUser, tier: grantedTier as UserProfile['tier'] };
-          const updatedLicense: LicenseData = data.license
+          let updatedLicense: LicenseData = data.license
             ? { ...(data.license as LicenseData), last_validated: Date.now() }
             : { ...(saved.license || currentLicense)!, tier: grantedTier as LicenseData['tier'], last_validated: Date.now() };
+          // Admin-grant + in-place upgrades DO flip tier to 'basic' in some
+          // flows (admin self-test, legacy downgrade paths). The server
+          // doesn't echo credit fields (Option A ledger), so seed them via
+          // validateWithServer's normalize path. Without this, an admin
+          // granting themselves Basic would see 0 credits and immediately
+          // fall through to Free gating even though tier='basic'.
+          if (grantedTier === 'basic' && updatedLicense.credits_remaining_seconds == null) {
+            const revalidated = await licenseService.validateWithServer();
+            if (revalidated && revalidated.tier === 'basic') {
+              updatedLicense = revalidated;
+            } else {
+              const fallbackExpiry = Date.now() + 14 * 24 * 60 * 60 * 1000;
+              updatedLicense = {
+                ...updatedLicense,
+                credits_remaining_seconds: 3 * 3600,
+                credits_expire_at: updatedLicense.expires_at > 0 ? updatedLicense.expires_at : fallbackExpiry,
+              };
+            }
+          }
           setCurrentUser(updatedUser);
           setCurrentLicense(updatedLicense);
           licenseService.saveAuth(updatedUser, updatedLicense);
@@ -3232,11 +3458,54 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 // to Free on next app load (it reads license.tier, not
                 // user.tier — a stale 'free' there would silently undo the
                 // upgrade the moment the app restarts).
-                const newLicense = verifyData.license
+                let newLicense = verifyData.license
                   || (currentLicense
                         ? { ...currentLicense, tier: grantedTier, status: 'active' as const }
                         : null);
                 if (newLicense) {
+                  // Basic-tier needs the client-side credit ledger seeded
+                  // (first purchase) or topped up (renewal). The server
+                  // updates tier + expires_at + sessions_limit but has no
+                  // credits_remaining_seconds column (Option A), so the
+                  // client handles credits here before saving.
+                  if (isRenewal) {
+                    // Idempotency: keyed by razorpay_payment_id so a retried
+                    // verify call (double-click, webhook race) doesn't grant
+                    // two credits for one payment.
+                    const paymentId = response?.razorpay_payment_id || '';
+                    const appliedKey = paymentId ? `mc_renewal_applied_${paymentId}` : '';
+                    let alreadyApplied = false;
+                    try { alreadyApplied = !!appliedKey && !!localStorage.getItem(appliedKey); } catch {}
+                    if (!alreadyApplied) {
+                      newLicense = licenseService.grantRenewalCredit(newLicense as LicenseData);
+                      if (appliedKey) {
+                        try { localStorage.setItem(appliedKey, String(Date.now())); } catch {}
+                      }
+                    }
+                  } else if (grantedTier === 'basic') {
+                    // First-time Basic purchase — saveAuth + reload of state
+                    // below needs credit fields populated. grantRenewalCredit
+                    // adds exactly one credit (1h) which would shortchange a
+                    // first-time buyer expecting 3h. Call validateWithServer
+                    // to re-run the normalize path which seeds 3 credits on
+                    // tierChanged (the server-side webhook may have flipped
+                    // the tier already, or the local tier swap we're doing
+                    // now is the trigger). Fall back to manual seed if
+                    // validateWithServer came back null (offline/unreachable).
+                    const revalidated = await licenseService.validateWithServer();
+                    if (revalidated && revalidated.tier === 'basic') {
+                      newLicense = revalidated;
+                    } else if ((newLicense as LicenseData).credits_remaining_seconds == null) {
+                      // Local fallback seed — same shape as freshBasicCreditSeed.
+                      const base = newLicense as LicenseData;
+                      const fallbackExpiry = Date.now() + 14 * 24 * 60 * 60 * 1000;
+                      newLicense = {
+                        ...base,
+                        credits_remaining_seconds: 3 * 3600,
+                        credits_expire_at: base.expires_at > 0 ? base.expires_at : fallbackExpiry,
+                      } as LicenseData;
+                    }
+                  }
                   setCurrentLicense(newLicense);
                   licenseService.saveAuth(updatedUser, newLicense);
                 }

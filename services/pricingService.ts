@@ -194,40 +194,38 @@ class PricingService {
       };
     }
 
-    // All other countries: USD base × exchange rate, rounded
-    let exchange = EXCHANGE_RATES[cc];
-    if (!exchange && EUROZONE.includes(cc)) exchange = EXCHANGE_RATES['EU'];
-    if (!exchange) exchange = { rate: 1, symbol: '$', code: 'USD' };
-
-    const basicPrice = roundPrice(USD_PRICES.basic * exchange.rate, exchange.code);
-    const proPrice = roundPrice(USD_PRICES.pro * exchange.rate, exchange.code);
-    const maxPrice = roundPrice(USD_PRICES.max * exchange.rate, exchange.code);
-
+    // All other countries: show USD. The server has exactly two charge paths
+    // — Stripe (single USD price ID per tier, and a hardcoded `currency:'usd'`
+    // on Basic renewal) and Razorpay (INR, India only). Converting USD to
+    // local currency in the UI would misrepresent the charge: the user would
+    // see £22.99 / ¥4,350 / etc. in-app and then get a USD charge on their
+    // statement at a different Stripe-computed rate. Showing USD keeps the
+    // display honest and matches what Stripe actually bills.
     return {
       country_code: cc,
       country_name: '',
-      currency: exchange.code,
-      currencySymbol: exchange.symbol,
+      currency: 'USD',
+      currencySymbol: '$',
       tiers: [
         {
           id: 'free', name: 'Starter', price: 0,
-          currency: exchange.code, currencySymbol: exchange.symbol, period: 'month',
+          currency: 'USD', currencySymbol: '$', period: 'month',
           features: BASE_FEATURES_FREE, cta: 'Get Started Free',
         },
         {
-          id: 'basic', name: 'Basic', price: basicPrice,
-          currency: exchange.code, currencySymbol: exchange.symbol, period: 'one-time',
+          id: 'basic', name: 'Basic', price: USD_PRICES.basic,
+          currency: 'USD', currencySymbol: '$', period: 'one-time',
           features: BASE_FEATURES_BASIC, popular: true, cta: 'Get 3 Interviews',
           subtitle: '3 credits · 14-day expiry',
         },
         {
-          id: 'pro', name: 'Pro', price: proPrice,
-          currency: exchange.code, currencySymbol: exchange.symbol, period: 'month',
+          id: 'pro', name: 'Pro', price: USD_PRICES.pro,
+          currency: 'USD', currencySymbol: '$', period: 'month',
           features: BASE_FEATURES_PRO, cta: 'Start Pro',
         },
         {
-          id: 'max', name: 'Max', price: maxPrice,
-          currency: exchange.code, currencySymbol: exchange.symbol, period: 'month',
+          id: 'max', name: 'Max', price: USD_PRICES.max,
+          currency: 'USD', currencySymbol: '$', period: 'month',
           features: BASE_FEATURES_MAX, cta: 'Start Max',
         },
       ],
@@ -244,19 +242,15 @@ class PricingService {
   }
 
   // Basic-tier renewal: +1 credit (1 hour). Only offered to Basic users.
-  // Returns { price, currency, currencySymbol } in the user's region.
+  // Returns { price, currency, currencySymbol } in the actual charge currency.
+  //
+  // India goes through Razorpay in INR. Everywhere else the server creates
+  // a Stripe checkout with hardcoded `currency:'usd'` + RENEWAL_USD_CENTS
+  // (see payments.js createStripeRenewal), so the UI must show USD to match.
   getBasicRenewalPrice(countryCode: string): { price: number; currency: string; currencySymbol: string } {
     const cc = countryCode.toUpperCase();
-    if (cc === 'US') return { price: 6.99, currency: 'USD', currencySymbol: '$' };
     if (cc === 'IN') return { price: 599, currency: 'INR', currencySymbol: '₹' };
-    let exchange = EXCHANGE_RATES[cc];
-    if (!exchange && EUROZONE.includes(cc)) exchange = EXCHANGE_RATES['EU'];
-    if (!exchange) exchange = { rate: 1, symbol: '$', code: 'USD' };
-    return {
-      price: roundPrice(6.99 * exchange.rate, exchange.code),
-      currency: exchange.code,
-      currencySymbol: exchange.symbol,
-    };
+    return { price: 6.99, currency: 'USD', currencySymbol: '$' };
   }
 }
 

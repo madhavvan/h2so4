@@ -2,6 +2,14 @@ const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Men
 const path = require('path');
 const database = require('./database.cjs');
 
+// Shared logger. Writes to <userData>/logs/main.log at info+ and to stdout.
+// Lifted to module scope so one-off failure paths (tray icon fallback, any
+// future early-lifecycle diagnostics) can log even before the updater block
+// runs — otherwise these warnings disappear into the void on packaged builds
+// where there's no console attached.
+const electronLog = require('electron-log');
+electronLog.transports.file.level = 'info';
+
 // ─── Single-instance lock ─────────────────────────────────────────────────
 // Without this, every desktop launch spawns a fresh copy of the OLD binary
 // — so any update sitting cached in %AppData%\Interview Copilot\pending\
@@ -80,8 +88,9 @@ function createMainWindow() {
 
   // Hide instead of close — app stays in tray. EXCEPTION: if a downloaded
   // update is sitting in the cache, give the user the choice to install it
-  // now instead of silently hiding (and never installing on next launch,
-  // since X-close doesn't trigger autoInstallOnAppQuit).
+  // now instead of silently hiding. X-close doesn't fire before-quit, and
+  // autoInstallOnAppQuit is off (we own the install path), so without this
+  // prompt the download would rot in the cache until the next full quit.
   mainWindow.on('close', (e) => {
     if (app.isQuitting) return;
     e.preventDefault();
@@ -1700,23 +1709,21 @@ ipcMain.handle('db:clear-session', (_event, sessionId) => {
 //  SYSTEM TRAY
 // ───────────────────────────────────────────────
 function createTray() {
-  // Create a simple 16x16 blue square icon for the tray
-  // On Windows: .ico works best. On Mac/Linux: PNG.
-  // nativeImage can create from a data URL
-  const size = 16;
-  const icon = nativeImage.createEmpty();
-  
-  // Try to load from app resources first, fall back to generated icon
+  // Tray icon: the branded 16px PNG emitted by scripts/build-icons.mjs.
+  // In dev it lives in public/ (served raw by Vite); in production Vite
+  // copies public/ → dist/ and the electron-builder `files` glob packages
+  // dist/ into app.asar. If the file is missing (icon pipeline skipped,
+  // or a bad build), fall back to a hardcoded blue square so the tray is
+  // at least visible — and log it so the regression doesn't hide silently.
   let trayIcon;
+  const iconPath = isDev
+    ? path.join(__dirname, '../public/tray-icon.png')
+    : path.join(__dirname, '../dist/tray-icon.png');
   try {
-    const iconPath = isDev 
-      ? path.join(__dirname, '../public/tray-icon.png')
-      : path.join(__dirname, '../dist/tray-icon.png');
     trayIcon = nativeImage.createFromPath(iconPath);
-    if (trayIcon.isEmpty()) throw new Error('Icon file not found');
+    if (trayIcon.isEmpty()) throw new Error(`tray icon empty/missing: ${iconPath}`);
   } catch (e) {
-    // Generate a simple 16x16 blue square as fallback
-    // This is a minimal 16x16 blue PNG as base64
+    electronLog.warn(`[tray] falling back to placeholder icon: ${e.message}`);
     const bluePng = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAMklEQVQ4T2P8z8BQz0BHwMgwasCoAQyjYcAwGgYMo2HAMKINAIZ/DAz1dAyDUQNGwwAALNYIEdLptSAAAAAASUVORK5CYII=';
     trayIcon = nativeImage.createFromBuffer(Buffer.from(bluePng, 'base64'));
   }
@@ -1845,17 +1852,23 @@ app.whenReady().then(() => {
   // quit + on X-close so a download never gets stranded in the cache.
   if (!isDev) {
     try {
-      const electronLog = require('electron-log');
       const { autoUpdater } = require('electron-updater');
 
-      // File log under %AppData%\Interview Copilot\logs\main.log (Windows)
-      // or ~/Library/Logs/Interview Copilot/main.log (macOS). Future updater
-      // failures leave a trail here instead of disappearing into stdout.
-      electronLog.transports.file.level = 'info';
+      // electronLog is initialized at module top; hand it to electron-updater
+      // so download/install events land in the same main.log as the rest of
+      // the app (under %AppData%\interview-copilot-ai\logs\ on Windows or
+      // ~/Library/Logs/Interview Copilot/ on macOS).
       autoUpdater.logger = electronLog;
 
       autoUpdater.autoDownload = true;
-      autoUpdater.autoInstallOnAppQuit = true;
+      // We own the quit-time install ourselves via the before-quit hook and
+      // the tray Quit handler. electron-updater's built-in autoInstallOnAppQuit
+      // registers a second app.once('quit') → quitAndInstall(true) handler
+      // that races ours — on slow teardowns one can fire while the other is
+      // mid-operation, and both pass isSilent=true which doesn't hold the
+      // installer alive long enough to replace locked files. Keep this false
+      // so there is exactly one install owner at quit.
+      autoUpdater.autoInstallOnAppQuit = false;
 
       function sendUpdateStatus(status, info) {
         const payload = { status, ...info };
@@ -1883,10 +1896,35 @@ app.whenReady().then(() => {
         }
       }
 
+      // Semver-lite comparator for x.y.z. Returns negative if a<b, 0 if a===b,
+      // positive if a>b. Used to detect stale or regression installers sitting
+      // in electron-updater's cache — firing `update-downloaded` for a version
+      // we're already on (or older) would loop the install-on-quit.
+      function compareAppVersions(a, b) {
+        const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
+        const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
+        for (let i = 0; i < 3; i++) {
+          const ai = pa[i] || 0;
+          const bi = pb[i] || 0;
+          if (ai !== bi) return ai - bi;
+        }
+        return 0;
+      }
+
       // The 6s launch-install window. If `update-downloaded` fires while
       // this is still active, it's a cached update from a prior session
-      // → install silently. If it fires later (a fresh download finished
+      // → install immediately. If it fires later (a fresh download finished
       // mid-session), we let the renderer prompt the user instead.
+      //
+      // Installs here are non-silent on purpose: the NSIS oneClick "silent"
+      // mode passes /S and tears down the installer UI before it has finished
+      // waiting for the running Electron process to release file locks on the
+      // .exe/.dll/.asar. That races with our teardown (tray, UIA bridge,
+      // better-sqlite3 flush) and in the worst case leaves the installed
+      // files unchanged while isForceRunAfter relaunches the *old* binary —
+      // which is what produced the "install-loops-every-launch" report.
+      // Non-silent shows a ~1s NSIS progress window that blocks until files
+      // are actually replaced, which is what we want.
       let launchInstallActive = true;
       const launchInstallTimer = setTimeout(() => {
         launchInstallActive = false;
@@ -1916,18 +1954,43 @@ app.whenReady().then(() => {
       });
 
       autoUpdater.on('update-downloaded', (info) => {
-        pendingUpdate = { version: info.version, info };
-        installPendingUpdate = () => performInstall(true);
-        sendUpdateStatus('ready', { version: info.version });
+        // Defensive: electron-updater can fire this for a cached installer
+        // whose version equals (or is below) our running version — e.g. when
+        // a previous install left a same-version .exe in pending/ and the
+        // version check on this launch races the cache read. Installing in
+        // that state would quit, run a no-op installer, relaunch the same
+        // binary, and loop. Detect and refuse.
+        const running = app.getVersion();
+        const incoming = info && info.version;
+        if (!incoming || compareAppVersions(incoming, running) <= 0) {
+          electronLog.warn(
+            `[updater] update-downloaded fired for stale/regression version: incoming=${incoming} running=${running} — refusing to install`
+          );
+          launchInstallActive = false;
+          clearTimeout(launchInstallTimer);
+          // Don't touch pendingUpdate/installPendingUpdate — leave them null
+          // so before-quit / X-close / tray Quit don't try to install the
+          // stale cache either. Treat the app as up-to-date for the UI.
+          sendUpdateStatus('up-to-date', {});
+          return;
+        }
+
+        pendingUpdate = { version: incoming, info };
+        // Non-silent — see the rationale above the launch-install window.
+        // Applies to every quit-time install path (before-quit hook, X-close
+        // dialog) so they all benefit from NSIS holding files locked until
+        // replacement actually completes.
+        installPendingUpdate = () => performInstall(false);
+        sendUpdateStatus('ready', { version: incoming });
 
         if (launchInstallActive) {
           launchInstallActive = false;
           clearTimeout(launchInstallTimer);
-          electronLog.info(`[updater] cached update ${info.version} found at launch — installing silently`);
+          electronLog.info(`[updater] cached update ${incoming} found at launch — installing (non-silent)`);
           // Tiny defer so the renderer can flush the 'ready' status; not
           // strictly necessary but avoids a hard-cut transition for users
           // who happen to see the brief flash before relaunch.
-          setTimeout(() => performInstall(true), 200);
+          setTimeout(() => performInstall(false), 200);
         }
       });
 
@@ -1990,12 +2053,12 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', (e) => {
-  // If a download is sitting ready, install it now instead of letting
-  // it rot in the cache. autoInstallOnAppQuit is supposed to handle this
-  // automatically but has been observed to silently no-op in some Windows
-  // configs — doing it explicitly is the safe path. performInstall sets
-  // isQuitting=true and re-enters this handler once the installer takes
-  // over, so the cleanup branch below still runs.
+  // If a download is sitting ready, install it now instead of letting it rot
+  // in the cache. We are the sole install owner at quit — autoInstallOnAppQuit
+  // is deliberately off (see the autoUpdater setup block) to avoid a second,
+  // silent install racing this one and failing to replace locked files.
+  // performInstall sets isQuitting=true and re-enters this handler once the
+  // installer takes over, so the cleanup branch below still runs.
   if (pendingUpdate && installPendingUpdate && !app.isQuitting) {
     e.preventDefault();
     installPendingUpdate();

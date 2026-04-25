@@ -77,7 +77,7 @@ export const FEATURE_GATES = {
     exportHistory: false,
   },
   basic: {
-    models: ['gemini', 'groq', 'openai', 'xai'] as string[],
+    models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
     screenCapture: true,
     autoSolve: true,
     autoType: false,     // Auto-Type is Max-exclusive
@@ -87,7 +87,7 @@ export const FEATURE_GATES = {
     exportHistory: true,
   },
   pro: {
-    models: ['gemini', 'groq', 'openai', 'xai'] as string[],
+    models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
     screenCapture: true,
     autoSolve: true,
     autoType: false,     // Auto-Type is Max-exclusive
@@ -97,7 +97,7 @@ export const FEATURE_GATES = {
     exportHistory: true,
   },
   max: {
-    models: ['gemini', 'groq', 'openai', 'xai'] as string[],
+    models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
     screenCapture: true,
     autoSolve: true,
     autoType: true,      // Max tier unlocks Auto-Type
@@ -367,19 +367,79 @@ class LicenseService {
     return updated;
   }
 
-  // Credit one additional hour (Basic renewal flow). Extends expiry to 14d.
+  // ── Fresh Basic credit seed ──
+  // A new Basic grant = 3 credits (3 hours) valid until the server-set
+  // license.expires_at. Called on first-time Basic purchase, NOT on renewal.
+  // Kept private because only normalizeLicenseCredits should decide when to
+  // seed — direct callers would mis-overwrite an in-flight balance.
+  private freshBasicCreditSeed(license: LicenseData): { credits_remaining_seconds: number; credits_expire_at: number } {
+    const fallback = Date.now() + TIME_CONSTANTS.BASIC_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+    return {
+      credits_remaining_seconds: 3 * TIME_CONSTANTS.SECONDS_PER_CREDIT,
+      credits_expire_at: license.expires_at > 0 ? license.expires_at : fallback,
+    };
+  }
+
+  // ── Credit-state normalizer ──
+  // Server today does NOT echo credit fields (Option A: client-side ledger).
+  // So every path that merges a server license into local state has to decide
+  // whether the credit balance survives, gets seeded fresh, or gets wiped:
+  //
+  //   · Basic + no prior Basic state    → seed 3 credits (new purchase).
+  //   · Basic + coherent prior Basic    → carry the running balance over.
+  //   · Non-Basic tier                  → strip Basic-only fields (cleanliness).
+  //
+  // Without this, tierChanged: 'free'→'basic' left credits_remaining_seconds
+  // undefined, which getEffectiveTier treats as 0 and silently downgrades
+  // the paying user back to 'free' features.
+  private normalizeLicenseCredits(license: LicenseData, priorLicense: LicenseData | null): LicenseData {
+    if (license.tier !== 'basic') {
+      const clean: any = { ...license };
+      delete clean.credits_remaining_seconds;
+      delete clean.credits_expire_at;
+      return clean as LicenseData;
+    }
+    const prior = priorLicense && priorLicense.tier === 'basic' ? priorLicense : null;
+    const hasCoherentPrior =
+      !!prior &&
+      typeof prior.credits_remaining_seconds === 'number' &&
+      typeof prior.credits_expire_at === 'number' &&
+      prior.credits_expire_at > 0;
+    if (hasCoherentPrior) {
+      return {
+        ...license,
+        credits_remaining_seconds: prior!.credits_remaining_seconds,
+        credits_expire_at: prior!.credits_expire_at,
+      };
+    }
+    return { ...license, ...this.freshBasicCreditSeed(license) };
+  }
+
+  // Credit one additional hour (Basic renewal flow).
   //
   // Base off effective balance, NOT the raw field: if the prior credits
   // already expired (credits_expire_at < now), effective balance is 0 and
   // stale seconds should not carry over. Otherwise a user whose credits
   // expired with 1800s unused would pay for renewal and silently get
   // 3600 + 1800 = 5400s — effectively a free half-credit.
+  //
+  // Anchor the new expiry from max(now, license.expires_at) + 1h, mirroring
+  // the server's grantBasicRenewal in database.js. /create-renewal does NOT
+  // pre-bump expires_at — the payment.captured webhook does — so when this
+  // runs from the success URL, license.expires_at is still the pre-renewal
+  // value (often already past for a user who just hit the 14-day wall).
+  // Using it verbatim would place credits_expire_at in the past and void
+  // the credit the user just paid for. The next successful revalidation
+  // picks up the server-bumped expires_at and the two ledgers reconverge.
   grantRenewalCredit(license: LicenseData): LicenseData {
     const effectiveRemaining = this.getCreditsRemainingSeconds(license);
+    const ONE_HOUR_MS = TIME_CONSTANTS.SECONDS_PER_CREDIT * 1000;
+    const anchor = Math.max(Date.now(), license.expires_at > 0 ? license.expires_at : 0);
     const updated: LicenseData = {
       ...license,
+      tier: 'basic', // grantBasicRenewal also reactivates from free/expired → basic
       credits_remaining_seconds: effectiveRemaining + TIME_CONSTANTS.SECONDS_PER_CREDIT,
-      credits_expire_at: Date.now() + TIME_CONSTANTS.BASIC_EXPIRY_DAYS * 24 * 60 * 60 * 1000,
+      credits_expire_at: anchor + ONE_HOUR_MS,
     };
     const user = this.loadAuth().user;
     if (user) this.saveAuth(user, updated);
@@ -451,6 +511,13 @@ class LicenseService {
 
     const data = await response.json();
     data.license.last_validated = Date.now();
+    // Server doesn't echo client-ledger credit fields. Preserve any prior
+    // balance (same user, new tab) or seed a fresh one when the server
+    // says tier='basic' and we have no local state yet. Without this,
+    // a Basic user re-logging in would land with credits undefined →
+    // getEffectiveTier() downgrades them to Free.
+    const { license: priorLicense } = this.loadAuth();
+    data.license = this.normalizeLicenseCredits(data.license, priorLicense);
     this.saveAuth(data.user, data.license, data.token);
     this.startRevalidation();
     return data;
@@ -485,6 +552,12 @@ class LicenseService {
       ) {
         data.license.trial_remaining_seconds = TIME_CONSTANTS.TRIAL_SECONDS;
       }
+      // Basic-tier users returning via Google: preserve or seed the
+      // client-side credit ledger. Same reason as login() — server doesn't
+      // echo these fields and the 'basic' tier needs them or
+      // getEffectiveTier() falls through to Free.
+      const { license: priorLicense } = this.loadAuth();
+      data.license = this.normalizeLicenseCredits(data.license, priorLicense);
     }
     this.saveAuth(data.user, data.license, data.token);
     this.startRevalidation();
@@ -495,6 +568,13 @@ class LicenseService {
     const { license, token } = this.loadAuth();
     if (!license || !token) return null;
 
+    // license.device_id loaded from localStorage is always undefined —
+    // the server's licenses table has no device_id column, so it's never
+    // populated on auth responses. Compute a fresh fingerprint each call
+    // (same as signup/login/google) or the server rejects with 400 and
+    // revalidation silently noops forever.
+    const deviceId = await this.getDeviceId();
+
     try {
       const response = await fetch(`${this.API_BASE}/api/v1/license/validate`, {
         method: 'POST',
@@ -504,7 +584,7 @@ class LicenseService {
         },
         body: JSON.stringify({
           key: license.key,
-          device_id: license.device_id,
+          device_id: deviceId,
           platform: this.getPlatform(),
           app_version: APP_VERSION,
         }),
@@ -529,10 +609,11 @@ class LicenseService {
       // (Option A, client-side ledger). A naive spread would let a stale
       // server value overwrite the locally-consumed field — so on every
       // focus/revalidation during a session the user would get their
-      // time refunded. Strip those fields from the merge unless the
-      // server is signalling a tier change (e.g. Basic→Pro upgrade),
-      // in which case the server's balance is authoritative for the new
-      // plan.
+      // time refunded. Strip those fields from the merge so the in-memory
+      // ticker is never clobbered; tier transitions (e.g. Free → Basic
+      // after a webhook lands) are re-seeded deterministically below via
+      // normalizeLicenseCredits, which does NOT read from serverData —
+      // the server never echoes these fields in the first place (Option A).
       const tierChanged = serverData.tier && serverData.tier !== license.tier;
       const {
         credits_remaining_seconds: _crs,
@@ -541,20 +622,27 @@ class LicenseService {
         trial_started_at: _tsa,
         ...serverSafe
       } = serverData;
-      const creditOverride = tierChanged
-        ? {
-            credits_remaining_seconds: serverData.credits_remaining_seconds,
-            credits_expire_at: serverData.credits_expire_at,
-            trial_remaining_seconds: serverData.trial_remaining_seconds,
-          }
-        : {};
 
-      const updatedLicense = {
+      let updatedLicense: LicenseData = {
         ...license,
         ...serverSafe,
-        ...creditOverride,
         last_validated: Date.now(),
       };
+
+      if (tierChanged) {
+        // Fresh tier grant — re-seed the client ledger for the NEW tier.
+        // Pass the prior license so a Basic→Basic no-op (shouldn't happen
+        // here since tierChanged is true, but defensive) would still
+        // preserve balance. For Free→Basic this seeds 3 credits. For
+        // Basic→Pro/Max it strips the Basic-only credit fields.
+        updatedLicense = this.normalizeLicenseCredits(updatedLicense, license);
+        // If the user just left Free, clear the trial remnants so the
+        // Pro/Max timer service doesn't read a stale trial balance.
+        if (updatedLicense.tier !== 'free') {
+          delete (updatedLicense as any).trial_remaining_seconds;
+        }
+      }
+
       const user = this.loadAuth().user;
       // If server rotated the token, save the new one so the next
       // request doesn't hit 401. Falls back to existing token otherwise.

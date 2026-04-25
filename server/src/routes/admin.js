@@ -392,13 +392,13 @@ router.post('/users/:id/impersonate', authMiddleware, adminOnly, stepUpOnly, (re
       tier: user.tier,
       impersonatedBy: req.user.email,
       impersonatedAt: Date.now(),
-    });
+    }, '30m');
 
     writeAudit(req, 'impersonate', user, { reason: req.body?.reason || null });
     res.json({
       token,
       user: serializeUserRow(user),
-      expires_in_seconds: 30 * 24 * 60 * 60, // 30d (same as generateToken default)
+      expires_in_seconds: 30 * 60, // 30m — scoped token, short-lived
       warning: 'All actions taken under this token will be attributed to the target user AND audit-logged against the admin.',
     });
   } catch (err) {
@@ -602,8 +602,24 @@ router.post('/users/force-logout', authMiddleware, adminOnly, (req, res) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  CONVERSATIONS (admin delete)
+//  CONVERSATIONS (admin delete + recent cross-user feed)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// GET /conversations/recent — latest N conversations across every user.
+// Powers the admin Conversations tab. Previews contain interview content,
+// so we write an audit row on every fetch for traceability.
+router.get('/conversations/recent', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit, 10) || 50));
+    const q = typeof req.query.q === 'string' && req.query.q.trim() ? req.query.q.trim() : null;
+    const rows = db.getRecentConversationsAcrossUsers({ limit, q });
+    writeAudit(req, 'view-recent-conversations', null, { limit, q, count: rows.length });
+    res.json(rows);
+  } catch (err) {
+    console.error('Recent conversations error:', err);
+    res.status(500).json({ error: 'Failed to fetch recent conversations' });
+  }
+});
 
 router.delete('/users/:id/conversations/:convId', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   try {
@@ -958,7 +974,7 @@ router.get('/audit-log/facets', authMiddleware, adminOnly, (req, res) => {
 // GET /config — dumps all keys (bounded, these are admin-editable flags).
 router.get('/config', authMiddleware, adminOnly, (req, res) => {
   try {
-    const rows = db.getDB().prepare('SELECT key, value, updated_at FROM config ORDER BY key').all();
+    const rows = db.getDB().prepare('SELECT key, value, updated_at FROM app_config ORDER BY key').all();
     res.json(rows);
   } catch (err) {
     console.error('Config list error:', err);
