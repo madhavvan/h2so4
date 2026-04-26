@@ -780,9 +780,23 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
     // retry, double-apply the additive renewal top-up.
     const user = db.getUserById(req.user.id);
     let grantedTierLabel = grantedTier;
+    let alreadyGranted = false;
     if (user) {
       const sqlite = db.getDB();
       const applyGrant = sqlite.transaction(() => {
+        // Re-check WITHIN the transaction. The pre-tx check at the top of
+        // this handler can race with payment.captured: this handler does
+        // an `await razorpay.orders.fetch()` between the pre-check and the
+        // transaction, and during that await the webhook can run end-to-end
+        // and INSERT the payment row. Without this in-tx re-check, both
+        // paths would each call grantBasicRenewal (additive +1h) and the
+        // user would get +2h for one payment. The UNIQUE index on
+        // (provider, provider_payment_id) is the DB-layer backstop.
+        const dup = sqlite.prepare(
+          "SELECT id FROM payments WHERE user_id = ? AND provider = 'razorpay' AND provider_payment_id = ? AND status = 'completed' LIMIT 1"
+        ).get(user.id, razorpay_payment_id);
+        if (dup) { alreadyGranted = true; return; }
+
         if (isRenewal) {
           // Renewal: +1 session, +1 hour — no tier reset, no expiry overwrite.
           db.grantBasicRenewal(user.id);
@@ -827,6 +841,20 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
     }
 
     const license = db.getLicenseByUserId(req.user.id);
+
+    // If the in-tx re-check found the webhook had already granted, return
+    // the same friendly "duplicate" shape the pre-tx check uses, so the
+    // client UI still shows success but knows not to double-celebrate.
+    if (alreadyGranted) {
+      return res.json({
+        success: true,
+        duplicate: true,
+        message: isRenewal ? 'Renewal already applied.' : 'Payment already verified.',
+        tier: license ? license.tier : grantedTierLabel,
+        mode: isRenewal ? 'renewal' : 'tier',
+        license: license ? { ...license, last_validated: Date.now() } : null,
+      });
+    }
 
     res.json({
       success: true,
@@ -921,12 +949,43 @@ router.post('/cancel-razorpay', authMiddleware, async (req, res) => {
     // See: https://razorpay.com/docs/api/payments/subscriptions/cancel-subscription/
     await razorpay.subscriptions.cancel(subId, false);
 
-    // Optimistic status update in the local DB — the definitive downgrade
-    // lands via the subscription.cancelled webhook once the cycle ends.
+    // Mirror Stripe's `cancel_at_period_end` behavior locally: keep the
+    // tier active but pin expires_at to the actual cycle-end so the UI
+    // can render "Pro until <date>" and the gate auto-locks the user
+    // out at the right moment even if subscription.cancelled is delayed.
+    // Without this the UI shows an indefinite "Pro Active" badge with no
+    // signal that billing has been cancelled, and the user is left
+    // wondering whether they're still being charged.
+    let periodEndMs = null;
+    let updatedLicense = null;
+    try {
+      const sub = await razorpay.subscriptions.fetch(subId);
+      if (sub && typeof sub.current_end === 'number' && sub.current_end > 0) {
+        periodEndMs = sub.current_end * 1000;
+      }
+    } catch (fetchErr) {
+      // Fetch is best-effort — if it fails the webhook still reconciles.
+      console.warn('[cancel-razorpay] subscription.fetch failed:', fetchErr.message);
+    }
+    if (periodEndMs) {
+      const license = db.getLicenseByUserId(req.user.id);
+      if (license) {
+        db.updateLicenseOnPayment(req.user.id, {
+          tier: license.tier,            // unchanged — user keeps access through cycle
+          status: 'active',              // still active until cycle end
+          expires_at: periodEndMs,       // auto-expires at cycle end
+          sessions_limit: license.sessions_limit,
+        });
+        updatedLicense = db.getLicenseByUserId(req.user.id);
+      }
+    }
+
     res.json({
       success: true,
       message: 'Your subscription will be cancelled at the end of the current billing period. You keep full access until then.',
       subscription_id: subId,
+      cancels_at: periodEndMs,
+      license: updatedLicense ? { ...updatedLicense, last_validated: Date.now() } : null,
     });
   } catch (err) {
     console.error('Razorpay cancel error:', err.message);

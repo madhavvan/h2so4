@@ -70,15 +70,29 @@ function createMainWindow() {
     backgroundColor: '#09090b', // Dark zinc background
     skipTaskbar: true,  // Hidden from taskbar — access via system tray
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
+      // Sandboxed renderer: no Node.js access, no shared context with the
+      // main world. The renderer reaches main only via the allowlisted
+      // bridge in electron/preload.cjs (window.electronAPI). This blocks
+      // a renderer XSS / compromised npm dep from spawning shells, reading
+      // the filesystem, or pivoting to arbitrary IPC channels.
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.cjs'),
       // DevTools windows are NOT covered by setContentProtection — they
       // open as a separate HWND. Disable in packaged builds so a curious
       // keystroke (Ctrl+Shift+I) can't pop an unprotected inspector up
       // during an interview screen-share.
       devTools: isDev,
     },
-    icon: path.join(__dirname, '../dist/favicon.ico'),
+    // In packaged builds the icon must come from a path bundled by
+    // electron-builder — dist/ is in `files`, so dist/favicon.ico ships.
+    // In dev, dist/ may not exist (vite dev serves from public/), so fall
+    // back to public/favicon.ico. Without the fallback, dev runs show the
+    // bare default Electron icon in the Windows title bar — looks like an
+    // "old" icon next to the conversation sidebar.
+    icon: isDev
+      ? path.join(__dirname, '../public/favicon.ico')
+      : path.join(__dirname, '../dist/favicon.ico'),
     title: 'Interview Copilot',
     show: false,
   });
@@ -95,25 +109,30 @@ function createMainWindow() {
     if (app.isQuitting) return;
     e.preventDefault();
     if (!pendingUpdate || !installPendingUpdate) {
+      // Tell the renderer we're hiding to the tray so it can show a
+      // first-time toast with the "right-click the slot to bring it back"
+      // tip. Sent BEFORE hide() so the renderer can paint the toast in
+      // the popout (which stays visible) before the main window vanishes.
+      try { mainWindow.webContents.send('app-hidden-to-tray'); } catch {}
       mainWindow.hide();
       return;
     }
-    dialog.showMessageBox(mainWindow, {
-      type: 'question',
-      buttons: ['Install update & quit', 'Stay in tray'],
-      defaultId: 0,
-      cancelId: 1,
-      title: 'Update ready',
-      message: `Interview Copilot ${pendingUpdate.version} is ready to install.`,
-      detail: 'Install now to upgrade — the app will quit and relaunch on the new version. Or stay in the tray and install later.',
-      noLink: true,
-    }).then(({ response }) => {
-      if (response === 0) {
-        installPendingUpdate();
-      } else {
-        mainWindow.hide();
-      }
-    }).catch(() => mainWindow.hide());
+    // Pending update — ask in-app instead of via native dialog.
+    // dialog.showMessageBox is a separate Win32 HWND that is NOT covered by
+    // setContentProtection and would leak the app's existence + version
+    // string to anyone watching the screen-share. We send to the renderer
+    // and let the React modal handle the choice; the renderer relays the
+    // user's pick back via 'install-update' (install) or 'close-window'
+    // (stay in tray, fall through to plain hide).
+    try {
+      mainWindow.webContents.send('show-update-prompt', {
+        version: pendingUpdate.version,
+      });
+    } catch {
+      // If renderer is gone for any reason, fall back to plain hide rather
+      // than open a native dialog (which would still leak).
+      mainWindow.hide();
+    }
   });
 
   mainWindow.once('ready-to-show', () => {
@@ -179,8 +198,11 @@ function createPopoutWindow(options = {}) {
     skipTaskbar: true,     // ← HIDDEN from taskbar
     focusable: true,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
+      // Same sandboxed-renderer config as the main window — see the comment
+      // there for the security rationale.
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.cjs'),
       // Same rationale as main window — unprotected DevTools HWND would
       // bypass setContentProtection on the popout during screen-share.
       devTools: isDev,
@@ -297,6 +319,20 @@ ipcMain.on('close-window', (event) => {
   if (win) win.close();
 });
 
+// Decision back from the in-app update-on-close prompt. We can't reuse
+// 'close-window' because that would re-fire the close handler and loop
+// the prompt. 'install' triggers the deferred installer (which quits +
+// relaunches); 'dismiss' just hides the main window to the tray.
+ipcMain.on('update-prompt-decision', (_event, payload) => {
+  const decision = payload && payload.decision;
+  if (decision === 'install' && installPendingUpdate) {
+    try { installPendingUpdate(); } catch {}
+  } else if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.webContents.send('app-hidden-to-tray'); } catch {}
+    mainWindow.hide();
+  }
+});
+
 // Resize pop-out — keeps window on-screen and animates
 ipcMain.on('resize-popout', (_event, { width, height }) => {
   if (popoutWindow && !popoutWindow.isDestroyed()) {
@@ -360,6 +396,54 @@ ipcMain.on('relay-to-popout', (_event, data) => {
 ipcMain.on('relay-to-main', (_event, data) => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('from-popout', data);
+  }
+});
+
+// ───────────────────────────────────────────────
+//  SESSION-ACTIVE (screen-share security)
+// ───────────────────────────────────────────────
+// When the renderer flips into "listening" (interview live, screen
+// share likely on), the tray icon and its context menu MUST disappear
+// from the OS shell — both are rendered by Windows / macOS outside
+// Electron's setContentProtection scope and would otherwise show up
+// in the screen-share frame, revealing both the existence of the app
+// and any menu labels the user happened to right-click.
+//
+// Strategy: on session-active=true, destroy the tray entirely so the
+// icon vanishes from the system tray. On false, recreate it. The
+// renderer is the source of truth — `isListening` flipping there
+// drives this. If the renderer crashes mid-session the tray stays
+// hidden, which is a safer failure mode than the inverse.
+let sessionActive = false;
+// Periodic tray-menu refresh handle. Tracked at module scope so we can
+// clear it from session-active (which destroys the tray) and from each
+// createTray() call (which would otherwise stack a new interval on every
+// session-end → leaking intervals + multiplying crash surface).
+let trayMenuInterval = null;
+ipcMain.on('session-active', (_event, payload) => {
+  const next = !!(payload && payload.active);
+  if (next === sessionActive) return;
+  sessionActive = next;
+  if (sessionActive) {
+    // Tear down the tray. createTray re-attaches on session-end.
+    // Stop the periodic menu refresh first — otherwise the next tick
+    // calls tray.setContextMenu() on null and crashes the main process
+    // with an uncaught TypeError that pops a blocking native dialog.
+    if (trayMenuInterval) {
+      clearInterval(trayMenuInterval);
+      trayMenuInterval = null;
+    }
+    if (tray && !tray.isDestroyed()) {
+      try { tray.destroy(); } catch {}
+    }
+    tray = null;
+  } else {
+    // Re-create only if app is still running and tray is gone.
+    if (!tray && typeof createTray === 'function') {
+      try { createTray(); } catch (err) {
+        electronLog.warn('[tray] re-create after session-end failed:', err.message);
+      }
+    }
   }
 });
 
@@ -765,6 +849,10 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   // duplicating boilerplate.
   const rawSkip = payload && typeof payload.skipLines === 'number' ? payload.skipLines : 0;
   const skipLines = Number.isInteger(rawSkip) && rawSkip > 0 ? rawSkip : 0;
+  // Auth token for the Haiku planner Railway call. Renderer reads it from
+  // licenseService.getToken() and passes through; main never persists it.
+  const authToken = payload && typeof payload.authToken === 'string' ? payload.authToken : '';
+  const language = payload && typeof payload.language === 'string' ? payload.language : 'unknown';
   if (autoTypeInFlight) return { error: 'Auto-Type already in progress.' };
   if (!code.length) return { error: 'Nothing to type.' };
 
@@ -872,6 +960,54 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     }
   } catch (uiaErr) {
     console.warn('[auto-type] UIA read threw:', uiaErr && uiaErr.message);
+  }
+
+  // ── Haiku AI plan fallback ──
+  // Only fires when (a) we got a UIA snapshot and (b) the deterministic
+  // planner DIDN'T earn the high-confidence override (so usedUIA is still
+  // false). When deterministic was confident, we trust it — saves a $0.005
+  // API call and ~600ms of latency. When deterministic punted (whitespace
+  // mismatch, scope-aware insertion needed, partial-signature recovery),
+  // Haiku gets the snapshot and tries to produce a smarter plan. Failures
+  // are silent — falls through to whatever skipLines the caller passed.
+  if (!usedUIA && uiaSnapshotBefore && authToken) {
+    try {
+      const snapText = uiaSnapshotBefore.text || '';
+      const cursorOff = uiaSnapshotBefore.cursorOffset || 0;
+      const planRes = await fetch('https://h2so4-production.up.railway.app/api/v1/ai/autotype-plan', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({
+          editorText: snapText,
+          cursorOffset: cursorOff,
+          code,
+          language,
+        }),
+      });
+      if (planRes.ok) {
+        const aiPlan = await planRes.json().catch(() => null);
+        if (aiPlan && aiPlan.ok === true
+            && Number.isFinite(aiPlan.confidence) && aiPlan.confidence >= 0.7) {
+          const planSkipLeading = Number.isInteger(aiPlan.skip_leading)
+            ? Math.max(0, aiPlan.skip_leading) : 0;
+          const planSkipTrailing = Number.isInteger(aiPlan.skip_trailing)
+            ? Math.max(0, aiPlan.skip_trailing) : 0;
+          effectiveSkipLines = planSkipLeading;
+          effectiveSkipTrailing = planSkipTrailing;
+          wipeFirstLine = !!aiPlan.wipe_first_line;
+          console.log(`[auto-type] Haiku plan ACCEPTED: skip=${planSkipLeading} trail=${planSkipTrailing} wipe=${wipeFirstLine} conf=${aiPlan.confidence.toFixed(2)} reason=${aiPlan.reasoning || ''}`);
+        } else if (aiPlan) {
+          console.log(`[auto-type] Haiku plan rejected (conf=${aiPlan.confidence ?? '?'}, threshold=0.7)`);
+        }
+      } else {
+        console.log(`[auto-type] Haiku planner HTTP ${planRes.status}`);
+      }
+    } catch (planErr) {
+      console.warn('[auto-type] Haiku plan call failed:', planErr && planErr.message);
+    }
   }
 
   // UIA read can block up to 3.5s. If the user clicked cancel during that
@@ -1709,26 +1845,17 @@ ipcMain.handle('db:clear-session', (_event, sessionId) => {
 //  SYSTEM TRAY
 // ───────────────────────────────────────────────
 function createTray() {
-  // Tray icon: the branded 16px PNG emitted by scripts/build-icons.mjs.
-  // In dev it lives in public/ (served raw by Vite); in production Vite
-  // copies public/ → dist/ and the electron-builder `files` glob packages
-  // dist/ into app.asar. If the file is missing (icon pipeline skipped,
-  // or a bad build), fall back to a hardcoded blue square so the tray is
-  // at least visible — and log it so the regression doesn't hide silently.
-  let trayIcon;
-  const iconPath = isDev
-    ? path.join(__dirname, '../public/tray-icon.png')
-    : path.join(__dirname, '../dist/tray-icon.png');
-  try {
-    trayIcon = nativeImage.createFromPath(iconPath);
-    if (trayIcon.isEmpty()) throw new Error(`tray icon empty/missing: ${iconPath}`);
-  } catch (e) {
-    electronLog.warn(`[tray] falling back to placeholder icon: ${e.message}`);
-    const bluePng = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAMklEQVQ4T2P8z8BQz0BHwMgwasCoAQyjYcAwGgYMo2HAMKINAIZ/DAz1dAyDUQNGwwAALNYIEdLptSAAAAAASUVORK5CYII=';
-    trayIcon = nativeImage.createFromBuffer(Buffer.from(bluePng, 'base64'));
-  }
-  
-  // Resize for tray
+  // Tray icon — INTENTIONALLY TRANSPARENT for screen-share invisibility.
+  // The OS still reserves a slot in the system tray (right-clickable + the
+  // hover surface is preserved) but no graphic draws there, so a viewer
+  // watching the candidate's screen can't visually identify the app from
+  // the taskbar tray strip. The first-launch tutorial walks the user through
+  // (a) where the slot is and (b) dragging it into the Windows overflow
+  // popup so it leaves the always-visible strip entirely.
+  //
+  // 1×1 fully-transparent PNG. Electron resizes to the OS-default tray size.
+  const transparentPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+  let trayIcon = nativeImage.createFromBuffer(Buffer.from(transparentPng, 'base64'));
   trayIcon = trayIcon.resize({ width: 16, height: 16 });
 
   tray = new Tray(trayIcon);
@@ -1739,6 +1866,10 @@ function createTray() {
   tray.setToolTip('');
 
   function updateTrayMenu() {
+    // Defense-in-depth — the session-active handler clears trayMenuInterval
+    // before destroying the tray, but a still-pending tick from before that
+    // clearInterval() call could still land here after `tray = null`.
+    if (!tray || tray.isDestroyed()) return;
     const isMainVisible = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible();
     const isPopoutOpen = popoutWindow && !popoutWindow.isDestroyed();
 
@@ -1802,9 +1933,13 @@ function createTray() {
 
   // Update menu whenever windows change
   updateTrayMenu();
-  
-  // Re-build menu periodically to reflect window state changes
-  setInterval(updateTrayMenu, 3000);
+
+  // Re-build menu periodically to reflect window state changes. Clear any
+  // prior interval first — createTray() runs again on session-end, and
+  // without this clear we'd stack a fresh interval each time, leaking
+  // closures and multiplying the work the tick has to do.
+  if (trayMenuInterval) clearInterval(trayMenuInterval);
+  trayMenuInterval = setInterval(updateTrayMenu, 3000);
 }
 
 // ───────────────────────────────────────────────

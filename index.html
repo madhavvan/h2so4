@@ -13,6 +13,13 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="icon" type="image/x-icon" href="/favicon.ico" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <!-- Anthropic-inspired display serif (Newsreader is the closest free
+         Tiempos-alike on Google Fonts) + Inter for UI body. Preconnect for
+         the font CDN so the first paint isn't blocked by the DNS round-trip;
+         display=swap so we never block render on the font itself. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Inter:wght@400;500;600;700&display=swap" />
     <!-- Tailwind compiled via PostCSS; loaded BEFORE the inline <style> so
          our custom iOS-token CSS below wins the cascade (matches the order
          Play CDN used to produce). Vite processes this through tailwind.config.cjs + postcss.config.cjs. -->
@@ -24,6 +31,26 @@
         --surface-color: #ffffff; /* White */
         --border-color: #e2e8f0; /* Slate 200 */
         --text-color: #0f172a; /* Slate 900 */
+
+        /* ── Anthropic-inspired warm palette (landing + auth views) ──
+           Used on the public marketing surface and the login/signup
+           modals so visitors get the polished, restrained feel of
+           anthropic.com / claude.ai instead of generic SaaS-dark.
+           The in-app tool surface stays on the dark zinc tokens above
+           for eye-comfort during long interview sessions. */
+        --cream:        #faf7f0;
+        --cream-soft:   #f3eee2;
+        --cream-line:   #e8e2d1;
+        --ink:          #141413;
+        --ink-soft:     #2a2925;
+        --ink-muted:    #6b6a64;
+        --ink-faint:    #9b988e;
+        --accent:       #c96342;  /* Anthropic terracotta */
+        --accent-soft:  #f4ddd2;
+        --serif: 'Newsreader', 'Tiempos Headline', 'Source Serif 4',
+                 ui-serif, Georgia, serif;
+        --sans:  'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+                 Roboto, Helvetica, Arial, sans-serif;
 
         /* ── iOS motion tokens ──
            These map to the feel of UIKit's standard spring curves.

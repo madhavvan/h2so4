@@ -39,6 +39,10 @@ export interface LicenseData {
   credits_remaining_seconds?: number;  // Paid balance (Basic tier)
   credits_expire_at?: number;          // Unix ms — credits void after this
   trial_remaining_seconds?: number;    // One-time 30-min trial for Free users
+  // Server-stamped at license creation. Used to compute trial remaining
+  // wall-clock seconds without trusting the client. Without this, a Free
+  // user could log out + back in to re-seed a fresh trial on every login.
+  trial_granted_at?: number;
 }
 
 export interface AuthState {
@@ -77,7 +81,9 @@ export const FEATURE_GATES = {
     exportHistory: false,
   },
   basic: {
-    models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
+    // Claude is Max-only — its hosted web_search + the per-session "Train
+    // Model" pipeline are positioned as the premium differentiator.
+    models: ['gemini', 'groq', 'openai', 'xai'] as string[],
     screenCapture: true,
     autoSolve: true,
     autoType: false,     // Auto-Type is Max-exclusive
@@ -87,7 +93,8 @@ export const FEATURE_GATES = {
     exportHistory: true,
   },
   pro: {
-    models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
+    // Claude is Max-only — see comment in `basic`.
+    models: ['gemini', 'groq', 'openai', 'xai'] as string[],
     screenCapture: true,
     autoSolve: true,
     autoType: false,     // Auto-Type is Max-exclusive
@@ -132,15 +139,10 @@ class LicenseService {
   private readonly AUTH_KEY = 'minicaai_auth';
   private readonly TOKEN_KEY = 'minicaai_token';
 
-  // Will be set to real server URL when deployed
+  // Server base URL. Both renderer (Vite/Electron at localhost) and the
+  // packaged Electron build hit the same Railway-hosted backend — there's
+  // no separate dev origin to switch to here, so the URL is fixed.
   private API_BASE = 'https://h2so4-production.up.railway.app';
-
-  constructor() {
-    // Use local server in development
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-      this.API_BASE = 'https://h2so4-production.up.railway.app';
-    }
-  }
 
   // ── Device Fingerprint ──
   async getDeviceId(): Promise<string> {
@@ -380,6 +382,49 @@ class LicenseService {
     };
   }
 
+  // ── Trial-state normalizer ──
+  // Server stamps `trial_granted_at` at signup. We use that to compute
+  // the remaining wall-clock seconds when there is no in-session local
+  // ledger to preserve (e.g., logout → re-login on the same device).
+  // Without this, the old code defaulted any login with
+  // trial_remaining_seconds === undefined to a fresh 30 min, which let
+  // a free user reset their trial by logging out and back in. With this,
+  // the trial is authoritatively bounded by `trial_granted_at + 30 min`
+  // wall-clock, regardless of how many auth events the user triggers.
+  //
+  // We still PREFER the in-session local ledger when present so a
+  // legitimate session-tab refresh or background revalidation doesn't
+  // reset what the timer already consumed.
+  private normalizeTrialState(license: LicenseData, priorLicense: LicenseData | null): LicenseData {
+    if (license.tier !== 'free') {
+      // Paid tiers don't use the trial bucket — strip for cleanliness so
+      // getEffectiveTier never reads a stale free-tier trial value.
+      const clean: any = { ...license };
+      delete clean.trial_remaining_seconds;
+      return clean as LicenseData;
+    }
+    if (
+      priorLicense?.tier === 'free' &&
+      typeof priorLicense.trial_remaining_seconds === 'number'
+    ) {
+      // In-session preserve: the timer service is mid-tick and trusts
+      // its own balance. Server revalidation lands here too.
+      return { ...license, trial_remaining_seconds: priorLicense.trial_remaining_seconds };
+    }
+    // Fresh login (no local ledger): derive from the server timestamp.
+    return { ...license, trial_remaining_seconds: this.computeTrialRemainingFromServer(license) };
+  }
+
+  private computeTrialRemainingFromServer(license: LicenseData): number {
+    const grantedAt = license.trial_granted_at || 0;
+    // grantedAt = 0 → server hasn't recorded a grant (legacy row that
+    // somehow missed the migration backfill). Fail closed at 0 — better
+    // to under-grant than re-open the unbounded-trial window.
+    if (grantedAt <= 0) return 0;
+    const elapsedSec = Math.max(0, Math.floor((Date.now() - grantedAt) / 1000));
+    return Math.max(0, TIME_CONSTANTS.TRIAL_SECONDS - elapsedSec);
+  }
+
   // ── Credit-state normalizer ──
   // Server today does NOT echo credit fields (Option A: client-side ledger).
   // So every path that merges a server license into local state has to decide
@@ -484,12 +529,12 @@ class LicenseService {
 
     const data = await response.json();
     data.license.last_validated = Date.now();
-    // Signup is by definition a new account — seed the trial client-side
-    // as a defensive default in case the server doesn't populate it yet.
-    // Paid tiers ignore this field entirely via getLiveTimeBalance.
-    if (data.license.tier === 'free' && data.license.trial_remaining_seconds === undefined) {
-      data.license.trial_remaining_seconds = TIME_CONSTANTS.TRIAL_SECONDS;
-    }
+    // Trial seed is now derived from the server's trial_granted_at timestamp
+    // rather than unconditionally defaulted to 30 min. On a brand-new signup
+    // grantedAt ≈ Date.now(), so the computed remaining is ≈ TRIAL_SECONDS;
+    // on subsequent re-auths the same code path correctly subtracts elapsed
+    // wall-clock time and never resets the trial.
+    data.license = this.normalizeTrialState(data.license, null);
     this.saveAuth(data.user, data.license, data.token);
     this.startRevalidation();
     return data;
@@ -517,6 +562,7 @@ class LicenseService {
     // a Basic user re-logging in would land with credits undefined →
     // getEffectiveTier() downgrades them to Free.
     const { license: priorLicense } = this.loadAuth();
+    data.license = this.normalizeTrialState(data.license, priorLicense);
     data.license = this.normalizeLicenseCredits(data.license, priorLicense);
     this.saveAuth(data.user, data.license, data.token);
     this.startRevalidation();
@@ -541,22 +587,17 @@ class LicenseService {
     const data = await response.json();
     if (data.license) {
       data.license.last_validated = Date.now();
-      // New Google-signup users get the 30-min trial. Existing users keep
-      // whatever balance the server remembers. `is_new_user` is the signal
-      // we trust from the server; falling back to undefined-check as a
-      // belt-and-suspenders guard.
-      if (
-        data.license.tier === 'free' &&
-        data.license.trial_remaining_seconds === undefined &&
-        data.is_new_user === true
-      ) {
-        data.license.trial_remaining_seconds = TIME_CONSTANTS.TRIAL_SECONDS;
-      }
-      // Basic-tier users returning via Google: preserve or seed the
-      // client-side credit ledger. Same reason as login() — server doesn't
-      // echo these fields and the 'basic' tier needs them or
-      // getEffectiveTier() falls through to Free.
+      // Trial: derived from server's trial_granted_at, preserving the
+      // in-session balance when one exists (same as login()). The old
+      // `is_new_user === true` guard is no longer needed — the server
+      // timestamp already encodes whether this is a fresh grant or an
+      // already-elapsed one.
       const { license: priorLicense } = this.loadAuth();
+      data.license = this.normalizeTrialState(data.license, priorLicense);
+      // Basic-tier users returning via Google: preserve or seed the
+      // client-side credit ledger. Server doesn't echo these fields and
+      // the 'basic' tier needs them or getEffectiveTier() falls through
+      // to Free.
       data.license = this.normalizeLicenseCredits(data.license, priorLicense);
     }
     this.saveAuth(data.user, data.license, data.token);
@@ -615,11 +656,16 @@ class LicenseService {
       // normalizeLicenseCredits, which does NOT read from serverData —
       // the server never echoes these fields in the first place (Option A).
       const tierChanged = serverData.tier && serverData.tier !== license.tier;
+      // Fields that must NOT clobber the client ledger on revalidation.
+      // is_admin is also broken out — it lives on the user, not the license,
+      // so we strip it from the license merge and apply it to the user
+      // separately below.
       const {
         credits_remaining_seconds: _crs,
         credits_expire_at: _cea,
         trial_remaining_seconds: _trs,
         trial_started_at: _tsa,
+        is_admin: serverIsAdmin,
         ...serverSafe
       } = serverData;
 
@@ -644,10 +690,18 @@ class LicenseService {
       }
 
       const user = this.loadAuth().user;
+      // Pick up an admin-flag flip from the server. Without this, a user
+      // whose email was removed from ADMIN_EMAILS would keep admin
+      // powers (self-grant tiers, Recent Conversations, force-logout)
+      // until they happened to log out manually. Mirror flag-on too so
+      // a freshly-promoted admin doesn't have to log out and back in.
+      const updatedUser = (user && typeof serverIsAdmin === 'boolean' && user.is_admin !== serverIsAdmin)
+        ? { ...user, is_admin: serverIsAdmin }
+        : user;
       // If server rotated the token, save the new one so the next
       // request doesn't hit 401. Falls back to existing token otherwise.
       const newToken = serverData.token || token;
-      if (user) this.saveAuth(user, updatedLicense, newToken);
+      if (updatedUser) this.saveAuth(updatedUser, updatedLicense, newToken);
       return updatedLicense;
     } catch {
       // Network hiccup — keep the cached license, do not lock anything.

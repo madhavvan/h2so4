@@ -250,6 +250,31 @@ function getDB() {
     db.exec('ALTER TABLE devices ADD COLUMN platform TEXT');
   }
 
+  // Server-authoritative trial timestamp. Without this, a Free user could
+  // log out and log back in to re-seed a fresh 30-min trial — the client
+  // ledger gets wiped on logout and the previous re-seed condition
+  // (trial_remaining_seconds === undefined) fired again every login.
+  // Backfill existing free users from activated_at so a long-ago signup
+  // shows a long-elapsed trial (i.e. zero remaining), not a fresh 30 min.
+  const licenseCols = db.prepare("PRAGMA table_info(licenses)").all();
+  if (!licenseCols.find(c => c.name === 'trial_granted_at')) {
+    db.exec('ALTER TABLE licenses ADD COLUMN trial_granted_at INTEGER DEFAULT 0');
+    db.exec("UPDATE licenses SET trial_granted_at = activated_at WHERE tier = 'free' AND trial_granted_at = 0");
+  }
+
+  // Defense-in-depth against the /verify-razorpay ↔ payment.captured race:
+  // both paths grant the same payment if they both see "no row yet" between
+  // their dedup check and their transaction. The in-transaction re-check
+  // (added below in payments.js + webhooks.js) closes the window functionally;
+  // this UNIQUE index ensures a stray double-INSERT also fails at the DB
+  // layer. Partial index on NOT NULL because legitimate cancel/subscription-
+  // delete events record null provider_payment_id and shouldn't collide.
+  db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_provider_id ' +
+    'ON payments(provider, provider_payment_id) ' +
+    'WHERE provider_payment_id IS NOT NULL'
+  );
+
   // Same field on the per-attempt login_logs row so the admin can see
   // platform per login attempt (catches the case where a single device
   // has been re-signed-in across OS reinstalls).
@@ -435,6 +460,33 @@ function invalidatePendingResetTokensForUser(userId) {
     .run(Date.now(), userId).changes;
 }
 
+// Atomic password reset: hashes the new password, updates the user row,
+// bumps tokens_revoked_after to invalidate every existing JWT, and marks
+// any sibling unused reset tokens used — all in one transaction. The
+// previous flow ran these as three separate calls; a SIGKILL between the
+// password update and the tokens_revoked_after bump would leave the new
+// password live while old sessions still passed authMiddleware. Narrow
+// window in practice but a real security gap during the exact case the
+// reset is meant to address (suspected compromise). Returns the count
+// of sibling tokens marked used, for logging.
+function applyPasswordReset(userId, newPassword) {
+  const d = getDB();
+  const passwordHash = hashPassword(newPassword);
+  const now = Date.now();
+  let invalidatedSiblings = 0;
+  const tx = d.transaction(() => {
+    d.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')
+      .run(passwordHash, now, userId);
+    d.prepare('UPDATE users SET tokens_revoked_after = ? WHERE id = ?')
+      .run(now, userId);
+    invalidatedSiblings = d.prepare(
+      'UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL'
+    ).run(now, userId).changes;
+  });
+  tx();
+  return invalidatedSiblings;
+}
+
 function getAllUsers() {
   // Include the columns the admin UI needs to render without a second
   // round-trip per row: updated_at for recency, stripe_customer_id so the
@@ -469,10 +521,17 @@ function getActiveToday() {
 
 function createLicense({ key, user_id, email, tier, status, country_code, expires_at, sessions_limit }) {
   const d = getDB();
+  // Stamp trial_granted_at at signup time for free tier so the client
+  // can compute remaining trial seconds from the server clock instead
+  // of unconditionally seeding 30 min on every login (which let a free
+  // user farm infinite trials by logging out + back in). Paid tiers
+  // get 0 (the column default) — they don't use the trial bucket.
+  const now = Date.now();
+  const trialGrantedAt = tier === 'free' ? now : 0;
   d.prepare(`
-    INSERT INTO licenses (key, user_id, email, tier, status, country_code, activated_at, expires_at, sessions_used, sessions_limit)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-  `).run(key, user_id, email.toLowerCase(), tier, status, country_code, Date.now(), expires_at, sessions_limit);
+    INSERT INTO licenses (key, user_id, email, tier, status, country_code, activated_at, expires_at, sessions_used, sessions_limit, trial_granted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+  `).run(key, user_id, email.toLowerCase(), tier, status, country_code, now, expires_at, sessions_limit, trialGrantedAt);
 
   return getLicenseByKey(key);
 }
@@ -646,12 +705,28 @@ function getConversationById(id) {
   return getDB().prepare('SELECT * FROM conversations WHERE id = ?').get(id) || null;
 }
 
-function updateConversation(id, { name, is_active }) {
+// Updateable columns are explicitly whitelisted (with their SQL coercion) to
+// prevent SQL-injection if a future caller ever forwards untrusted field
+// names from req.body. The current call sites only pass `name` / `is_active`
+// but the construction pattern (`SET ${updates.join(', ')}`) is the kind of
+// thing that grows dangerous as the codebase evolves — locking it down now.
+const CONVERSATION_UPDATE_FIELDS = {
+  name:      { sql: 'name = ?',      coerce: (v) => String(v) },
+  is_active: { sql: 'is_active = ?', coerce: (v) => v ? 1 : 0 },
+};
+
+function updateConversation(id, patch) {
   const d = getDB();
   const updates = [];
   const values = [];
-  if (name !== undefined) { updates.push('name = ?'); values.push(name); }
-  if (is_active !== undefined) { updates.push('is_active = ?'); values.push(is_active ? 1 : 0); }
+  for (const key of Object.keys(patch || {})) {
+    const def = CONVERSATION_UPDATE_FIELDS[key];
+    if (!def) continue; // silently drop non-whitelisted fields
+    if (patch[key] === undefined) continue;
+    updates.push(def.sql);
+    values.push(def.coerce(patch[key]));
+  }
+  // updated_at is server-controlled, always stamped.
   updates.push('updated_at = ?');
   values.push(Date.now());
   values.push(id);
@@ -1573,7 +1648,7 @@ module.exports = {
   updateUserProfile, deleteUser, getUserDataExport,
   // Password reset
   createPasswordResetToken, getPasswordResetToken, getRawPasswordResetToken, consumePasswordResetToken, cleanupExpiredResetTokens,
-  invalidatePendingResetTokensForUser,
+  invalidatePendingResetTokensForUser, applyPasswordReset,
   // Licenses
   createLicense, getLicenseByKey, getLicenseByUserId,
   incrementSessionCount, updateLicenseStatus, updateLicenseOnPayment,

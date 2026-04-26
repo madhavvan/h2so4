@@ -11,8 +11,10 @@ interface UseSpeechRecognitionProps {
   onError?: (error: string) => void;
 }
 
-// Detect Electron
-const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+// Detect Electron via the contextBridge surface (window.electronAPI is set
+// by electron/preload.cjs). The old `process.versions.electron` check no
+// longer works under contextIsolation:true + nodeIntegration:false.
+const isElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
 
 /**
  * Get audio stream — handles both Browser (getDisplayMedia) and Electron (desktopCapturer)
@@ -20,11 +22,12 @@ const isElectron = typeof window !== 'undefined' && !!(window as any).process?.v
 async function getAudioStream(): Promise<{ stream: MediaStream; audioStream: MediaStream }> {
   if (isElectron) {
     // ── ELECTRON PATH ──
-    // desktopCapturer is only available in main process (Electron 17+)
-    // Use IPC to get sources from main process
-    const { ipcRenderer } = (window as any).require('electron');
-
-    const sources = await ipcRenderer.invoke('get-desktop-sources');
+    // desktopCapturer is only available in main process (Electron 17+).
+    // Reach it through the contextBridge surface — see electron/preload.cjs.
+    if (!window.electronAPI) {
+      throw new Error('Electron API not available');
+    }
+    const sources = await window.electronAPI.invoke<any[]>('get-desktop-sources');
 
     if (!sources || sources.length === 0) {
       throw new Error('No capture sources found');

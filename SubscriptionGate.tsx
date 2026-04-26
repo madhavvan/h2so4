@@ -1,5 +1,25 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search } from 'lucide-react';
+// Phosphor duotone — used on the public landing + auth surfaces for the
+// editorial, premium feel that lucide's flat strokes can't quite reach.
+// In-app utility icons stay on lucide so dense toolbars don't get heavy.
+import {
+  Sparkle as PhSparkle,
+  Headphones as PhHeadphones,
+  Monitor as PhMonitor,
+  Cpu as PhCpu,
+  Shield as PhShield,
+  ChartBar as PhChart,
+  Lock as PhLock,
+  Globe as PhGlobe,
+  Lightning as PhBolt,
+  DownloadSimple as PhDownload,
+  ArrowRight as PhArrowRight,
+  Star as PhStar,
+  Users as PhUsers,
+  Quotes as PhQuote,
+  CheckCircle as PhCheck,
+} from '@phosphor-icons/react';
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import { geoService, GeoData } from './services/geoService';
 import { pricingService, RegionPricing, PricingTier } from './services/pricingService';
@@ -19,7 +39,9 @@ interface SubscriptionGateProps {
 type View = 'landing' | 'login' | 'signup' | 'forgot_password' | 'pricing' | 'vpn_blocked' | 'download' | 'tutorials' | 'admin' | 'support';
 
 // ── Detect if running inside Electron ──
-const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+// Reads window.electronAPI (set by electron/preload.cjs) — works under
+// the new contextIsolation:true + nodeIntegration:false config.
+const isElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
 
 // Single-flight Razorpay SDK loader. Without this, a user who clicks
 // "Upgrade" twice before the first checkout modal renders would append
@@ -67,19 +89,73 @@ const NoiseOverlay = React.memo(() => (
   <div className="fixed inset-0 pointer-events-none opacity-[0.015]" style={{ zIndex: 1, backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E")` }} />
 ));
 
-const Logo = ({ size = 'md' }: { size?: 'sm' | 'md' | 'lg' }) => {
-  const sizes = { sm: 'w-8 h-8', md: 'w-10 h-10', lg: 'w-14 h-14' };
-  const textSizes = { sm: 'text-lg', md: 'text-xl', lg: 'text-3xl' };
+// Refined wordmark. Replaces the gradient-cube + Bot icon with a hand-set
+// editorial mark: a single ink glyph mark in a circle (more dignified than
+// a generic Bot face) and the wordmark in our display serif so the brand
+// reads as an Anthropic-class product, not a generic SaaS dashboard.
+//
+// Two variants:
+//   theme='light' — cream surface (landing, auth modals).
+//   theme='dark'  — dark surface (in-app shell, popout, admin).
+//
+// The glyph is a stylized "m" in a thin-stroke circle, small enough to
+// pair with text without dominating it.
+const Logo = ({
+  size = 'md',
+  theme = 'dark',
+}: { size?: 'sm' | 'md' | 'lg'; theme?: 'light' | 'dark' }) => {
+  const dot = { sm: 28, md: 34, lg: 44 }[size];
+  const text = { sm: 'text-base', md: 'text-lg', lg: 'text-2xl' }[size];
+  const sub = size === 'lg';
+  const isLight = theme === 'light';
+  const inkColor = isLight ? 'var(--ink)' : '#f5f4ef';
+  const subColor = isLight ? 'var(--ink-muted)' : 'rgba(245,244,239,0.55)';
+  const ringColor = isLight ? 'var(--ink)' : '#f5f4ef';
   return (
-    <div className="flex items-center gap-3">
-      <div className={`${sizes[size]} rounded-2xl bg-gradient-to-br from-blue-500 via-blue-600 to-purple-600 flex items-center justify-center shadow-lg shadow-blue-500/25`}>
-        <Bot className="text-white" size={size === 'lg' ? 28 : size === 'md' ? 20 : 16} strokeWidth={1.5} />
-      </div>
-      <div>
-        <h1 className={`${textSizes[size]} font-bold tracking-tight text-white`}>
-          minica<span className="text-blue-400">ai</span>
-        </h1>
-        {size === 'lg' && <p className="text-[11px] text-gray-500 font-medium tracking-widest uppercase mt-0.5">Interview Intelligence</p>}
+    <div className="flex items-center gap-3" style={{ fontFamily: 'var(--sans)' }}>
+      <span
+        aria-hidden
+        className="inline-flex items-center justify-center shrink-0 rounded-full"
+        style={{
+          width: dot,
+          height: dot,
+          border: `1.25px solid ${ringColor}`,
+          color: inkColor,
+        }}
+      >
+        <span
+          style={{
+            fontFamily: 'var(--serif)',
+            fontWeight: 500,
+            fontStyle: 'italic',
+            fontSize: dot * 0.58,
+            lineHeight: 1,
+            transform: 'translateY(-0.04em)',
+            letterSpacing: '-0.02em',
+          }}
+        >
+          m
+        </span>
+      </span>
+      <div className="leading-none">
+        <span
+          className={`${text} font-medium`}
+          style={{
+            fontFamily: 'var(--serif)',
+            color: inkColor,
+            letterSpacing: '-0.02em',
+          }}
+        >
+          minicaai
+        </span>
+        {sub && (
+          <div
+            className="text-[10px] font-medium tracking-[0.18em] uppercase mt-1.5"
+            style={{ color: subColor }}
+          >
+            Interview Intelligence
+          </div>
+        )}
       </div>
     </div>
   );
@@ -93,88 +169,99 @@ const FeaturePill = ({ icon: Icon, text }: { icon: any; text: string }) => (
 );
 
 // ── Pricing Card (Free / Basic / Pro / Max) ──
+// Editorial cream-theme card. The "popular" tier is signalled by an
+// inverted ink-on-cream tile rather than a saturated gradient — louder
+// in restraint than in ornament. Period label is set in tabular numerals
+// so the price row aligns optically across cards.
 const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelect: (tier: PricingTier) => void; isLoading: boolean }) => {
   const isPopular = !!tier.popular;
-
-  // Per-tier visual theme. Popular tier gets the highlighted "Recommended" card frame.
-  const theme =
-    tier.id === 'max'   ? { accent: 'amber',   iconBg: 'bg-amber-500/15',   icon: <Crown size={20} className="text-amber-400" /> } :
-    tier.id === 'pro'   ? { accent: 'blue',    iconBg: 'bg-blue-500/15',    icon: <Crown size={20} className="text-blue-400" /> } :
-    tier.id === 'basic' ? { accent: 'emerald', iconBg: 'bg-emerald-500/15', icon: <Sparkles size={20} className="text-emerald-400" /> } :
-                          { accent: 'gray',    iconBg: 'bg-gray-500/10',    icon: <Zap size={20} className="text-gray-400" /> };
-
   const periodLabel = tier.period === 'month' ? '/mo' : tier.period === 'year' ? '/yr' : '';
 
-  const ctaClass = isPopular
-    ? 'bg-gradient-to-r from-emerald-500 to-emerald-600 text-white hover:from-emerald-400 hover:to-emerald-500 shadow-lg shadow-emerald-500/25'
-    : tier.id === 'max'
-      ? 'bg-gradient-to-r from-amber-500 to-purple-500 text-white hover:from-amber-400 hover:to-purple-400 shadow-lg shadow-amber-500/20'
-      : tier.id === 'pro'
-        ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white hover:from-blue-400 hover:to-blue-500 shadow-lg shadow-blue-500/25'
-        : 'bg-white/[0.06] text-white hover:bg-white/[0.1] border border-white/[0.1]';
+  const frameStyle: React.CSSProperties = isPopular
+    ? { background: 'var(--ink)', color: 'var(--cream)', border: '1px solid var(--ink)' }
+    : { background: 'transparent', color: 'var(--ink)', border: '1px solid var(--cream-line)' };
 
-  const frameClass = isPopular
-    ? 'border-emerald-500/40 bg-gradient-to-b from-emerald-500/[0.08] to-transparent shadow-xl shadow-emerald-500/10'
-    : tier.id === 'max'
-      ? 'border-amber-500/30 bg-gradient-to-b from-amber-500/[0.05] to-transparent'
-      : 'border-white/[0.08] bg-white/[0.02] hover:border-white/[0.15]';
+  const subColor = isPopular ? 'rgba(245,244,239,0.65)' : 'var(--ink-muted)';
+  const featureColor = isPopular ? 'rgba(245,244,239,0.85)' : 'var(--ink-soft)';
+
+  const ctaStyle: React.CSSProperties = isPopular
+    ? { background: 'var(--cream)', color: 'var(--ink)' }
+    : { background: 'var(--ink)', color: 'var(--cream)' };
 
   return (
-    <div className={`relative rounded-2xl border transition-all duration-300 hover:scale-[1.02] ${frameClass}`}>
+    <div
+      className="relative rounded-2xl flex flex-col p-7 transition-all duration-300"
+      style={frameStyle}
+    >
       {isPopular && (
-        <div className="absolute -top-3.5 left-1/2 -translate-x-1/2">
-          <div className="px-4 py-1 rounded-full bg-gradient-to-r from-emerald-500 to-emerald-600 text-white text-[10px] font-bold tracking-wider uppercase shadow-lg">
-            Best Deal
-          </div>
+        <div
+          className="absolute -top-2.5 left-7 px-2.5 py-1 rounded-full text-[10px] font-medium uppercase tracking-[0.16em]"
+          style={{ background: 'var(--accent)', color: 'var(--cream)' }}
+        >
+          Most chosen
         </div>
       )}
 
-      <div className="p-6 pt-8">
-        <div className={`w-10 h-10 rounded-xl flex items-center justify-center mb-4 ${theme.iconBg}`}>
-          {theme.icon}
-        </div>
+      <h3
+        className="text-[22px]"
+        style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.015em' }}
+      >
+        {tier.name}
+      </h3>
+      {tier.subtitle && (
+        <p className="mt-1 text-[12.5px]" style={{ color: subColor }}>
+          {tier.subtitle}
+        </p>
+      )}
 
-        <h3 className="text-lg font-bold text-white mb-1">{tier.name}</h3>
-        {tier.subtitle && <p className="text-[11px] text-gray-500 mb-3">{tier.subtitle}</p>}
-
-        <div className="flex items-baseline gap-1 mb-6">
-          {tier.price === 0 ? (
-            <span className="text-3xl font-bold text-white">Free</span>
-          ) : (
-            <>
-              <span className="text-3xl font-bold text-white">
-                {pricingService.formatPrice(tier.price, tier.currencySymbol, tier.currency)}
+      <div className="flex items-baseline gap-1 mt-6 mb-6 tabular-nums">
+        {tier.price === 0 ? (
+          <span
+            className="text-[40px]"
+            style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.025em' }}
+          >
+            Free
+          </span>
+        ) : (
+          <>
+            <span
+              className="text-[40px]"
+              style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.025em' }}
+            >
+              {pricingService.formatPrice(tier.price, tier.currencySymbol, tier.currency)}
+            </span>
+            {periodLabel && (
+              <span className="text-[14px]" style={{ color: subColor }}>
+                {periodLabel}
               </span>
-              {periodLabel && <span className="text-sm text-gray-500">{periodLabel}</span>}
-            </>
-          )}
-        </div>
-
-        <button
-          onClick={() => onSelect(tier)}
-          disabled={isLoading}
-          className={`w-full py-3 px-4 rounded-xl font-semibold text-sm transition-all duration-200 flex items-center justify-center gap-2 ${ctaClass}`}
-        >
-          {isLoading ? <Loader2 size={16} className="animate-spin" /> : null}
-          {tier.cta}
-          {!isLoading && <ArrowRight size={14} />}
-        </button>
-
-        <div className="mt-6 space-y-3">
-          {tier.features.map((feature, i) => (
-            <div key={i} className="flex items-start gap-2.5">
-              <div className={`w-4 h-4 rounded-full flex items-center justify-center mt-0.5 shrink-0 ${
-                isPopular ? 'bg-emerald-500/20' : tier.id === 'max' ? 'bg-amber-500/20' : 'bg-white/[0.06]'
-              }`}>
-                <Check size={10} className={
-                  isPopular ? 'text-emerald-400' : tier.id === 'max' ? 'text-amber-400' : 'text-gray-400'
-                } strokeWidth={3} />
-              </div>
-              <span className="text-sm text-gray-400">{feature}</span>
-            </div>
-          ))}
-        </div>
+            )}
+          </>
+        )}
       </div>
+
+      <button
+        onClick={() => onSelect(tier)}
+        disabled={isLoading}
+        className="w-full py-3 px-4 rounded-full text-[14px] font-medium transition-all duration-200 inline-flex items-center justify-center gap-2 hover:opacity-90"
+        style={ctaStyle}
+      >
+        {isLoading ? <Loader2 size={14} className="animate-spin" /> : null}
+        {tier.cta}
+        {!isLoading && <PhArrowRight size={14} weight="bold" />}
+      </button>
+
+      <ul className="mt-7 space-y-3.5">
+        {tier.features.map((feature, i) => (
+          <li key={i} className="flex items-start gap-2.5 text-[13.5px]" style={{ color: featureColor }}>
+            <PhCheck
+              size={16}
+              weight="duotone"
+              style={{ color: isPopular ? 'var(--accent-soft)' : 'var(--accent)', flexShrink: 0, marginTop: 1 }}
+            />
+            <span style={{ lineHeight: 1.5 }}>{feature}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 };
@@ -3594,8 +3681,8 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
     try {
       // Open Google sign-in in system browser
-      if (isElectron) {
-        (window as any).require('electron').shell.openExternal(authUrl);
+      if (isElectron && window.electronAPI?.openExternal) {
+        window.electronAPI.openExternal(authUrl);
       } else {
         window.open(authUrl, '_blank');
       }
@@ -3630,9 +3717,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               // Pull the Electron window back to the foreground — the browser
               // "you can close this tab" page leaves the desktop app hidden
               // behind it otherwise.
-              try {
-                (window as any).require('electron').ipcRenderer.send('focus-main-window');
-              } catch {}
+              try { window.electronAPI?.send('focus-main-window'); } catch {}
               onAuthenticated(data.user, data.license);
             } else {
               setView('download');
@@ -4121,140 +4206,388 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'landing') {
     return (
-      <div className="fixed inset-0 bg-[#050507] text-white overflow-y-auto">
-        <AnimatedBackground />
-        <NoiseOverlay />
-
-        {/* Nav */}
-        <nav className="relative z-10 flex items-center justify-between px-6 py-4 max-w-6xl mx-auto">
-          <Logo size="md" />
-          <div className="flex items-center gap-3">
-            <button onClick={() => setView('tutorials')} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-400 hover:text-white transition-colors">
-              Tutorials
-            </button>
-            <button onClick={() => setView('login')} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-400 hover:text-white transition-colors">
-              Sign In
-            </button>
-            <button onClick={() => setView('signup')} className="px-4 py-2 rounded-lg text-sm font-medium bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] transition-all">
-              Get Started
-            </button>
+      <div
+        className="fixed inset-0 overflow-y-auto"
+        style={{
+          background: 'var(--cream)',
+          color: 'var(--ink)',
+          fontFamily: 'var(--sans)',
+        }}
+      >
+        {/* Nav — hairline border, no glass, generous breathing */}
+        <nav
+          className="sticky top-0 z-20 backdrop-blur-md"
+          style={{
+            background: 'color-mix(in oklab, var(--cream) 92%, transparent)',
+            borderBottom: '1px solid var(--cream-line)',
+          }}
+        >
+          <div className="max-w-6xl mx-auto flex items-center justify-between px-8 py-5">
+            <Logo size="md" theme="light" />
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setView('tutorials')}
+                className="px-4 py-2 text-sm font-medium hover:opacity-100 transition-opacity"
+                style={{ color: 'var(--ink-muted)' }}
+              >
+                How it works
+              </button>
+              <button
+                onClick={() => { document.getElementById('pricing')?.scrollIntoView({ behavior: 'smooth' }); }}
+                className="px-4 py-2 text-sm font-medium hover:opacity-100 transition-opacity"
+                style={{ color: 'var(--ink-muted)' }}
+              >
+                Pricing
+              </button>
+              <button
+                onClick={() => setView('login')}
+                className="px-4 py-2 text-sm font-medium hover:opacity-100 transition-opacity"
+                style={{ color: 'var(--ink-muted)' }}
+              >
+                Sign in
+              </button>
+              <button
+                onClick={() => setView('signup')}
+                className="ml-3 inline-flex items-center gap-2 px-5 py-2.5 rounded-full text-sm font-medium transition-all"
+                style={{
+                  background: 'var(--ink)',
+                  color: 'var(--cream)',
+                  letterSpacing: '-0.005em',
+                }}
+              >
+                Get started
+                <PhArrowRight size={14} weight="bold" />
+              </button>
+            </div>
           </div>
         </nav>
 
-        {/* Hero */}
-        <div className="relative z-10 max-w-4xl mx-auto px-6 pt-20 pb-16 text-center">
-          <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full border border-blue-500/20 bg-blue-500/[0.06] mb-8">
-            <Sparkles size={12} className="text-blue-400" />
-            <span className="text-xs font-medium text-blue-300">Powered by GPT-5 & Gemini 3</span>
-          </div>
-
-          <h1 className="text-5xl md:text-7xl font-bold tracking-tight leading-[1.1] mb-6">
-            Ace every interview
-            <br />
-            <span className="bg-gradient-to-r from-blue-400 via-purple-400 to-cyan-400 bg-clip-text text-transparent">
-              with AI by your side
+        {/* Hero — editorial, restrained, serif display */}
+        <section className="max-w-5xl mx-auto px-8 pt-24 pb-20">
+          <div className="inline-flex items-center gap-2 mb-10" style={{ color: 'var(--ink-muted)' }}>
+            <PhSparkle size={14} weight="duotone" style={{ color: 'var(--accent)' }} />
+            <span className="text-[12px] font-medium uppercase tracking-[0.18em]">
+              Real-time interview intelligence
             </span>
+          </div>
+          <h1
+            className="text-[56px] md:text-[80px] leading-[1.02] mb-8"
+            style={{
+              fontFamily: 'var(--serif)',
+              fontWeight: 400,
+              letterSpacing: '-0.025em',
+              color: 'var(--ink)',
+            }}
+          >
+            Walk into every<br />
+            interview <em style={{ fontStyle: 'italic', fontWeight: 400 }}>already prepared</em>.
           </h1>
-
-          <p className="text-lg md:text-xl text-gray-400 max-w-2xl mx-auto mb-10 leading-relaxed">
-            Real-time AI copilot that listens to your interview, understands context from your resume,
-            and crafts perfect answers instantly. Invisible. Intelligent. Unstoppable.
+          <p
+            className="text-[19px] md:text-[21px] max-w-2xl mb-12"
+            style={{
+              color: 'var(--ink-soft)',
+              lineHeight: 1.55,
+              letterSpacing: '-0.005em',
+            }}
+          >
+            A quiet copilot that listens to your interview, holds your résumé and the role in
+            mind, and shapes an answer in your voice — character-by-character, in real time.
+            Invisible to the interviewer. Tuned to you.
           </p>
-
-          <div className="flex items-center justify-center gap-4 mb-12">
-            <button onClick={() => setView('signup')} className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm hover:from-blue-400 hover:to-blue-500 transition-all shadow-xl shadow-blue-500/25 hover:shadow-blue-500/40 flex items-center gap-2">
-              Download Free <Download size={16} />
+          <div className="flex items-center gap-3 mb-14">
+            <button
+              onClick={() => setView('signup')}
+              className="inline-flex items-center gap-2 px-7 py-3.5 rounded-full text-[15px] font-medium transition-all hover:opacity-90"
+              style={{
+                background: 'var(--ink)',
+                color: 'var(--cream)',
+                letterSpacing: '-0.005em',
+              }}
+            >
+              Start free
+              <PhArrowRight size={15} weight="bold" />
             </button>
-            <button onClick={() => setView('pricing')} className="px-8 py-3.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.1] text-white font-semibold text-sm transition-all flex items-center gap-2">
-              View Pricing <ChevronRight size={16} />
+            <button
+              onClick={() => setView('tutorials')}
+              className="inline-flex items-center gap-2 px-7 py-3.5 rounded-full text-[15px] font-medium transition-all"
+              style={{
+                background: 'transparent',
+                color: 'var(--ink)',
+                border: '1px solid var(--cream-line)',
+              }}
+            >
+              See how it works
             </button>
           </div>
-
-          <div className="flex flex-wrap items-center justify-center gap-2">
-            <FeaturePill icon={Headphones} text="System Audio Capture" />
-            <FeaturePill icon={Monitor} text="Screen Analysis" />
-            <FeaturePill icon={Cpu} text="Multi-Model AI" />
-            <FeaturePill icon={Shield} text="Invisible Mode" />
-            <FeaturePill icon={BarChart3} text="Smart Context" />
+          <div
+            className="flex flex-wrap items-center gap-x-8 gap-y-3 pt-10"
+            style={{ borderTop: '1px solid var(--cream-line)', color: 'var(--ink-muted)' }}
+          >
+            <div className="flex items-center gap-2 text-[13px] font-medium">
+              <PhUsers size={16} weight="duotone" />
+              10,000+ candidates
+            </div>
+            <div className="flex items-center gap-2 text-[13px] font-medium">
+              <PhStar size={16} weight="duotone" />
+              4.9 / 5 rating
+            </div>
+            <div className="flex items-center gap-2 text-[13px] font-medium">
+              <PhGlobe size={16} weight="duotone" />
+              Available in 50+ countries
+            </div>
           </div>
-        </div>
+        </section>
 
-        {/* Social proof */}
-        <div className="flex items-center justify-center gap-8 py-6 opacity-40">
-          <div className="flex items-center gap-2"><Users size={14} /><span className="text-xs font-medium">10,000+ users</span></div>
-          <div className="w-1 h-1 rounded-full bg-gray-600" />
-          <div className="flex items-center gap-2"><Star size={14} className="fill-current" /><span className="text-xs font-medium">4.9/5 rating</span></div>
-          <div className="w-1 h-1 rounded-full bg-gray-600" />
-          <div className="flex items-center gap-2"><Globe size={14} /><span className="text-xs font-medium">50+ countries</span></div>
-        </div>
-
-        {/* How it works */}
-        <div className="relative z-10 max-w-5xl mx-auto px-6 py-20">
-          <h2 className="text-2xl md:text-3xl font-bold text-center mb-4">How it works</h2>
-          <p className="text-gray-500 text-center mb-14 text-sm">Three steps to interview mastery</p>
-          <div className="grid md:grid-cols-3 gap-6">
+        {/* What it does — editorial three-column */}
+        <section
+          className="max-w-6xl mx-auto px-8 py-24"
+          style={{ borderTop: '1px solid var(--cream-line)' }}
+        >
+          <div className="mb-16">
+            <span
+              className="text-[12px] font-medium uppercase tracking-[0.18em]"
+              style={{ color: 'var(--ink-muted)' }}
+            >
+              Capabilities
+            </span>
+            <h2
+              className="text-[40px] md:text-[52px] leading-[1.05] mt-4 max-w-3xl"
+              style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.02em', color: 'var(--ink)' }}
+            >
+              Built for the moment that decides the offer.
+            </h2>
+          </div>
+          <div className="grid md:grid-cols-3 gap-x-12 gap-y-14">
             {[
-              { step: '01', title: 'Download & Sign In', desc: 'Download the desktop app, create an account, and your license activates on your device.', icon: Download },
-              { step: '02', title: 'AI Listens', desc: 'Share your interview audio. minicaai transcribes and analyzes questions against your resume.', icon: Bot },
-              { step: '03', title: 'Get Answers', desc: 'Receive crafted responses instantly. Copy, adapt, and deliver with confidence.', icon: Zap },
-            ].map(({ step, title, desc, icon: Icon }) => (
-              <div key={step} className="p-6 rounded-2xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] transition-all group">
-                <div className="flex items-center gap-3 mb-4">
-                  <span className="text-xs font-bold text-blue-500 bg-blue-500/10 px-2.5 py-1 rounded-md">{step}</span>
-                  <Icon size={18} className="text-gray-500 group-hover:text-blue-400 transition-colors" />
-                </div>
-                <h3 className="text-base font-semibold text-white mb-2">{title}</h3>
-                <p className="text-sm text-gray-500 leading-relaxed">{desc}</p>
+              {
+                Icon: PhHeadphones,
+                title: 'Hears the interviewer',
+                body: 'System-audio capture transcribes every question with sub-second latency. Word-level streaming, no upload, no waiting.',
+              },
+              {
+                Icon: PhCpu,
+                title: 'Reasons in your voice',
+                body: 'Picks the model that fits the question — GPT, Claude Sonnet 4.6, Gemini, Grok, Llama — and shapes the answer to your résumé and the role.',
+              },
+              {
+                Icon: PhShield,
+                title: 'Invisible on the call',
+                body: 'Window content is excluded from screen-share at the OS level. Your interviewer sees you. They never see the copilot.',
+              },
+              {
+                Icon: PhMonitor,
+                title: 'Reads the screen',
+                body: 'Auto-Solve captures the coding-platform screenshot and types the answer into the editor on demand. CoderPad, HackerRank, LeetCode.',
+              },
+              {
+                Icon: PhChart,
+                title: 'Holds your context',
+                body: 'Resume, JD, and notes stay in working memory across the whole interview. Answers reference projects you actually shipped, not generic ones.',
+              },
+              {
+                Icon: PhBolt,
+                title: 'Pop-out + PiP',
+                body: 'A glanceable window that floats over Zoom, Meet, or Teams. Resize, dim, or hide it without breaking the interview.',
+              },
+            ].map(({ Icon, title, body }) => (
+              <div key={title}>
+                <Icon size={28} weight="duotone" style={{ color: 'var(--accent)' }} />
+                <h3
+                  className="mt-5 text-[20px]"
+                  style={{
+                    fontFamily: 'var(--serif)',
+                    fontWeight: 500,
+                    letterSpacing: '-0.015em',
+                    color: 'var(--ink)',
+                  }}
+                >
+                  {title}
+                </h3>
+                <p
+                  className="mt-2 text-[15px]"
+                  style={{ color: 'var(--ink-soft)', lineHeight: 1.6 }}
+                >
+                  {body}
+                </p>
               </div>
             ))}
           </div>
-        </div>
+        </section>
 
-        {/* Pricing (Free + Pro only) */}
-        <div className="relative z-10 max-w-4xl mx-auto px-6 py-20" id="pricing">
-          <h2 className="text-2xl md:text-3xl font-bold text-center mb-4">Simple pricing</h2>
-          <p className="text-gray-500 text-center mb-4 text-sm">Start free, upgrade when you're ready</p>
-          {geo && (
-            <div className="flex items-center justify-center mb-10">
-              <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white/[0.03] border border-white/[0.06] text-gray-500 text-xs">
-                <Globe size={12} /> Prices for {geo.country_name}
-              </div>
-            </div>
-          )}
+        {/* How it works — three numbered steps, no card chrome */}
+        <section
+          className="max-w-5xl mx-auto px-8 py-24"
+          style={{ borderTop: '1px solid var(--cream-line)' }}
+        >
+          <div className="mb-16">
+            <span
+              className="text-[12px] font-medium uppercase tracking-[0.18em]"
+              style={{ color: 'var(--ink-muted)' }}
+            >
+              How it works
+            </span>
+            <h2
+              className="text-[40px] md:text-[52px] leading-[1.05] mt-4 max-w-3xl"
+              style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.02em', color: 'var(--ink)' }}
+            >
+              Three steps. Then you forget it's there.
+            </h2>
+          </div>
+          <ol className="space-y-12">
+            {[
+              {
+                n: '01',
+                title: 'Install the desktop app',
+                body: 'Download for macOS, Windows, or Linux. Sign in once. Your license binds to this device.',
+              },
+              {
+                n: '02',
+                title: 'Drop in your résumé and the JD',
+                body: 'A single drag. The copilot extracts your story and the role in one preflight call so the first answer arrives instantly.',
+              },
+              {
+                n: '03',
+                title: 'Open your interview',
+                body: 'Start the mic. Answers stream as the interviewer speaks. Glance at the popout, deliver in your own voice.',
+              },
+            ].map((s) => (
+              <li
+                key={s.n}
+                className="grid md:grid-cols-[120px_1fr] gap-x-10 pb-12"
+                style={{ borderBottom: '1px solid var(--cream-line)' }}
+              >
+                <div
+                  className="text-[15px] font-medium tabular-nums tracking-[0.06em]"
+                  style={{ color: 'var(--ink-muted)' }}
+                >
+                  {s.n}
+                </div>
+                <div>
+                  <h3
+                    className="text-[26px]"
+                    style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.015em' }}
+                  >
+                    {s.title}
+                  </h3>
+                  <p
+                    className="mt-3 text-[16px] max-w-2xl"
+                    style={{ color: 'var(--ink-soft)', lineHeight: 1.65 }}
+                  >
+                    {s.body}
+                  </p>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </section>
+
+        {/* Pricing */}
+        <section
+          id="pricing"
+          className="max-w-6xl mx-auto px-8 py-24"
+          style={{ borderTop: '1px solid var(--cream-line)' }}
+        >
+          <div className="mb-16">
+            <span
+              className="text-[12px] font-medium uppercase tracking-[0.18em]"
+              style={{ color: 'var(--ink-muted)' }}
+            >
+              Pricing
+            </span>
+            <h2
+              className="text-[40px] md:text-[52px] leading-[1.05] mt-4 max-w-3xl"
+              style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.02em', color: 'var(--ink)' }}
+            >
+              Pay for the interviews you take.
+            </h2>
+            {geo && (
+              <p
+                className="mt-4 text-[14px]"
+                style={{ color: 'var(--ink-muted)' }}
+              >
+                Pricing for {geo.country_name}. We adjust regionally so the offer is always fair.
+              </p>
+            )}
+          </div>
           {pricing && (
-            <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6 max-w-6xl mx-auto">
+            <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6">
               {pricing.tiers.map((tier) => (
                 <PricingCard key={tier.id} tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
               ))}
             </div>
           )}
-        </div>
+        </section>
 
-        {/* Security badges */}
-        <div className="relative z-10 max-w-3xl mx-auto px-6 py-16">
-          <div className="grid grid-cols-3 gap-4 text-center">
+        {/* Trust strip */}
+        <section
+          className="max-w-5xl mx-auto px-8 py-20"
+          style={{ borderTop: '1px solid var(--cream-line)' }}
+        >
+          <div className="grid md:grid-cols-3 gap-x-12 gap-y-10">
             {[
-              { icon: Shield, label: 'Device-Bound License', desc: 'Your license is tied to your device. Cannot be shared.' },
-              { icon: Lock, label: 'Server Validated', desc: 'Every session verified with our secure servers.' },
-              { icon: Globe, label: 'Geo-Enforced', desc: 'Regional pricing enforced. VPN/proxy detected & blocked.' },
-            ].map(({ icon: Icon, label, desc }, i) => (
-              <div key={i} className="p-4">
-                <Icon size={20} className="text-blue-400 mx-auto mb-2" />
-                <p className="text-xs font-semibold text-white mb-1">{label}</p>
-                <p className="text-[10px] text-gray-600 leading-relaxed">{desc}</p>
+              { Icon: PhShield, label: 'Device-bound licenses', body: 'A license activates on the device that bought it. No silent sharing.' },
+              { Icon: PhLock, label: 'Server-validated sessions', body: 'Every active interview is checked against our backend in real time.' },
+              { Icon: PhGlobe, label: 'Regional pricing, enforced', body: 'No VPN-shopping for cheaper tiers. Your country, your fair price.' },
+            ].map(({ Icon, label, body }) => (
+              <div key={label}>
+                <Icon size={22} weight="duotone" style={{ color: 'var(--ink)' }} />
+                <h4
+                  className="mt-4 text-[15px] font-medium"
+                  style={{ color: 'var(--ink)', letterSpacing: '-0.005em' }}
+                >
+                  {label}
+                </h4>
+                <p
+                  className="mt-1.5 text-[13.5px]"
+                  style={{ color: 'var(--ink-muted)', lineHeight: 1.6 }}
+                >
+                  {body}
+                </p>
               </div>
             ))}
           </div>
-        </div>
+        </section>
+
+        {/* Closing CTA */}
+        <section className="max-w-5xl mx-auto px-8 py-24 text-center">
+          <h2
+            className="text-[44px] md:text-[60px] leading-[1.05] mb-8"
+            style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.02em', color: 'var(--ink)' }}
+          >
+            Your next interview is on Tuesday.<br />
+            <em style={{ fontStyle: 'italic' }}>Be ready by Monday.</em>
+          </h2>
+          <button
+            onClick={() => setView('signup')}
+            className="inline-flex items-center gap-2 px-8 py-4 rounded-full text-[15px] font-medium transition-all hover:opacity-90"
+            style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+          >
+            Start free
+            <PhArrowRight size={15} weight="bold" />
+          </button>
+          <p className="mt-6 text-[13px]" style={{ color: 'var(--ink-muted)' }}>
+            No card. 30-minute trial. Upgrade only if it earned the offer.
+          </p>
+        </section>
 
         {/* Footer */}
-        <footer className="relative z-10 border-t border-white/[0.06] mt-10">
-          <div className="max-w-5xl mx-auto px-6 py-8 flex items-center justify-between">
-            <div className="flex items-center gap-2 text-gray-600 text-xs">
-              <Bot size={14} /><span>minicaai.com</span>
-            </div>
-            <div className="flex items-center gap-6 text-xs text-gray-600">
-              <span>Privacy</span><span>Terms</span><button onClick={() => { if (currentUser) { setView('support'); } else { setView('login'); setAuthError('Please sign in to access support'); } }} className="hover:text-white transition-colors">Support</button>
+        <footer style={{ borderTop: '1px solid var(--cream-line)' }}>
+          <div className="max-w-6xl mx-auto px-8 py-10 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+            <Logo size="sm" theme="light" />
+            <div
+              className="flex items-center gap-7 text-[13px]"
+              style={{ color: 'var(--ink-muted)' }}
+            >
+              <span>© {new Date().getFullYear()} minicaai</span>
+              <span>Privacy</span>
+              <span>Terms</span>
+              <button
+                onClick={() => { if (currentUser) { setView('support'); } else { setView('login'); setAuthError('Please sign in to access support'); } }}
+                className="transition-colors hover:opacity-100"
+                style={{ color: 'var(--ink-muted)' }}
+              >
+                Support
+              </button>
             </div>
           </div>
         </footer>
@@ -4263,87 +4596,133 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  LOGIN
+  //  LOGIN — cream-on-ink, editorial typography
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'login') {
     return (
-      <div className="fixed inset-0 bg-[#050507] flex items-center justify-center p-6">
-        <AnimatedBackground />
-        <NoiseOverlay />
-        <div className="relative z-10 w-full max-w-md">
-          <div className="relative rounded-3xl border border-white/[0.08] bg-gradient-to-b from-white/[0.06] to-white/[0.02] backdrop-blur-xl shadow-2xl shadow-black/40 p-8 pt-6">
-            {/* Close button */}
-            <button onClick={() => setView('landing')} className="absolute top-4 right-4 w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all">
+      <div
+        className="fixed inset-0 flex items-center justify-center p-6 overflow-y-auto"
+        style={{ background: 'var(--cream)', color: 'var(--ink)', fontFamily: 'var(--sans)' }}
+      >
+        <div className="w-full max-w-md">
+          <div
+            className="relative rounded-3xl p-9 pt-7"
+            style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
+          >
+            <button
+              onClick={() => setView('landing')}
+              className="absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center transition-colors hover:opacity-80"
+              style={{ color: 'var(--ink-muted)' }}
+              aria-label="Close"
+            >
               <X size={16} />
             </button>
 
-            <Logo size="md" />
-            <h2 className="text-xl font-bold text-white mt-6 mb-1">Welcome back</h2>
-            <p className="text-sm text-gray-500 mb-6">Sign in to your minicaai account</p>
+            <Logo size="md" theme="light" />
+            <h2
+              className="mt-7 text-[28px]"
+              style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em' }}
+            >
+              Welcome back.
+            </h2>
+            <p className="mt-1.5 text-[14px] mb-7" style={{ color: 'var(--ink-muted)' }}>
+              Sign in to continue with your interview copilot.
+            </p>
 
             <form onSubmit={handleLogin} className="space-y-4">
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5">Email</label>
-                <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com"
-                  className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" required autoFocus />
+                <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>EMAIL</label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="you@example.com"
+                  className="w-full px-4 py-3 rounded-xl text-[14px] focus:outline-none transition-all"
+                  style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+                  required
+                  autoFocus
+                />
               </div>
               <div>
                 <div className="flex items-center justify-between mb-1.5">
-                  <label className="block text-xs font-medium text-gray-400">Password</label>
+                  <label className="block text-[11.5px] font-medium" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>PASSWORD</label>
                   <button
                     type="button"
                     onClick={() => { setAuthError(null); setForgotSent(false); setView('forgot_password'); }}
-                    className="text-xs font-medium text-blue-400 hover:text-blue-300 transition-colors"
+                    className="text-[12px] font-medium transition-colors hover:opacity-100"
+                    style={{ color: 'var(--accent)' }}
                   >
                     Forgot password?
                   </button>
                 </div>
                 <div className="relative">
-                  <input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Enter your password"
-                    className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all pr-10" required />
-                  <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 transition-colors">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Enter your password"
+                    className="w-full px-4 py-3 pr-10 rounded-xl text-[14px] focus:outline-none transition-all"
+                    style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 transition-colors hover:opacity-100"
+                    style={{ color: 'var(--ink-muted)' }}
+                  >
                     {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
                 </div>
               </div>
               {authError && (
-                <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
-                  <AlertTriangle size={12} /> {authError}
+                <div
+                  className="flex items-center gap-2 px-3 py-2.5 rounded-lg text-[12.5px]"
+                  style={{ background: 'color-mix(in oklab, var(--accent) 10%, transparent)', border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)', color: 'var(--accent)' }}
+                >
+                  <AlertTriangle size={13} /> {authError}
                 </div>
               )}
-              <button type="submit" disabled={isSubmitting}
-                className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex items-center justify-center gap-2 disabled:opacity-50">
-                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null} Sign In
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90 inline-flex items-center justify-center gap-2 disabled:opacity-60"
+                style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+              >
+                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
+                Sign in
+                {!isSubmitting && <PhArrowRight size={14} weight="bold" />}
               </button>
             </form>
 
             {/* Google Sign-In */}
             {GOOGLE_CLIENT_ID && (
               <>
-                <div className="mt-6 flex items-center gap-3">
-                  <div className="flex-1 h-px bg-white/[0.08]" />
-                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">or</span>
-                  <div className="flex-1 h-px bg-white/[0.08]" />
+                <div className="mt-7 flex items-center gap-3">
+                  <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
+                  <span className="text-[10px] uppercase tracking-[0.18em]" style={{ color: 'var(--ink-faint)' }}>or</span>
+                  <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
                 </div>
                 {isElectron ? (
                   <button
                     onClick={handleGoogleElectron}
                     disabled={isSubmitting}
-                    className="mt-4 w-full py-3 px-4 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.1] text-white text-sm font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-50"
+                    className="mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-60 hover:opacity-90"
+                    style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   >
                     {isSubmitting ? (
                       <Loader2 size={16} className="animate-spin" />
                     ) : (
-                      <svg width="18" height="18" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+                      <svg width="17" height="17" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
                     )}
                     {isSubmitting ? 'Waiting for sign-in...' : 'Continue with Google'}
                   </button>
                 ) : (
-                  <div className="mt-4 flex justify-center [&_iframe]:rounded-xl">
+                  <div className="mt-5 flex justify-center [&_iframe]:rounded-full">
                     <GoogleLogin
                       onSuccess={handleGoogleSuccess}
                       onError={handleGoogleError}
-                      theme="filled_black"
+                      theme="outline"
                       size="large"
                       width="350"
                       text="signin_with"
@@ -4354,13 +4733,15 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </>
             )}
 
-            <div className="mt-6 text-center">
-              <span className="text-xs text-gray-600">Don't have an account? </span>
-              <button onClick={() => setView('signup')} className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors">Create one</button>
+            <div className="mt-7 text-center text-[13px]" style={{ color: 'var(--ink-muted)' }}>
+              No account?{' '}
+              <button onClick={() => setView('signup')} className="font-medium" style={{ color: 'var(--ink)' }}>
+                Create one
+              </button>
             </div>
             {geo && (
-              <div className="mt-6 flex items-center justify-center gap-2 text-[10px] text-gray-600">
-                <Lock size={10} /> Secure connection from {geo.country_name}
+              <div className="mt-5 flex items-center justify-center gap-1.5 text-[11px]" style={{ color: 'var(--ink-faint)' }}>
+                <PhLock size={11} weight="duotone" /> Secure connection from {geo.country_name}
               </div>
             )}
           </div>
@@ -4370,67 +4751,84 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  FORGOT PASSWORD
+  //  FORGOT PASSWORD — cream theme, restrained
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'forgot_password') {
     return (
-      <div className="fixed inset-0 bg-[#050507] flex items-center justify-center p-6">
-        <AnimatedBackground />
-        <NoiseOverlay />
-        <div className="relative z-10 w-full max-w-md">
-          <div className="relative rounded-3xl border border-white/[0.08] bg-gradient-to-b from-white/[0.06] to-white/[0.02] backdrop-blur-xl shadow-2xl shadow-black/40 p-8 pt-6">
+      <div
+        className="fixed inset-0 flex items-center justify-center p-6 overflow-y-auto"
+        style={{ background: 'var(--cream)', color: 'var(--ink)', fontFamily: 'var(--sans)' }}
+      >
+        <div className="w-full max-w-md">
+          <div
+            className="relative rounded-3xl p-9 pt-7"
+            style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
+          >
             <button
               onClick={() => { setAuthError(null); setForgotSent(false); setView('login'); }}
-              className="absolute top-4 left-4 w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all"
-              aria-label="Back to login"
+              className="absolute top-4 left-4 w-8 h-8 rounded-full flex items-center justify-center transition-colors hover:opacity-80"
+              style={{ color: 'var(--ink-muted)' }}
+              aria-label="Back to sign in"
             >
               <ArrowLeft size={16} />
             </button>
             <button
               onClick={() => { setAuthError(null); setForgotSent(false); setView('landing'); }}
-              className="absolute top-4 right-4 w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all"
+              className="absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center transition-colors hover:opacity-80"
+              style={{ color: 'var(--ink-muted)' }}
               aria-label="Close"
             >
               <X size={16} />
             </button>
 
-            <div className="flex flex-col items-center mt-4 mb-6">
-              <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-500/20 to-purple-500/20 border border-white/[0.08] flex items-center justify-center mb-4">
-                {forgotSent ? <Check size={24} className="text-emerald-400" /> : <Mail size={22} className="text-blue-400" />}
-              </div>
-              <h2 className="text-xl font-bold text-white mb-1">
-                {forgotSent ? 'Check your email' : 'Forgot your password?'}
+            <div className="mt-7 mb-6">
+              <span
+                className="text-[12px] font-medium uppercase tracking-[0.18em]"
+                style={{ color: 'var(--ink-muted)' }}
+              >
+                Reset password
+              </span>
+              <h2
+                className="mt-3 text-[28px]"
+                style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em' }}
+              >
+                {forgotSent ? 'Check your email.' : 'Forgot your password?'}
               </h2>
-              <p className="text-sm text-gray-500 text-center max-w-xs">
+              <p className="mt-2 text-[14px]" style={{ color: 'var(--ink-muted)', lineHeight: 1.6 }}>
                 {forgotSent
-                  ? `If an account exists for ${email}, a reset link is on its way. The link expires in 1 hour.`
-                  : "Enter the email you signed up with and we'll send you a link to reset your password."}
+                  ? `If an account exists for ${email}, a reset link is on its way. The link expires in one hour.`
+                  : 'Enter the email you signed up with and we’ll send you a link to reset your password.'}
               </p>
             </div>
 
             {!forgotSent ? (
               <form onSubmit={handleForgotPassword} className="space-y-4">
                 <div>
-                  <label className="block text-xs font-medium text-gray-400 mb-1.5">Email</label>
+                  <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>EMAIL</label>
                   <input
                     type="email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     placeholder="you@example.com"
-                    className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all"
+                    className="w-full px-4 py-3 rounded-xl text-[14px] focus:outline-none transition-all"
+                    style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                     required
                     autoFocus
                   />
                 </div>
                 {authError && (
-                  <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
-                    <AlertTriangle size={12} /> {authError}
+                  <div
+                    className="flex items-center gap-2 px-3 py-2.5 rounded-lg text-[12.5px]"
+                    style={{ background: 'color-mix(in oklab, var(--accent) 10%, transparent)', border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)', color: 'var(--accent)' }}
+                  >
+                    <AlertTriangle size={13} /> {authError}
                   </div>
                 )}
                 <button
                   type="submit"
                   disabled={isSubmitting}
-                  className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex items-center justify-center gap-2 disabled:opacity-50"
+                  className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90 inline-flex items-center justify-center gap-2 disabled:opacity-60"
+                  style={{ background: 'var(--ink)', color: 'var(--cream)' }}
                 >
                   {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
                   Send reset link
@@ -4439,17 +4837,19 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             ) : (
               <button
                 onClick={() => { setForgotSent(false); setAuthError(null); setView('login'); }}
-                className="w-full py-3 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-white text-sm font-medium transition-all"
+                className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90"
+                style={{ background: 'var(--ink)', color: 'var(--cream)' }}
               >
                 Back to sign in
               </button>
             )}
 
-            <div className="mt-6 text-center">
-              <span className="text-xs text-gray-600">Remembered it? </span>
+            <div className="mt-7 text-center text-[13px]" style={{ color: 'var(--ink-muted)' }}>
+              Remembered it?{' '}
               <button
                 onClick={() => { setAuthError(null); setForgotSent(false); setView('login'); }}
-                className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors"
+                className="font-medium"
+                style={{ color: 'var(--ink)' }}
               >
                 Sign in
               </button>
@@ -4461,86 +4861,138 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  SIGNUP
+  //  SIGNUP — cream-on-ink, editorial typography
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'signup') {
     return (
-      <div className="fixed inset-0 bg-[#050507] flex items-center justify-center p-6">
-        <AnimatedBackground />
-        <NoiseOverlay />
-        <div className="relative z-10 w-full max-w-md">
-          <div className="relative rounded-3xl border border-white/[0.08] bg-gradient-to-b from-white/[0.06] to-white/[0.02] backdrop-blur-xl shadow-2xl shadow-black/40 p-8 pt-6">
-            {/* Close button */}
-            <button onClick={() => setView('landing')} className="absolute top-4 right-4 w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all">
+      <div
+        className="fixed inset-0 flex items-center justify-center p-6 overflow-y-auto"
+        style={{ background: 'var(--cream)', color: 'var(--ink)', fontFamily: 'var(--sans)' }}
+      >
+        <div className="w-full max-w-md">
+          <div
+            className="relative rounded-3xl p-9 pt-7"
+            style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
+          >
+            <button
+              onClick={() => setView('landing')}
+              className="absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center transition-colors hover:opacity-80"
+              style={{ color: 'var(--ink-muted)' }}
+              aria-label="Close"
+            >
               <X size={16} />
             </button>
 
-            <Logo size="md" />
-            <h2 className="text-xl font-bold text-white mt-6 mb-1">Create your account</h2>
-            <p className="text-sm text-gray-500 mb-6">Start with 5 free interview sessions</p>
+            <Logo size="md" theme="light" />
+            <h2
+              className="mt-7 text-[28px]"
+              style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em' }}
+            >
+              Create your account.
+            </h2>
+            <p className="mt-1.5 text-[14px] mb-7" style={{ color: 'var(--ink-muted)' }}>
+              Free 30-minute trial. No card. Upgrade only if it earned the offer.
+            </p>
 
             <form onSubmit={handleSignup} className="space-y-4">
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5">Name</label>
-                <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name"
-                  className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" autoFocus />
+                <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>NAME</label>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Your name"
+                  className="w-full px-4 py-3 rounded-xl text-[14px] focus:outline-none transition-all"
+                  style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+                  autoFocus
+                />
               </div>
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5">Email</label>
-                <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com"
-                  className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all" required />
+                <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>EMAIL</label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="you@example.com"
+                  className="w-full px-4 py-3 rounded-xl text-[14px] focus:outline-none transition-all"
+                  style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+                  required
+                />
               </div>
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5">Password</label>
+                <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>PASSWORD</label>
                 <div className="relative">
-                  <input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Create a password (min 8 chars)"
-                    className="w-full px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all pr-10" required minLength={8} />
-                  <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 transition-colors">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Create a password (min 8 chars)"
+                    className="w-full px-4 py-3 pr-10 rounded-xl text-[14px] focus:outline-none transition-all"
+                    style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+                    required
+                    minLength={8}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 transition-colors hover:opacity-100"
+                    style={{ color: 'var(--ink-muted)' }}
+                  >
                     {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
                 </div>
               </div>
               {authError && (
-                <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
-                  <AlertTriangle size={12} /> {authError}
+                <div
+                  className="flex items-center gap-2 px-3 py-2.5 rounded-lg text-[12.5px]"
+                  style={{ background: 'color-mix(in oklab, var(--accent) 10%, transparent)', border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)', color: 'var(--accent)' }}
+                >
+                  <AlertTriangle size={13} /> {authError}
                 </div>
               )}
-              <button type="submit" disabled={isSubmitting}
-                className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex items-center justify-center gap-2 disabled:opacity-50">
-                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null} Create Account
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90 inline-flex items-center justify-center gap-2 disabled:opacity-60"
+                style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+              >
+                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
+                Create account
+                {!isSubmitting && <PhArrowRight size={14} weight="bold" />}
               </button>
-              <p className="text-[10px] text-gray-600 text-center leading-relaxed">
-                By creating an account, you agree to our Terms of Service and Privacy Policy
+              <p className="text-[11px] text-center leading-relaxed" style={{ color: 'var(--ink-faint)' }}>
+                By creating an account, you agree to our Terms and Privacy Policy.
               </p>
             </form>
 
             {/* Google Sign-Up */}
             {GOOGLE_CLIENT_ID && (
               <>
-                <div className="mt-6 flex items-center gap-3">
-                  <div className="flex-1 h-px bg-white/[0.08]" />
-                  <span className="text-[10px] text-gray-600 uppercase tracking-wider">or</span>
-                  <div className="flex-1 h-px bg-white/[0.08]" />
+                <div className="mt-7 flex items-center gap-3">
+                  <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
+                  <span className="text-[10px] uppercase tracking-[0.18em]" style={{ color: 'var(--ink-faint)' }}>or</span>
+                  <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
                 </div>
                 {isElectron ? (
                   <button
                     onClick={handleGoogleElectron}
                     disabled={isSubmitting}
-                    className="mt-4 w-full py-3 px-4 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.1] text-white text-sm font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-50"
+                    className="mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-60 hover:opacity-90"
+                    style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   >
                     {isSubmitting ? (
                       <Loader2 size={16} className="animate-spin" />
                     ) : (
-                      <svg width="18" height="18" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+                      <svg width="17" height="17" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
                     )}
                     {isSubmitting ? 'Waiting for sign-up...' : 'Continue with Google'}
                   </button>
                 ) : (
-                  <div className="mt-4 flex justify-center [&_iframe]:rounded-xl">
+                  <div className="mt-5 flex justify-center [&_iframe]:rounded-full">
                     <GoogleLogin
                       onSuccess={handleGoogleSuccess}
                       onError={handleGoogleError}
-                      theme="filled_black"
+                      theme="outline"
                       size="large"
                       width="350"
                       text="signup_with"
@@ -4551,13 +5003,15 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </>
             )}
 
-            <div className="mt-6 text-center">
-              <span className="text-xs text-gray-600">Already have an account? </span>
-              <button onClick={() => setView('login')} className="text-xs text-blue-400 hover:text-blue-300 font-medium transition-colors">Sign in</button>
+            <div className="mt-7 text-center text-[13px]" style={{ color: 'var(--ink-muted)' }}>
+              Already have an account?{' '}
+              <button onClick={() => setView('login')} className="font-medium" style={{ color: 'var(--ink)' }}>
+                Sign in
+              </button>
             </div>
             {geo && (
-              <div className="mt-6 flex items-center justify-center gap-2 text-[10px] text-gray-600">
-                <Globe size={10} /> {geo.country_name} &middot; {pricing?.currencySymbol} {pricing?.currency}
+              <div className="mt-5 flex items-center justify-center gap-1.5 text-[11px]" style={{ color: 'var(--ink-faint)' }}>
+                <PhGlobe size={11} weight="duotone" /> {geo.country_name} &middot; {pricing?.currencySymbol} {pricing?.currency}
               </div>
             )}
           </div>

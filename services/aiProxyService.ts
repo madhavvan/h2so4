@@ -55,7 +55,7 @@ async function withRetry<T>(
   throw lastError || new Error('AI request failed after retries');
 }
 
-async function proxyRequest(endpoint: string, body: any): Promise<string> {
+export async function proxyRequest(endpoint: string, body: any): Promise<string> {
   const token = licenseService.getToken();
   if (!token) throw new Error('AI request failed');
 
@@ -90,7 +90,7 @@ async function proxyRequest(endpoint: string, body: any): Promise<string> {
 // ─────────────────────────────────────────────────────────────
 export type OnToken = (chunk: string, full: string) => void;
 
-async function proxyStream(
+export async function proxyStream(
   endpoint: string,
   body: any,
   onToken: OnToken,
@@ -175,7 +175,7 @@ function buildTextContext(contextFiles: ContextFile[]): string {
     .join('\n\n');
 }
 
-function buildSystemInstruction(textContext: string, generalMode: boolean): string {
+export function buildSystemInstruction(textContext: string, generalMode: boolean): string {
   const modeInstruction = generalMode
     ? `\nMODE — GENERAL KNOWLEDGE. Answer from general knowledge. If the question is about personal experience or "tell me about a time...", switch to the KNOWLEDGE BASE and speak from that lived background.\n`
     : `\nMODE — GROUNDED IN RESUME/JD. Anchor every answer in the KNOWLEDGE BASE. Reference projects, stacks, and numbers that appear there. If KB is empty, fall back to general knowledge silently — never mention the gap.\n`;
@@ -210,7 +210,7 @@ Output format: emit ONLY the answer text. No preamble. No "Here's my response:".
 // Few-shot voice examples do 80% of the tone work — rules alone
 // are insufficient; the model needs to see the target voice.
 // ─────────────────────────────────────────────────────────────
-function buildUserRulesBlock(): string {
+export function buildUserRulesBlock(): string {
   return `<<<RESPONSE RULES — FOLLOW EXACTLY>>>
 
 You are speaking as a real human candidate. The output is played out loud or typed live. If it sounds like an AI, the interview ends.
@@ -329,7 +329,7 @@ If any check fails, rewrite before emitting.
 //  The interview must never break because of a preflight glitch.
 // ─────────────────────────────────────────────────────────────
 
-const SUBSTANCE_PREPEND = `=== THE THREE MOVES (every answer, quietly) ===
+export const SUBSTANCE_PREPEND = `=== THE THREE MOVES (every answer, quietly) ===
 Every answer does three things at once, without calling attention to any of them:
 1. TASTE — a position rooted in experience, not a definition. "X, almost always — because in practice Y" beats "X is a technique for…"
 2. HOOK — ONE recalled specific from your life: a tool+version, a number, a team size, a failure, the week it went sideways. Hedge numbers ("ballpark 3M/day", "maybe closer to three months in"). The specific must sound recalled, not recited.
@@ -371,7 +371,7 @@ Exceptional: "Honestly, it's the streaming-to-anomaly-detection piece. Closest I
 
 `;
 
-function buildSystemInstructionNew(
+export function buildSystemInstructionNew(
   identity: string,
   jdPriorities: string,
   resume: string,
@@ -436,7 +436,7 @@ function buildUserRulesBlockNew(): string {
   );
 }
 
-function buildExtractionPrompt(resume: string, jd: string): string {
+export function buildExtractionPrompt(resume: string, jd: string): string {
   return `You are preparing an interview candidate for a specific role. Extract two compact briefing documents that will be injected into the candidate's live-interview prompt.
 
 RESUME:
@@ -469,16 +469,23 @@ Output only the two sections with exact headers. No preamble, no meta, no closin
 
 // ── Context hashing + resume/JD splitting for extraction cache ──
 
-interface ExtractedCards {
+export interface ExtractedCards {
   identity: string;
   jdPriorities: string;
   resume: string;
   jd: string;
 }
 
+// Bounded so a marathon session that swaps context files dozens of times
+// can't grow this map without limit. JavaScript Map iterates in insertion
+// order, so deleting the first key is FIFO eviction — close enough to LRU
+// for a cache where every entry is roughly the same cost. 32 is more than
+// enough for any realistic interview flow (typically 1-2 unique resume/JD
+// hashes per session).
+const IDENTITY_CACHE_MAX = 32;
 const identityCache = new Map<string, Promise<ExtractedCards | null>>();
 
-function hashContextFiles(contextFiles: ContextFile[]): string {
+export function hashContextFiles(contextFiles: ContextFile[]): string {
   const content = contextFiles
     .filter(f => !f.base64)
     .map(f => `${f.name}:${f.content}`)
@@ -493,7 +500,7 @@ function hashContextFiles(contextFiles: ContextFile[]): string {
   return h.toString(36);
 }
 
-function splitResumeAndJd(contextFiles: ContextFile[]): { resume: string; jd: string } {
+export function splitResumeAndJd(contextFiles: ContextFile[]): { resume: string; jd: string } {
   let resume = '';
   let jd = '';
   for (const f of contextFiles) {
@@ -549,6 +556,13 @@ async function getExtractedCards(contextFiles: ContextFile[]): Promise<Extracted
   })();
 
   identityCache.set(hash, promise);
+  // Bound the cache. Map iterates insertion-order, so the first key is
+  // the oldest. Deleting it is FIFO eviction — fine because all entries
+  // are similar cost and we only expect 1–2 in flight per session.
+  if (identityCache.size > IDENTITY_CACHE_MAX) {
+    const oldest = identityCache.keys().next().value;
+    if (oldest !== undefined && oldest !== hash) identityCache.delete(oldest);
+  }
   // Drop rejected/null promises so the next call retries instead of
   // serving stale null indefinitely.
   promise.then(cards => {
@@ -630,7 +644,7 @@ async function prepareStreamPrompts(
 // duplicate that could drift from what the system prompt expects.
 export const AUTO_SOLVE_PROMPT = 'Solve the coding problem visible in the attached screenshot.';
 
-function buildAutoSolveSystemInstruction(): string {
+export function buildAutoSolveSystemInstruction(): string {
   return `You are solving a coding problem from a screenshot of a coding-interview platform (HackerRank, CoderPad, LeetCode, CodeSignal, Codility, or similar). Your output is typed character-by-character into the candidate's editor — anything you write becomes typed code.
 
 OUTPUT FORMAT — STRICT:
@@ -890,82 +904,105 @@ export async function streamGroq(
   return full.trim() === '...' ? 'Listening...' : full;
 }
 
+// Claude (Anthropic Sonnet 4.6) lives in its own file —
+// services/claudeService.ts — so the persona pipeline can layer
+// WEB SEARCH instructions on top of the shared prompt builders
+// without touching the other models, and so identity extraction
+// can run through Claude itself instead of /chat/openai.
+
 // ─────────────────────────────────────────────────────────────
-//  CLAUDE (Anthropic) — Sonnet 4.6 with hosted web_search
+//  CONVERSATION AUTO-TITLE
 //
-//  Different from the OpenAI-shaped clients above because Anthropic uses:
-//    • a separate `system` field instead of a system-role message
-//    • `{ type: 'image', source: { type: 'base64', media_type, data } }`
-//      for image content blocks (not OpenAI's image_url shape)
-//    • a server-managed `web_search_20250305` tool that the MODEL decides
-//      to invoke. The tool runs on Anthropic's infra; from our side it's
-//      a single API call that may take a bit longer when search triggers.
-//      Web search is OFF for auto-solve (the screenshot is the question;
-//      a search call would be both wrong and slow).
+//  Called once per session, after the first model response, to
+//  replace the placeholder "Interview <date>" / first-user-message
+//  title with a 2-5 word topic summary — same UX as ChatGPT's
+//  "auto-rename based on conversation" behavior. Fire-and-forget;
+//  if the LLM call fails the existing placeholder name stays.
+//
+//  Cheap by design: short prompt, low max_tokens, OpenAI mini-class.
+//  Routed through /chat/openai so it inherits the server's API key
+//  + auth + idempotency without a dedicated route.
 // ─────────────────────────────────────────────────────────────
+export async function generateConversationTitle(
+  messages: Pick<Message, 'role' | 'content'>[],
+): Promise<string | null> {
+  try {
+    const transcript = messages
+      .filter(m => m.role === 'user' || m.role === 'model')
+      .slice(0, 6)  // first 6 turns is plenty to identify the topic
+      .map(m => `${m.role === 'user' ? 'Interviewer' : 'Candidate'}: ${m.content}`)
+      .join('\n')
+      .slice(0, 4000);
+    if (!transcript.trim()) return null;
+    const prompt = `Summarize the topic of this interview conversation in 2-5 words. Output only the title — no quotes, no period, no preamble. Title-case.
 
-function buildClaudeMessages(
-  history: Message[],
-  userText: string,
-  imageFiles: ContextFile[],
-  isAutoSolve: boolean,
-): any[] {
-  const messages: any[] = [];
-  if (!isAutoSolve) {
-    history.forEach(m => {
-      if (m.role !== 'system') {
-        messages.push({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content });
-      }
+${transcript}`;
+    const text = await proxyRequest('/chat/openai', {
+      messages: [{ role: 'user', content: prompt }],
     });
+    // Strip quotes, trailing punctuation, surrounding whitespace, "Title:"
+    // prefixes some models emit despite the instruction.
+    const cleaned = text
+      .replace(/^["'""']+|["'""']+$/g, '')
+      .replace(/^(title|topic):\s*/i, '')
+      .replace(/[.!?]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 60);
+    if (cleaned.length < 3) return null;
+    return cleaned;
+  } catch {
+    // Fire-and-forget — never break the interview because a side
+    // titling call failed.
+    return null;
   }
-  const contentBlocks: any[] = [{ type: 'text', text: userText }];
-  imageFiles.forEach(f => contentBlocks.push({
-    type: 'image',
-    source: { type: 'base64', media_type: f.mimeType, data: f.base64 },
-  }));
-  messages.push({ role: 'user', content: contentBlocks });
-  return messages;
 }
 
-export async function generateClaude(
-  query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
-): Promise<string> {
-  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
-
-  const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
-  const userText = `${userRulesBlock}Interviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
-
-  const messages = buildClaudeMessages(history, userText, imageFiles, false);
-
-  const text = await proxyRequest('/chat/claude', { messages, systemInstruction, enableWebSearch: true });
-  return (text.trim() === '...' || text.trim().toLowerCase() === 'listening...') ? 'Listening...' : text;
+// AI-planned Auto-Type. Renderer reads the focused editor's text + cursor
+// via UIA, sends both + the code to type to /autotype-plan, gets back a
+// JSON plan from Claude Haiku 4.5. Returns null on any failure — caller
+// must fall back to the deterministic UIA / OCR planning path. Best-effort
+// — never throw, never block the Auto-Type cycle.
+export interface AutoTypeAIPlan {
+  ok: true;
+  wipe_first_line: boolean;
+  skip_leading: number;
+  skip_trailing: number;
+  confidence: number;
+  reasoning: string;
 }
 
-export async function streamClaude(
-  query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean,
-  onToken: OnToken, signal?: AbortSignal, isAutoSolve?: boolean
-): Promise<string> {
-  let systemInstruction: string;
-  let userText: string;
-  if (isAutoSolve) {
-    systemInstruction = buildAutoSolveSystemInstruction();
-    userText = query;
-  } else {
-    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
-    systemInstruction = si;
-    userText = `${userRulesBlock}Interviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
+export async function getAutoTypePlan(args: {
+  editorText: string;
+  cursorOffset: number;
+  code: string;
+  language: string;
+  signal?: AbortSignal;
+}): Promise<AutoTypeAIPlan | null> {
+  try {
+    const token = licenseService.getToken();
+    if (!token) return null;
+    const res = await fetch(`${API_BASE}/api/v1/ai/autotype-plan`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        editorText: args.editorText,
+        cursorOffset: args.cursorOffset,
+        code: args.code,
+        language: args.language,
+      }),
+      signal: args.signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || data.ok !== true) return null;
+    return data as AutoTypeAIPlan;
+  } catch {
+    return null;
   }
-
-  const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
-  const messages = buildClaudeMessages(history, userText, imageFiles, !!isAutoSolve);
-
-  // Auto-solve: web search would steal latency on a question whose answer
-  // is purely the screenshot in front of the model. Disable it explicitly.
-  const enableWebSearch = !isAutoSolve;
-
-  const full = await proxyStream('/stream/claude', { messages, systemInstruction, enableWebSearch }, onToken, signal);
-  if (isAutoSolve) return full;
-  return (full.trim() === '...' || full.trim().toLowerCase() === 'listening...') ? 'Listening...' : full;
 }
 
 export async function getDeepgramKey(): Promise<string> {
