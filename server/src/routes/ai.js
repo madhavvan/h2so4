@@ -58,7 +58,9 @@ router.post('/chat/openai', async (req, res) => {
       model: 'gpt-5.5',
       messages,
       max_completion_tokens: 16000,
-      temperature: 0.7,
+      // GPT-5.5 only accepts the default temperature (1). Setting any other
+      // value returns 400 "Unsupported value: 'temperature' does not support
+      // X with this model." Per OpenAI's GPT-5.x family contract.
     });
 
     res.json({ text: completion.choices[0]?.message?.content || '' });
@@ -281,7 +283,7 @@ router.post('/stream/openai', async (req, res) => {
         model: 'gpt-5.5',
         messages,
         max_completion_tokens: 16000,
-        temperature: 0.7,
+        // GPT-5.5 only accepts default temperature (1). See chat handler above.
         stream: true,
       },
       { signal: sse.signal }
