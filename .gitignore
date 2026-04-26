@@ -32,6 +32,10 @@ release/
 dist-electron/
 build/*
 !build/entitlements.mac.plist
+!build/icon.svg
+!build/icon.ico
+!build/icon.icns
+!build/icon.png
 *.exe
 *.dmg
 *.AppImage

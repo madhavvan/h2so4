@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Interview Copilot AI — master app icon.
+  1024x1024 vector source. Drives every raster output via scripts/build-icons.mjs.
+  Concept: dark glass squircle + luminous "m" letterform whose form anchors brand
+  recognition while the gradient + glow signal "AI assistant." Single focal element
+  so the silhouette holds at 16px (Windows taskbar) and the materials sing at 1024px
+  (macOS dock at Retina). Brand gradient mirrors the email templates so the icon
+  harmonizes with every other touchpoint.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- iOS-style squircle. Corner radius ~22% of side mirrors what
+         macOS expects so the icon reads as a first-party shape on the
+         dock instead of an obvious rounded rect. -->
+    <clipPath id="squircle">
+      <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228"/>
+    </clipPath>
+
+    <!-- Background: deep indigo→near-black radial, light source upper-left.
+         Gives the squircle a subtle "lit from above" depth instead of a
+         flat fill — the move that separates premium icons from defaults. -->
+    <radialGradient id="bgGrad" cx="32%" cy="18%" r="105%">
+      <stop offset="0%"   stop-color="#221c5c"/>
+      <stop offset="35%"  stop-color="#10102a"/>
+      <stop offset="100%" stop-color="#020208"/>
+    </radialGradient>
+
+    <!-- Top edge specular shine. ~22% alpha at the very top, fading to
+         zero by mid-height. Reads as glass under a soft overhead light. -->
+    <linearGradient id="topShine" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%"  stop-color="#ffffff" stop-opacity="0.24"/>
+      <stop offset="45%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Bottom ambient occlusion. Anchors the icon visually so it doesn't
+         feel like it's floating against pure black. -->
+    <linearGradient id="bottomShade" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="55%"  stop-color="#000000" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.45"/>
+    </linearGradient>
+
+    <!-- m letterform fill: brand sky→blue→violet→fuchsia diagonal. Direct
+         echo of the welcome/reset email gradient (#3b82f6 → #8b5cf6) with
+         brighter caps at the ends so the form catches light at the edges.
+         gradientUnits="userSpaceOnUse" with absolute endpoints anchored to
+         the m's bounding box — without this, each sub-shape (3 stems + 2
+         arches) would re-map the gradient locally, producing a visible
+         seam at every join. With it, the gradient spans the m as one
+         continuous surface. Endpoints extend ~40px past the m on each
+         diagonal so the outermost caps land on vivid color rather than
+         the washed-out gradient extremes. -->
+    <linearGradient id="mGrad" x1="300" y1="240" x2="720" y2="780"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#bfe7ff"/>
+      <stop offset="28%"  stop-color="#3b82f6"/>
+      <stop offset="72%"  stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#e879f9"/>
+    </linearGradient>
+
+    <!-- Top specular highlight on the m — a thin bright glaze across the
+         arch tops that simulates light catching the rounded crowns. Applied
+         as a separate gradient masked to the same m shape; sits ON TOP of
+         the main gradient at low opacity so it reads as a sheen, not a
+         second color. y1 sits just above the arch peaks; y2 fades out by
+         mid-stem so the bottom of the glyph keeps its full gradient. -->
+    <linearGradient id="mSheen" x1="0" y1="260" x2="0" y2="520"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="60%"  stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Soft halo around the m. Filtered Gaussian on a duplicate of the
+         shape, blue-only, low opacity. Adds the "luminous from within"
+         effect without washing out the gradient on the solid letterform. -->
+    <filter id="mGlow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="34"/>
+    </filter>
+
+    <!-- 1px inner edge highlight on the squircle. Gives the rim definition
+         against the dark canvas / dark dock — without it the icon visually
+         dissolves on macOS dark mode. -->
+    <linearGradient id="rimHighlight" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.30"/>
+      <stop offset="50%"  stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.14"/>
+    </linearGradient>
+
+    <!-- Reusable "m" geometry: 3 capsule stems + 2 short arched bridges
+         tucked between their tops. Stems are 92×400 (rx=46) for thicker,
+         friendlier strokes that still read at 16px. Arches use outer
+         radius 112 + inner radius 20, which keeps the 92px stroke weight
+         identical to the stems (112−20 = 92) while shrinking the overall
+         arch height from the original 136 → 112 — the "small cute wings"
+         silhouette instead of the tall formal ones. The whole glyph is
+         centered on x=512 and balanced so the squircle negative space
+         feels even on every side. -->
+    <g id="mShape">
+      <rect x="334" y="350" width="92" height="400" rx="46"/>
+      <rect x="466" y="350" width="92" height="400" rx="46"/>
+      <rect x="598" y="350" width="92" height="400" rx="46"/>
+      <path d="M 334 390 A 112 112 0 0 1 558 390 L 466 390 A 20 20 0 0 0 426 390 Z"/>
+      <path d="M 466 390 A 112 112 0 0 1 690 390 L 598 390 A 20 20 0 0 0 558 390 Z"/>
+    </g>
+  </defs>
+
+  <!-- Background stack: base radial → top shine → bottom shade. All clipped
+       to the squircle so the rim is sharp. -->
+  <g clip-path="url(#squircle)">
+    <rect width="1024" height="1024" fill="url(#bgGrad)"/>
+    <rect width="1024" height="700"  fill="url(#topShine)"/>
+    <rect width="1024" height="1024" fill="url(#bottomShade)"/>
+  </g>
+
+  <!-- Glow halo behind the m, then the solid m on top, then the sheen overlay.
+       Order matters: glow → base gradient → sheen. The sheen is the same shape
+       re-stamped with the mSheen gradient on top, so it reads as light catching
+       the arch crowns rather than a separate UI element. -->
+  <g clip-path="url(#squircle)">
+    <g opacity="0.55" filter="url(#mGlow)" fill="#60a5fa">
+      <use href="#mShape"/>
+    </g>
+    <use href="#mShape" fill="url(#mGrad)"/>
+    <use href="#mShape" fill="url(#mSheen)"/>
+  </g>
+
+  <!-- Rim highlight overlay. Drawn LAST so it sits on top of everything. -->
+  <rect x="1.5" y="1.5" width="1021" height="1021" rx="226.5" ry="226.5"
+        fill="none" stroke="url(#rimHighlight)" stroke-width="3"/>
+</svg>
