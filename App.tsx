@@ -1,24 +1,29 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, LogOut, Crown } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, LogOut, Crown, Sparkles } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { generateGemini, generateOpenAI, generateXAI, generateGroq, generateClaude, streamGemini, streamOpenAI, streamXAI, streamGroq, streamClaude, AUTO_SOLVE_PROMPT, prewarmIdentity } from './services/aiProxyService';
+import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT, prewarmIdentity, generateConversationTitle } from './services/aiProxyService';
+import { generateClaude, streamClaude, prewarmClaudeIdentity, trainClaudeModel, trainClaudeModelBeast, hasCachedTechState, type TrainingProgress } from './services/claudeService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { extractTextFromPdf } from './services/pdfService';
 import { extractTextFromDocx } from './services/docxService';
 import { useDatabase, SessionSummary } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
 import { SubscriptionGate } from './SubscriptionGate';
+import { Tutorial, shouldShowTutorial, markTutorialCompleted, clearTutorialCompletion } from './Tutorial';
 import { licenseService, UserProfile, LicenseData, TIME_CONSTANTS } from './services/licenseService';
 import { creditTimerService } from './services/creditTimerService';
 import { pricingService } from './services/pricingService';
 import './pip-styles.css';
 
 // --- Electron Helpers ---
-const isElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+// Electron detection now reads window.electronAPI (set by preload.cjs)
+// instead of the old `process.versions.electron`, which isn't exposed
+// when contextIsolation:true + nodeIntegration:false.
+const isElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
 const isPopoutMode = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('mode') === 'popout';
 
 // Add popout-mode class to HTML for CSS targeting (cursor override for screen share)
@@ -26,41 +31,24 @@ if (isPopoutMode && typeof document !== 'undefined') {
   document.documentElement.classList.add('popout-mode');
 }
 
+// Thin wrapper over the contextBridge surface in electron/preload.cjs.
+// The bridge already enforces channel allowlists + returns disposers from
+// on(), so this layer mostly just guards the non-Electron (browser) case.
 const electronIPC = {
   send: (channel: string, data?: any) => {
-    if (isElectron) {
-      try {
-        const ipc = (window as any).require?.('electron')?.ipcRenderer;
-        ipc?.send(channel, data);
-      } catch (e) { console.warn('IPC send failed:', e); }
-    }
+    if (!isElectron) return;
+    try { window.electronAPI?.send(channel, data); }
+    catch (e) { console.warn('IPC send failed:', e); }
   },
-  // ipcRenderer.on receives (event, ...args), so we wrap the caller's
-  // (data) => void. removeListener uses reference equality, so the caller
-  // can't remove the wrapper using its own callback — we return a disposer
-  // that closes over the exact wrapper instance we registered.
   on: (channel: string, callback: (data: any) => void): (() => void) => {
     if (!isElectron) return () => {};
-    try {
-      const ipc = (window as any).require?.('electron')?.ipcRenderer;
-      if (!ipc) return () => {};
-      const wrapped = (_event: any, data: any) => callback(data);
-      ipc.on(channel, wrapped);
-      return () => {
-        try { ipc.removeListener(channel, wrapped); }
-        catch (e) { console.warn('IPC off failed:', e); }
-      };
-    } catch (e) {
-      console.warn('IPC on failed:', e);
-      return () => {};
-    }
+    try { return window.electronAPI?.on(channel, callback) || (() => {}); }
+    catch (e) { console.warn('IPC on failed:', e); return () => {}; }
   },
   invoke: async (channel: string, ...args: any[]): Promise<any> => {
     if (!isElectron) return null;
-    try {
-      const ipc = (window as any).require?.('electron')?.ipcRenderer;
-      return await ipc?.invoke(channel, ...args);
-    } catch (e) { console.warn('IPC invoke failed:', e); return null; }
+    try { return await window.electronAPI?.invoke(channel, ...args); }
+    catch (e) { console.warn('IPC invoke failed:', e); return null; }
   }
 };
 
@@ -78,8 +66,7 @@ async function captureScreenBase64ForOCR(): Promise<string | null> {
   if (!isElectron) return null;
   let tempStream: MediaStream | null = null;
   try {
-    const { ipcRenderer } = (window as any).require('electron');
-    const sources = await ipcRenderer.invoke('get-desktop-sources');
+    const sources = await electronIPC.invoke('get-desktop-sources');
     if (!sources || sources.length === 0) return null;
     const screenSource = sources.find((s: any) =>
       s.name === 'Entire Screen' || s.name === 'Screen 1' || s.name.toLowerCase().includes('screen')
@@ -403,15 +390,17 @@ const CodeBlock: React.FC<{
 
             // Smart skip planning. Two paths:
             //
-            //   (A) Windows w/ UIA — accessibility bridge in main owns planning
-            //       (deterministic prefix match against the focused control's
-            //       actual text). No OCR, no Tesseract WASM load, no "preparing"
-            //       stall. Main runs the plan inside auto-type:send AFTER the
-            //       countdown dwell, when the user has actually focused the
-            //       target editor — so the read is of the right control.
+            //   (A) Windows w/ UIA — main does ALL planning AFTER the countdown,
+            //       once the user has alt-tabbed to the target editor. Main
+            //       reads the focused editor via UIA, runs the deterministic
+            //       prefix-matcher, and if confidence is low it calls the
+            //       Claude Haiku 4.5 planner over Railway using the auth token
+            //       we pass through. Putting the snapshot AFTER countdown is
+            //       critical — pre-countdown the focus is still on our app
+            //       (we'd snapshot the wrong control).
             //
-            //   (B) Everything else — fall back to screen OCR (Tesseract) as the
-            //       preparing step before countdown. Slower but portable.
+            //   (B) Everything else — fall back to screen OCR (Tesseract) as
+            //       the preparing step before countdown. Slower but portable.
             //
             // Degrades to 0 (type everything) on any failure.
             prepCancelledRef.current = false;
@@ -437,7 +426,17 @@ const CodeBlock: React.FC<{
 
             setAtPhase('countdown');
             setAtCountdown(3);
-            const result = await electronIPC.invoke('auto-type:send', { code, skipLines });
+            // Auth token piggybacks on the payload so main can call the Railway
+            // /autotype-plan endpoint directly post-countdown without needing
+            // its own credential. Empty string if not signed in (Haiku planner
+            // won't fire; deterministic UIA still runs).
+            const authToken = licenseService.getToken() || '';
+            const result = await electronIPC.invoke('auto-type:send', {
+                code,
+                skipLines,
+                authToken,
+                language: language || 'unknown',
+            });
             if (result && result.error) {
                 surfaceAtError(`Auto-Type failed: ${result.error}`);
                 setAtPhase('idle');
@@ -610,27 +609,83 @@ const MessageRenderer = React.memo(({ content, fontSize, canAutoType, isStreamin
 
 // --- Components ---
 
-const Modal = ({ isOpen, onClose, title, children }: any) => {
+const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: any) => {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const lastFocusRef = useRef<HTMLElement | null>(null);
+
+  // Escape closes; Tab cycles focus inside the dialog (focus trap). Without
+  // these, keyboard users had no way out of the modal and could tab into the
+  // dimmed background.
+  useEffect(() => {
+    if (!isOpen) return;
+    lastFocusRef.current = document.activeElement as HTMLElement | null;
+    const dlg = dialogRef.current;
+    // Focus the first focusable element inside the dialog so screen-readers
+    // and keyboard users land in the right place.
+    const focusables = dlg?.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    focusables?.[0]?.focus();
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose?.();
+        return;
+      }
+      if (e.key === 'Tab' && dlg) {
+        const items = dlg.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        );
+        if (items.length === 0) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    document.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('keydown', onKey, true);
+      // Restore focus to whatever opened the modal so the user lands back
+      // where they were before.
+      try { lastFocusRef.current?.focus(); } catch {}
+    };
+  }, [isOpen, onClose]);
+
   if (!isOpen) return null;
-  const inElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+  const inElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
   return (
-    <div 
+    <div
       className="fixed inset-0 flex items-center justify-center p-4"
       style={{
         background: inElectron ? 'rgba(0,0,0,0.92)' : 'rgba(0,0,0,0.5)',
         zIndex: 99999,
         WebkitAppRegion: 'no-drag',
       } as any}
-      onClick={onClose}
+      onClick={dismissOnBackdrop ? onClose : undefined}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
     >
-      <div 
+      <div
+        ref={dialogRef}
         className="border border-border rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col shadow-2xl overflow-hidden text-text"
         style={{ background: inElectron ? '#1a1a2e' : 'var(--surface-color)' }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-4 border-b border-border flex justify-between items-center bg-gray-500/5">
           <h2 className="text-lg font-bold flex items-center gap-2">{title}</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-primary transition-colors p-1 rounded-full hover:bg-gray-500/10">
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-primary transition-colors p-1 rounded-full hover:bg-gray-500/10 focus-visible:ring-2 focus-visible:ring-primary outline-none"
+            aria-label="Close"
+          >
              <X size={20} />
           </button>
         </div>
@@ -683,8 +738,7 @@ const ChatInterface = ({
     markPendingPopoutModel,
 }: any) => {
 
-    const handleModelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-        const newModel = e.target.value as 'gemini' | 'groq' | 'openai' | 'xai' | 'claude';
+    const setSelectedModel = (newModel: 'gemini' | 'groq' | 'openai' | 'xai' | 'claude') => {
         // ── Feature Gate: Block model switch for free users ──
         if (!gate.canUseModel(newModel)) return;
         // Immediate optimistic update in whichever window this runs in
@@ -708,6 +762,10 @@ const ChatInterface = ({
         }
     };
 
+    const handleModelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+        setSelectedModel(e.target.value as 'gemini' | 'groq' | 'openai' | 'xai' | 'claude');
+    };
+
     // Pop-out size presets: S → M → L cycle
     const sizePresets = [
         { label: 'S', w: 340, h: 480 },
@@ -716,9 +774,61 @@ const ChatInterface = ({
     ];
     const [sizeIndex, setSizeIndex] = useState(1); // Start at M
 
+    // Pop-out model selector — custom DOM popover replaces the native <select>.
+    // Native <select> opens a separate Win32 HWND that can't survive
+    // enforceAlwaysOnTop's 2s reassertion (electron/main.cjs:239) — the popup
+    // ends up z-buried under the popout window. A portal'd DOM popover lives
+    // inside the BrowserWindow's compositor surface, so it inherits
+    // setContentProtection (invisible to screen share) and can't be z-buried.
+    const MODEL_OPTIONS = [
+        { value: 'gemini' as const, label: 'Gemini' },
+        { value: 'groq' as const, label: 'Groq' },
+        { value: 'openai' as const, label: 'GPT' },
+        { value: 'xai' as const, label: 'Grok' },
+        { value: 'claude' as const, label: 'Claude' },
+    ];
+    const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
+    const [modelMenuPos, setModelMenuPos] = useState<{ top: number; right: number } | null>(null);
+    const modelButtonRef = useRef<HTMLButtonElement>(null);
+    const modelMenuRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        if (!isModelMenuOpen) return;
+        const closeOnOutside = (e: MouseEvent) => {
+            const t = e.target as Node;
+            if (modelMenuRef.current?.contains(t)) return;
+            if (modelButtonRef.current?.contains(t)) return;
+            setIsModelMenuOpen(false);
+        };
+        const closeOnEsc = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setIsModelMenuOpen(false);
+        };
+        const closeOnResize = () => setIsModelMenuOpen(false);
+        document.addEventListener('mousedown', closeOnOutside);
+        document.addEventListener('keydown', closeOnEsc);
+        window.addEventListener('resize', closeOnResize);
+        return () => {
+            document.removeEventListener('mousedown', closeOnOutside);
+            document.removeEventListener('keydown', closeOnEsc);
+            window.removeEventListener('resize', closeOnResize);
+        };
+    }, [isModelMenuOpen]);
+
+    const toggleModelMenu = () => {
+        if (isModelMenuOpen) { setIsModelMenuOpen(false); return; }
+        const btn = modelButtonRef.current;
+        if (!btn) return;
+        const rect = btn.getBoundingClientRect();
+        setModelMenuPos({
+            top: rect.bottom + 4,
+            right: window.innerWidth - rect.right,
+        });
+        setIsModelMenuOpen(true);
+    };
+
     if (isPipMode) {
         // Detect Electron for window controls
-        const inElectron = typeof window !== 'undefined' && !!(window as any).process?.versions?.electron;
+        const inElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
 
         const cycleSize = () => {
             const next = (sizeIndex + 1) % sizePresets.length;
@@ -743,8 +853,7 @@ const ChatInterface = ({
                     id="dragHandle"
                     style={inElectron ? { WebkitAppRegion: 'drag', padding: '10px 12px' } as any : undefined}
                 >
-                    {/* Left: Avatar + Name */}
-                    <div className="avatar">✦</div>
+                    {/* Left: Name (avatar removed — name is the only identity element) */}
                     <div className="header-info" style={{ minWidth: 0 }}>
                         <h4>minicaai</h4>
                         <span><span className="dot"></span> Online</span>
@@ -786,22 +895,71 @@ const ChatInterface = ({
                             {creditTimer.source === 'trial' ? 'TRIAL' : ''} {formatTimeRemaining(creditTimer.remaining)}
                           </div>
                         )}
-                        {/* Model selector — compact, with custom chevron so it matches the
-                            main window instead of the platform's default OS arrow. */}
+                        {/* Model selector — custom popover (not native <select>) so the
+                            options list lives inside the popout's compositor surface.
+                            See comment block above on `MODEL_OPTIONS` for the rationale. */}
                         <div className="relative flex items-center">
-                          <select
-                              value={settings.selectedModel}
-                              onChange={handleModelChange}
+                          <button
+                              ref={modelButtonRef}
+                              type="button"
+                              onClick={toggleModelMenu}
                               className="appearance-none text-[10px] rounded pl-1.5 pr-5 py-0.5 outline-none cursor-pointer"
                               style={glassBtn}
+                              aria-haspopup="listbox"
+                              aria-expanded={isModelMenuOpen}
                           >
-                              <option value="gemini" className="text-black">Gemini</option>
-                              <option value="groq" disabled={!gate.canUseModel('groq')} className="text-black">Groq{!gate.canUseModel('groq') ? ' — PRO' : ''}</option>
-                              <option value="openai" disabled={!gate.canUseModel('openai')} className="text-black">GPT{!gate.canUseModel('openai') ? ' — PRO' : ''}</option>
-                              <option value="xai" disabled={!gate.canUseModel('xai')} className="text-black">Grok{!gate.canUseModel('xai') ? ' — PRO' : ''}</option>
-                              <option value="claude" disabled={!gate.canUseModel('claude')} className="text-black">Claude{!gate.canUseModel('claude') ? ' — PRO' : ''}</option>
-                          </select>
+                              {(MODEL_OPTIONS.find(o => o.value === settings.selectedModel)?.label) ?? 'Gemini'}
+                          </button>
                           <ChevronDown size={10} className="absolute right-1 top-1/2 -translate-y-1/2 pointer-events-none opacity-70" />
+                          {isModelMenuOpen && modelMenuPos && createPortal(
+                            <div
+                              ref={modelMenuRef}
+                              role="listbox"
+                              className="fixed z-[9999] py-1 rounded-md border text-[10px] min-w-[110px]"
+                              style={{
+                                  top: modelMenuPos.top,
+                                  right: modelMenuPos.right,
+                                  background: 'rgba(10, 10, 30, 0.92)',
+                                  borderColor: 'var(--glass-border)',
+                                  boxShadow: '0 6px 24px rgba(0, 0, 0, 0.55)',
+                                  WebkitAppRegion: 'no-drag',
+                              } as any}
+                            >
+                              {MODEL_OPTIONS.map(opt => {
+                                  const allowed = gate.canUseModel(opt.value);
+                                  const selected = opt.value === settings.selectedModel;
+                                  return (
+                                      <div
+                                          key={opt.value}
+                                          role="option"
+                                          aria-selected={selected}
+                                          aria-disabled={!allowed}
+                                          onClick={() => {
+                                              if (!allowed) return;
+                                              setSelectedModel(opt.value);
+                                              setIsModelMenuOpen(false);
+                                          }}
+                                          className={`px-2 py-1 flex items-center justify-between gap-2 ${
+                                              allowed
+                                                  ? 'hover:bg-white/10 cursor-pointer text-white'
+                                                  : 'text-white/40 cursor-not-allowed'
+                                          }`}
+                                      >
+                                          <span className="flex items-center gap-1">
+                                              <Check size={9} className={selected ? 'opacity-90' : 'opacity-0'} />
+                                              <span>{opt.label}</span>
+                                          </span>
+                                          {!allowed && (
+                                              <span className={`text-[8px] font-bold tracking-wider ${opt.value === 'claude' ? 'text-orange-400/90' : 'text-amber-400/80'}`}>
+                                                  {opt.value === 'claude' ? 'MAX' : 'PRO'}
+                                              </span>
+                                          )}
+                                      </div>
+                                  );
+                              })}
+                            </div>,
+                            document.body
+                          )}
                         </div>
 
                         {/* Settings */}
@@ -921,10 +1079,13 @@ const ChatInterface = ({
                             fontSize: 11,
                             fontWeight: 600,
                             color: 'var(--text-main)',
-                            background: 'var(--glass-bg, rgba(20,20,28,0.78))',
+                            // Bumped opacity from glass-bg's 0.78 to 0.92 because
+                            // backdrop-filter is forbidden in the transparent popout
+                            // (pip-styles.css line 312 — would crash the window),
+                            // so the pill needs higher opacity to read against any
+                            // desktop background behind it.
+                            background: 'rgba(20,20,28,0.92)',
                             border: '1px solid var(--glass-border, rgba(255,255,255,0.14))',
-                            backdropFilter: 'blur(8px)',
-                            WebkitBackdropFilter: 'blur(8px)',
                             boxShadow: '0 4px 14px rgba(0,0,0,0.28)',
                             cursor: 'pointer',
                             zIndex: 5,
@@ -1034,9 +1195,6 @@ const ChatInterface = ({
              {/* --- RESPONSIVE HEADER --- */}
             <header className={`h-14 md:h-16 border-b border-white/15 bg-transparent flex items-center justify-between px-4 shrink-0 z-20 sticky top-0`}>
                 <div className="flex items-center gap-2 md:gap-3">
-                <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
-                    <Cpu size={18} className="text-white" />
-                </div>
                 <h1 className="font-bold text-base md:text-lg tracking-tight hidden xs:block">minica<span className="text-blue-500">ai</span></h1>
                 </div>
 
@@ -1247,9 +1405,9 @@ const ChatInterface = ({
                                         >
                                             <option value="gemini" className="bg-white dark:bg-gray-800 text-black dark:text-white">Gemini 3.1 Flash</option>
                                             <option value="groq" disabled={!gate.canUseModel('groq')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Groq{!gate.canUseModel('groq') ? ' — PRO' : ''}</option>
-                                            <option value="openai" disabled={!gate.canUseModel('openai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">GPT-5.4 Mini{!gate.canUseModel('openai') ? ' — PRO' : ''}</option>
+                                            <option value="openai" disabled={!gate.canUseModel('openai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">GPT-5.5{!gate.canUseModel('openai') ? ' — PRO' : ''}</option>
                                             <option value="xai" disabled={!gate.canUseModel('xai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Grok (xAI){!gate.canUseModel('xai') ? ' — PRO' : ''}</option>
-                                            <option value="claude" disabled={!gate.canUseModel('claude')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Claude Sonnet 4.6{!gate.canUseModel('claude') ? ' — PRO' : ''}</option>
+                                            <option value="claude" disabled={!gate.canUseModel('claude')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Claude Sonnet 4.6{!gate.canUseModel('claude') ? ' — MAX' : ''}</option>
                                         </select>
                                         <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500">
                                             <ChevronDown size={10} />
@@ -1687,8 +1845,8 @@ async function openProUpgrade() {
     if (!response.ok) throw new Error(data.error || 'Failed to start checkout');
     if (data.checkout_url) {
       // Open in default browser (works in Electron and web)
-      if (typeof window !== 'undefined' && (window as any).require) {
-        (window as any).require('electron').shell.openExternal(data.checkout_url);
+      if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+        window.electronAPI.openExternal(data.checkout_url);
       } else {
         window.open(data.checkout_url, '_blank');
       }
@@ -1939,7 +2097,123 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   useEffect(() => {
       contextFilesRef.current = db.contextFiles;
       prewarmIdentity(db.contextFiles);
+      prewarmClaudeIdentity(db.contextFiles);
   }, [db.contextFiles]);
+
+  // --- "Train Model" pipeline state (Max-tier only) ---
+  // Pre-researches every tech in resume + JD via parallel web_search calls,
+  // caches the result for 24h, and injects it into Claude's system prompt
+  // so version/pricing/comparison questions answer in 2-3s instead of
+  // triggering 12-25s live searches mid-interview.
+  const [isTraining, setIsTraining] = useState(false);
+  const [trainingProgress, setTrainingProgress] = useState<TrainingProgress | null>(null);
+  const [hasTrainedCache, setHasTrainedCache] = useState(false);
+  // Recompute "is there a fresh cache?" whenever files change — different
+  // resume/JD = different hash key, so old cache is invalid.
+  useEffect(() => {
+      setHasTrainedCache(hasCachedTechState(db.contextFiles));
+  }, [db.contextFiles]);
+  // ── First-launch Tutorial ──
+  // One-time per account walkthrough. Auto-shows the first time we have a
+  // userProfile.id and no completion flag. Replayable from Settings.
+  const [tutorialOpen, setTutorialOpen] = useState(false);
+  useEffect(() => {
+      if (!userProfile?.id) return;
+      // Slight defer so the main UI has paint-time to show the empty chat
+      // first — opening on top of a still-loading background looks janky.
+      const t = window.setTimeout(() => {
+          if (shouldShowTutorial(userProfile.id)) setTutorialOpen(true);
+      }, 600);
+      return () => window.clearTimeout(t);
+  }, [userProfile?.id]);
+  const handleTutorialClose = useCallback(() => {
+      setTutorialOpen(false);
+      markTutorialCompleted(userProfile?.id);
+  }, [userProfile?.id]);
+  const handleReplayTutorial = useCallback(() => {
+      // Clear completion flag and re-open. Clearing means a fresh launch
+      // would show it again until they finish/dismiss this replay.
+      clearTutorialCompletion(userProfile?.id);
+      setTutorialOpen(true);
+  }, [userProfile?.id]);
+
+  // ── In-app update-on-close prompt ──
+  // Replaces electron/main.cjs's native dialog.showMessageBox (which leaks
+  // on screen-share). When user closes the main window AND a pending update
+  // is downloaded, main sends 'show-update-prompt' and we render an in-app
+  // modal. Choice flows back via the existing 'install-update' / 'close-window'
+  // channels — no new wiring on main.
+  const [updatePromptOpen, setUpdatePromptOpen] = useState(false);
+  const [updatePromptVersion, setUpdatePromptVersion] = useState<string>('');
+  useEffect(() => {
+      if (!isElectron) return;
+      return electronIPC.on('show-update-prompt', (data: any) => {
+          setUpdatePromptVersion(data?.version || '');
+          setUpdatePromptOpen(true);
+      });
+  }, []);
+
+  // ── First-time tray-hide toast ──
+  // When the user hits the close button on the main window for the very first
+  // time per account, we surface an in-app toast (NOT a native dialog — that'd
+  // leak on screen-share) explaining the app went to the system tray. The
+  // tutorial's tray step covers this in detail; the toast is a one-shot
+  // breadcrumb in case the user skipped the tutorial.
+  const [trayToastOpen, setTrayToastOpen] = useState(false);
+  useEffect(() => {
+      if (!isElectron || !userProfile?.id) return;
+      const key = `tray_hide_toast_shown_${userProfile.id}`;
+      return electronIPC.on('app-hidden-to-tray', () => {
+          try {
+              if (localStorage.getItem(key) === 'true') return;
+              localStorage.setItem(key, 'true');
+          } catch {}
+          setTrayToastOpen(true);
+          // Auto-dismiss after 12s — long enough to read, short enough not
+          // to occupy the popout indefinitely if user is mid-interview.
+          window.setTimeout(() => setTrayToastOpen(false), 12000);
+      });
+  }, [userProfile?.id]);
+
+  // Admin gets unlimited re-trains AND beast mode (deep individual research,
+  // ~$3-6 per run). Non-admin is locked to one standard training per 24h
+  // (no re-train button — the cache lockout enforces it).
+  const isAdmin = !!userProfile?.is_admin;
+  // Admin re-train opens an in-app confirm modal. We can't use window.confirm()
+  // — that's a native OS dialog that bypasses setContentProtection and would
+  // leak on screen-share during a live interview.
+  const [retrainConfirmOpen, setRetrainConfirmOpen] = useState(false);
+  const runTrainingNow = useCallback(async () => {
+      setIsTraining(true);
+      setTrainingProgress({ stage: 'extracting', done: 0, total: 0, pct: 0, message: 'Starting...' });
+      try {
+          const trainer = isAdmin ? trainClaudeModelBeast : trainClaudeModel;
+          const result = await trainer(db.contextFiles, (p) => setTrainingProgress(p));
+          if (result.success) {
+              setHasTrainedCache(true);
+              setTimeout(() => setTrainingProgress(null), 6000);
+          } else {
+              setTimeout(() => setTrainingProgress(null), 4000);
+          }
+      } catch (e: any) {
+          setTrainingProgress({ stage: 'error', done: 0, total: 0, pct: 0, message: e?.message || 'Training failed' });
+          setTimeout(() => setTrainingProgress(null), 4000);
+      } finally {
+          setIsTraining(false);
+      }
+  }, [db.contextFiles, isAdmin]);
+  const handleTrainModel = useCallback(() => {
+      if (isTraining || db.contextFiles.length === 0) return;
+      // Non-admin: silently bail if there's a fresh cache. The button is
+      // hidden in this case anyway, but defense-in-depth.
+      if (!isAdmin && hasTrainedCache) return;
+      // Admin re-train opens the confirm modal (cost warning, screen-share-safe).
+      if (isAdmin && hasTrainedCache) {
+          setRetrainConfirmOpen(true);
+          return;
+      }
+      runTrainingNow();
+  }, [db.contextFiles.length, isTraining, hasTrainedCache, isAdmin, runTrainingNow]);
   const [inputText, setInputText] = useState("");
   const [interimText, setInterimText] = useState("");
   
@@ -2032,15 +2306,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
   useEffect(() => {
     if (!isElectron) return;
-    try {
-      const ipc = (window as any).require?.('electron')?.ipcRenderer;
-      if (!ipc) return;
-      const handler = (_e: any, data: any) => {
-        setUpdateStatus(data);
-      };
-      ipc.on('update-status', handler);
-      return () => ipc.removeListener('update-status', handler);
-    } catch {}
+    return electronIPC.on('update-status', (data: any) => {
+      setUpdateStatus(data);
+    });
   }, []);
 
   // Check server for updates (works even when Electron updater fails)
@@ -2708,6 +2976,26 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
             } else {
               setMessages(prev => [...prev, aiMsg]);
             }
+            // Auto-title the session once the first model response lands
+            // (ChatGPT-style topic summary). Fire-and-forget; if the LLM
+            // call fails the placeholder "Interview <date>" stays put.
+            // Skip in non-Electron / popout — only main owns the rename.
+            if (db.isElectron && !inPopout && db.sessionId) {
+              const currentSession = (db.sessions || []).find((s: any) => s.id === db.sessionId);
+              const currentName: string = currentSession?.name || '';
+              const isPlaceholder = !currentName || /^Interview\s/.test(currentName);
+              const turnsSoFar = (messagesRef.current?.length || 0) + 1; // user + this AI msg
+              if (isPlaceholder && turnsSoFar >= 2 && turnsSoFar <= 4) {
+                const transcript = [...(messagesRef.current || []), aiMsg].map(m => ({ role: m.role, content: m.content }));
+                generateConversationTitle(transcript)
+                  .then(title => {
+                    if (title && db.sessionId) {
+                      try { db.renameSession(db.sessionId, title); } catch {}
+                    }
+                  })
+                  .catch(() => {});
+              }
+            }
         }
         // Cancel any queued chunk rAF before clearing — otherwise a late
         // frame could re-populate the bubble we're about to null.
@@ -2827,6 +3115,18 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   useEffect(() => { rawIsListeningRef.current = _rawIsListening; }, [_rawIsListening]);
   useEffect(() => { isProcessingRef.current = isProcessing; }, [isProcessing]);
   useEffect(() => { interimTextRef.current = interimText; }, [interimText]);
+
+  // Tell the Electron main process when an interview is live so it can
+  // tear down the system-tray icon and any other OS-shell surface that
+  // sits outside setContentProtection. The tray icon is rendered by
+  // the OS, not by us, so it leaks on screen-share even though every
+  // BrowserWindow we own is content-protected. Fired only from the
+  // main window — popouts shouldn't double-fire (they're a thin client
+  // mirroring main's state).
+  useEffect(() => {
+    if (!isElectron || isPopoutMode) return;
+    electronIPC.send('session-active', { active: !!_rawIsListening });
+  }, [_rawIsListening]);
   useEffect(() => { rawSpeechErrorRef.current = _rawSpeechError; }, [_rawSpeechError]);
   useEffect(() => { gateRef.current = gate; }, [gate]);
 
@@ -2871,10 +3171,8 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // Pop-out: receive state from main window
   useEffect(() => {
     if (!isPopoutThinClient) return;
-    const ipc = (window as any).require?.('electron')?.ipcRenderer;
-    if (!ipc) return;
 
-    const handler = (_e: any, data: any) => {
+    const handler = (data: any) => {
       if (data?.type === 'state-sync') {
         setRemoteIsListening(data.isListening);
         setRemoteIsProcessing(data.isProcessing);
@@ -2951,9 +3249,9 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         }, 1500);
       }
     };
-    ipc.on('from-main', handler);
+    const dispose = electronIPC.on('from-main', handler);
     electronIPC.send('relay-to-main', { type: 'request-state' });
-    return () => ipc.removeListener('from-main', handler);
+    return dispose;
   }, []);
 
   // --- UI Actions (pop-out relays to main, main executes locally) ---
@@ -3053,8 +3351,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
       if (isElectron) {
         // Fresh one-shot capture in Electron
-        const { ipcRenderer } = (window as any).require('electron');
-        const sources = await ipcRenderer.invoke('get-desktop-sources');
+        const sources = await electronIPC.invoke('get-desktop-sources');
         if (!sources || sources.length === 0) return null;
 
         const screenSource = sources.find((s: any) =>
@@ -3122,10 +3419,8 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // Main window: listen for commands from pop-out
   useEffect(() => {
     if (!isElectron || isPopoutMode) return;
-    const ipc = (window as any).require?.('electron')?.ipcRenderer;
-    if (!ipc) return;
 
-    const handler = (_e: any, data: any) => {
+    const handler = (data: any) => {
       if (!data?.type) return;
       switch (data.type) {
         case 'cmd-start-listening':
@@ -3215,8 +3510,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           break;
       }
     };
-    ipc.on('from-popout', handler);
-    return () => ipc.removeListener('from-popout', handler);
+    return electronIPC.on('from-popout', handler);
   }, [executeSend, captureScreenshot, _rawStartListening, _rawStopListening]);
 
   const handleAutoSolve = async () => {
@@ -3336,6 +3630,13 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   };
 
   const triggerFileUpload = () => {
+    // The OS file picker is a native dialog and is NOT covered by
+    // setContentProtection. If a screen-share is on while this opens,
+    // the picker contents (filenames in the chosen folder, recents
+    // sidebar) leak to viewers. The button is disabled while listening
+    // (see render site) — this is a defense-in-depth check in case the
+    // disabled state ever gets bypassed (keyboard shortcut, etc.).
+    if (rawIsListeningRef.current) return;
     fileInputRef.current?.click();
   };
 
@@ -3756,9 +4057,11 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                     <label className="text-sm font-bold text-text flex items-center gap-2">
                         <Cpu size={16} /> AI Model Selection
                     </label>
-                    {gate.isPro ? (
+                    {/* Max users get no upgrade-nag label — they have everything.
+                        Pro users get a soft suggestion. Free/Basic get the upgrade prompt. */}
+                    {gate.isMax ? null : gate.isPro ? (
                       <span className="text-[10px] text-green-400 font-medium bg-green-400/10 px-2 py-0.5 rounded-full border border-green-400/20">
-                        For better experience choose GPT-5.4 Mini
+                        For better experience choose GPT-5.5
                       </span>
                     ) : (
                       <span className="text-[10px] text-amber-400 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/20 flex items-center gap-1">
@@ -3812,7 +4115,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                     >
                         <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'openai' ? 'bg-green-500' : 'bg-gray-400'}`}></div>
                         <span className={`font-bold text-xs ${tempModel === 'openai' ? 'text-green-500' : 'text-text'}`}>
-                            GPT-5.4 Mini {gate.canUseModel('openai') && <span className="ml-1 text-[9px] bg-green-500 text-white px-1.5 py-0.5 rounded-full">Recommended</span>}
+                            GPT-5.5 {gate.canUseModel('openai') && <span className="ml-1 text-[9px] bg-green-500 text-white px-1.5 py-0.5 rounded-full">Recommended</span>}
                         </span>
                         {!gate.canUseModel('openai') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
                     </button>
@@ -3989,6 +4292,106 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
          </div>
       </Modal>
 
+      {/* --- First-launch Tutorial (auto on first login per account, replayable from Help) --- */}
+      <Tutorial isOpen={tutorialOpen} onClose={handleTutorialClose} />
+
+      {/* --- Update-on-close prompt — replaces native dialog.showMessageBox so it doesn't leak on screen-share --- */}
+      <Modal
+          isOpen={updatePromptOpen}
+          onClose={() => { setUpdatePromptOpen(false); electronIPC.send('update-prompt-decision', { decision: 'dismiss' }); }}
+          title="Update ready"
+          dismissOnBackdrop={false}
+      >
+          <div className="space-y-4">
+              <p className="text-sm text-text">
+                  minicaai {updatePromptVersion ? <span className="font-bold">{updatePromptVersion}</span> : 'a new version'} is ready to install.
+              </p>
+              <p className="text-xs text-gray-400 leading-relaxed">
+                  Install now to upgrade — the app will quit and relaunch on the new version. Or stay in the tray and install later.
+              </p>
+              <div className="flex justify-end gap-2 pt-2">
+                  <button
+                      onClick={() => { setUpdatePromptOpen(false); electronIPC.send('update-prompt-decision', { decision: 'dismiss' }); }}
+                      className="px-4 py-2 rounded-lg text-sm font-medium bg-gray-500/10 text-gray-300 hover:bg-gray-500/20 transition-colors"
+                  >
+                      Stay in tray
+                  </button>
+                  <button
+                      onClick={() => { setUpdatePromptOpen(false); electronIPC.send('update-prompt-decision', { decision: 'install' }); }}
+                      className="px-4 py-2 rounded-lg text-sm font-bold bg-gradient-to-r from-blue-500 to-purple-500 text-white shadow-lg shadow-blue-500/30 hover:shadow-blue-400/50 transition-all"
+                  >
+                      Install update & quit
+                  </button>
+              </div>
+          </div>
+      </Modal>
+
+      {/* --- Tray-hidden toast — shown ONCE per account, the first time the user closes the main window --- */}
+      {trayToastOpen && (
+          <div
+              className="fixed bottom-6 right-6 z-[100000] max-w-sm rounded-xl border border-blue-500/30 bg-gradient-to-br from-slate-900 to-slate-800 shadow-2xl shadow-blue-500/10 p-4 animate-in slide-in-from-bottom"
+              role="status"
+              aria-live="polite"
+          >
+              <div className="flex items-start gap-3">
+                  <div className="shrink-0 w-9 h-9 rounded-lg bg-blue-500/20 flex items-center justify-center">
+                      <Info size={18} className="text-blue-400" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                      <h4 className="text-sm font-bold text-text mb-1">App moved to system tray</h4>
+                      <p className="text-xs text-gray-400 leading-relaxed">
+                          minicaai is still running in the background. Right-click the small slot near your clock (bottom-right) to bring it back or quit.
+                      </p>
+                      <p className="text-[10px] text-blue-300/80 mt-2">
+                          To hide it during screen-share, click the up-arrow <span className="font-mono bg-gray-700/50 px-1 rounded">^</span> in your taskbar and drag the slot into the overflow popup. <button onClick={() => { setTrayToastOpen(false); handleReplayTutorial(); }} className="underline hover:text-blue-200 transition-colors">See tutorial</button>.
+                      </p>
+                  </div>
+                  <button
+                      onClick={() => setTrayToastOpen(false)}
+                      className="shrink-0 text-gray-500 hover:text-white p-1 rounded transition-colors"
+                      aria-label="Dismiss"
+                  >
+                      <X size={14} />
+                  </button>
+              </div>
+          </div>
+      )}
+
+      {/* --- Re-train confirmation modal (admin Beast mode) ---
+          Replaces window.confirm() which would leak on screen-share. */}
+      <Modal
+          isOpen={retrainConfirmOpen}
+          onClose={() => setRetrainConfirmOpen(false)}
+          title="Re-train Claude (Beast)"
+      >
+          <div className="space-y-4">
+              <p className="text-sm leading-relaxed text-text">
+                  This re-runs deep individual web research on up to 25 technologies plus a synthesis pass that builds interview-leverage framing.
+              </p>
+              <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-3 space-y-1">
+                  <p className="text-xs font-bold text-orange-300">Estimated cost: ~$3-6 in API tokens</p>
+                  <p className="text-xs text-orange-200/80">Time: ~3-5 minutes</p>
+              </div>
+              <p className="text-xs text-gray-400">
+                  Your previous training is still cached and valid for 24h — only re-train if your resume/JD changed or you want fresher research.
+              </p>
+              <div className="flex justify-end gap-2 pt-2">
+                  <button
+                      onClick={() => setRetrainConfirmOpen(false)}
+                      className="px-4 py-2 rounded-lg text-sm font-medium bg-gray-500/10 text-gray-300 hover:bg-gray-500/20 transition-colors"
+                  >
+                      Cancel
+                  </button>
+                  <button
+                      onClick={() => { setRetrainConfirmOpen(false); runTrainingNow(); }}
+                      className="px-4 py-2 rounded-lg text-sm font-bold bg-gradient-to-r from-orange-500 to-orange-600 text-white shadow-lg shadow-orange-500/30 hover:shadow-orange-400/50 transition-all"
+                  >
+                      Re-train
+                  </button>
+              </div>
+          </div>
+      </Modal>
+
       {/* --- Context Files Modal --- */}
       <Modal isOpen={showContext} onClose={() => setShowContext(false)} title="Knowledge Base">
         <div className="space-y-6">
@@ -3998,11 +4401,107 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                    <Info size={18} className="text-blue-500 mt-0.5" />
                    <div className="text-xs text-blue-200/80 leading-relaxed">
                        <strong className="text-blue-400 block mb-1">How Context Works</strong>
-                       Files uploaded here are sent to the AI with every message. 
+                       Files uploaded here are sent to the AI with every message.
                        Use "Context Mode" to force the AI to rely on these files.
                    </div>
                </div>
            </div>
+
+           {/* ── Train Model — Max-tier only ──
+               Pre-researches every tech in resume + JD via parallel web_search,
+               caches it for 24h, and injects into Claude's system prompt. Runtime
+               version/pricing/comparison questions then answer in 2-3s instead
+               of triggering 12-25s live searches mid-interview. */}
+           {gate.canUseModel('claude') && (
+               <div className="relative overflow-hidden rounded-xl border border-orange-500/25 bg-gradient-to-br from-orange-950/50 via-orange-900/25 to-amber-900/20 p-4">
+                   {/* Top-edge accent glow */}
+                   <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-orange-400/50 to-transparent" />
+
+                   <div className="flex items-start justify-between gap-4 mb-3">
+                       <div className="flex-1 min-w-0">
+                           <div className="flex items-center gap-2 mb-1">
+                               <Crown size={14} className="text-orange-400" />
+                               <h3 className="text-sm font-bold text-orange-100">
+                                   {isAdmin ? 'Train Claude (Beast)' : 'Train Claude'}
+                               </h3>
+                               {isAdmin && (
+                                   <span className="text-[9px] font-bold tracking-wider bg-purple-500/25 text-purple-300 px-1.5 py-0.5 rounded border border-purple-400/40">
+                                       ADMIN
+                                   </span>
+                               )}
+                               {hasTrainedCache && !isTraining && (
+                                   <span className="text-[9px] font-bold tracking-wider bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/30">
+                                       READY
+                                   </span>
+                               )}
+                           </div>
+                           <p className="text-[10px] text-orange-200/60 leading-relaxed">
+                               {isAdmin ? (
+                                   <>
+                                       Beast mode — deep individual web research on up to 25 techs + synthesis pass building interview-leverage framing. <span className="text-orange-300/80">~$3-6 · ~3-5min · re-train any time</span>
+                                   </>
+                               ) : (
+                                   <>
+                                       Pre-researches every tech in your resume + JD on the live web. Interview answers come back in 2–3s instead of waiting on a mid-question search. <span className="text-orange-300/80">~$0.30 · ~60s · one train per 24h</span>
+                                   </>
+                               )}
+                           </p>
+                       </div>
+                       {/* Non-admin: button hidden once trained (24h lockout enforced).
+                           Admin: button always visible, re-train confirm dialog handles intent. */}
+                       {(isAdmin || !hasTrainedCache) && (
+                           <button
+                               onClick={handleTrainModel}
+                               disabled={isTraining || db.contextFiles.length === 0}
+                               className="shrink-0 px-4 py-2 rounded-lg text-xs font-bold whitespace-nowrap bg-gradient-to-r from-orange-500 to-orange-600 text-white shadow-lg shadow-orange-500/30 hover:shadow-orange-400/50 hover:from-orange-400 hover:to-orange-500 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none transition-all"
+                           >
+                               {isTraining
+                                   ? `Training… ${trainingProgress?.pct ?? 0}%`
+                                   : hasTrainedCache
+                                       ? 'Re-train'
+                                       : (isAdmin ? 'Train (Beast)' : 'Train Model')}
+                           </button>
+                       )}
+                       {/* Non-admin trained state: replace button with locked status pill */}
+                       {!isAdmin && hasTrainedCache && !isTraining && (
+                           <div className="shrink-0 px-3 py-2 rounded-lg text-xs font-semibold whitespace-nowrap bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                               Trained · 24h
+                           </div>
+                       )}
+                   </div>
+
+                   {/* Progress bar — visible during training and a beat after */}
+                   {trainingProgress && (
+                       <div className="space-y-1.5">
+                           <div className="h-1.5 rounded-full bg-orange-950/60 overflow-hidden">
+                               <div
+                                   className={`h-full transition-all duration-300 ease-out ${
+                                       trainingProgress.stage === 'error'
+                                           ? 'bg-red-500'
+                                           : trainingProgress.stage === 'done'
+                                               ? 'bg-gradient-to-r from-emerald-400 to-orange-400 shadow-[0_0_12px_rgba(251,146,60,0.7)]'
+                                               : 'bg-gradient-to-r from-orange-400 via-orange-500 to-amber-400'
+                                   }`}
+                                   style={{ width: `${trainingProgress.pct}%` }}
+                               />
+                           </div>
+                           <p className={`text-[10px] truncate ${
+                               trainingProgress.stage === 'error' ? 'text-red-400/80' :
+                               trainingProgress.stage === 'done' ? 'text-emerald-400/90 font-semibold' :
+                               'text-orange-300/80'
+                           }`}>
+                               {trainingProgress.message}
+                           </p>
+                       </div>
+                   )}
+
+                   {db.contextFiles.length === 0 && !isTraining && !trainingProgress && (
+                       <p className="text-[10px] text-orange-300/50 italic">
+                           Add a resume + JD below to enable training.
+                       </p>
+                   )}
+               </div>
+           )}
 
            {/* File List */}
            <div className="space-y-3">
@@ -4010,9 +4509,21 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                    <h3 className="text-sm font-bold text-text">
                      Attached Files ({db.contextFiles.length}{gate.maxContextFiles !== -1 ? `/${gate.maxContextFiles}` : ''})
                    </h3>
-                   <button onClick={triggerFileUpload} disabled={gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles} className={`text-xs flex items-center gap-1 ${gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles ? 'text-gray-500 cursor-not-allowed' : 'text-primary hover:underline'}`}>
-                       <Plus size={12} /> {gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles ? 'Limit reached' : 'Add File'}
-                   </button>
+                   {(() => {
+                     const limitHit = gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles;
+                     // Disable while listening: the OS file picker isn't
+                     // covered by setContentProtection and would leak on
+                     // screen-share. Stop the mic, upload, then resume.
+                     const blockedForSession = _rawIsListening;
+                     const disabled = limitHit || blockedForSession;
+                     const label = blockedForSession ? 'Paused (live)' : limitHit ? 'Limit reached' : 'Add File';
+                     const title = blockedForSession ? 'File picker is paused during a live interview to keep filenames off your screen-share. Stop the mic to add files.' : undefined;
+                     return (
+                       <button onClick={triggerFileUpload} disabled={disabled} title={title} className={`text-xs flex items-center gap-1 ${disabled ? 'text-gray-500 cursor-not-allowed' : 'text-primary hover:underline'}`}>
+                         <Plus size={12} /> {label}
+                       </button>
+                     );
+                   })()}
                    {/* HIDDEN INPUT */}
                    <input
                        type="file"
@@ -4107,11 +4618,19 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
               <div className="p-4 bg-surface border border-border rounded-xl space-y-2">
                   <h3 className="font-bold flex items-center gap-2"><ExternalLink size={16} className="text-blue-500" /> Pop-out Mode</h3>
                   <p className="text-gray-400 leading-relaxed">
-                      If you are sharing your <strong>Entire Screen</strong>, the interviewer will see this AI overlay. 
-                      To hide it, click the <span className="text-blue-500 font-bold">Pop-out Icon</span> in the top right. 
+                      If you are sharing your <strong>Entire Screen</strong>, the interviewer will see this AI overlay.
+                      To hide it, click the <span className="text-blue-500 font-bold">Pop-out Icon</span> in the top right.
                       This moves the AI to a separate window that is <em>not</em> visible in screen share.
                   </p>
               </div>
+              {/* Replay tutorial — opens the same first-launch walkthrough. */}
+              <button
+                  onClick={() => { setShowHelp(false); handleReplayTutorial(); }}
+                  className="w-full p-3 rounded-xl border border-border bg-gradient-to-r from-blue-500/10 to-purple-500/10 hover:from-blue-500/15 hover:to-purple-500/15 text-text font-semibold flex items-center justify-center gap-2 transition-all"
+              >
+                  <Sparkles size={16} className="text-blue-400" />
+                  Replay first-time tutorial
+              </button>
           </div>
       </Modal>
 

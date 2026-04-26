@@ -1,7 +1,7 @@
 {
   "name": "interview-copilot-ai",
   "private": true,
-  "version": "3.4.0",
+  "version": "3.4.1",
   "description": "AI-powered real-time interview assistant",
   "author": {
     "name": "Interview Copilot",
@@ -90,6 +90,7 @@
   "dependencies": {
     "@google/genai": "^1.48.0",
     "@nut-tree-fork/nut-js": "^4.2.6",
+    "@phosphor-icons/react": "^2.1.10",
     "@react-oauth/google": "^0.13.4",
     "better-sqlite3": "^12.8.0",
     "electron-log": "^5.4.3",

@@ -4,7 +4,7 @@ import { Message, ContextFile } from "../types";
 export class OpenAIService {
   private openai: OpenAI | null = null;
   
-  private modelName = "gpt-5.4-mini";
+  private modelName = "gpt-5.5";
 
   public init(apiKey: string) {
     this.openai = new OpenAI({

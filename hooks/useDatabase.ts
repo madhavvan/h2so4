@@ -2,13 +2,22 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Message, ContextFile } from '../types';
 
 const isElectron = typeof window !== 'undefined'
-  && !!(window as any).process?.versions?.electron;
+  && !!window.electronAPI?.isElectron;
 
-function getIPC() {
-  if (!isElectron) return null;
-  try {
-    return (window as any).require('electron').ipcRenderer;
-  } catch { return null; }
+// Thin wrapper that mimics the old ipcRenderer surface using the
+// contextBridge-exposed electronAPI. Returns null in browser context;
+// callers must guard. We map ipc.on/.removeListener pairs through
+// disposers — see Electron preload.cjs for the shape.
+function getIPC(): {
+  invoke: (channel: string, ...args: any[]) => Promise<any>;
+  on: (channel: string, callback: (data: any) => void) => () => void;
+} | null {
+  if (!isElectron || !window.electronAPI) return null;
+  const api = window.electronAPI;
+  return {
+    invoke: (channel, ...args) => api.invoke(channel, ...args),
+    on: (channel, callback) => api.on(channel, callback),
+  };
 }
 
 export interface SessionSummary {
@@ -73,23 +82,26 @@ export function useDatabase(userId: string | null) {
 
   // Cross-window event listeners. Each renderer (main + popout) subscribes
   // and the main process fans out the relevant channels via broadcastToAllWindows.
+  // The contextBridge `on` returns a disposer; we collect them and run all
+  // on cleanup. Handler args are now (data) — the bridge strips the Electron
+  // event arg before delivering.
   useEffect(() => {
     if (!ipc) return;
 
-    const onMessagesUpdated = (_e: any, sid: string) => {
+    const onMessagesUpdated = (sid: string) => {
       if (sid === sessionRef.current?.id) {
         ipc.invoke('db:get-messages', sid).then(setMessages);
       }
     };
 
-    const onFilesUpdated = (_e: any, sid?: string) => {
+    const onFilesUpdated = (sid?: string) => {
       const id = sid || sessionRef.current?.id;
       if (id) {
         ipc.invoke('db:get-context-files', id).then(setContextFiles);
       }
     };
 
-    const onSessionCleared = (_e: any, sid: string) => {
+    const onSessionCleared = (sid: string) => {
       if (sid === sessionRef.current?.id) {
         setMessages([]);
         setContextFiles([]);
@@ -105,7 +117,7 @@ export function useDatabase(userId: string | null) {
     // Fired when the active session changes from another window (popout)
     // or from a delete that promoted a different session. Pull the new
     // messages/files so the UI switches in place.
-    const onActiveSessionChanged = async (_e: any, newId: string) => {
+    const onActiveSessionChanged = async (newId: string) => {
       if (!newId || newId === sessionRef.current?.id) return;
       const uid = userIdRef.current;
       if (!uid) return;
@@ -120,19 +132,15 @@ export function useDatabase(userId: string | null) {
       setContextFiles(files);
     };
 
-    ipc.on('db:messages-updated', onMessagesUpdated);
-    ipc.on('db:files-updated', onFilesUpdated);
-    ipc.on('db:session-cleared', onSessionCleared);
-    ipc.on('db:sessions-updated', onSessionsUpdated);
-    ipc.on('db:active-session-changed', onActiveSessionChanged);
+    const disposers = [
+      ipc.on('db:messages-updated', onMessagesUpdated),
+      ipc.on('db:files-updated', onFilesUpdated),
+      ipc.on('db:session-cleared', onSessionCleared),
+      ipc.on('db:sessions-updated', onSessionsUpdated),
+      ipc.on('db:active-session-changed', onActiveSessionChanged),
+    ];
 
-    return () => {
-      ipc.removeListener('db:messages-updated', onMessagesUpdated);
-      ipc.removeListener('db:files-updated', onFilesUpdated);
-      ipc.removeListener('db:session-cleared', onSessionCleared);
-      ipc.removeListener('db:sessions-updated', onSessionsUpdated);
-      ipc.removeListener('db:active-session-changed', onActiveSessionChanged);
-    };
+    return () => { disposers.forEach(d => d()); };
   }, []);
 
   const addMessage = useCallback(async (msg: Message) => {

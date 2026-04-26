@@ -147,12 +147,28 @@
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
 }
-.messages::-webkit-scrollbar { width: 4px; }
+.messages::-webkit-scrollbar { width: 8px; }
 .messages::-webkit-scrollbar-track { background: transparent; }
+/* Scrollbar thumb needs solid contrast — the popout is a transparent window
+   so a rgba(255,255,255,0.28) thumb (the glass-border value) effectively
+   disappears against a typical desktop background. Users couldn't tell the
+   chat was scrollable. Bumped to ~55% opacity at rest with a hover boost. */
 .messages::-webkit-scrollbar-thumb {
-  background: var(--glass-border);
+  background: rgba(255, 255, 255, 0.55);
   border-radius: 999px;
   transition: background var(--dur-ios) var(--ease-ios);
+}
+.messages:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.75);
+}
+.messages::-webkit-scrollbar-thumb:hover,
+.messages::-webkit-scrollbar-thumb:active {
+  background: rgba(255, 255, 255, 0.9);
+}
+/* Firefox / standards */
+.messages {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.55) transparent;
 }
 
 /* iOS spring entrance — every new bubble (user or AI) rides the

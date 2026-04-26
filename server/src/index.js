@@ -100,6 +100,13 @@ const checkoutLimiter = new RateLimiterMemory({ points: 20, duration: 300 });
 const adminLimiter = new RateLimiterMemory({ points: 120, duration: 60 });
 const adminDestructiveLimiter = new RateLimiterMemory({ points: 30, duration: 300 });
 
+// AI endpoint limiter — keyed by user (when authenticated) or IP (fallback).
+// Each AI call is real money to us (Claude w/ web_search ≈ $0.05+, GPT/Gemini
+// cheaper but still non-trivial), so a leaked token must not be able to grind
+// thousands of dollars in inference. 60/min/user covers heavy interview use
+// (≈1 call/sec sustained) without exposing the cost ceiling.
+const aiLimiter = new RateLimiterMemory({ points: 60, duration: 60 });
+
 // Optional IP allowlist for admin endpoints. Comma-separated CIDR-free list
 // (single IPs and IPv4/IPv6 exact match). Empty string = no restriction
 // (this is the default for dev). In prod we strongly recommend setting
@@ -187,6 +194,35 @@ app.use(async (req, res, next) => {
         } catch {
           return res.status(429).json({ error: 'Too many admin mutations. Wait 5 minutes and retry.' });
         }
+      }
+    }
+
+    // AI cost control. Authenticated AI endpoints are real money per call —
+    // a leaked or compromised JWT must NOT be able to grind unbounded
+    // inference. Key by user_id when present (so two users on the same
+    // office IP don't share a bucket) else fall back to IP. We can't
+    // resolve user_id here without parsing JWT, so we attempt a cheap
+    // header sniff: clients send Authorization: Bearer <jwt>. If parse
+    // fails, fall back to IP — strictly safe since IP is always present.
+    if (req.path.startsWith('/api/v1/ai/')) {
+      let aiKey = key;
+      try {
+        const auth = req.headers.authorization;
+        if (auth && auth.startsWith('Bearer ')) {
+          // Decode payload only — signature verification happens in
+          // authMiddleware later. We just need a stable per-user bucket key.
+          const token = auth.slice(7);
+          const parts = token.split('.');
+          if (parts.length === 3) {
+            const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+            if (payload && payload.user_id) aiKey = `u:${payload.user_id}`;
+          }
+        }
+      } catch { /* fall back to IP */ }
+      try {
+        await aiLimiter.consume(aiKey);
+      } catch {
+        return res.status(429).json({ error: 'AI rate limit reached. Slow down and try again in a minute.' });
       }
     }
 

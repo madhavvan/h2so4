@@ -177,24 +177,14 @@ function addMessage(sessionId, message) {
   d.prepare('INSERT OR REPLACE INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)')
     .run(message.id, sessionId, message.role, message.content, message.timestamp);
 
-  // Auto-name: when the user sends their first message in a session that
-  // still carries the default "Interview <date>" name, derive a name from
-  // the message so the sidebar is scannable. Skip if the session has
-  // already been renamed (manually or automatically).
-  if (message.role === 'user' && message.content) {
-    const row = d.prepare('SELECT name FROM sessions WHERE id = ?').get(sessionId);
-    if (row && /^Interview\s/.test(row.name)) {
-      const userMsgCount = d
-        .prepare("SELECT COUNT(*) AS c FROM messages WHERE session_id = ? AND role = 'user'")
-        .get(sessionId).c;
-      if (userMsgCount === 1) {
-        const derived = String(message.content).replace(/\s+/g, ' ').trim().slice(0, 60);
-        if (derived) {
-          d.prepare('UPDATE sessions SET name = ? WHERE id = ?').run(derived, sessionId);
-        }
-      }
-    }
-  }
+  // Title generation moved to the renderer (generateConversationTitle in
+  // aiProxyService.ts) which fires an LLM-backed summary after the first
+  // model response and renames via db:rename-session IPC. The previous
+  // "first user message → take 60 chars as the title" approach turned
+  // every conversation into a verbatim slice of the opening question,
+  // not a topic summary. Renderer-side titling keeps the placeholder
+  // ("Interview <date>") for the brief window before the first answer
+  // lands; the renderer overwrites it once it has the topic.
 }
 
 function clearMessages(sessionId) {

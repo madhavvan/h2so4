@@ -55,7 +55,7 @@ router.post('/chat/openai', async (req, res) => {
     const openai = new OpenAI({ apiKey });
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-5.4-mini',
+      model: 'gpt-5.5',
       messages,
       max_completion_tokens: 16000,
       temperature: 0.7,
@@ -146,7 +146,7 @@ router.post('/chat/claude', async (req, res) => {
 
     const tools = [];
     if (enableWebSearch !== false) {
-      tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 2 });
+      tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 3 });
     }
 
     const system = systemInstruction
@@ -155,7 +155,7 @@ router.post('/chat/claude', async (req, res) => {
 
     const completion = await client.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 1500,
+      max_tokens: 16000,
       system,
       messages,
       tools: tools.length ? tools : undefined,
@@ -278,7 +278,7 @@ router.post('/stream/openai', async (req, res) => {
 
     const stream = await openai.chat.completions.create(
       {
-        model: 'gpt-5.4-mini',
+        model: 'gpt-5.5',
         messages,
         max_completion_tokens: 16000,
         temperature: 0.7,
@@ -391,7 +391,7 @@ router.post('/stream/claude', async (req, res) => {
 
     const tools = [];
     if (enableWebSearch !== false) {
-      tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 2 });
+      tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 3 });
     }
 
     const system = systemInstruction
@@ -400,7 +400,7 @@ router.post('/stream/claude', async (req, res) => {
 
     const stream = client.messages.stream({
       model: 'claude-sonnet-4-6',
-      max_tokens: 1500,
+      max_tokens: 16000,
       system,
       messages,
       tools: tools.length ? tools : undefined,
@@ -425,11 +425,214 @@ router.post('/stream/claude', async (req, res) => {
   }
 });
 
-// ── Deepgram API key (app fetches this to connect WebSocket) ──
-router.get('/deepgram-key', (req, res) => {
-  const key = process.env.DEEPGRAM_API_KEY;
-  if (!key) return res.status(503).json({ error: 'Deepgram not configured' });
-  res.json({ key });
+// ── Auto-type planner — Claude Haiku 4.5 ──
+//
+// The Auto-Type feature types AI-generated code into the candidate's
+// editor. The hard part isn't the typing — it's figuring out WHERE to
+// start: did the editor already have a partial signature? Are some
+// lines already on screen? Where's the cursor?
+//
+// The Windows UIA path in main.cjs reads the editor's exact text +
+// cursor position deterministically, then runs `planAutoTypeFromUIA`
+// (a hand-rolled prefix matcher). When that planner's confidence is
+// high (≥ 0.85), great — but it misses cases like "user already typed
+// the function signature with a tiny whitespace diff" or "cursor is
+// mid-block, append-below would duplicate enclosing scope."
+//
+// This endpoint wraps Claude Haiku 4.5 as a smarter fallback planner.
+// Renderer sends the UIA snapshot + the code to type, gets back a
+// JSON plan that the deterministic logic couldn't have produced.
+// Cost: ~$0.005 per call. Latency target: ~500-800ms. Used only for
+// Auto-Type, only on Max-tier (Auto-Type is gated to Max anyway).
+router.post('/autotype-plan', async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey || !Anthropic) {
+    return res.status(503).json({ error: 'Claude not configured' });
+  }
+
+  try {
+    const { editorText, cursorOffset, code, language } = req.body;
+    if (typeof code !== 'string' || code.length === 0) {
+      return res.status(400).json({ error: 'code is required' });
+    }
+    // Cap inputs so a runaway editor (1MB+ files) can't blow up our
+    // token budget. 6000 chars covers any sane code-interview window.
+    const editorTextSafe = String(editorText || '').slice(0, 6000);
+    const codeSafe = String(code).slice(0, 6000);
+    const cursorSafe = Number.isFinite(cursorOffset)
+      ? Math.max(0, Math.min(editorTextSafe.length, Math.floor(cursorOffset)))
+      : editorTextSafe.length;
+    const langSafe = (language || 'unknown').toString().slice(0, 30);
+
+    const client = new Anthropic({ apiKey });
+
+    // Strict structured prompt — Haiku follows this format reliably.
+    // We split the cursor mark into the editor text so Haiku doesn't
+    // need to reason about offsets numerically (it just sees |⟨CURSOR⟩|
+    // in the string at the right position).
+    const editorWithMark =
+      editorTextSafe.slice(0, cursorSafe) +
+      '|⟨CURSOR⟩|' +
+      editorTextSafe.slice(cursorSafe);
+
+    const systemPrompt = `You are an Auto-Type planner. The user's editor currently shows EDITOR_TEXT (the marker |⟨CURSOR⟩| shows where the cursor is). The user wants to type CODE_TO_TYPE into the editor. Plan how to insert it without duplicating what's already there.
+
+Output ONLY a JSON object — no preamble, no markdown, no commentary:
+
+{
+  "wipe_first_line": boolean,   // true if EDITOR_TEXT contains a partial first line of CODE_TO_TYPE that we should backspace before typing (e.g. editor has "def foo(" and code starts with "def foo(self):")
+  "skip_leading": integer,      // number of leading lines of CODE_TO_TYPE that are ALREADY in EDITOR_TEXT verbatim and should NOT be re-typed (0 if none)
+  "skip_trailing": integer,     // number of trailing lines of CODE_TO_TYPE that are ALREADY in EDITOR_TEXT below the cursor (e.g. closing braces) — 0 if not applicable
+  "confidence": number,         // 0.0 to 1.0 — your confidence in this plan; <0.5 means "not sure, just type everything"
+  "reasoning": string           // ONE short sentence explaining the plan
+}
+
+Rules:
+- If EDITOR_TEXT is empty or just whitespace, return {wipe_first_line:false, skip_leading:0, skip_trailing:0, confidence:1.0, reasoning:"empty editor"}
+- If CODE_TO_TYPE is fully present in EDITOR_TEXT, return skip_leading equal to total lines of CODE_TO_TYPE
+- Be conservative — when uncertain, prefer a low skip count (typing extra is recoverable; missing lines isn't)
+- Whitespace differences are OK to ignore (treat "  x" and "    x" as same line for skip purposes — re-indent happens at type time)`;
+
+    const userPrompt = `LANGUAGE: ${langSafe}
+
+EDITOR_TEXT:
+\`\`\`
+${editorWithMark}
+\`\`\`
+
+CODE_TO_TYPE:
+\`\`\`
+${codeSafe}
+\`\`\`
+
+JSON:`;
+
+    const completion = await client.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 400,                    // plan response is ~100-200 tokens
+      system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: userPrompt }],
+      temperature: 0.0,                   // deterministic — same input → same plan
+    });
+
+    const text = (completion.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('')
+      .trim();
+
+    // Hunt for the JSON object — Haiku occasionally wraps in stray text
+    // despite the strict prompt.
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) {
+      return res.status(200).json({ ok: false, reason: 'no_json_in_reply' });
+    }
+
+    let plan;
+    try {
+      plan = JSON.parse(match[0]);
+    } catch {
+      return res.status(200).json({ ok: false, reason: 'json_parse_failed' });
+    }
+
+    // Sanitize the response — Haiku is mostly well-behaved but we never
+    // trust unbounded ints from a planner that could push the typing
+    // loop into never-never land.
+    const codeLineCount = codeSafe.split('\n').length;
+    const sanitized = {
+      ok: true,
+      wipe_first_line: Boolean(plan.wipe_first_line),
+      skip_leading: Math.max(0, Math.min(codeLineCount, Number(plan.skip_leading) || 0)),
+      skip_trailing: Math.max(0, Math.min(codeLineCount, Number(plan.skip_trailing) || 0)),
+      confidence: Math.max(0, Math.min(1, Number(plan.confidence) || 0)),
+      reasoning: String(plan.reasoning || '').slice(0, 200),
+    };
+
+    res.json(sanitized);
+  } catch (err) {
+    console.error('[autotype-plan] error:', err.message);
+    res.status(500).json({ error: 'AI planning failed', detail: err.message });
+  }
+});
+
+// ── Deepgram key — short-lived per-user project tokens ──
+//
+// The client opens a WebSocket DIRECTLY to Deepgram for low-latency live
+// transcription, which means it needs an API key. Returning the master
+// DEEPGRAM_API_KEY would let any authenticated user extract it from
+// DevTools and rack up unbounded transcription bills against the project.
+//
+// Fix: each call to this endpoint mints a fresh short-lived project key
+// (1h TTL, scope=usage:write only, tagged with user_id) via Deepgram's
+// project-keys API. The master key never leaves the server. A leaked
+// per-user key expires on its own; abusive sessions can be revoked from
+// the Deepgram dashboard by user tag.
+//
+// ROLLOUT: the new behavior only activates when DEEPGRAM_PROJECT_ID is
+// set on the server env. Until then we fall back to the old master-key
+// behavior + log a loud warning, so deploys don't break voice mode for
+// existing users while you go set the env var. Once it's set, the
+// fallback never runs.
+// 2 hours — safely past the 99th percentile of interview lengths (most are
+// 30-60 min). Once the WebSocket is open, the key TTL doesn't affect the
+// live connection — Deepgram only checks the key at handshake. But on any
+// reconnect (network blip, WiFi switch, sleep/wake) the client refreshes
+// via getDeepgramKey() in useSpeechRecognition.ts, so even multi-hour
+// sessions keep transcribing without the user ever noticing the rotation.
+const DEEPGRAM_KEY_TTL_SECONDS = 7200;
+
+router.get('/deepgram-key', async (req, res) => {
+  const masterKey = process.env.DEEPGRAM_API_KEY;
+  if (!masterKey) return res.status(503).json({ error: 'Deepgram not configured' });
+
+  const projectId = process.env.DEEPGRAM_PROJECT_ID;
+  if (!projectId) {
+    // Rollout fallback — see header comment. Set DEEPGRAM_PROJECT_ID in
+    // your Railway env to switch to ephemeral keys.
+    console.warn('[deepgram] DEEPGRAM_PROJECT_ID not set — serving master key (security fallback). Configure DEEPGRAM_PROJECT_ID to mint short-lived per-user keys.');
+    return res.json({ key: masterKey });
+  }
+
+  // Tag the key with user identity so the Deepgram dashboard's "Keys"
+  // view shows who minted what — easy to spot/revoke abusive sessions.
+  // Falls back to IP if for any reason req.user isn't populated (would
+  // only happen if authMiddleware was bypassed, which shouldn't occur
+  // since this route is mounted under it).
+  const userTag = req.user?.id ? `user-${req.user.id}` : `ip-${req.ip || 'unknown'}`;
+
+  try {
+    const dgRes = await fetch(`https://api.deepgram.com/v1/projects/${projectId}/keys`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${masterKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        comment: `minicaai-${userTag}-${Date.now()}`,
+        scopes: ['usage:write'],
+        time_to_live_in_seconds: DEEPGRAM_KEY_TTL_SECONDS,
+      }),
+    });
+
+    if (!dgRes.ok) {
+      const errText = await dgRes.text().catch(() => '');
+      console.error(`[deepgram] mint failed (${dgRes.status}): ${errText.slice(0, 200)}`);
+      return res.status(503).json({ error: 'Voice mode temporarily unavailable' });
+    }
+
+    const data = await dgRes.json().catch(() => null);
+    // Deepgram returns { api_key_id, key, comment, created, scopes }.
+    // We only forward `key` to the client — the rest is for our records.
+    if (!data || typeof data.key !== 'string') {
+      console.error('[deepgram] mint response missing key field:', JSON.stringify(data || {}).slice(0, 200));
+      return res.status(503).json({ error: 'Voice mode temporarily unavailable' });
+    }
+
+    res.json({ key: data.key });
+  } catch (e) {
+    console.error('[deepgram] mint error:', e.message);
+    res.status(503).json({ error: 'Voice mode temporarily unavailable' });
+  }
 });
 
 module.exports = router;

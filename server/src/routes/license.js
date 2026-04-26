@@ -81,6 +81,11 @@ router.post('/validate', async (req, res) => {
       });
     }
 
+    // Echo the live admin flag so the client can refresh its cached
+    // user.is_admin on every revalidation. Without this, removing an
+    // admin's email from ADMIN_EMAILS leaves them with admin powers
+    // until they manually log out — a stale-flag insider risk.
+    const isAdmin = ADMIN_EMAILS.includes((user.email || '').toLowerCase());
     res.json({
       valid: true,
       key: license.key,
@@ -90,6 +95,7 @@ router.post('/validate', async (req, res) => {
       sessions_used: license.sessions_used,
       sessions_limit: license.sessions_limit,
       sessions_exhausted: false,
+      is_admin: isAdmin,
     });
   } catch (err) {
     console.error('License validation error:', err);

@@ -745,17 +745,16 @@ router.post('/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'This reset link has expired or already been used. Please request a new one.' });
     }
 
-    db.updateUserPassword(row.user_id, password);
-    // SECURITY — invalidate every JWT issued before "now" for this user.
-    // The most common reason people reset their password is suspected
-    // compromise; leaving old sessions live would let an attacker keep
-    // access on every device they already have. authMiddleware enforces
-    // this via the tokens_revoked_after gate.
-    db.forceLogoutUser(row.user_id);
-    // Also mark any sibling unused tokens (e.g. the user clicked "Forgot
-    // password" twice) as used, so the spare can't be replayed in the
-    // 1-hour window that follows.
-    const killed = db.invalidatePendingResetTokensForUser(row.user_id);
+    // Single atomic write: hashes + updates password, bumps
+    // tokens_revoked_after to invalidate every existing JWT (the most
+    // common reason for a reset is suspected compromise — old sessions
+    // staying live would let an attacker keep access on devices they
+    // already have), and marks any sibling unused reset tokens used so
+    // a spare from "Forgot password" clicked twice can't be replayed
+    // within the 1-hour TTL. Wrapping the three writes in one transaction
+    // closes the SIGKILL race window between password-changed and
+    // sessions-revoked.
+    const killed = db.applyPasswordReset(row.user_id, password);
     console.log(`[reset-password] POST success user_id=${row.user_id} siblings_invalidated=${killed}`);
 
     if (wantsHtml) return res.send(renderResetSuccessPage(frontendUrl, row.email));

@@ -666,13 +666,13 @@ async function handleRazorpayEvent(body) {
 
       // Race with /verify-razorpay: both this webhook and the client's
       // success callback record a completed payment AND grant the same
-      // tier/renewal on the same razorpay_payment_id. Skip if the client
-      // already won the race — license state is applied idempotently by
-      // updateLicenseOnPayment / grantBasicRenewal, so the only thing at
-      // risk here is a duplicate payments row (inflating admin revenue
-      // stats and confusing refund lookups). Dedup applies to BOTH tier
-      // grants and renewals — the renewal-only guard that lived here
-      // previously missed the tier-grant collision entirely.
+      // tier/renewal on the same razorpay_payment_id. The pre-tx check
+      // here is a fast-path — most duplicates are caught and we return
+      // early without touching the DB. The IN-tx re-check below is the
+      // correctness guarantee — it sees writes the pre-check missed
+      // because of the await between /verify's signature verify and its
+      // grant transaction. The UNIQUE index on (provider, provider_payment_id)
+      // is the final DB-layer backstop.
       if (db.isPaymentAlreadyRecorded(user.id, payment.id)) {
         console.log('[RZP WEBHOOK] Payment already recorded by /verify-razorpay — skipping:', payment.id);
         return;
@@ -683,7 +683,14 @@ async function handleRazorpayEvent(body) {
       // cleanly and the webhook retry processes the event exactly once.
       const sqlite = db.getDB();
       let grantedTier;
+      let alreadyGranted = false;
       const apply = sqlite.transaction(() => {
+        // In-tx re-check, see comment above the pre-tx check.
+        const dup = sqlite.prepare(
+          "SELECT id FROM payments WHERE user_id = ? AND provider = 'razorpay' AND provider_payment_id = ? AND status = 'completed' LIMIT 1"
+        ).get(user.id, payment.id);
+        if (dup) { alreadyGranted = true; return; }
+
         if (isRenewal) {
           const updated = db.grantBasicRenewal(user.id);
           grantedTier = (updated && updated.tier) || 'basic';
@@ -719,7 +726,11 @@ async function handleRazorpayEvent(body) {
         });
       });
       apply();
-      console.log('[RZP WEBHOOK]', isRenewal ? 'Renewal applied for:' : `User upgraded to ${grantedTier.toUpperCase()}:`, email);
+      if (alreadyGranted) {
+        console.log('[RZP WEBHOOK] Payment already recorded inside tx — /verify-razorpay won the race:', payment.id);
+      } else {
+        console.log('[RZP WEBHOOK]', isRenewal ? 'Renewal applied for:' : `User upgraded to ${grantedTier.toUpperCase()}:`, email);
+      }
       return;
     }
 
