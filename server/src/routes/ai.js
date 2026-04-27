@@ -621,6 +621,21 @@ const DEEPGRAM_KEY_TTL_SECONDS = 7200;
 // One-shot flag so we don't flood logs when DEEPGRAM_PROJECT_ID is unset
 // and the client polls every ~1 minute on WebSocket reconnects.
 let _deepgramProjectIdWarned = false;
+// Process-level circuit breaker — when minting fails with a permanent error
+// (insufficient scope, missing project), stop trying and serve the master
+// key. Avoids burning Deepgram API calls + log spam on every reconnect.
+// Cleared on server restart so a fixed env var or scope takes effect.
+let _deepgramMintDisabled = false;
+let _deepgramMintDisabledReason = null;
+let _deepgramMintFallbackWarned = false;
+
+function fallbackToMasterKey(res, masterKey, reason) {
+  if (!_deepgramMintFallbackWarned) {
+    _deepgramMintFallbackWarned = true;
+    console.warn(`[deepgram] FALLING BACK TO MASTER KEY for the rest of this server process. Reason: ${reason}. Voice mode will keep working, but the master key is now reachable from the client (DevTools). Fix: grant keys:write scope to your Deepgram API key at https://console.deepgram.com/ → Settings → API Keys, OR set DEEPGRAM_PROJECT_ID to a project the key can mint into. Suppressing further fallback warnings this process.`);
+  }
+  return res.json({ key: masterKey });
+}
 
 router.get('/deepgram-key', async (req, res) => {
   const masterKey = process.env.DEEPGRAM_API_KEY;
@@ -637,6 +652,12 @@ router.get('/deepgram-key', async (req, res) => {
       console.warn('[deepgram] DEEPGRAM_PROJECT_ID not set — serving master key (security fallback). Configure DEEPGRAM_PROJECT_ID to mint short-lived per-user keys. (suppressing further warnings this process)');
     }
     return res.json({ key: masterKey });
+  }
+
+  // Circuit-breaker fast path: a previous request hit a permanent mint
+  // failure (403 insufficient scope, etc.). Don't waste an API call.
+  if (_deepgramMintDisabled) {
+    return fallbackToMasterKey(res, masterKey, _deepgramMintDisabledReason);
   }
 
   // Tag the key with user identity so the Deepgram dashboard's "Keys"
@@ -663,6 +684,28 @@ router.get('/deepgram-key', async (req, res) => {
     if (!dgRes.ok) {
       const errText = await dgRes.text().catch(() => '');
       console.error(`[deepgram] mint failed (${dgRes.status}): ${errText.slice(0, 200)}`);
+
+      // 403 = master key lacks the keys:write scope (or project membership).
+      // This is PERMANENT until the user fixes it in the Deepgram dashboard,
+      // so trip the circuit breaker — every subsequent /deepgram-key call
+      // serves the master key directly without re-attempting the mint.
+      // 404 = projectId is wrong/deleted — same situation, breaker trip.
+      if (dgRes.status === 403 || dgRes.status === 404) {
+        _deepgramMintDisabled = true;
+        _deepgramMintDisabledReason = `Deepgram returned ${dgRes.status} on key mint (${dgRes.status === 403 ? 'insufficient scope — needs keys:write' : 'project not found — check DEEPGRAM_PROJECT_ID'})`;
+        return fallbackToMasterKey(res, masterKey, _deepgramMintDisabledReason);
+      }
+
+      // 5xx / 429 / parse error / network — TRANSIENT. Serve master key for
+      // this one request so voice mode works, but don't trip the breaker —
+      // the next request might succeed.
+      if (dgRes.status >= 500 || dgRes.status === 429) {
+        return fallbackToMasterKey(res, masterKey, `Deepgram transient ${dgRes.status} — serving master this request`);
+      }
+
+      // 401 = master key itself is bad. Falling back wouldn't help (the same
+      // key gets handed to the client and would also fail at handshake).
+      // Other 4xx = our request body is malformed → genuine code bug.
       return res.status(503).json({ error: 'Voice mode temporarily unavailable' });
     }
 
@@ -671,13 +714,17 @@ router.get('/deepgram-key', async (req, res) => {
     // We only forward `key` to the client — the rest is for our records.
     if (!data || typeof data.key !== 'string') {
       console.error('[deepgram] mint response missing key field:', JSON.stringify(data || {}).slice(0, 200));
-      return res.status(503).json({ error: 'Voice mode temporarily unavailable' });
+      // Malformed success response — treat as transient, fall back so the
+      // user's voice session doesn't drop on a Deepgram-side glitch.
+      return fallbackToMasterKey(res, masterKey, 'mint response missing key field');
     }
 
     res.json({ key: data.key });
   } catch (e) {
     console.error('[deepgram] mint error:', e.message);
-    res.status(503).json({ error: 'Voice mode temporarily unavailable' });
+    // Network failure / DNS / TLS — transient. Serve master key so the user
+    // can keep transcribing while Deepgram is unreachable.
+    return fallbackToMasterKey(res, masterKey, `mint exception: ${e.message}`);
   }
 });
 
