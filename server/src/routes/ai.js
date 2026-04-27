@@ -477,23 +477,41 @@ router.post('/autotype-plan', async (req, res) => {
       '|⟨CURSOR⟩|' +
       editorTextSafe.slice(cursorSafe);
 
-    const systemPrompt = `You are an Auto-Type planner. The user's editor currently shows EDITOR_TEXT (the marker |⟨CURSOR⟩| shows where the cursor is). The user wants to type CODE_TO_TYPE into the editor. Plan how to insert it without duplicating what's already there.
+    const systemPrompt = `You are an Auto-Type planner. The user's editor currently shows EDITOR_TEXT (the marker |⟨CURSOR⟩| shows where the cursor is). The user wants to type CODE_TO_TYPE into the editor. Plan a complete typing sequence that gets the editor to the correct final state without duplicating, mangling, or skipping content.
 
 Output ONLY a JSON object — no preamble, no markdown, no commentary:
 
 {
-  "wipe_first_line": boolean,   // true if EDITOR_TEXT contains a partial first line of CODE_TO_TYPE that we should backspace before typing (e.g. editor has "def foo(" and code starts with "def foo(self):")
-  "skip_leading": integer,      // number of leading lines of CODE_TO_TYPE that are ALREADY in EDITOR_TEXT verbatim and should NOT be re-typed (0 if none)
-  "skip_trailing": integer,     // number of trailing lines of CODE_TO_TYPE that are ALREADY in EDITOR_TEXT below the cursor (e.g. closing braces) — 0 if not applicable
-  "confidence": number,         // 0.0 to 1.0 — your confidence in this plan; <0.5 means "not sure, just type everything"
+  "cursor_action": "use_current" | "move_to_end" | "go_to_line",
+  "target_line": integer,       // 1-indexed; only meaningful when cursor_action="go_to_line"
+  "target_column": integer,     // 0-indexed column AFTER cursor moves to target_line
+  "wipe_chars": integer,        // number of characters to backspace BEFORE typing (e.g., editor has "def fac" and code starts with "def factorial" — set wipe_chars=3 to clear "fac" and re-type)
+  "wipe_first_line": boolean,   // true to do Home+Shift+End+Delete on the cursor line BEFORE typing (cleans up auto-indent / partial signature on the WHOLE line)
+  "skip_leading": integer,      // number of leading lines of CODE_TO_TYPE that are ALREADY in EDITOR_TEXT verbatim and should NOT be re-typed
+  "skip_trailing": integer,     // number of trailing lines of CODE_TO_TYPE that are ALREADY in EDITOR_TEXT below the cursor (e.g. closing braces)
+  "prefix": string,             // optional text to type BEFORE the main content (e.g., "\\n" if we need to start a new line first). Keep tiny — usually "" or "\\n".
+  "suffix": string,             // optional text to type AFTER the main content (e.g., closing brackets). Keep tiny — usually "".
+  "confidence": number,         // 0.0 to 1.0 — your confidence in this plan; <0.5 means "not sure, type the safe default"
   "reasoning": string           // ONE short sentence explaining the plan
 }
 
-Rules:
-- If EDITOR_TEXT is empty or just whitespace, return {wipe_first_line:false, skip_leading:0, skip_trailing:0, confidence:1.0, reasoning:"empty editor"}
-- If CODE_TO_TYPE is fully present in EDITOR_TEXT, return skip_leading equal to total lines of CODE_TO_TYPE
-- Be conservative — when uncertain, prefer a low skip count (typing extra is recoverable; missing lines isn't)
-- Whitespace differences are OK to ignore (treat "  x" and "    x" as same line for skip purposes — re-indent happens at type time)`;
+CURSOR_ACTION rules (choose ONE):
+- "use_current" — cursor is already at a valid insertion point (e.g., end of file, on a blank line at correct scope, mid-expression you want completed). Type at current cursor position.
+- "move_to_end" — cursor is in the WRONG place (middle of imports, inside an unrelated function, in a comment block). Move to end of file FIRST via Ctrl+End, then type. Choose this when CODE_TO_TYPE is meant to be APPENDED rather than inserted at cursor.
+- "go_to_line" — cursor needs to be moved to a SPECIFIC line+column before typing (rare; mainly when inserting into a known empty function body in the middle of a file). Set target_line + target_column.
+
+Decision rules for cursor_action:
+- If cursor is at end of EDITOR_TEXT AND CODE_TO_TYPE is meant to be appended → "use_current"
+- If cursor is mid-text AND CODE_TO_TYPE clearly continues from where cursor is (mid-expression, after partial signature, inside an empty body) → "use_current"
+- If cursor is mid-text in a place where typing CODE_TO_TYPE would damage existing content (in imports, in a different function, inside a comment) → "move_to_end"
+- If you're certain a specific line is the right insertion point → "go_to_line" with target_line + target_column
+
+Other rules:
+- If EDITOR_TEXT is empty or just whitespace: cursor_action="use_current", everything else 0/false, confidence=1.0
+- If CODE_TO_TYPE is fully present in EDITOR_TEXT: skip_leading=total_lines_of_code, confidence=1.0
+- wipe_chars and wipe_first_line are mutually compatible — wipe_chars runs FIRST (within current line), then wipe_first_line if true (selects whole line)
+- Be conservative — when uncertain, prefer cursor_action="move_to_end" + skip_leading=0 (typing extra at end is recoverable; mangling existing code isn't)
+- Whitespace differences are OK to ignore for skip_leading (re-indent happens at type time)`;
 
     const userPrompt = `LANGUAGE: ${langSafe}
 
@@ -541,11 +559,29 @@ JSON:`;
     // trust unbounded ints from a planner that could push the typing
     // loop into never-never land.
     const codeLineCount = codeSafe.split('\n').length;
+    const editorLineCount = editorTextSafe.split('\n').length;
+    // cursor_action whitelist — anything else degrades to use_current
+    const validActions = new Set(['use_current', 'move_to_end', 'go_to_line']);
+    const cursorAction = validActions.has(plan.cursor_action) ? plan.cursor_action : 'use_current';
     const sanitized = {
       ok: true,
+      cursor_action: cursorAction,
+      target_line: cursorAction === 'go_to_line'
+        ? Math.max(1, Math.min(editorLineCount + 1, Number(plan.target_line) || 1))
+        : 0,
+      target_column: cursorAction === 'go_to_line'
+        ? Math.max(0, Math.min(500, Number(plan.target_column) || 0))
+        : 0,
+      // wipe_chars capped at 200 — anything beyond that is almost certainly a planner error;
+      // a real "wipe partial token" use case is <20 chars.
+      wipe_chars: Math.max(0, Math.min(200, Number(plan.wipe_chars) || 0)),
       wipe_first_line: Boolean(plan.wipe_first_line),
       skip_leading: Math.max(0, Math.min(codeLineCount, Number(plan.skip_leading) || 0)),
       skip_trailing: Math.max(0, Math.min(codeLineCount, Number(plan.skip_trailing) || 0)),
+      // prefix/suffix capped tight — these should be tiny (newlines, brackets, "~" chars).
+      // Anything longer means the planner tried to put main content here instead of `content`.
+      prefix: typeof plan.prefix === 'string' ? plan.prefix.slice(0, 200) : '',
+      suffix: typeof plan.suffix === 'string' ? plan.suffix.slice(0, 200) : '',
       confidence: Math.max(0, Math.min(1, Number(plan.confidence) || 0)),
       reasoning: String(plan.reasoning || '').slice(0, 200),
     };
@@ -582,6 +618,9 @@ JSON:`;
 // via getDeepgramKey() in useSpeechRecognition.ts, so even multi-hour
 // sessions keep transcribing without the user ever noticing the rotation.
 const DEEPGRAM_KEY_TTL_SECONDS = 7200;
+// One-shot flag so we don't flood logs when DEEPGRAM_PROJECT_ID is unset
+// and the client polls every ~1 minute on WebSocket reconnects.
+let _deepgramProjectIdWarned = false;
 
 router.get('/deepgram-key', async (req, res) => {
   const masterKey = process.env.DEEPGRAM_API_KEY;
@@ -590,8 +629,13 @@ router.get('/deepgram-key', async (req, res) => {
   const projectId = process.env.DEEPGRAM_PROJECT_ID;
   if (!projectId) {
     // Rollout fallback — see header comment. Set DEEPGRAM_PROJECT_ID in
-    // your Railway env to switch to ephemeral keys.
-    console.warn('[deepgram] DEEPGRAM_PROJECT_ID not set — serving master key (security fallback). Configure DEEPGRAM_PROJECT_ID to mint short-lived per-user keys.');
+    // your Railway env to switch to ephemeral keys. Warn ONCE per server
+    // process; clients reconnect every ~1min during long sessions and the
+    // unguarded version flooded the log with the same message.
+    if (!_deepgramProjectIdWarned) {
+      _deepgramProjectIdWarned = true;
+      console.warn('[deepgram] DEEPGRAM_PROJECT_ID not set — serving master key (security fallback). Configure DEEPGRAM_PROJECT_ID to mint short-lived per-user keys. (suppressing further warnings this process)');
+    }
     return res.json({ key: masterKey });
   }
 

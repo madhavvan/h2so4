@@ -323,6 +323,13 @@ ipcMain.on('close-window', (event) => {
 // 'close-window' because that would re-fire the close handler and loop
 // the prompt. 'install' triggers the deferred installer (which quits +
 // relaunches); 'dismiss' just hides the main window to the tray.
+//
+// Either way, clear pendingUpdate after the decision so the close handler
+// stops re-prompting on subsequent close attempts. Without this clear, a
+// user who picked "Stay in tray" once would be re-prompted on every close,
+// and if they kept dismissing, the app would feel unquittable (close
+// always opens the prompt; Stay in tray never quits; Quit from the tray
+// also fires close which re-prompts).
 ipcMain.on('update-prompt-decision', (_event, payload) => {
   const decision = payload && payload.decision;
   if (decision === 'install' && installPendingUpdate) {
@@ -331,6 +338,11 @@ ipcMain.on('update-prompt-decision', (_event, payload) => {
     try { mainWindow.webContents.send('app-hidden-to-tray'); } catch {}
     mainWindow.hide();
   }
+  // After this decision the user has acknowledged the pending update.
+  // Don't keep the prompt sticky — it'll re-arm naturally when a NEW
+  // update finishes downloading and assigns pendingUpdate again.
+  pendingUpdate = null;
+  installPendingUpdate = null;
 });
 
 // Resize pop-out — keeps window on-screen and animates
@@ -923,6 +935,40 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     // — getting skipLines wrong means typing into the wrong spot — so we'd
     // rather wait 3s than fall through to skipLines=0 and overwrite.
     const uia = await readFocusedViaUIA(3500);
+
+    // ── Preflight: is the user actually focused on a foreign editor? ──
+    // The most common Auto-Type failure mode is the user clicking the button
+    // and forgetting to alt-tab — so we type into our own popout, our chat
+    // input, or nothing at all. Check the focused element's process id (we
+    // taught the UIA bridge to report it). If it matches our own pid OR a
+    // child of ours, abort with a user-actionable message instead of silently
+    // typing into the void.
+    const ownPid = process.pid;
+    const focusedPid = uia && typeof uia.processId === 'number' ? uia.processId : 0;
+    const focusedProcName = uia && typeof uia.processName === 'string' ? uia.processName : '';
+    // Electron spawns helper processes (renderer, gpu, utility) — they share
+    // a process name but not pid. Match on either: (a) exact pid, or (b)
+    // process name that smells like our own (Electron / the productName).
+    const looksLikeOurProcess = (
+      focusedPid === ownPid ||
+      /electron|interview\s*copilot/i.test(focusedProcName)
+    );
+    if (looksLikeOurProcess) {
+      console.warn(`[auto-type] Preflight failed: focus is on our own process (pid=${focusedPid}, name=${focusedProcName}). Aborting before keystrokes.`);
+      // Restore main window visibility before bailing — otherwise the user
+      // is left with nothing on screen.
+      restore.forEach(fn => { try { fn(); } catch (_) {} });
+      autoTypeInFlight = false;
+      autoTypeBroadcast({
+        phase: 'done',
+        aborted: true,
+        reason: 'no_target_editor',
+        // Bubble up to the renderer toast — same path SID-drift uses.
+        hint: `Auto-Type aborted: your focus is still on the ${focusedProcName || 'AI app'} window. Click into your code editor (HackerRank, VS Code, IDE) before pressing Auto-Type again.`,
+      });
+      return { aborted: true, reason: 'no_target_editor' };
+    }
+
     if (uia && uia.ok) {
       uiaSnapshotBefore = uia;
       const plan = planAutoTypeFromUIA({
@@ -964,12 +1010,17 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
 
   // ── Haiku AI plan fallback ──
   // Only fires when (a) we got a UIA snapshot and (b) the deterministic
-  // planner DIDN'T earn the high-confidence override (so usedUIA is still
-  // false). When deterministic was confident, we trust it — saves a $0.005
-  // API call and ~600ms of latency. When deterministic punted (whitespace
-  // mismatch, scope-aware insertion needed, partial-signature recovery),
-  // Haiku gets the snapshot and tries to produce a smarter plan. Failures
-  // are silent — falls through to whatever skipLines the caller passed.
+  // planner DIDN'T earn the high-confidence override. Haiku returns a
+  // richer plan than the deterministic one — cursor_action, wipe_chars,
+  // prefix, suffix in addition to skip/wipe_first_line. Falls through
+  // silently to whatever skipLines the caller passed on any failure.
+  let cursorAction = 'use_current';
+  let cursorTargetLine = 0;
+  let cursorTargetColumn = 0;
+  let wipeChars = 0;
+  let typePrefix = '';
+  let typeSuffix = '';
+  let usedHaiku = false;
   if (!usedUIA && uiaSnapshotBefore && authToken) {
     try {
       const snapText = uiaSnapshotBefore.text || '';
@@ -991,17 +1042,32 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         const aiPlan = await planRes.json().catch(() => null);
         if (aiPlan && aiPlan.ok === true
             && Number.isFinite(aiPlan.confidence) && aiPlan.confidence >= 0.7) {
-          const planSkipLeading = Number.isInteger(aiPlan.skip_leading)
-            ? Math.max(0, aiPlan.skip_leading) : 0;
-          const planSkipTrailing = Number.isInteger(aiPlan.skip_trailing)
-            ? Math.max(0, aiPlan.skip_trailing) : 0;
-          effectiveSkipLines = planSkipLeading;
-          effectiveSkipTrailing = planSkipTrailing;
+          effectiveSkipLines = Number.isInteger(aiPlan.skip_leading) ? Math.max(0, aiPlan.skip_leading) : 0;
+          effectiveSkipTrailing = Number.isInteger(aiPlan.skip_trailing) ? Math.max(0, aiPlan.skip_trailing) : 0;
           wipeFirstLine = !!aiPlan.wipe_first_line;
-          console.log(`[auto-type] Haiku plan ACCEPTED: skip=${planSkipLeading} trail=${planSkipTrailing} wipe=${wipeFirstLine} conf=${aiPlan.confidence.toFixed(2)} reason=${aiPlan.reasoning || ''}`);
+          cursorAction = ['use_current', 'move_to_end', 'go_to_line'].includes(aiPlan.cursor_action)
+            ? aiPlan.cursor_action : 'use_current';
+          cursorTargetLine = Number.isInteger(aiPlan.target_line) ? aiPlan.target_line : 0;
+          cursorTargetColumn = Number.isInteger(aiPlan.target_column) ? aiPlan.target_column : 0;
+          wipeChars = Number.isInteger(aiPlan.wipe_chars) ? Math.max(0, Math.min(200, aiPlan.wipe_chars)) : 0;
+          typePrefix = typeof aiPlan.prefix === 'string' ? aiPlan.prefix.slice(0, 200) : '';
+          typeSuffix = typeof aiPlan.suffix === 'string' ? aiPlan.suffix.slice(0, 200) : '';
+          usedHaiku = true;
+          console.log(`[auto-type] Haiku plan ACCEPTED: cursor=${cursorAction}${cursorAction === 'go_to_line' ? `(L${cursorTargetLine}:C${cursorTargetColumn})` : ''} wipeChars=${wipeChars} skip=${effectiveSkipLines} trail=${effectiveSkipTrailing} wipeLine=${wipeFirstLine} prefix=${JSON.stringify(typePrefix.slice(0, 30))} suffix=${JSON.stringify(typeSuffix.slice(0, 30))} conf=${aiPlan.confidence.toFixed(2)} reason=${aiPlan.reasoning || ''}`);
         } else if (aiPlan) {
           console.log(`[auto-type] Haiku plan rejected (conf=${aiPlan.confidence ?? '?'}, threshold=0.7)`);
         }
+      } else if (planRes.status === 404 || planRes.status === 503) {
+        // Endpoint not deployed (Railway lagging on a tag) or downstream
+        // unavailable. Surface a non-blocking warning to the renderer so
+        // the user knows the AI planner isn't doing its job — without it
+        // they'd silently get the deterministic fallback and might be
+        // confused why "the smart auto-type" isn't smart.
+        console.warn(`[auto-type] Haiku planner HTTP ${planRes.status} — using deterministic fallback only (server may need redeploy)`);
+        autoTypeBroadcast({
+          phase: 'planner-unavailable',
+          status: planRes.status,
+        });
       } else {
         console.log(`[auto-type] Haiku planner HTTP ${planRes.status}`);
       }
@@ -1049,6 +1115,68 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       return { ok: true };
     }
 
+    // ── Cursor positioning (from Haiku plan) ──
+    // 'use_current': cursor is already at the right spot — no-op.
+    // 'move_to_end': cursor was in the wrong place; jump to end of file.
+    //   Ctrl+End is universal across Monaco/CodeMirror/Notepad/VSCode/etc.
+    // 'go_to_line': v1 falls back to move_to_end. True go-to-line via Ctrl+G
+    //   is editor-specific (works in Monaco/VSCode but not e.g. plain text
+    //   inputs); shipping that reliably is a v2 enhancement.
+    if (cursorAction === 'move_to_end' || cursorAction === 'go_to_line') {
+      try {
+        await keyboard.pressKey(Key.LeftControl);
+        await autoTypeSleep(8);
+        await keyboard.pressKey(Key.End);
+        await autoTypeSleep(8);
+        await keyboard.releaseKey(Key.End);
+        await autoTypeSleep(8);
+        await keyboard.releaseKey(Key.LeftControl);
+        await autoTypeSleep(60);
+        if (cursorAction === 'go_to_line') {
+          console.log(`[auto-type] cursor: go_to_line not yet implemented — used Ctrl+End instead`);
+        } else {
+          console.log(`[auto-type] cursor: moved to end-of-file via Ctrl+End`);
+        }
+      } catch (kErr) {
+        console.warn('[auto-type] cursor move failed:', kErr && kErr.message);
+      }
+    }
+
+    // ── wipe_chars: backspace N chars to clear a partial token ──
+    // Used when the editor has e.g. "def fac" and the code is "def factorial(...)";
+    // wipe_chars=3 backspaces "fac", then we type the full identifier from scratch.
+    if (wipeChars > 0) {
+      try {
+        for (let i = 0; i < wipeChars; i++) {
+          if (autoTypeAbort) break;
+          await keyboard.pressKey(Key.Backspace);
+          await keyboard.releaseKey(Key.Backspace);
+          await autoTypeSleep(8);
+        }
+        console.log(`[auto-type] wiped ${wipeChars} chars before typing`);
+      } catch (kErr) {
+        console.warn('[auto-type] wipe_chars failed:', kErr && kErr.message);
+      }
+    }
+
+    // ── prefix: tiny lead-in (usually "" or "\n") typed before main content ──
+    if (typePrefix) {
+      try {
+        for (const ch of typePrefix) {
+          if (autoTypeAbort) break;
+          if (ch === '\n') {
+            await keyboard.pressKey(Key.Enter);
+            await keyboard.releaseKey(Key.Enter);
+          } else {
+            await keyboard.type(ch);
+          }
+          await autoTypeSleep(15);
+        }
+      } catch (kErr) {
+        console.warn('[auto-type] prefix type failed:', kErr && kErr.message);
+      }
+    }
+
     // First-line wipe: when leading skip > 0 the cursor sits on a whitespace
     // line whose content would stack with the typed line's own indent. Home
     // → Shift+End → Delete neutralizes the line before the first char lands.
@@ -1076,6 +1204,25 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         console.warn('[auto-type] first-line wipe failed:', kErr && kErr.message);
       }
     }
+
+    // ── SID — Smart Interrupt Detection ──
+    // Every N lines, do a quick UIA tail-read and compare against what we
+    // expect to have typed. On drift (extra chars from accidental keystroke,
+    // editor autocomplete intercept, focus loss), abort the typing run with
+    // a clear "verify-mismatch" so the user can recover instead of letting
+    // 50 more lines land in the wrong place. Cheap-ish (~150ms per check)
+    // and only fires every 4 lines, so total slowdown is ~10-15% absorbed
+    // mostly by the existing newline pause.
+    //
+    // Disabled when cursor_action='go_to_line' because computing the expected
+    // editor state after a mid-file insertion is more involved than the
+    // simple "typed text appended at end / at cursor" cases.
+    const SID_INTERVAL_LINES = 4;
+    const SID_TAIL_CHARS = 60;
+    const sidEnabled = uiaSnapshotBefore
+      && (cursorAction === 'use_current' || cursorAction === 'move_to_end');
+    let typedTailBuf = ''; // accumulates the last ~few-hundred chars we typed
+    let linesSinceLastVerify = 0;
 
     let prevCh = null;
     // Track the last non-skipped line so we can tell "was the previous
@@ -1201,14 +1348,88 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       }
 
       prevLineTextForBlockCheck = line;
+
+      // SID: accumulate, then verify every N lines.
+      if (sidEnabled) {
+        typedTailBuf += line + (li < lines.length - 1 ? '\n' : '');
+        // Cap at 4×TAIL so memory stays small but enough context for verify.
+        if (typedTailBuf.length > SID_TAIL_CHARS * 4) {
+          typedTailBuf = typedTailBuf.slice(-SID_TAIL_CHARS * 4);
+        }
+        linesSinceLastVerify++;
+        if (linesSinceLastVerify >= SID_INTERVAL_LINES && typedTailBuf.length >= 8) {
+          linesSinceLastVerify = 0;
+          try {
+            const uiaCheck = await readFocusedViaUIA(800);
+            if (uiaCheck && uiaCheck.ok) {
+              // Whitespace-tolerant tail comparison: take the last SID_TAIL_CHARS
+              // non-whitespace chars we typed, look for them in the last
+              // ~SID_TAIL_CHARS+80 non-whitespace chars of the actual editor.
+              // If our tail is missing → unexpected content (drift) → abort.
+              const stripWs = (s) => s.replace(/\s+/g, '');
+              const wantTail = stripWs(typedTailBuf).slice(-SID_TAIL_CHARS);
+              const actualNw = stripWs(uiaCheck.text || '');
+              const actualTailWindow = actualNw.slice(-(SID_TAIL_CHARS + 80));
+              if (wantTail.length >= 8 && !actualTailWindow.includes(wantTail)) {
+                // Capture concrete diagnostics so the renderer can show the
+                // user WHY we aborted — opaque "interrupted" toasts make it
+                // impossible to tell editor-focus-loss from autocomplete
+                // interference from genuine race conditions.
+                const expectedSnippet = wantTail.slice(-50);
+                const actualSnippet = actualTailWindow.slice(-80);
+                console.warn(`[auto-type] SID drift detected after line ${li + 1} — typed tail not present in editor; aborting for recovery`);
+                console.warn(`[auto-type]   wanted: ${JSON.stringify(expectedSnippet)}`);
+                console.warn(`[auto-type]   actual tail: ${JSON.stringify(actualSnippet)}`);
+                autoTypeAbort = true;
+                autoTypeBroadcast({
+                  phase: 'verify-mismatch',
+                  reason: 'sid_drift_during_typing',
+                  ratio: 0,
+                  // Surface to the renderer so the toast can show "Expected
+                  // 'foo' / Found 'bar'" instead of a generic message.
+                  expected: expectedSnippet,
+                  actual: actualSnippet,
+                  lineIndex: li + 1,
+                  // Most common root causes, ordered by likelihood — gives
+                  // the user a clear next step rather than just "something
+                  // went wrong". Renderer surfaces this as a hint line.
+                  hint: 'Likely cause: editor lost focus, autocomplete inserted text, or you typed manually during the run. Try again with the editor focused and autocomplete off.',
+                });
+                break;
+              }
+            }
+          } catch (sidErr) {
+            // Best-effort — never let SID itself break the typing run.
+            console.warn('[auto-type] SID check failed (non-fatal):', sidErr && sidErr.message);
+          }
+        }
+      }
+    }
+
+    // ── suffix: tiny tail (usually closing brackets) typed after main content ──
+    if (!autoTypeAbort && typeSuffix) {
+      try {
+        for (const ch of typeSuffix) {
+          if (autoTypeAbort) break;
+          if (ch === '\n') {
+            await keyboard.pressKey(Key.Enter);
+            await keyboard.releaseKey(Key.Enter);
+          } else {
+            await keyboard.type(ch);
+          }
+          await autoTypeSleep(15);
+        }
+      } catch (kErr) {
+        console.warn('[auto-type] suffix type failed:', kErr && kErr.message);
+      }
     }
 
     // ── Post-type verify ──
-    // Only run when UIA gave us the pre-type snapshot (so we have "before"
-    // context) AND the type completed without abort. Best-effort: on any
-    // error or inconclusive result we don't alert, because false positives
-    // during an interview are worse than missed detections.
-    if (!autoTypeAbort && usedUIA && uiaSnapshotBefore) {
+    // Run when ANY UIA-aware path (deterministic OR Haiku) produced the pre-type
+    // snapshot AND the type completed without abort. Best-effort: on any error
+    // or inconclusive result we don't alert, because false positives during an
+    // interview are worse than missed detections.
+    if (!autoTypeAbort && (usedUIA || usedHaiku) && uiaSnapshotBefore) {
       try {
         // Short settle: some editors debounce their accessibility tree updates.
         await autoTypeSleep(180);
@@ -1282,6 +1503,19 @@ function Read-Focused {
     $el = [System.Windows.Automation.AutomationElement]::FocusedElement
     if ($null -eq $el) { return '{"ok":false,"error":"no_focus"}' }
 
+    # Capture the owning process so the Node side can detect "focus is still
+    # on our own Electron app" — typing into our own chat input is the most
+    # common Auto-Type failure mode.
+    $pid_ = 0
+    $pname = ''
+    try {
+      $pid_ = [int]$el.Current.ProcessId
+      if ($pid_ -gt 0) {
+        $proc = Get-Process -Id $pid_ -ErrorAction SilentlyContinue
+        if ($proc) { $pname = $proc.ProcessName }
+      }
+    } catch { }
+
     $tp = $null
     $hasTp = $el.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$tp)
     if ($hasTp -and $tp) {
@@ -1298,7 +1532,7 @@ function Read-Focused {
         if ($null -eq $before) { $before = '' }
         $cursorOffset = $before.Length
       }
-      $obj = [PSCustomObject]@{ ok = $true; text = $fullText; cursorOffset = $cursorOffset; source = 'text_pattern' }
+      $obj = [PSCustomObject]@{ ok = $true; text = $fullText; cursorOffset = $cursorOffset; source = 'text_pattern'; processId = $pid_; processName = $pname }
       return ($obj | ConvertTo-Json -Compress -Depth 3)
     }
 
@@ -1307,11 +1541,15 @@ function Read-Focused {
     if ($hasVp -and $vp) {
       $value = $vp.Current.Value
       if ($null -eq $value) { $value = '' }
-      $obj = [PSCustomObject]@{ ok = $true; text = $value; cursorOffset = $value.Length; source = 'value_pattern' }
+      $obj = [PSCustomObject]@{ ok = $true; text = $value; cursorOffset = $value.Length; source = 'value_pattern'; processId = $pid_; processName = $pname }
       return ($obj | ConvertTo-Json -Compress -Depth 3)
     }
 
-    return '{"ok":false,"error":"no_pattern"}'
+    # No text/value pattern but we still know who has focus — let the Node
+    # side decide whether that's our own process (abort) or an editor we
+    # just can't read text from (let the user try anyway).
+    $obj = [PSCustomObject]@{ ok = $false; error = 'no_pattern'; processId = $pid_; processName = $pname }
+    return ($obj | ConvertTo-Json -Compress -Depth 3)
   } catch {
     $msg = $_.Exception.Message -replace '[\\r\\n]+',' '
     $obj = [PSCustomObject]@{ ok = $false; error = $msg }
@@ -1859,11 +2097,14 @@ function createTray() {
   trayIcon = trayIcon.resize({ width: 16, height: 16 });
 
   tray = new Tray(trayIcon);
-  // Native tray tooltip is rendered by the OS shell — it is NOT covered by
+  // Native tray tooltip is rendered by the OS shell — NOT covered by
   // setContentProtection and shows on screen-share when the cursor crosses
-  // the system tray. Empty string suppresses the leak; the context menu
-  // (opened deliberately via right-click) is kept for access.
-  tray.setToolTip('');
+  // the system tray. We need a non-empty tooltip so Windows doesn't
+  // collapse / garbage-collect the tray slot (which would lock the user
+  // out of right-click access), but the string must NOT identify the app.
+  // A single space character: takes up no visible width, satisfies "non-empty",
+  // doesn't leak any branding on screen-share.
+  tray.setToolTip(' ');
 
   function updateTrayMenu() {
     // Defense-in-depth — the session-active handler clears trayMenuInterval

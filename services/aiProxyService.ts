@@ -1005,6 +1005,319 @@ export async function getAutoTypePlan(args: {
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+//  CONVERSATION SYNC — push local messages to server for admin
+//  visibility + cross-device persistence
+// ─────────────────────────────────────────────────────────────
+//
+//  The Electron client stores chat history in a per-machine SQLite (see
+//  electron/database.cjs). Without sync, those messages live only on the
+//  device and admin support has no way to see what a user actually saw —
+//  blocking incident response, billing-dispute review, and UX research
+//  on real interview transcripts.
+//
+//  We push EACH message to /api/v1/conversations/:id/sync immediately
+//  after the local write. The /sync endpoint auto-creates the conversation
+//  on first call, batches messages by id (idempotent — re-uploading the
+//  same message id is a no-op), and is auth-gated to the calling user
+//  (server-side: only the owner's user_id can write to the conversation;
+//  admins read via /admin/users/:id which already pulls these tables).
+//
+//  Privacy boundaries:
+//    - Only ADMINS can read other users' conversations (adminOnly middleware
+//      on /api/v1/admin/users/:id, plus stepUpOnly for destructive actions).
+//    - Every admin view is audit-logged (writeAudit('view-user-detail', ...)).
+//    - Sync is best-effort: a failed POST never blocks the UI or surfaces
+//      an error to the candidate mid-interview.
+//    - Currently no per-user opt-out — if we add one later, gate this call
+//      on a user.privacy.disable_cloud_sync flag.
+// ── Sync retry queue ───────────────────────────────────────────────────
+// Conversation sync used to be pure fire-and-forget: a network blip or
+// transient 5xx silently dropped the message from the cloud copy (local
+// sqlite was fine, admin dashboard was not). This queue persists failed
+// payloads to localStorage and drains on the next successful sync — so the
+// admin's view eventually catches up without burdening the candidate UI.
+//
+// Drop policy:
+//   - 401 → don't enqueue (auth issue, retry won't help until next login).
+//   - 400 → don't enqueue (server rejected payload; retrying won't fix it).
+//   - 5xx / network error → enqueue, drain on next success.
+// Cap: SYNC_QUEUE_MAX entries. Oldest dropped on overflow so a long offline
+// run doesn't unbounded-grow localStorage.
+const SYNC_QUEUE_KEY = '__conv_sync_queue_v1__';
+const SYNC_QUEUE_MAX = 500;
+const SYNC_QUEUE_MAX_RETRIES = 8;
+
+interface SyncQueueEntry {
+  sessionId: string;
+  body: { name: string; messages: any[] };
+  enqueuedAt: number;
+  retries: number;
+}
+
+function readQueue(): SyncQueueEntry[] {
+  try {
+    if (typeof localStorage === 'undefined') return [];
+    const raw = localStorage.getItem(SYNC_QUEUE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+
+function writeQueue(entries: SyncQueueEntry[]): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    // Trim oldest first if over cap.
+    const trimmed = entries.length > SYNC_QUEUE_MAX
+      ? entries.slice(entries.length - SYNC_QUEUE_MAX)
+      : entries;
+    localStorage.setItem(SYNC_QUEUE_KEY, JSON.stringify(trimmed));
+  } catch {
+    // localStorage full or disabled — last resort, drop the queue. The
+    // local sqlite copy is still authoritative; only cloud mirror is lost.
+  }
+}
+
+function enqueueSync(entry: Omit<SyncQueueEntry, 'enqueuedAt' | 'retries'> & { retries?: number }): void {
+  const queue = readQueue();
+  queue.push({
+    sessionId: entry.sessionId,
+    body: entry.body,
+    enqueuedAt: Date.now(),
+    retries: entry.retries ?? 0,
+  });
+  writeQueue(queue);
+}
+
+// Single sync attempt. Returns:
+//   - { ok: true } on 2xx
+//   - { ok: false, retriable: true } on network error or 5xx
+//   - { ok: false, retriable: false } on 4xx (don't queue)
+async function attemptSync(sessionId: string, body: { name: string; messages: any[] }, token: string):
+  Promise<{ ok: boolean; retriable: boolean }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/conversations/${encodeURIComponent(sessionId)}/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) return { ok: true, retriable: false };
+    // 401 = auth — retrying with same token won't help. Drop, surface in console.
+    // 400/403/404 = bad payload or revoked access — drop.
+    if (res.status >= 400 && res.status < 500) return { ok: false, retriable: false };
+    // 5xx = server-side, retry later.
+    return { ok: false, retriable: true };
+  } catch {
+    // Network failure (offline, DNS, TLS) — retriable.
+    return { ok: false, retriable: true };
+  }
+}
+
+// Drain the persisted queue. Called after every successful sync, on module
+// load, and on `online` events. Single-flight via a module-level guard so
+// concurrent drains don't double-send.
+let drainInFlight = false;
+async function drainSyncQueue(): Promise<void> {
+  if (drainInFlight) return;
+  const token = licenseService.getToken();
+  if (!token) return; // wait until we're logged in again
+  const queue = readQueue();
+  if (queue.length === 0) return;
+  drainInFlight = true;
+  try {
+    const remaining: SyncQueueEntry[] = [];
+    for (const entry of queue) {
+      // Bound retries so a permanently-failing payload doesn't block the
+      // queue forever. After SYNC_QUEUE_MAX_RETRIES we give up and drop —
+      // the local copy is still safe; only the cloud mirror is lost for
+      // this one message.
+      if (entry.retries >= SYNC_QUEUE_MAX_RETRIES) continue;
+      const result = await attemptSync(entry.sessionId, entry.body, token);
+      if (result.ok) continue; // successfully drained
+      if (!result.retriable) continue; // server rejected — drop
+      remaining.push({ ...entry, retries: entry.retries + 1 });
+    }
+    writeQueue(remaining);
+  } finally {
+    drainInFlight = false;
+  }
+}
+
+// Drain on module load (covers app restart with a queued backlog) and on
+// network-recovery. We don't drain on token refresh — the next user-driven
+// sync naturally triggers it via attemptSync's success path.
+if (typeof window !== 'undefined') {
+  // Defer so we don't fight with the licenseService boot sequence.
+  setTimeout(() => { drainSyncQueue().catch(() => {}); }, 2000);
+  window.addEventListener('online', () => { drainSyncQueue().catch(() => {}); });
+}
+
+export async function syncConversationMessage(args: {
+  sessionId: string;
+  sessionName: string;
+  message: { id: string; role: string; content: string; timestamp: number };
+}): Promise<void> {
+  if (!args.sessionId || !args.message?.id || !args.message?.content) return;
+  const token = licenseService.getToken();
+  if (!token) return; // not signed in — skip silently
+
+  // Server roles are 'user' / 'assistant' / 'system'. Renderer uses
+  // 'model' for AI responses (legacy from Gemini SDK terminology).
+  const normalizedRole = args.message.role === 'model' ? 'assistant' : args.message.role;
+
+  const body = {
+    name: args.sessionName || 'Interview session',
+    messages: [{
+      id: args.message.id,
+      role: normalizedRole,
+      content: args.message.content,
+      timestamp: args.message.timestamp || Date.now(),
+    }],
+  };
+
+  const result = await attemptSync(args.sessionId, body, token);
+  if (result.ok) {
+    // Opportunistically drain anything that piled up while we were offline.
+    drainSyncQueue().catch(() => {});
+    return;
+  }
+  if (result.retriable) {
+    enqueueSync({ sessionId: args.sessionId, body });
+  }
+  // Non-retriable failures are dropped — local sqlite still has the message.
+}
+
+// Sync just a conversation rename (no messages). Used when the auto-titler
+// or user's manual rename updates the session label, so admin sees the
+// up-to-date title in their dashboard.
+export async function syncConversationRename(args: {
+  sessionId: string;
+  newName: string;
+}): Promise<void> {
+  if (!args.sessionId || !args.newName) return;
+  const token = licenseService.getToken();
+  if (!token) return;
+  const body = { name: args.newName, messages: [] as any[] };
+  const result = await attemptSync(args.sessionId, body, token);
+  if (result.ok) {
+    drainSyncQueue().catch(() => {});
+    return;
+  }
+  if (result.retriable) {
+    enqueueSync({ sessionId: args.sessionId, body });
+  }
+}
+
+// Backfill: upload ALL local conversations + messages to the server.
+// Useful one-shot tool to populate the admin dashboard for users who had
+// pre-existing local-only sessions before the per-message sync was wired
+// in. Idempotent — re-running is safe (server's /sync upserts by message id).
+//
+// Reports per-session progress via callback so the UI can show "Syncing
+// X of Y" instead of an opaque spinner. Failures on individual sessions
+// are counted but don't abort the loop — partial sync is still useful.
+export interface BackfillProgress {
+  done: number;
+  total: number;
+  current: string;
+  synced: number;
+  failed: number;
+}
+
+export interface BackfillResult {
+  success: boolean;
+  synced: number;
+  failed: number;
+  message: string;
+}
+
+export async function backfillAllConversations(
+  userId: string,
+  onProgress: (state: BackfillProgress) => void,
+): Promise<BackfillResult> {
+  if (typeof window === 'undefined' || !window.electronAPI?.invoke) {
+    return { success: false, synced: 0, failed: 0, message: 'Backfill is only available in the desktop app' };
+  }
+  const token = licenseService.getToken();
+  if (!token) return { success: false, synced: 0, failed: 0, message: 'Not signed in' };
+  if (!userId) return { success: false, synced: 0, failed: 0, message: 'No user id available' };
+
+  let synced = 0;
+  let failed = 0;
+
+  try {
+    const sessions = await window.electronAPI.invoke<any[]>('db:list-sessions', userId);
+    const list = Array.isArray(sessions) ? sessions : [];
+    if (list.length === 0) {
+      return { success: true, synced: 0, failed: 0, message: 'No local conversations found' };
+    }
+
+    onProgress({ done: 0, total: list.length, current: list[0]?.name || '', synced: 0, failed: 0 });
+
+    for (let i = 0; i < list.length; i++) {
+      const session = list[i];
+      onProgress({
+        done: i,
+        total: list.length,
+        current: session.name || 'Untitled',
+        synced,
+        failed,
+      });
+
+      try {
+        const messagesRaw = await window.electronAPI.invoke<any[]>('db:get-messages', session.id);
+        const messages = Array.isArray(messagesRaw) ? messagesRaw : [];
+
+        // Normalize to server schema. Drop empty messages — server requires content.
+        const batch = messages.map(m => ({
+          id: String(m.id),
+          role: m.role === 'model' ? 'assistant' : String(m.role || 'user'),
+          content: String(m.content || ''),
+          timestamp: typeof m.timestamp === 'number' ? m.timestamp : Date.now(),
+        })).filter(m => m.content);
+
+        const res = await fetch(`${API_BASE}/api/v1/conversations/${encodeURIComponent(session.id)}/sync`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            name: session.name || 'Interview session',
+            messages: batch,
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        synced++;
+      } catch (e) {
+        console.warn('[backfill] session sync failed:', session.id, e);
+        failed++;
+      }
+    }
+
+    onProgress({ done: list.length, total: list.length, current: '', synced, failed });
+    return {
+      success: failed === 0,
+      synced,
+      failed,
+      message: failed === 0
+        ? `Synced ${synced} conversation${synced === 1 ? '' : 's'} to the cloud`
+        : `Synced ${synced}, ${failed} failed (will retry next time you click)`,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      synced,
+      failed,
+      message: err?.message || 'Backfill failed',
+    };
+  }
+}
+
 export async function getDeepgramKey(): Promise<string> {
   const token = licenseService.getToken();
   if (!token) throw new Error('Not authenticated');

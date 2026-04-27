@@ -293,11 +293,17 @@ app.get('/api/health', (req, res) => {
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/h2so4/releases/latest';
 const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
+// Bump this on every release. If GitHub is unreachable AND the in-memory
+// cache is cold (server just restarted), every running 3.4.3 client would
+// otherwise get told "latest is 3.3.5" and see a misleading downgrade prompt.
+// MUST match the package.json version that's currently being released —
+// pointing at a version that doesn't have a GitHub release yet would make
+// every client see an "update available" prompt for a phantom release.
 const FALLBACK_VERSION = {
-  version: '3.3.5',
+  version: '3.4.3',
   minVersion: '2.0.0',
-  releaseDate: '2026-04-14',
-  releaseNotes: 'Performance improvements and bug fixes',
+  releaseDate: '2026-04-26',
+  releaseNotes: 'Admin portal polish, conversation sync retry queue, voice/auto-type stability fixes, support WebSocket hardening',
   downloadUrl: {
     windows: 'https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe',
     // x64 DMG works on all Macs (Apple Silicon runs it under Rosetta). When
@@ -439,8 +445,29 @@ setInterval(runResetTokenCleanup, RESET_TOKEN_CLEANUP_INTERVAL_MS).unref();
 const WebSocket = require('ws');
 const wss = new WebSocket.Server({ server, path: '/ws/support' });
 
-// Track connected clients: customers and agents
-const supportClients = new Map(); // sessionId -> { ws, type: 'customer'|'agent', email, name }
+// Track connected clients: customers and agents.
+// `lastSeen` powers the idle sweeper; `pingPending` lets the heartbeat
+// detect dead-but-not-closed sockets (firewall NAT timeout, broken Wi-Fi
+// where TCP FIN never lands) that would otherwise leak forever.
+const supportClients = new Map(); // sessionId -> { ws, type, email, name, lastSeen, pingPending }
+
+// Tunables. 30-min idle close matches typical support-chat patience; ping
+// every 60s is well under common 2-min NAT timeouts. MAX_PER_USER prevents
+// a flapping client from inflating the map without bound.
+const SUPPORT_IDLE_MS = 30 * 60 * 1000;
+const SUPPORT_PING_INTERVAL_MS = 60 * 1000;
+const SUPPORT_MAX_PER_USER = 1; // one active connection per email
+
+// Helper: find any existing connection for the same logical user (same
+// role + email). Used to evict the older session when a new one joins, so
+// reconnect storms don't accumulate stale entries.
+function findExistingClientId(role, email) {
+  if (!email) return null;
+  for (const [id, c] of supportClients) {
+    if (c.type === role && c.email === email) return id;
+  }
+  return null;
+}
 
 wss.on('connection', (ws) => {
   let clientId = null;
@@ -450,20 +477,37 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(raw);
 
       if (data.type === 'join') {
-        clientId = `${data.role || 'customer'}_${data.user || Date.now()}`;
+        const role = data.role || 'customer';
+        const email = data.user || `anon_${Date.now()}`;
+
+        // Per-user cap: if this user already has an active connection, evict
+        // the older one. Mirrors how mobile apps handle reconnect — newest
+        // wins, the orphan socket gets a clean close instead of lingering.
+        if (SUPPORT_MAX_PER_USER === 1) {
+          const existing = findExistingClientId(role, email);
+          if (existing) {
+            const prev = supportClients.get(existing);
+            try { prev.ws.close(4000, 'Replaced by newer connection'); } catch {}
+            supportClients.delete(existing);
+          }
+        }
+
+        clientId = `${role}_${email}`;
         supportClients.set(clientId, {
           ws,
-          type: data.role || 'customer',
-          email: data.user,
-          name: data.name || 'User'
+          type: role,
+          email,
+          name: data.name || 'User',
+          lastSeen: Date.now(),
+          pingPending: false,
         });
-        console.log(`Support chat: ${data.name || data.user} connected as ${data.role || 'customer'}`);
+        console.log(`Support chat: ${data.name || email} connected as ${role}`);
 
         // Notify agents of new customer
-        if (data.role !== 'agent') {
+        if (role !== 'agent') {
           for (const [, client] of supportClients) {
             if (client.type === 'agent' && client.ws.readyState === WebSocket.OPEN) {
-              client.ws.send(JSON.stringify({ type: 'customer_joined', email: data.user, name: data.name }));
+              client.ws.send(JSON.stringify({ type: 'customer_joined', email, name: data.name }));
             }
           }
         }
@@ -472,6 +516,7 @@ wss.on('connection', (ws) => {
       if (data.type === 'message') {
         const sender = supportClients.get(clientId);
         if (!sender) return;
+        sender.lastSeen = Date.now();
 
         // Route message: customer->agents, agent->specific customer
         if (sender.type === 'customer') {
@@ -493,6 +538,15 @@ wss.on('connection', (ws) => {
     } catch {}
   });
 
+  // Heartbeat ack — clears the pingPending flag so the sweeper knows this
+  // socket is alive. ws library fires 'pong' for both server-initiated pings
+  // and client-initiated ones.
+  ws.on('pong', () => {
+    if (!clientId) return;
+    const c = supportClients.get(clientId);
+    if (c) { c.pingPending = false; c.lastSeen = Date.now(); }
+  });
+
   ws.on('close', () => {
     if (clientId) {
       const client = supportClients.get(clientId);
@@ -509,4 +563,43 @@ wss.on('connection', (ws) => {
       supportClients.delete(clientId);
     }
   });
+});
+
+// Sweeper: every PING_INTERVAL we ping every open socket and evict anything
+// that (a) didn't pong from the previous tick or (b) crossed the idle
+// threshold. Without this, half-open sockets (firewall dropped, no FIN/RST
+// reaches us) sit in supportClients forever, waste memory, and broadcast to
+// dead recipients. Single setInterval, cleaned up on server close.
+const supportSweeper = setInterval(() => {
+  const now = Date.now();
+  for (const [id, c] of supportClients) {
+    if (!c.ws || c.ws.readyState !== WebSocket.OPEN) {
+      supportClients.delete(id);
+      continue;
+    }
+    // Idle close — user walked away, conversation effectively over.
+    if (now - c.lastSeen > SUPPORT_IDLE_MS) {
+      try { c.ws.close(4001, 'Idle timeout'); } catch {}
+      supportClients.delete(id);
+      continue;
+    }
+    // Heartbeat — last ping was never answered. Treat as dead.
+    if (c.pingPending) {
+      try { c.ws.terminate(); } catch {}
+      supportClients.delete(id);
+      continue;
+    }
+    // Issue a fresh ping. ws.ping() sends an opcode 0x9 frame and the client
+    // library handles the pong automatically; no app-level support needed.
+    c.pingPending = true;
+    try { c.ws.ping(); } catch {
+      supportClients.delete(id);
+    }
+  }
+}, SUPPORT_PING_INTERVAL_MS);
+
+// Stop the sweeper on server shutdown so test suites and graceful restarts
+// don't leak the interval into the next process.
+wss.on('close', () => {
+  clearInterval(supportSweeper);
 });
