@@ -300,10 +300,10 @@ const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 // pointing at a version that doesn't have a GitHub release yet would make
 // every client see an "update available" prompt for a phantom release.
 const FALLBACK_VERSION = {
-  version: '3.4.4',
+  version: '3.4.5',
   minVersion: '2.0.0',
-  releaseDate: '2026-04-27',
-  releaseNotes: 'Auto-Type stability hotfix: respect user cursor placement, fix SID drift false-positives mid-typing, surface abort reason instead of silent reset',
+  releaseDate: '2026-04-26',
+  releaseNotes: 'Google sign-in hotfix: split shared loading state so only the clicked button spins, add 6s timeout + manual-URL fallback when system browser fails to open after logout',
   downloadUrl: {
     windows: 'https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe',
     // x64 DMG works on all Macs (Apple Silicon runs it under Rosetta). When
