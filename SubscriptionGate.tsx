@@ -3311,7 +3311,21 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   const [name, setName] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Google sign-in lives on its own loading flag so clicking "Continue with
+  // Google" doesn't make the regular email/password Sign-in button also
+  // appear to be loading. The shared isSubmitting was the source of the
+  // "both buttons are loading at the same time" confusion in v3.4.4.
+  const [googleSubmitting, setGoogleSubmitting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  // When the system browser fails to open (shell.openExternal rejects/hangs),
+  // we surface the auth URL so the user can copy it and finish sign-in
+  // manually. Cleared when sign-in resolves or is cancelled.
+  const [googleManualUrl, setGoogleManualUrl] = useState<string | null>(null);
+  const [googleUrlCopied, setGoogleUrlCopied] = useState(false);
+  // Aborts the in-flight Google poll without unmounting (mountedRef would
+  // also need a remount to recover). Set to true by the Cancel button; the
+  // poll loop checks it on every tick.
+  const googlePollAbortRef = useRef(false);
   const [forgotSent, setForgotSent] = useState(false);
 
   // Authenticated user (for download/dashboard views)
@@ -4157,125 +4171,251 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   };
 
   // ── Google OAuth via system browser (for Electron) ──
-  const handleGoogleElectron = async () => {
-    setIsSubmitting(true);
+  // Cancel any in-flight Google sign-in. Wired to a Cancel button that
+  // shows during the polling phase — without it, a botched openExternal
+  // (browser doesn't open) traps the user with a spinner for 2 full
+  // minutes until poll timeout. Also called by the manual-fallback flow.
+  const cancelGoogleElectron = () => {
+    googlePollAbortRef.current = true;
+    setGoogleSubmitting(false);
+    setGoogleManualUrl(null);
+    setGoogleUrlCopied(false);
     setAuthError(null);
+  };
+
+  const handleGoogleElectron = async () => {
+    setGoogleSubmitting(true);
+    setAuthError(null);
+    setGoogleManualUrl(null);
+    setGoogleUrlCopied(false);
+    googlePollAbortRef.current = false;
 
     const sessionId = crypto.randomUUID();
     const serverUrl = 'https://h2so4-production.up.railway.app';
     const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}`;
 
+    // Open Google sign-in in system browser. We MUST await + catch here —
+    // the previous fire-and-forget pattern silently swallowed shell errors
+    // (default-browser misconfigured, ShellExecuteEx failure, etc.) and the
+    // spinner ran for 2 minutes with no diagnostic. The 6-second timeout
+    // catches the rarer "openExternal hangs forever" case (seen on Windows
+    // when the OS shell process is overloaded right after a logout).
+    let openedOk = false;
     try {
-      // Open Google sign-in in system browser. Capability check is on
-      // window.electronAPI.openExternal directly — the top-level isElectron
-      // const is module-load-time-evaluated and historically had subtle
-      // timing/preload-injection edge cases. Optional-chaining the actual
-      // function is the durable check.
       if (window.electronAPI?.openExternal) {
-        window.electronAPI.openExternal(authUrl);
+        const openPromise = window.electronAPI.openExternal(authUrl);
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Browser launch timed out (6s)')), 6000)
+        );
+        await Promise.race([openPromise, timeoutPromise]);
+        openedOk = true;
       } else {
-        window.open(authUrl, '_blank');
+        // Browser fallback (non-Electron path — should not hit here in
+        // practice since this handler is gated on isElectron). window.open
+        // can be popup-blocked; we still surface the URL so the user can
+        // open it manually if the popup is suppressed.
+        const opened = window.open(authUrl, '_blank');
+        openedOk = !!opened;
       }
+    } catch (openErr: any) {
+      console.error('[google-auth] openExternal failed:', openErr);
+      // Don't reset isSubmitting — show the manual-fallback UI so the user
+      // can copy the URL and finish in their browser. The poll will still
+      // run so that completing manually still authenticates them.
+      setGoogleManualUrl(authUrl);
+      setAuthError(
+        `Couldn't open your browser automatically (${openErr?.message || 'unknown error'}). Copy the link below and open it in any browser to continue.`
+      );
+    }
 
-      // Poll for result
-      let attempts = 0;
-      const maxAttempts = 60; // 60 * 2s = 2 minutes
-      const pollInterval = 2000;
+    if (!openedOk && !googleManualUrl) {
+      // Browser fallback got popup-blocked but didn't throw — still surface
+      // the URL.
+      setGoogleManualUrl(authUrl);
+      setAuthError('Couldn\'t open your browser automatically. Copy the link below and open it in any browser to continue.');
+    }
 
-      const poll = async (): Promise<void> => {
-        // Abort if the gate unmounted between polls (user navigated away
-        // or auth completed on another code path). Saved auth from the
-        // server is already persisted by /poll handler's saveAuth above,
-        // so dropping this poll does not lose data.
+    // Poll for result regardless of whether openExternal succeeded — if the
+    // user opens the URL manually, polling still picks up the success.
+    let attempts = 0;
+    const maxAttempts = 60; // 60 * 2s = 2 minutes
+    const pollInterval = 2000;
+
+    const poll = async (): Promise<void> => {
+      // Three abort conditions:
+      //  1. User clicked Cancel (googlePollAbortRef.current = true)
+      //  2. Component unmounted (mountedRef.current = false)
+      //  3. Max attempts reached (handled below)
+      if (googlePollAbortRef.current) return;
+      if (!mountedRef.current) return;
+      attempts++;
+      try {
+        const res = await fetch(`${serverUrl}/api/v1/auth/google/poll?session_id=${sessionId}`);
+        const data = await res.json();
+        if (googlePollAbortRef.current) return;
         if (!mountedRef.current) return;
-        attempts++;
-        try {
-          const res = await fetch(`${serverUrl}/api/v1/auth/google/poll?session_id=${sessionId}`);
-          const data = await res.json();
-          if (!mountedRef.current) return;
 
-          if (data.status === 'success') {
-            // Defensive: server should always return a license on success,
-            // but if for any reason it's missing we'd otherwise authenticate
-            // the user and then immediately crash downstream code that reads
-            // license.tier. Surface the issue clearly instead.
-            if (!data.user || !data.license || !data.token) {
-              console.error('[google-auth] success response missing fields:', {
-                hasUser: !!data.user,
-                hasLicense: !!data.license,
-                hasToken: !!data.token,
-              });
-              setAuthError('Sign-in succeeded but server returned incomplete data. Please try again.');
-              setIsSubmitting(false);
-              return;
-            }
-            // Save auth data
-            data.license.last_validated = Date.now();
-            try {
-              licenseService.saveAuth(data.user, data.license, data.token);
-            } catch (saveErr: any) {
-              // localStorage quota / disabled / corrupt JSON. Without this
-              // try-catch, a saveAuth throw silently aborts the success path
-              // and the spinner runs forever — the "loading there itself"
-              // symptom from logout→re-login.
-              console.error('[google-auth] saveAuth threw:', saveErr);
-              setAuthError('Could not save sign-in (storage error). Please try again.');
-              setIsSubmitting(false);
-              return;
-            }
-
-            setCurrentUser(data.user);
-            setCurrentLicense(data.license);
-            setIsSubmitting(false);
-
-            if (window.electronAPI?.send) {
-              // Pull the Electron window back to the foreground — the browser
-              // "you can close this tab" page leaves the desktop app hidden
-              // behind it otherwise.
-              try { window.electronAPI.send('focus-main-window'); } catch {}
-              onAuthenticated(data.user, data.license);
-            } else {
-              setView('download');
-            }
+        if (data.status === 'success') {
+          // Defensive: server should always return a license on success,
+          // but if for any reason it's missing we'd otherwise authenticate
+          // the user and then immediately crash downstream code that reads
+          // license.tier. Surface the issue clearly instead.
+          if (!data.user || !data.license || !data.token) {
+            console.error('[google-auth] success response missing fields:', {
+              hasUser: !!data.user,
+              hasLicense: !!data.license,
+              hasToken: !!data.token,
+            });
+            setAuthError('Sign-in succeeded but server returned incomplete data. Please try again.');
+            setGoogleSubmitting(false);
+            setGoogleManualUrl(null);
+            return;
+          }
+          // Save auth data
+          data.license.last_validated = Date.now();
+          try {
+            licenseService.saveAuth(data.user, data.license, data.token);
+          } catch (saveErr: any) {
+            // localStorage quota / disabled / corrupt JSON. Without this
+            // try-catch, a saveAuth throw silently aborts the success path
+            // and the spinner runs forever — the "loading there itself"
+            // symptom from logout→re-login.
+            console.error('[google-auth] saveAuth threw:', saveErr);
+            setAuthError('Could not save sign-in (storage error). Please try again.');
+            setGoogleSubmitting(false);
+            setGoogleManualUrl(null);
             return;
           }
 
-          if (data.status === 'error') {
-            setAuthError(data.error || 'Google sign-in failed');
-            setIsSubmitting(false);
-            return;
-          }
+          setCurrentUser(data.user);
+          setCurrentLicense(data.license);
+          setGoogleSubmitting(false);
+          setGoogleManualUrl(null);
 
-          // Still pending
-          if (attempts < maxAttempts) {
-            await new Promise(r => setTimeout(r, pollInterval));
-            if (!mountedRef.current) return;
-            return poll();
+          if (window.electronAPI?.send) {
+            // Pull the Electron window back to the foreground — the browser
+            // "you can close this tab" page leaves the desktop app hidden
+            // behind it otherwise.
+            try { window.electronAPI.send('focus-main-window'); } catch {}
+            onAuthenticated(data.user, data.license);
           } else {
-            setAuthError('Sign-in timed out. Please try again.');
-            setIsSubmitting(false);
+            setView('download');
           }
-        } catch (pollErr) {
-          // Log so we can see WHAT failed if the user reports it again.
-          // Previously this catch was silent + retried, masking real bugs
-          // (e.g., CORS, DNS, certificate errors) as "still pending".
-          console.warn('[google-auth] poll attempt failed:', pollErr);
-          if (!mountedRef.current) return;
-          if (attempts < maxAttempts) {
-            await new Promise(r => setTimeout(r, pollInterval));
-            if (!mountedRef.current) return;
-            return poll();
-          }
-          setAuthError('Connection error. Please try again.');
-          setIsSubmitting(false);
+          return;
         }
-      };
 
+        if (data.status === 'error') {
+          setAuthError(data.error || 'Google sign-in failed');
+          setGoogleSubmitting(false);
+          setGoogleManualUrl(null);
+          return;
+        }
+
+        // Still pending
+        if (attempts < maxAttempts) {
+          await new Promise(r => setTimeout(r, pollInterval));
+          if (googlePollAbortRef.current) return;
+          if (!mountedRef.current) return;
+          return poll();
+        } else {
+          setAuthError('Sign-in timed out. Please try again.');
+          setGoogleSubmitting(false);
+          setGoogleManualUrl(null);
+        }
+      } catch (pollErr) {
+        // Log so we can see WHAT failed if the user reports it again.
+        // Previously this catch was silent + retried, masking real bugs
+        // (e.g., CORS, DNS, certificate errors) as "still pending".
+        console.warn('[google-auth] poll attempt failed:', pollErr);
+        if (googlePollAbortRef.current) return;
+        if (!mountedRef.current) return;
+        if (attempts < maxAttempts) {
+          await new Promise(r => setTimeout(r, pollInterval));
+          if (googlePollAbortRef.current) return;
+          if (!mountedRef.current) return;
+          return poll();
+        }
+        setAuthError('Connection error. Please try again.');
+        setGoogleSubmitting(false);
+        setGoogleManualUrl(null);
+      }
+    };
+
+    try {
       await poll();
     } catch (err: any) {
-      setAuthError(err.message || 'Google sign-in failed');
-      setIsSubmitting(false);
+      console.error('[google-auth] poll loop threw:', err);
+      setAuthError(err?.message || 'Google sign-in failed');
+      setGoogleSubmitting(false);
+      setGoogleManualUrl(null);
     }
+  };
+
+  // Reusable fallback panel shown when shell.openExternal fails (or hangs)
+  // and during the polling phase. Without this the user is trapped: spinner
+  // running, browser never opened, no way out for 2 full minutes. Defined
+  // here so it captures the latest state via closure and renders identically
+  // in both the login and signup views.
+  const renderGoogleFallback = () => {
+    if (!googleSubmitting && !googleManualUrl) return null;
+    return (
+      <div className="mt-3 space-y-2">
+        {googleManualUrl && (
+          <div
+            className="rounded-xl px-3 py-2.5 text-[12px] break-all"
+            style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink-muted)' }}
+          >
+            <div className="font-mono text-[11px] mb-2" style={{ color: 'var(--ink)' }}>
+              {googleManualUrl}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(googleManualUrl);
+                    setGoogleUrlCopied(true);
+                    setTimeout(() => setGoogleUrlCopied(false), 2000);
+                  } catch {
+                    setGoogleUrlCopied(false);
+                  }
+                }}
+                className="px-3 py-1.5 rounded-full text-[11.5px] font-medium transition-all hover:opacity-90"
+                style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+              >
+                {googleUrlCopied ? 'Copied!' : 'Copy link'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  // Last-ditch: try openExternal one more time. If it
+                  // works, polling that's already running picks up the
+                  // success. If it fails again, the catch updates the
+                  // fallback message — at least the user sees we tried.
+                  if (window.electronAPI?.openExternal && googleManualUrl) {
+                    window.electronAPI.openExternal(googleManualUrl).catch((e: any) => {
+                      console.warn('[google-auth] retry openExternal failed:', e);
+                    });
+                  }
+                }}
+                className="px-3 py-1.5 rounded-full text-[11.5px] font-medium transition-all hover:opacity-90"
+                style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+              >
+                Try again
+              </button>
+            </div>
+          </div>
+        )}
+        <button
+          type="button"
+          onClick={cancelGoogleElectron}
+          className="w-full py-2 text-[12px] font-medium transition-all hover:opacity-100"
+          style={{ color: 'var(--ink-muted)' }}
+        >
+          Cancel sign-in
+        </button>
+      </div>
+    );
   };
 
   // ── Logout ──
@@ -4296,6 +4436,14 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setEmail('');
     setPassword('');
     setName('');
+    // Cancel any in-flight Google sign-in and clear its UI state so a
+    // re-login attempt starts fully fresh — without these, a stale
+    // googleManualUrl or polled-out abort flag would block the next
+    // openExternal from running cleanly.
+    googlePollAbortRef.current = true;
+    setGoogleSubmitting(false);
+    setGoogleManualUrl(null);
+    setGoogleUrlCopied(false);
   };
 
   // ── Loading ──
@@ -5213,7 +5361,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               )}
               <button
                 type="submit"
-                disabled={isSubmitting}
+                disabled={isSubmitting || googleSubmitting}
                 className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90 inline-flex items-center justify-center gap-2 disabled:opacity-60"
                 style={{ background: 'var(--ink)', color: 'var(--cream)' }}
               >
@@ -5234,16 +5382,16 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 {isElectron ? (
                   <button
                     onClick={handleGoogleElectron}
-                    disabled={isSubmitting}
+                    disabled={isSubmitting || googleSubmitting}
                     className="mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-60 hover:opacity-90"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   >
-                    {isSubmitting ? (
+                    {googleSubmitting ? (
                       <Loader2 size={16} className="animate-spin" />
                     ) : (
                       <svg width="17" height="17" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
                     )}
-                    {isSubmitting ? 'Waiting for sign-in...' : 'Continue with Google'}
+                    {googleSubmitting ? 'Waiting for sign-in...' : 'Continue with Google'}
                   </button>
                 ) : (
                   <div className="mt-5 flex justify-center [&_iframe]:rounded-full">
@@ -5258,6 +5406,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                     />
                   </div>
                 )}
+                {isElectron && renderGoogleFallback()}
               </>
             )}
 
@@ -5480,7 +5629,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               )}
               <button
                 type="submit"
-                disabled={isSubmitting}
+                disabled={isSubmitting || googleSubmitting}
                 className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90 inline-flex items-center justify-center gap-2 disabled:opacity-60"
                 style={{ background: 'var(--ink)', color: 'var(--cream)' }}
               >
@@ -5504,16 +5653,16 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 {isElectron ? (
                   <button
                     onClick={handleGoogleElectron}
-                    disabled={isSubmitting}
+                    disabled={isSubmitting || googleSubmitting}
                     className="mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-60 hover:opacity-90"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   >
-                    {isSubmitting ? (
+                    {googleSubmitting ? (
                       <Loader2 size={16} className="animate-spin" />
                     ) : (
                       <svg width="17" height="17" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
                     )}
-                    {isSubmitting ? 'Waiting for sign-up...' : 'Continue with Google'}
+                    {googleSubmitting ? 'Waiting for sign-up...' : 'Continue with Google'}
                   </button>
                 ) : (
                   <div className="mt-5 flex justify-center [&_iframe]:rounded-full">
@@ -5528,6 +5677,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                     />
                   </div>
                 )}
+                {isElectron && renderGoogleFallback()}
               </>
             )}
 
