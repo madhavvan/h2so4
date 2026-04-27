@@ -5,10 +5,20 @@
 
 const express = require('express');
 const { authMiddleware } = require('../middleware/auth');
+const { requireTier } = require('../middleware/tier');
 const router = express.Router();
 
 // All AI routes require authentication
 router.use(authMiddleware);
+
+// ── Tier gate aliases ──
+// Mirrors services/licenseService.ts FEATURE_GATES.models, in shorthand:
+//   - PAID  → basic + pro + max  (GPT-5.5, Grok, Llama-4-Scout)
+//   - MAX   → max only           (Claude Sonnet 4.6, Auto-Type planner)
+// Free tier: only Gemini, ungated. Defined here so adding a new model
+// route only requires picking the right gate, not hand-listing tiers.
+const PAID = ['basic', 'pro', 'max'];
+const MAX_ONLY = ['max'];
 
 // ── Gemini ──
 router.post('/chat/gemini', async (req, res) => {
@@ -45,7 +55,22 @@ router.post('/chat/gemini', async (req, res) => {
 });
 
 // ── OpenAI (GPT) ──
-router.post('/chat/openai', async (req, res) => {
+// GPT-5.5 reasoning_effort knob. Accepted values for gpt-5.5 are
+// `none, low, medium, high, xhigh` — `minimal` is gpt-5-only and
+// returns HTTP 400 here. We use `medium` (also the default) because
+// the user prefers the deeper reasoning quality even at the cost of
+// 2-10s of pre-token thinking time. Setting it explicitly so future
+// model upgrades don't silently drift the behavior.
+//
+// We deliberately do NOT pass `verbosity` — that parameter is on
+// the Responses API surface and openai-node's chat.completions
+// types only accept it inconsistently across versions. Passing it
+// would risk 400'ing every paid user. (See openai-python #2610.)
+//
+// Temperature is still omitted — GPT-5.5 rejects any non-default
+// value with HTTP 400. Same for top_p / presence_penalty /
+// frequency_penalty / logprobs.
+router.post('/chat/openai', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OpenAI not configured' });
 
@@ -58,9 +83,7 @@ router.post('/chat/openai', async (req, res) => {
       model: 'gpt-5.5',
       messages,
       max_completion_tokens: 16000,
-      // GPT-5.5 only accepts the default temperature (1). Setting any other
-      // value returns 400 "Unsupported value: 'temperature' does not support
-      // X with this model." Per OpenAI's GPT-5.x family contract.
+      reasoning_effort: 'medium',
     });
 
     res.json({ text: completion.choices[0]?.message?.content || '' });
@@ -71,7 +94,7 @@ router.post('/chat/openai', async (req, res) => {
 });
 
 // ── xAI (Grok) ──
-router.post('/chat/xai', async (req, res) => {
+router.post('/chat/xai', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.XAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'xAI not configured' });
 
@@ -95,7 +118,7 @@ router.post('/chat/xai', async (req, res) => {
 });
 
 // ── Groq ──
-router.post('/chat/groq', async (req, res) => {
+router.post('/chat/groq', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Groq not configured' });
 
@@ -138,7 +161,7 @@ const _AnthropicMod = (() => {
 })();
 const Anthropic = _AnthropicMod && (_AnthropicMod.default || _AnthropicMod);
 
-router.post('/chat/claude', async (req, res) => {
+router.post('/chat/claude', requireTier(...MAX_ONLY), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
 
@@ -268,7 +291,12 @@ router.post('/stream/gemini', async (req, res) => {
 });
 
 // ── OpenAI (stream) ──
-router.post('/stream/openai', async (req, res) => {
+// Same reasoning_effort='medium' as /chat/openai above. See the chat
+// handler comment for the full rationale (in particular: 'medium' is
+// the GPT-5.5 default, 'minimal' is gpt-5-only and would 400 here,
+// verbosity is omitted because chat.completions types reject it
+// inconsistently across SDK versions).
+router.post('/stream/openai', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OpenAI not configured' });
 
@@ -283,7 +311,7 @@ router.post('/stream/openai', async (req, res) => {
         model: 'gpt-5.5',
         messages,
         max_completion_tokens: 16000,
-        // GPT-5.5 only accepts default temperature (1). See chat handler above.
+        reasoning_effort: 'medium',
         stream: true,
       },
       { signal: sse.signal }
@@ -304,7 +332,7 @@ router.post('/stream/openai', async (req, res) => {
 });
 
 // ── xAI Grok (stream) ──
-router.post('/stream/xai', async (req, res) => {
+router.post('/stream/xai', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.XAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'xAI not configured' });
 
@@ -340,7 +368,7 @@ router.post('/stream/xai', async (req, res) => {
 });
 
 // ── Groq (stream) ──
-router.post('/stream/groq', async (req, res) => {
+router.post('/stream/groq', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Groq not configured' });
 
@@ -382,7 +410,7 @@ router.post('/stream/groq', async (req, res) => {
 // out by the helper, so the candidate sees only the final answer text.
 // Web search runs server-side on Anthropic's infra during a single API
 // call — no extra round-trip on our end.
-router.post('/stream/claude', async (req, res) => {
+router.post('/stream/claude', requireTier(...MAX_ONLY), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
 
@@ -446,7 +474,7 @@ router.post('/stream/claude', async (req, res) => {
 // JSON plan that the deterministic logic couldn't have produced.
 // Cost: ~$0.005 per call. Latency target: ~500-800ms. Used only for
 // Auto-Type, only on Max-tier (Auto-Type is gated to Max anyway).
-router.post('/autotype-plan', async (req, res) => {
+router.post('/autotype-plan', requireTier(...MAX_ONLY), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) {
     return res.status(503).json({ error: 'Claude not configured' });

@@ -27,6 +27,18 @@ declare global {
     /** Open an http/https/mailto URL in the OS default browser. Rejects
      * other protocols (no file://, javascript:, data:). */
     openExternal(url: string): Promise<void>;
+
+    /** Robust opener that goes through main-process IPC and tries multiple
+     * launch paths (shell.openExternal → child_process spawn). Resolves
+     * with a structured result so the renderer can show diagnostic info.
+     * Use this in preference to openExternal — the legacy helper is kept
+     * for code paths that haven't been migrated yet. */
+    openExternalRobust(url: string): Promise<{
+      ok: boolean;
+      method: string;
+      error?: string;
+      attempts: Array<{ method: string; ok: boolean; error?: string }>;
+    }>;
   }
 
   interface Window {

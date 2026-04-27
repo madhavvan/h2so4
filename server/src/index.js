@@ -57,11 +57,17 @@ app.use(cors({
 }));
 
 // DEV-ONLY: log every incoming request so we can see what the renderer
-// is hitting. Remove or guard before production.
-app.use((req, res, next) => {
-  console.log(`[req] ${req.method} ${req.originalUrl}`);
-  next();
-});
+// is hitting. Skipped entirely in production — req.originalUrl can carry
+// sensitive query params (?session_id=…, ?token=… for password reset)
+// that we don't want piling up in Railway log retention. Wrapping the
+// app.use itself rather than the callback avoids the per-request
+// NODE_ENV branch on the hot path.
+if (process.env.NODE_ENV !== 'production') {
+  app.use((req, res, next) => {
+    console.log(`[req] ${req.method} ${req.originalUrl}`);
+    next();
+  });
+}
 
 // Stripe webhooks need raw body — must be BEFORE express.json()
 app.use('/api/v1/webhooks', webhookRoutes);
@@ -278,6 +284,23 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', version: '1.0.0', service: 'minicaai-api' });
 });
 
+// ── Stealth verification page ──
+// Standalone HTML page that exposes the same browser focus events
+// proctoring stacks listen to (window.onblur / onfocus / visibilitychange)
+// + a typing speed measurement textarea. Lets the user verify in 30
+// seconds that:
+//   1. Popout button clicks don't trigger focus loss in the browser
+//      (focusable:false fix is applied)
+//   2. Auto-Type rhythm hits realistic human-coder chars/sec
+// Public route — no auth needed; the page is a diagnostic tool, not
+// an attack surface. Cache-Control public so a Railway dyno cold start
+// doesn't slow down the test page.
+const path = require('path');
+app.get('/stealth-test', (req, res) => {
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.sendFile(path.join(__dirname, 'stealth-test.html'));
+});
+
 // ── App Version Check ──
 // Returns the latest app version info. All clients (including old versions)
 // can call this to check if they need to update. This works even when the
@@ -300,10 +323,10 @@ const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 // pointing at a version that doesn't have a GitHub release yet would make
 // every client see an "update available" prompt for a phantom release.
 const FALLBACK_VERSION = {
-  version: '3.4.5',
+  version: '3.4.6',
   minVersion: '2.0.0',
-  releaseDate: '2026-04-26',
-  releaseNotes: 'Google sign-in hotfix: split shared loading state so only the clicked button spins, add 6s timeout + manual-URL fallback when system browser fails to open after logout',
+  releaseDate: '2026-04-27',
+  releaseNotes: 'Stability and polish improvements.',
   downloadUrl: {
     windows: 'https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe',
     // x64 DMG works on all Macs (Apple Silicon runs it under Rosetta). When

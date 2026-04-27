@@ -1,5 +1,6 @@
-const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage, dialog, shell } = require('electron');
 const path = require('path');
+const { spawn } = require('child_process');
 const database = require('./database.cjs');
 
 // Shared logger. Writes to <userData>/logs/main.log at info+ and to stdout.
@@ -9,6 +10,28 @@ const database = require('./database.cjs');
 // where there's no console attached.
 const electronLog = require('electron-log');
 electronLog.transports.file.level = 'info';
+
+// ─── Process-level safety nets ────────────────────────────────────────────
+// Without these, an unhandled main-process exception (a typo in an IPC
+// handler, a Promise rejection in the auto-updater, a UIA spawn failure)
+// pops a native Electron error dialog. That HWND is NOT covered by
+// setContentProtection — during an active interview screen-share the
+// user's interviewer would see "Interview Copilot encountered an error",
+// leaking the app's existence and brand. Logging instead of crashing
+// keeps us alive and invisible.
+//
+// We also kill the UIA PowerShell bridge on either fatal event because
+// the normal `killUIABridge()` call is in the `before-quit` handler,
+// which won't run if the process is exiting on an uncaught exception.
+// Without this branch, the spawned PowerShell orphans every crash and
+// accumulates in Task Manager.
+process.on('uncaughtException', (err) => {
+  try { electronLog.error('UNCAUGHT EXCEPTION:', err && err.stack || err); } catch {}
+  try { if (typeof killUIABridge === 'function') killUIABridge(); } catch {}
+});
+process.on('unhandledRejection', (reason) => {
+  try { electronLog.error('UNHANDLED REJECTION:', reason && reason.stack || reason); } catch {}
+});
 
 // ─── Single-instance lock ─────────────────────────────────────────────────
 // Without this, every desktop launch spawns a fresh copy of the OLD binary
@@ -194,9 +217,41 @@ function createPopoutWindow(options = {}) {
     hasShadow: false,
     // --- END TRANSPARENCY ---
     alwaysOnTop: true,
-    resizable: true,
+    // STEALTH for screen-share: OS resize cursors are rendered by the
+    // OS over EVERYTHING (they ignore setContentProtection — the cursor
+    // is drawn by Windows above all windows, content-protected or not).
+    // With native resizable:true the user moving their cursor from the
+    // popout to a code editor naturally crosses the LEFT side resize
+    // hit-area and the cursor flashes to ↔ for a moment. A reviewer
+    // watching the screen-share would see "why did the cursor change to
+    // a resize arrow on empty space?" and start asking questions.
+    //
+    // Solution: disable native resize entirely (kills the OS resize
+    // cursor on all four edges + corners), then re-add resize ONLY on
+    // top/bottom edges + four corners via JS handles in the popout
+    // renderer (see the popout-resize useEffect in App.tsx, plus the
+    // popout:resize-* IPC handlers below). Side edges have no JS
+    // handles and no OS resize → cursor stays default arrow on
+    // horizontal cursor traversal.
+    resizable: false,
     skipTaskbar: true,     // ← HIDDEN from taskbar
-    focusable: true,
+    // CRITICAL for stealth: focusable=false means clicking on this popout
+    // does NOT steal focus from whatever the user was working in (e.g., a
+    // browser-based coding assessment like Ropes.ai). Without this, every
+    // click on a popout button fires `window.onblur` on the browser tab,
+    // which proctoring stacks log as a focus-loss / suspicious-activity
+    // event. On Windows this maps to WS_EX_NOACTIVATE — mouse events still
+    // reach the WebContents (so buttons work), but the window never
+    // becomes the foreground HWND.
+    //
+    // Trade-off: text inputs (textarea/input) inside the popout can't
+    // receive keyboard input while the window is non-focusable. We
+    // restore focusability on demand via the 'popout:set-focusable' IPC
+    // channel below — the renderer toggles it when a text input is
+    // clicked, and releases it when the input blurs. So the rare typing
+    // case still works at the cost of one focus-loss event (acceptable
+    // since it's user-initiated, not background activity).
+    focusable: false,
     webPreferences: {
       // Same sandboxed-renderer config as the main window — see the comment
       // there for the security rationale.
@@ -293,6 +348,121 @@ ipcMain.handle('get-desktop-sources', async () => {
   return sources.map(s => ({ id: s.id, name: s.name }));
 });
 
+// Robust external-URL opener — tries multiple OS-level launch paths and
+// returns a structured result so the renderer can show diagnostic info.
+//
+// Why this exists: shell.openExternal() can silently fail on Windows when
+// the default-browser registration is corrupted, when ShellExecuteW hangs
+// for non-obvious reasons (AV interference, OS shell process busy), or
+// when the returned Promise just never resolves. The fire-and-forget
+// pattern in older code meant a failed browser launch left the user
+// staring at a forever-spinner during Google sign-in. This handler:
+//   1. Tries shell.openExternal first (the standard path)
+//   2. On failure, falls back to child_process spawn — on Windows that's
+//      `cmd /c start "" "URL"` which uses a different ShellExecute code
+//      path; if Win32 ShellExecuteEx is broken, this still often works
+//      because cmd's `start` resolves the protocol handler differently.
+//      On macOS we use `open <url>`, on Linux `xdg-open <url>`.
+//   3. Returns { ok, method, error, attempts } so the renderer can show
+//      the user what was tried and why it failed.
+ipcMain.handle('open-external-robust', async (_event, url) => {
+  const attempts = [];
+
+  // Validate URL upfront — same allowlist as the legacy preload helper.
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { ok: false, method: 'none', error: 'Invalid URL', attempts };
+  }
+  if (!['http:', 'https:', 'mailto:'].includes(parsed.protocol)) {
+    return { ok: false, method: 'none', error: `Protocol ${parsed.protocol} not allowed`, attempts };
+  }
+
+  // Method 1: shell.openExternal with 6s timeout race
+  try {
+    const openPromise = shell.openExternal(url);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('shell.openExternal timed out (6s)')), 6000)
+    );
+    await Promise.race([openPromise, timeoutPromise]);
+    attempts.push({ method: 'shell.openExternal', ok: true });
+    return { ok: true, method: 'shell.openExternal', attempts };
+  } catch (err) {
+    const msg = (err && err.message) || String(err);
+    electronLog.warn('[open-external] shell.openExternal failed:', msg);
+    attempts.push({ method: 'shell.openExternal', ok: false, error: msg });
+  }
+
+  // Method 2: OS-specific child_process spawn fallback. We wait briefly
+  // for the 'error' event because failures like ENOENT (xdg-open missing
+  // on a stripped Linux install) fire asynchronously on next tick — if
+  // we returned immediately after spawn() we'd report ok:true even when
+  // the launch actually failed.
+  const platform = process.platform;
+  const spawnLabel = `child_process.spawn (${platform})`;
+  try {
+    const spawnResult = await new Promise((resolve) => {
+      let child;
+      try {
+        if (platform === 'win32') {
+          // The empty `""` is the start-command's title argument — without
+          // it, start would interpret a quoted URL as the title and
+          // silently do nothing. windowsHide:true keeps a cmd window from
+          // briefly flashing into view.
+          child = spawn('cmd.exe', ['/s', '/c', 'start', '""', url], {
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: true,
+          });
+        } else if (platform === 'darwin') {
+          child = spawn('open', [url], { detached: true, stdio: 'ignore' });
+        } else {
+          child = spawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
+        }
+      } catch (syncErr) {
+        // spawn can throw synchronously on bad args. ENOENT and similar
+        // are async and handled by the 'error' listener below.
+        resolve({ ok: false, error: (syncErr && syncErr.message) || String(syncErr) });
+        return;
+      }
+
+      let settled = false;
+      child.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        resolve({ ok: false, error: (err && err.message) || String(err) });
+      });
+      // 150ms is enough for ENOENT-style errors to surface (they fire on
+      // next tick) without delaying the user noticeably. If we make it
+      // through the window, the spawned process is alive enough that the
+      // OS will handle the URL launch on its own.
+      setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { child.unref(); } catch {}
+        resolve({ ok: true });
+      }, 150);
+    });
+
+    if (spawnResult.ok) {
+      attempts.push({ method: spawnLabel, ok: true });
+      return { ok: true, method: spawnLabel, attempts };
+    }
+    electronLog.error('[open-external] spawn fallback failed:', spawnResult.error);
+    attempts.push({ method: spawnLabel, ok: false, error: spawnResult.error });
+    // Both methods failed — return a combined error so the renderer can
+    // surface every attempted method to the user for support diagnosis.
+    const allErrors = attempts.filter(a => !a.ok).map(a => `${a.method}: ${a.error}`).join('; ');
+    return { ok: false, method: 'all', error: allErrors, attempts };
+  } catch (outerErr) {
+    const msg = (outerErr && outerErr.message) || String(outerErr);
+    electronLog.error('[open-external] spawn outer error:', msg);
+    attempts.push({ method: spawnLabel, ok: false, error: msg });
+    return { ok: false, method: spawnLabel, error: msg, attempts };
+  }
+});
+
 // Pop-out window management
 ipcMain.on('open-popout', (_event, options) => {
   createPopoutWindow(options);
@@ -377,6 +547,115 @@ ipcMain.on('set-always-on-top', (_event, flag) => {
     } else {
       popoutWindow.setAlwaysOnTop(false);
     }
+  }
+});
+
+// ─── Custom resize for the popout ──────────────────────────────────
+// Native resize is disabled (resizable:false on the BrowserWindow) so
+// the OS doesn't draw resize cursors on the side edges during a
+// screen-share. We re-add resize only on top/bottom/corners via JS
+// handles in the renderer; those handles drive these IPC handlers.
+//
+// Protocol: renderer sends `popout:resize-start` once on mousedown
+// (with the edge identifier and the screen-pixel cursor position),
+// streams `popout:resize-move` on every mousemove (current screen-pixel
+// cursor position), and finally `popout:resize-end` on mouseup. We
+// hold the captured starting bounds in module scope and apply deltas
+// in screen pixels — this avoids the popout's own mouse coords drifting
+// as the window moves under the cursor mid-resize.
+let _popoutResize = null;
+
+function clampPopoutBounds(b) {
+  const W_MIN = 320, W_MAX = 800, H_MIN = 400, H_MAX = 1000;
+  return {
+    x: Math.round(b.x),
+    y: Math.round(b.y),
+    width: Math.max(W_MIN, Math.min(W_MAX, Math.round(b.width))),
+    height: Math.max(H_MIN, Math.min(H_MAX, Math.round(b.height))),
+  };
+}
+
+ipcMain.on('popout:resize-start', (_event, payload) => {
+  if (!popoutWindow || popoutWindow.isDestroyed()) return;
+  if (!payload || typeof payload.screenX !== 'number') return;
+  const validEdges = ['top', 'bottom', 'tl', 'tr', 'bl', 'br'];
+  if (!validEdges.includes(payload.edge)) return;
+  _popoutResize = {
+    edge: payload.edge,
+    startX: payload.screenX,
+    startY: payload.screenY,
+    startBounds: popoutWindow.getBounds(),
+  };
+});
+
+ipcMain.on('popout:resize-move', (_event, payload) => {
+  if (!_popoutResize || !popoutWindow || popoutWindow.isDestroyed()) return;
+  if (!payload || typeof payload.screenX !== 'number') return;
+  const dx = payload.screenX - _popoutResize.startX;
+  const dy = payload.screenY - _popoutResize.startY;
+  const sb = _popoutResize.startBounds;
+  const e = _popoutResize.edge;
+
+  let nb = { x: sb.x, y: sb.y, width: sb.width, height: sb.height };
+
+  // Top edge (top, tl, tr) — y moves down by dy, height shrinks by dy
+  if (e === 'top' || e === 'tl' || e === 'tr') {
+    nb.y = sb.y + dy;
+    nb.height = sb.height - dy;
+  }
+  // Bottom edge (bottom, bl, br) — height grows by dy
+  if (e === 'bottom' || e === 'bl' || e === 'br') {
+    nb.height = sb.height + dy;
+  }
+  // Left side (tl, bl) — x moves right by dx, width shrinks by dx
+  if (e === 'tl' || e === 'bl') {
+    nb.x = sb.x + dx;
+    nb.width = sb.width - dx;
+  }
+  // Right side (tr, br) — width grows by dx
+  if (e === 'tr' || e === 'br') {
+    nb.width = sb.width + dx;
+  }
+
+  // After clamping width/height, fix up x/y if a top/left drag would
+  // have shrunk past the min — without this the user can drag the
+  // top edge down past the min height and the y still moves, so the
+  // window slides off where the bottom edge "should" be.
+  const clamped = clampPopoutBounds(nb);
+  if ((e === 'top' || e === 'tl' || e === 'tr') && clamped.height !== nb.height) {
+    clamped.y = sb.y + (sb.height - clamped.height);
+  }
+  if ((e === 'tl' || e === 'bl') && clamped.width !== nb.width) {
+    clamped.x = sb.x + (sb.width - clamped.width);
+  }
+
+  try { popoutWindow.setBounds(clamped); } catch {}
+});
+
+ipcMain.on('popout:resize-end', () => {
+  _popoutResize = null;
+});
+
+// Toggle popout focusability on demand — see the long comment on the
+// popoutWindow constructor. Renderer sends `true` when the user clicks a
+// text input inside the popout (so keyboard input can reach it) and
+// `false` when the input blurs (so subsequent button clicks don't steal
+// focus from whatever the user was working in). Idempotent — calling
+// setFocusable repeatedly with the same value is cheap.
+ipcMain.on('popout:set-focusable', (_event, focusable) => {
+  if (popoutWindow && popoutWindow.isDestroyed()) return;
+  if (!popoutWindow) return;
+  try {
+    popoutWindow.setFocusable(!!focusable);
+    if (focusable) {
+      // Bring popout to the foreground so the focused text input actually
+      // receives keyboard input from the OS — without this, even a focused
+      // textarea would still route keys to whatever was previously
+      // foreground (the browser).
+      popoutWindow.focus();
+    }
+  } catch (err) {
+    electronLog.warn('[popout:set-focusable] setFocusable threw:', err && err.message);
   }
 });
 
@@ -520,12 +799,23 @@ function autoTypeResetCadence() {
 function autoTypeAdvanceMode() {
   if (_atModeCharsLeft > 0) { _atModeCharsLeft--; return; }
   const r = Math.random();
+  // v3.4.7: shifted mode-flip probabilities toward 'flow' and 'hesitation'
+  // so the rhythm spends less time in 'burst'. Combined with the higher
+  // baselines below, this brings average effective WPM into the realistic
+  // human-coder range (~30-45 WPM with frequent thinking pauses) instead
+  // of the previous ~50-70 WPM bursts that read as bot-like to keystroke
+  // biometrics on proctored platforms (Ropes, HackerRank, etc.).
   if (_atMode === 'flow') {
-    _atMode = r < 0.40 ? 'burst' : r < 0.80 ? 'flow' : 'hesitation';
+    // 22% burst (was 40%), 48% flow (was 40%), 30% hesitation (was 20%)
+    _atMode = r < 0.22 ? 'burst' : r < 0.70 ? 'flow' : 'hesitation';
   } else if (_atMode === 'burst') {
-    _atMode = r < 0.55 ? 'flow' : r < 0.85 ? 'burst' : 'hesitation';
+    // Don't linger in burst — drop out fast. 55% flow (was 30%),
+    // 25% burst (was 55%), 20% hesitation (was 15%).
+    _atMode = r < 0.55 ? 'flow' : r < 0.80 ? 'burst' : 'hesitation';
   } else {
-    _atMode = r < 0.65 ? 'flow' : r < 0.90 ? 'hesitation' : 'burst';
+    // 55% flow (was 65%), 35% hesitation (was 25%), 10% burst (unchanged).
+    // Slight bias to stay in hesitation a bit longer.
+    _atMode = r < 0.55 ? 'flow' : r < 0.90 ? 'hesitation' : 'burst';
   }
   _atModeCharsLeft = 5 + Math.floor(Math.random() * 30);
 }
@@ -535,21 +825,32 @@ function autoTypeAdvanceMode() {
 //   • Punctuation pauses longer (end-of-thought)
 //   • Spaces add a small word-boundary pause
 //   • Double letters fire faster (finger already on key)
-//   • ~1.2% chance of an unscheduled 2–6s "stuck" pause — lands anywhere,
+//   • ~2.0% chance of an unscheduled 2-7s "stuck" pause — lands anywhere,
 //     which is what makes pauses feel unpredictable.
+//
+// v3.4.7 tuning: baselines bumped ~50% across all three modes after user
+// feedback that the previous rhythm was still too fast for proctored
+// coding assessments (keystroke-biometric flagging). New baselines yield
+// a realistic human-coder profile rather than a fast-typist profile:
+//   burst:      ~120ms/char  → ~8 chars/sec  (was ~85ms / ~12 chars/sec)
+//   flow:       ~210ms/char  → ~5 chars/sec  (was ~150ms / ~7 chars/sec)
+//   hesitation: ~430ms/char  → ~2 chars/sec  (was ~300ms / ~3 chars/sec)
 function autoTypeHumanDelay(ch, prevCh) {
   autoTypeAdvanceMode();
 
   let d;
   if (_atMode === 'burst') {
-    d = autoTypeGauss(85, 20);
-    d = Math.max(40, Math.min(180, d));
+    // Was 85±20 (clamped 40-180). Now 120±25 (clamped 65-220).
+    d = autoTypeGauss(120, 25);
+    d = Math.max(65, Math.min(220, d));
   } else if (_atMode === 'hesitation') {
-    d = autoTypeGauss(300, 80);
-    d = Math.max(160, Math.min(500, d));
+    // Was 300±80 (clamped 160-500). Now 430±110 (clamped 230-720).
+    d = autoTypeGauss(430, 110);
+    d = Math.max(230, Math.min(720, d));
   } else {
-    d = autoTypeGauss(150, 50);
-    d = Math.max(55, Math.min(380, d));
+    // Was 150±50 (clamped 55-380). Now 210±65 (clamped 90-460).
+    d = autoTypeGauss(210, 65);
+    d = Math.max(90, Math.min(460, d));
   }
 
   const isCap = ch >= 'A' && ch <= 'Z';
@@ -565,7 +866,12 @@ function autoTypeHumanDelay(ch, prevCh) {
 
   if (prevCh && prevCh === ch && /[a-zA-Z]/.test(ch)) d *= 0.55;
 
-  if (Math.random() < 0.012) d += 2000 + Math.random() * 4000;
+  // v3.4.7: stuck-pause rate bumped from 1.2% → 2.0%, max duration 6s → 7s.
+  // These long unscheduled pauses are what break up patterns that
+  // statistical keystroke analysis would otherwise lock onto — the
+  // *unpredictability* of when they land is more important than the
+  // average rhythm.
+  if (Math.random() < 0.020) d += 2000 + Math.random() * 5000;
 
   return Math.round(d);
 }
