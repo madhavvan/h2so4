@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search } from 'lucide-react';
+import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search, Copy, ChevronUp } from 'lucide-react';
 // Phosphor duotone — used on the public landing + auth surfaces for the
 // editorial, premium feel that lucide's flat strokes can't quite reach.
 // In-app utility icons stay on lucide so dense toolbars don't get heavy.
@@ -267,6 +267,257 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
 };
 
 // ── Tutorial Card ──
+// Two-step refund modal — collect amount/reason, then show confirmation
+// summary BEFORE the step-up password prompt fires. Replaces the older
+// inline IIFE that used closure variables (which retained stale values
+// across modal cycles, risking wrong-amount refunds).
+const RefundModal = ({
+  payment,
+  fmtAmount,
+  onCancel,
+  onSubmit,
+}: {
+  payment: any;
+  fmtAmount: (amt: number, ccy: string) => string;
+  onCancel: () => void;
+  onSubmit: (amount: number, reason: string) => void;
+}) => {
+  const [amount, setAmount] = useState<number>(payment.amount || 0);
+  const [reason, setReason] = useState<string>('requested_by_customer');
+  const [confirming, setConfirming] = useState(false);
+
+  // Esc closes; Enter advances on the confirm step.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.stopPropagation(); onCancel(); }
+      if (e.key === 'Enter' && confirming) { e.preventDefault(); onSubmit(amount, reason); }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [confirming, amount, reason, onCancel, onSubmit]);
+
+  const isPartial = amount > 0 && amount < payment.amount;
+  const isFull = amount === payment.amount;
+  const isOverRefund = amount > payment.amount;
+  const isZeroOrNeg = !amount || amount <= 0;
+  const isInvalid = isZeroOrNeg || isOverRefund;
+  // Validation messages — surfaced inline so the admin understands WHY Save is
+  // disabled. Provider-side rejections (e.g. Stripe "amount > original") are
+  // still possible if the payment was already partially refunded; that case is
+  // handled by callMutation's error toast.
+  const validationMsg = isOverRefund
+    ? `Refund cannot exceed the original ${fmtAmount(payment.amount, payment.currency)} charge.`
+    : isZeroOrNeg
+      ? 'Amount must be greater than zero.'
+      : null;
+
+  return (
+    <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/70 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={onCancel}>
+      <div className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-pink-500/20 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
+        <div className="flex items-start gap-3 mb-4">
+          <div className="shrink-0 p-2 rounded-lg bg-pink-500/15 text-pink-400"><RefreshCw size={18} /></div>
+          <div>
+            <h3 className="text-base font-semibold text-white">{confirming ? 'Confirm refund' : 'Issue Refund'}</h3>
+            <p className="text-xs text-gray-500">{payment.email} · {payment.provider.toUpperCase()} · original {fmtAmount(payment.amount, payment.currency)}</p>
+          </div>
+        </div>
+
+        {!confirming ? (
+          <>
+            <p className="text-xs text-gray-400 mb-4 p-3 rounded-lg bg-amber-500/[0.04] border border-amber-500/20">
+              Refund hits the provider immediately. A webhook will downgrade this user's tier shortly after. Partial refunds are supported — enter a smaller amount to refund less than the full charge.
+            </p>
+            <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">
+              Amount ({payment.currency.toUpperCase()} · minor units, e.g. cents/paise)
+            </label>
+            <input
+              type="number"
+              value={amount}
+              onChange={e => setAmount(parseInt(e.target.value, 10) || 0)}
+              className="w-full px-3 py-2 mb-1 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-pink-500/50 font-mono"
+            />
+            <p className={`text-[10px] mb-1 ${isOverRefund ? 'text-red-400' : 'text-gray-500'}`}>
+              ≈ {fmtAmount(amount, payment.currency)} {isPartial ? '(partial)' : isFull ? '(full)' : ''}
+            </p>
+            {validationMsg && (
+              <p className="text-[11px] text-red-400 mb-2 flex items-center gap-1">
+                <AlertTriangle size={10} /> {validationMsg}
+              </p>
+            )}
+            {!validationMsg && <div className="mb-2" />}
+            <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Reason</label>
+            <select
+              value={reason}
+              onChange={e => setReason(e.target.value)}
+              className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-pink-500/50"
+            >
+              <option value="requested_by_customer">Requested by customer</option>
+              <option value="duplicate">Duplicate charge</option>
+              <option value="fraudulent">Fraudulent</option>
+            </select>
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button onClick={onCancel} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Cancel</button>
+              <button
+                onClick={() => setConfirming(true)}
+                disabled={isInvalid}
+                className="px-4 py-2 rounded-lg text-sm font-semibold bg-pink-500/20 text-pink-200 hover:bg-pink-500/30 border border-pink-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Review refund
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="p-4 rounded-lg bg-red-500/[0.06] border border-red-500/30 space-y-3">
+              <div className="flex items-start gap-2">
+                <AlertTriangle size={16} className="text-red-400 shrink-0 mt-0.5" />
+                <div className="text-sm text-red-200 font-semibold">This refunds money to the customer immediately.</div>
+              </div>
+              <div className="text-xs space-y-1.5 text-gray-300">
+                <div><span className="text-gray-500">User:</span> <span className="text-white">{payment.email}</span></div>
+                <div><span className="text-gray-500">Provider:</span> <span className="text-white">{payment.provider.toUpperCase()}</span></div>
+                <div><span className="text-gray-500">Original charge:</span> <span className="text-white">{fmtAmount(payment.amount, payment.currency)}</span></div>
+                <div className="pt-1 mt-1 border-t border-red-500/20">
+                  <span className="text-gray-500">Refund amount:</span>{' '}
+                  <span className="text-red-300 font-bold">{fmtAmount(amount, payment.currency)} {isPartial ? '(partial)' : '(full)'}</span>
+                </div>
+                <div><span className="text-gray-500">Reason:</span> <span className="text-white">{reason}</span></div>
+              </div>
+            </div>
+            <p className="text-[11px] text-gray-500 mt-3">After confirming, you'll be asked for your step-up admin password.</p>
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button onClick={() => setConfirming(false)} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Back</button>
+              <button onClick={() => onSubmit(amount, reason)} className="px-4 py-2 rounded-lg text-sm font-semibold bg-red-500 text-white hover:bg-red-600 transition-all">Refund {fmtAmount(amount, payment.currency)}</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Reference list of every runtime knob the server reads from app_config. The
+// table shows description + default and lets the admin seed a row if it's not
+// in the DB yet (server seeds min_app_version / latest_app_version on boot,
+// but device-limit overrides only appear once explicitly set).
+const KNOWN_CONFIG_KEYS: { key: string; description: string; defaultValue: string; group: string }[] = [
+  { group: 'App version', key: 'min_app_version', defaultValue: '2.0.0', description: 'Minimum app version that can authenticate. Older builds are forced to upgrade on next launch.' },
+  { group: 'App version', key: 'latest_app_version', defaultValue: '2.0.0', description: 'Latest released version — drives the in-app "update available" prompt.' },
+  { group: 'Device limits', key: 'max_devices_free', defaultValue: '2', description: 'Concurrent device slots for the free tier.' },
+  { group: 'Device limits', key: 'max_devices_basic', defaultValue: '2', description: 'Concurrent device slots for Basic.' },
+  { group: 'Device limits', key: 'max_devices_pro', defaultValue: '3', description: 'Concurrent device slots for Pro.' },
+  { group: 'Device limits', key: 'max_devices_max', defaultValue: '5', description: 'Concurrent device slots for Max.' },
+];
+
+const KnownConfigKeysHint = ({ configRows, onSeed, busy }: { configRows: any[]; onSeed: (key: string, defaultValue: string) => Promise<void>; busy: boolean }) => {
+  const present = new Set(configRows.map(r => r.key));
+  const groups = Array.from(new Set(KNOWN_CONFIG_KEYS.map(k => k.group)));
+  return (
+    <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
+      <div className="px-4 py-3 border-b border-white/[0.06] bg-white/[0.02] flex items-center gap-2">
+        <BookOpen size={12} className="text-blue-400" />
+        <span className="text-[11px] uppercase tracking-wider text-gray-400 font-semibold">Known config keys</span>
+        <span className="text-[10px] text-gray-600">— server-recognized knobs. Custom keys you add via PUT also appear in the table above.</span>
+      </div>
+      <div className="divide-y divide-white/[0.04]">
+        {groups.map(group => (
+          <div key={group} className="px-4 py-3">
+            <div className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold mb-2">{group}</div>
+            <div className="space-y-1.5">
+              {KNOWN_CONFIG_KEYS.filter(k => k.group === group).map(k => {
+                const isSet = present.has(k.key);
+                return (
+                  <div key={k.key} className="flex items-start gap-3 text-[11px]">
+                    <span className={`shrink-0 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${isSet ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/20' : 'bg-white/[0.04] text-gray-500 border border-white/[0.06]'}`}>{isSet ? 'Set' : 'Default'}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-mono text-white text-[11px]">{k.key}</span>
+                        <span className="text-gray-600 text-[10px]">default: <span className="font-mono text-gray-400">{k.defaultValue}</span></span>
+                      </div>
+                      <p className="text-gray-500 text-[10px] mt-0.5 leading-relaxed">{k.description}</p>
+                    </div>
+                    {!isSet && (
+                      <button
+                        onClick={() => onSeed(k.key, k.defaultValue)}
+                        disabled={busy}
+                        className="shrink-0 px-2 py-1 rounded text-[10px] font-semibold bg-blue-500/15 text-blue-300 hover:bg-blue-500/25 border border-blue-500/20 transition-all disabled:opacity-40"
+                      >
+                        Seed default
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="px-4 py-2.5 border-t border-white/[0.06] bg-white/[0.01] text-[10px] text-gray-600 flex items-start gap-2">
+        <AlertTriangle size={11} className="shrink-0 mt-0.5 text-amber-400/60" />
+        <div>Saving any value triggers step-up reauth. Wrong values can lock users out — e.g. setting <span className="font-mono">min_app_version</span> above the latest published build.</div>
+      </div>
+    </div>
+  );
+};
+
+// 3-series sparkline grid for the analytics 30-day trends. Each card shows one
+// metric with min/max/last + a smoothed line. Uses raw SVG so we don't pull in
+// a chart library for what is essentially three poly-lines. Trends array is
+// already in chronological order (oldest → newest) from /admin/trends.
+const TrendsSparklines = ({ trends }: { trends: any[] }) => {
+  // We only chart USD revenue here — INR shows in the table. Charting both on
+  // the same axis would be misleading because USD/INR are different scales.
+  const series = [
+    { key: 'signups', label: 'Signups', color: '#c084fc', accent: 'text-purple-300', values: trends.map(t => Number(t.signups || 0)) },
+    { key: 'logins', label: 'Logins', color: '#67e8f9', accent: 'text-cyan-300', values: trends.map(t => Number(t.logins || 0)) },
+    { key: 'revenue_usd', label: 'USD Revenue', color: '#6ee7b7', accent: 'text-emerald-300', values: trends.map(t => Number(t.revenue_by_currency?.USD || 0)) },
+  ];
+  return (
+    <div className="grid sm:grid-cols-3 gap-3 mb-3">
+      {series.map(s => {
+        const max = Math.max(...s.values, 1);
+        const min = Math.min(...s.values, 0);
+        const range = max - min || 1;
+        const w = 240;
+        const h = 56;
+        const stepX = s.values.length > 1 ? w / (s.values.length - 1) : w;
+        const points = s.values.map((v, i) => {
+          const x = i * stepX;
+          const y = h - ((v - min) / range) * (h - 4) - 2;
+          return `${x.toFixed(1)},${y.toFixed(1)}`;
+        }).join(' ');
+        const areaPoints = `0,${h} ${points} ${(w).toFixed(1)},${h}`;
+        const last = s.values[s.values.length - 1] ?? 0;
+        const fmtVal = s.key === 'revenue_usd' ? `$${(last / 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : last.toLocaleString();
+        const fmtMax = s.key === 'revenue_usd' ? `$${(max / 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : max.toLocaleString();
+        return (
+          <div key={s.key} className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02]">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold">{s.label}</span>
+              <span className={`text-xs font-bold tabular-nums ${s.accent}`}>{fmtVal}</span>
+            </div>
+            <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="w-full h-12">
+              <defs>
+                <linearGradient id={`spark-${s.key}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={s.color} stopOpacity="0.35" />
+                  <stop offset="100%" stopColor={s.color} stopOpacity="0" />
+                </linearGradient>
+              </defs>
+              <polygon points={areaPoints} fill={`url(#spark-${s.key})`} />
+              <polyline points={points} fill="none" stroke={s.color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            <div className="flex items-center justify-between text-[9px] text-gray-600 mt-1">
+              <span>30d ago</span>
+              <span>peak {fmtMax}</span>
+              <span>today</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
 const TutorialCard = ({ step, title, desc, duration }: { step: string; title: string; desc: string; duration: string }) => (
   <div className="p-5 rounded-2xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] transition-all group cursor-pointer">
     <div className="flex items-center justify-between mb-3">
@@ -373,23 +624,22 @@ const ConversationsViewer = ({
     }
   };
 
-  // Reset view when the searched user changes. Always auto-expand if the
-  // user has any conversations at all — the old <=3 threshold meant heavy
-  // users appeared empty unless the admin thought to click "View messages".
-  // The outer list has max-h-96 + scroll so a long list stays contained.
+  // Reset view when the searched user changes. Always auto-expand AND
+  // auto-load — even when stubCount is 0, so the admin sees a clear
+  // "No conversations on record" instead of a closed accordion that
+  // looks like data is hidden behind a button. Without this, after the
+  // we-shipped client→server sync, an admin viewing a user with zero
+  // synced conversations would get no signal at all.
   useEffect(() => {
-    // Bump the request id so any in-flight loadFull for the previous user
-    // drops its response on arrival instead of writing it into state.
     requestIdRef.current++;
     setConversations(null);
     setOpenConvId(null);
     autoOpenedForRef.current = null;
     setError(null);
-    const shouldAutoExpand = stubCount > 0;
-    setExpanded(shouldAutoExpand);
-    if (shouldAutoExpand) loadFull();
+    setExpanded(true);
+    loadFull();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId, stubCount]);
+  }, [userId]);
 
   // When the full thread finishes loading and there's exactly one conversation,
   // open it automatically — saves the admin an extra click for the common
@@ -566,6 +816,10 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
   const [stats, setStats] = useState<any>(null);
   const [users, setUsers] = useState<any[]>([]);
   const [logins, setLogins] = useState<any[]>([]);
+  const [loginsLoading, setLoginsLoading] = useState(false);
+  // Audit-log row expansion — id of the currently-open row, or null. Stored
+  // as a Set so multiple rows can be inspected at once when triaging.
+  const [expandedAuditIds, setExpandedAuditIds] = useState<Set<string | number>>(new Set());
   const [auditLog, setAuditLog] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [adminError, setAdminError] = useState<string | null>(null);
@@ -660,9 +914,17 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
   } | null>(null);
 
   // Per-user action modals (edit profile, delete user, comp grant, refund).
-  const [editProfileFor, setEditProfileFor] = useState<{ id: string; email: string; name: string; country_code: string } | null>(null);
+  // `original_country_code` is captured at open time so the modal can detect
+  // when the admin actually changes the country (vs. opens-and-saves with the
+  // current value). Drives the billing-region warning.
+  const [editProfileFor, setEditProfileFor] = useState<{ id: string; email: string; name: string; country_code: string; original_country_code: string } | null>(null);
   const [compGrantFor, setCompGrantFor] = useState<{ id: string; email: string } | null>(null);
   const [refundFor, setRefundFor] = useState<{ payment: any } | null>(null);
+  const [banFor, setBanFor] = useState<{ email: string } | null>(null);
+  // Impersonation token modal — separate from the confirm dialog because the
+  // token is long, must be selectable, and the copy action must succeed even
+  // if the user just wants to read it before pasting elsewhere.
+  const [impersonateToken, setImpersonateToken] = useState<{ email: string; token: string } | null>(null);
 
   const baseToken = licenseService.getToken();
   // `activeToken` picks the step-up token when it's still valid, otherwise the
@@ -943,23 +1205,30 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
   };
 
   const handleBan = (email: string) => {
-    setConfirmDialog({
-      title: `Ban ${email}?`,
-      body: `Their license will be revoked and all active sessions invalidated. This action is logged in the audit trail.`,
-      confirmLabel: 'Ban user',
-      danger: true,
-      onConfirm: async () => {
-        const data = await callMutation('/api/v1/admin/users/ban', { email }, `${email} banned`);
-        if (!data) return;
-        patchUserEverywhere(email, u => ({ ...u, is_banned: 1 }));
-      },
-    });
+    // Open the dedicated ban modal so the admin can record a reason. The reason
+    // is propagated to the audit log AND to the underlying license-revoke row,
+    // so support can later explain to the user why they were locked out.
+    setBanFor({ email });
   };
 
-  const handleUnban = async (email: string) => {
-    const data = await callMutation('/api/v1/admin/users/unban', { email }, `${email} unbanned`);
+  const submitBan = async (email: string, reason: string) => {
+    const data = await callMutation('/api/v1/admin/users/ban', { email, reason }, `${email} banned`);
     if (!data) return;
-    patchUserEverywhere(email, u => ({ ...u, is_banned: 0 }));
+    patchUserEverywhere(email, u => ({ ...u, is_banned: 1 }));
+    setBanFor(null);
+  };
+
+  const handleUnban = (email: string) => {
+    setConfirmDialog({
+      title: `Unban ${email}?`,
+      body: `Their license will be reinstated and they'll be able to sign in again. This action is logged in the audit trail.`,
+      confirmLabel: 'Unban user',
+      onConfirm: async () => {
+        const data = await callMutation('/api/v1/admin/users/unban', { email }, `${email} unbanned`);
+        if (!data) return;
+        patchUserEverywhere(email, u => ({ ...u, is_banned: 0 }));
+      },
+    });
   };
 
   // ── Enterprise actions — all route through callMutation and reload local state. ──
@@ -1042,30 +1311,22 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
       onConfirm: async () => {
         const data = await callMutation(`/api/v1/admin/users/${userId}/impersonate`, {}, 'Impersonation token generated');
         if (!data) return;
-        // Drop the token into a quick prompt modal for copy.
-        setConfirmDialog({
-          title: 'Impersonation token',
-          body: `Expires in 30 days. DO NOT replace your own session.\n\n${data.token}`,
-          confirmLabel: 'Copy to clipboard',
-          onConfirm: async () => {
-            try {
-              await navigator.clipboard.writeText(data.token);
-              showMsg('Token copied — handle with care', 'success');
-            } catch {
-              showMsg('Failed to copy — select and copy manually', 'error');
-            }
-          },
-        });
+        // Show the token in a dedicated modal — readonly text input so the
+        // admin can select-all + copy manually if the clipboard write fails
+        // (e.g. inside a sandboxed Electron renderer without permissions).
+        setImpersonateToken({ email, token: data.token });
       },
     });
   };
 
   const handleEditProfile = (user: any) => {
+    const cc = (user.country_code || '').toUpperCase();
     setEditProfileFor({
       id: user.id,
       email: user.email,
       name: user.name || '',
-      country_code: user.country_code || '',
+      country_code: cc,
+      original_country_code: cc,
     });
   };
 
@@ -1168,6 +1429,13 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
   async function loadRevoked() {
     const data = await callGet('/api/v1/admin/revoked');
     if (data) setRevokedKeys(Array.isArray(data) ? data : []);
+  }
+
+  async function loadLogins() {
+    setLoginsLoading(true);
+    const data = await callGet('/api/v1/admin/logins?limit=100');
+    if (Array.isArray(data)) setLogins(data);
+    setLoginsLoading(false);
   }
 
   async function loadAudit() {
@@ -1893,9 +2161,18 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
             {/* ── LOGINS TAB ── */}
             {adminTab === 'logins' && (
               <div className="space-y-6">
-                <div>
-                  <h1 className="text-2xl font-bold mb-1">Login Activity</h1>
-                  <p className="text-gray-500 text-sm">Last 100 login attempts</p>
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <h1 className="text-2xl font-bold mb-1">Login Activity</h1>
+                    <p className="text-gray-500 text-sm">Last 100 login attempts {logins.length > 0 && `· showing ${logins.length}`}</p>
+                  </div>
+                  <button
+                    onClick={loadLogins}
+                    disabled={loginsLoading}
+                    className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all disabled:opacity-50"
+                  >
+                    <RefreshCw size={11} className={loginsLoading ? 'animate-spin' : ''} /> {loginsLoading ? 'Refreshing…' : 'Refresh'}
+                  </button>
                 </div>
 
                 <div className="border border-white/[0.06] rounded-xl overflow-hidden">
@@ -2022,11 +2299,23 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                       </thead>
                       <tbody>
                         {auditLog.map((row: any, i: number) => {
-                          let details = '';
+                          const rowKey = row.id ?? i;
+                          // Pretty-print so the expanded view is human-readable. Keep the
+                          // single-line variant for the collapsed cell.
+                          let detailsCompact = '';
+                          let detailsPretty = '';
                           if (row.details_json) {
-                            try { details = JSON.stringify(JSON.parse(row.details_json)); }
-                            catch { details = row.details_json; }
+                            try {
+                              const parsed = JSON.parse(row.details_json);
+                              detailsCompact = JSON.stringify(parsed);
+                              detailsPretty = JSON.stringify(parsed, null, 2);
+                            } catch {
+                              detailsCompact = row.details_json;
+                              detailsPretty = row.details_json;
+                            }
                           }
+                          const expanded = expandedAuditIds.has(rowKey);
+                          const hasDetails = detailsCompact.length > 0;
                           const actionColor =
                             row.action === 'ban' ? 'bg-red-500/20 text-red-400' :
                             row.action === 'unban' ? 'bg-emerald-500/20 text-emerald-400' :
@@ -2042,16 +2331,56 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                             row.action === 'dsar-export' ? 'bg-cyan-500/20 text-cyan-400' :
                             row.action === 'reauth-success' || row.action === 'reauth-failed' ? 'bg-purple-500/20 text-purple-400' :
                             'bg-white/[0.06] text-gray-400';
+                          const toggle = () => {
+                            if (!hasDetails) return;
+                            setExpandedAuditIds(prev => {
+                              const next = new Set(prev);
+                              if (next.has(rowKey)) next.delete(rowKey);
+                              else next.add(rowKey);
+                              return next;
+                            });
+                          };
                           return (
-                            <tr key={row.id || i} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
-                              <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{fmtDate(row.created_at)}</td>
-                              <td className="px-4 py-3 text-white font-medium">{row.admin_email}</td>
-                              <td className="px-4 py-3">
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${actionColor}`}>{row.action}</span>
-                              </td>
-                              <td className="px-4 py-3 text-gray-300">{row.target_email || '—'}</td>
-                              <td className="px-4 py-3 text-gray-500 font-mono text-[10px] max-w-[420px] truncate" title={details}>{details || '—'}</td>
-                            </tr>
+                            <React.Fragment key={rowKey}>
+                              <tr className={`border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors ${hasDetails ? 'cursor-pointer' : ''}`} onClick={toggle}>
+                                <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{fmtDate(row.created_at)}</td>
+                                <td className="px-4 py-3 text-white font-medium">{row.admin_email}</td>
+                                <td className="px-4 py-3">
+                                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${actionColor}`}>{row.action}</span>
+                                </td>
+                                <td className="px-4 py-3 text-gray-300">{row.target_email || '—'}</td>
+                                <td className="px-4 py-3 text-gray-500 font-mono text-[10px]">
+                                  <div className="flex items-center gap-2">
+                                    {hasDetails && (
+                                      <button onClick={e => { e.stopPropagation(); toggle(); }} className="shrink-0 text-gray-500 hover:text-white transition-colors" aria-label={expanded ? 'Collapse' : 'Expand'}>
+                                        {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                                      </button>
+                                    )}
+                                    <span className={`truncate max-w-[380px] ${!hasDetails ? 'text-gray-600' : ''}`} title={detailsCompact}>{detailsCompact || '—'}</span>
+                                  </div>
+                                </td>
+                              </tr>
+                              {expanded && hasDetails && (
+                                <tr className="border-b border-white/[0.03] bg-black/40">
+                                  <td colSpan={5} className="px-6 py-3">
+                                    <div className="flex items-start justify-between gap-3 mb-2">
+                                      <span className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold">Details payload</span>
+                                      <button
+                                        onClick={async (e) => {
+                                          e.stopPropagation();
+                                          try { await navigator.clipboard.writeText(detailsPretty); showMsg('Details copied'); }
+                                          catch { showMsg('Copy failed', 'error'); }
+                                        }}
+                                        className="text-[10px] text-gray-400 hover:text-white flex items-center gap-1 transition-colors"
+                                      >
+                                        <Copy size={10} /> Copy JSON
+                                      </button>
+                                    </div>
+                                    <pre className="text-[10px] font-mono text-gray-300 whitespace-pre-wrap break-all bg-white/[0.02] border border-white/[0.06] rounded-lg p-3 max-h-72 overflow-y-auto">{detailsPretty}</pre>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
                           );
                         })}
                       </tbody>
@@ -2400,12 +2729,15 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                   </div>
                 </div>
 
-                {/* Daily trends sparkline (text table — enough signal for now) */}
+                {/* Daily trends — SVG sparklines first (visual signal), then text table (precision). */}
                 <div>
                   <div className="flex items-center justify-between mb-3">
                     <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold">30-Day Trends</h2>
-                    <p className="text-[10px] text-gray-600">Signups · Logins · Revenue (all currencies summed in their native minor units — see tooltip for breakdown)</p>
+                    <p className="text-[10px] text-gray-600">Signups · Logins · Revenue (USD only in chart — multi-currency totals below)</p>
                   </div>
+                  {trends.length >= 2 && (
+                    <TrendsSparklines trends={trends} />
+                  )}
                   <div className="border border-white/[0.06] rounded-xl overflow-hidden">
                     <div className="overflow-x-auto max-h-[420px]">
                       <table className="w-full text-xs">
@@ -2575,15 +2907,18 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
                   )}
                 </div>
 
-                <div className="p-4 rounded-xl border border-amber-500/20 bg-amber-500/[0.04] text-amber-200 text-xs">
-                  <div className="flex items-start gap-2">
-                    <AlertTriangle size={14} className="shrink-0 mt-0.5" />
-                    <div>
-                      Known keys: <span className="font-mono">min_app_version</span>, <span className="font-mono">latest_app_version</span>.
-                      Other keys can be introduced by the server — they'll appear here automatically.
-                    </div>
-                  </div>
-                </div>
+                {/* Known-key reference. Each entry has a description + default,
+                    so an admin coming here cold can tell which knobs exist
+                    without reading source. Server still owns the truth — keys
+                    not yet seeded show a "Seed default" button. */}
+                <KnownConfigKeysHint
+                  configRows={configRows}
+                  onSeed={async (key, defaultValue) => {
+                    const updated = await callMutation(`/api/v1/admin/config/${encodeURIComponent(key)}`, { value: defaultValue }, `${key} seeded`, { method: 'PUT' });
+                    if (updated) loadConfig();
+                  }}
+                  busy={!!panelBusy}
+                />
               </div>
             )}
           </>
@@ -2734,9 +3069,25 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
               placeholder="US"
               className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-blue-500/50 uppercase font-mono"
             />
+            {editProfileFor.country_code !== editProfileFor.original_country_code && editProfileFor.country_code.length === 2 && (
+              // Country drives provider routing (Razorpay for IN, Stripe elsewhere) and pricing tables. Changing it here only updates the user record — it does NOT migrate active subscriptions, retroactively re-price past payments, or update what the user sees in their billing portal until their next renewal cycle.
+              <div className="mt-2 p-2.5 rounded-lg bg-amber-500/[0.06] border border-amber-500/20 text-amber-200 text-[11px] flex items-start gap-2">
+                <AlertTriangle size={12} className="shrink-0 mt-0.5" />
+                <div>
+                  Changing <span className="font-mono font-semibold">{editProfileFor.original_country_code || '—'}</span> → <span className="font-mono font-semibold">{editProfileFor.country_code}</span> affects which payment provider (Stripe vs. Razorpay) and pricing region the user sees on their <strong>next</strong> checkout. It does not retroactively re-bill or migrate an active subscription.
+                </div>
+              </div>
+            )}
+            {editProfileFor.country_code.length === 1 && (
+              <p className="mt-1 text-[10px] text-red-400">ISO-2 must be exactly 2 letters.</p>
+            )}
             <div className="mt-5 flex items-center justify-end gap-2">
               <button onClick={() => setEditProfileFor(null)} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Cancel</button>
-              <button onClick={submitEditProfile} className="px-4 py-2 rounded-lg text-sm font-semibold bg-blue-500/20 text-blue-200 hover:bg-blue-500/30 border border-blue-500/30 transition-all">Save</button>
+              <button
+                onClick={submitEditProfile}
+                disabled={editProfileFor.country_code.length === 1}
+                className="px-4 py-2 rounded-lg text-sm font-semibold bg-blue-500/20 text-blue-200 hover:bg-blue-500/30 border border-blue-500/30 transition-all disabled:opacity-40"
+              >Save</button>
             </div>
           </div>
         </div>
@@ -2782,49 +3133,163 @@ const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUs
         );
       })()}
 
-      {/* ── REFUND MODAL ── */}
-      {refundFor && (() => {
-        const p = refundFor.payment;
-        let amount = p.amount;
-        let reason = 'requested_by_customer';
-        return (
-          <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/70 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={() => setRefundFor(null)}>
-            <div className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-pink-500/20 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
-              <div className="flex items-start gap-3 mb-4">
-                <div className="shrink-0 p-2 rounded-lg bg-pink-500/15 text-pink-400"><RefreshCw size={18} /></div>
-                <div>
-                  <h3 className="text-base font-semibold text-white">Issue Refund</h3>
-                  <p className="text-xs text-gray-500">{p.email} · {p.provider.toUpperCase()} · {fmtAmount(p.amount, p.currency)}</p>
-                </div>
-              </div>
-              <p className="text-xs text-gray-400 mb-4 p-3 rounded-lg bg-amber-500/[0.04] border border-amber-500/20">
-                Refund hits the provider immediately. A webhook will downgrade this user's tier shortly after. Partial refunds are supported — enter a smaller amount to refund less than the full charge. Requires step-up password.
-              </p>
-              <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Amount ({p.currency.toUpperCase()} · minor units, e.g. cents/paise)</label>
-              <input
-                type="number"
-                defaultValue={p.amount}
-                onChange={e => { amount = parseInt(e.target.value, 10) || 0; }}
-                className="w-full px-3 py-2 mb-3 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-pink-500/50 font-mono"
-              />
-              <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Reason</label>
-              <select
-                defaultValue="requested_by_customer"
-                onChange={e => { reason = e.target.value; }}
-                className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-pink-500/50"
-              >
-                <option value="requested_by_customer">Requested by customer</option>
-                <option value="duplicate">Duplicate charge</option>
-                <option value="fraudulent">Fraudulent</option>
-              </select>
-              <div className="mt-5 flex items-center justify-end gap-2">
-                <button onClick={() => setRefundFor(null)} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Cancel</button>
-                <button onClick={() => submitRefund(amount, reason)} className="px-4 py-2 rounded-lg text-sm font-semibold bg-pink-500/20 text-pink-200 hover:bg-pink-500/30 border border-pink-500/30 transition-all">Issue refund</button>
-              </div>
-            </div>
+      {/* ── REFUND MODAL ──
+          Uses React state (was using closure variables, which silently
+          carried stale values across modal open/close cycles — admin could
+          accidentally refund the wrong amount on a second refund attempt). */}
+      {refundFor && (
+        <RefundModal
+          payment={refundFor.payment}
+          fmtAmount={fmtAmount}
+          onCancel={() => setRefundFor(null)}
+          onSubmit={(amount, reason) => submitRefund(amount, reason)}
+        />
+      )}
+
+      {/* ── BAN MODAL ──
+          Captures a free-text reason that gets stamped on both the audit log
+          and the license-revoke row, so support can later explain to the user
+          why they're locked out. */}
+      {banFor && (
+        <BanModal
+          email={banFor.email}
+          onCancel={() => setBanFor(null)}
+          onSubmit={(reason) => submitBan(banFor.email, reason)}
+        />
+      )}
+
+      {/* ── IMPERSONATION TOKEN MODAL ──
+          Token must be select-all-able so admin can paste it into a separate
+          tool. Auto-copy on open is a convenience; manual copy is the fallback
+          path when clipboard write throws (sandboxed renderer, focus loss). */}
+      {impersonateToken && (
+        <ImpersonationTokenModal
+          email={impersonateToken.email}
+          token={impersonateToken.token}
+          onClose={() => setImpersonateToken(null)}
+          onMessage={showMsg}
+        />
+      )}
+    </div>
+  );
+};
+
+// Ban modal — prompts for an audit-trail reason. Server stamps this on the
+// audit row + the license-revoke row, so a support agent can later answer
+// "why am I banned?" without having to dig through DB tables.
+const BanModal = ({ email, onCancel, onSubmit }: { email: string; onCancel: () => void; onSubmit: (reason: string) => void }) => {
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  // Server accepts any string; we just gate Submit on non-empty so the audit
+  // log isn't littered with blank-reason bans (which are useless to support).
+  const ok = reason.trim().length > 0;
+  return (
+    <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/70 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={onCancel}>
+      <div className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-red-500/30 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
+        <div className="flex items-start gap-3 mb-4">
+          <div className="shrink-0 p-2 rounded-lg bg-red-500/15 text-red-400"><Ban size={18} /></div>
+          <div>
+            <h3 className="text-base font-semibold text-white">Ban {email}</h3>
+            <p className="text-xs text-gray-500">Their license is revoked and active sessions are invalidated. Audit-logged.</p>
           </div>
-        );
-      })()}
+        </div>
+        <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Reason (required — appears in audit log)</label>
+        <textarea
+          autoFocus
+          value={reason}
+          onChange={e => setReason(e.target.value)}
+          placeholder="e.g. payment fraud confirmed by Stripe; abusive support behavior; chargeback recovery"
+          rows={4}
+          className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-red-500/50 resize-none"
+        />
+        <div className="mt-5 flex items-center justify-end gap-2">
+          <button onClick={onCancel} disabled={busy} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all disabled:opacity-50">Cancel</button>
+          <button
+            disabled={!ok || busy}
+            onClick={async () => { setBusy(true); try { await onSubmit(reason.trim()); } finally { setBusy(false); } }}
+            className="px-4 py-2 rounded-lg text-sm font-semibold bg-red-500/20 text-red-200 hover:bg-red-500/30 border border-red-500/30 transition-all disabled:opacity-40 flex items-center gap-2"
+          >
+            {busy && <Loader2 size={14} className="animate-spin" />}
+            Ban user
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Impersonation token modal — readonly text input + copy button. The token is
+// long (JWT), so a confirm-dialog body would line-wrap it ugly and admins
+// might not realize they need to scroll. Auto-copy on mount is a convenience;
+// the input stays for manual-select fallback.
+const ImpersonationTokenModal = ({ email, token, onClose, onMessage }: { email: string; token: string; onClose: () => void; onMessage: (msg: string, type?: 'success' | 'error') => void }) => {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [copied, setCopied] = useState(false);
+  // Auto-copy + select-all on open. clipboard.writeText can reject in
+  // sandboxed contexts, so the manual-select path stays available regardless.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        await navigator.clipboard.writeText(token);
+        if (!cancelled) {
+          setCopied(true);
+          onMessage('Token copied — handle with care', 'success');
+        }
+      } catch {
+        // Clipboard blocked — let the user select+copy manually.
+        inputRef.current?.select();
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const doCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(token);
+      setCopied(true);
+      onMessage('Token copied — handle with care', 'success');
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      inputRef.current?.select();
+      onMessage('Clipboard blocked — token is selected, press Ctrl+C', 'error');
+    }
+  };
+  return (
+    <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/70 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={onClose}>
+      <div className="relative w-full max-w-2xl mx-4 rounded-2xl bg-[#0b0b0f] border border-yellow-500/30 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
+        <div className="flex items-start gap-3 mb-4">
+          <div className="shrink-0 p-2 rounded-lg bg-yellow-500/15 text-yellow-400"><Key size={18} /></div>
+          <div className="flex-1">
+            <h3 className="text-base font-semibold text-white">Impersonation token for {email}</h3>
+            <p className="text-xs text-gray-500 mt-0.5">Expires in 30 minutes. Every action under this token is audit-logged against you.</p>
+          </div>
+          <button onClick={onClose} aria-label="Close" className="shrink-0 p-1 rounded-md text-gray-500 hover:text-white hover:bg-white/[0.06] transition-colors"><X size={16} /></button>
+        </div>
+        <div className="p-3 rounded-lg bg-amber-500/[0.06] border border-amber-500/20 text-amber-200 text-[11px] mb-4 flex items-start gap-2">
+          <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+          <div><span className="font-semibold">Do not paste into your own admin tab.</span> Use a separate browser/profile so you don't lock yourself out.</div>
+        </div>
+        <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">JWT</label>
+        <div className="flex items-stretch gap-2">
+          <input
+            ref={inputRef}
+            readOnly
+            value={token}
+            onFocus={e => e.currentTarget.select()}
+            className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-[11px] font-mono focus:outline-none focus:border-yellow-500/50"
+          />
+          <button
+            onClick={doCopy}
+            className="px-4 rounded-lg text-xs font-semibold bg-yellow-500/20 text-yellow-200 hover:bg-yellow-500/30 border border-yellow-500/30 transition-all flex items-center gap-1.5 whitespace-nowrap"
+          >
+            {copied ? <><Check size={13} /> Copied</> : <><Copy size={13} /> Copy</>}
+          </button>
+        </div>
+        <div className="mt-5 flex items-center justify-end">
+          <button onClick={onClose} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Done</button>
+        </div>
+      </div>
     </div>
   );
 };
@@ -2870,6 +3335,27 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   const [lastSuccessfulTier, setLastSuccessfulTier] = useState<string | null>(() => {
     try { return typeof localStorage !== 'undefined' ? localStorage.getItem('justPurchasedTier') : null; } catch { return null; }
   });
+  // If a webhook downgrades the user mid-session (refund, cancel processed
+  // immediately, comp revoked) the success banner would otherwise still claim
+  // "Pro Active" until next reload. Compare ranks: when the live license tier
+  // drops below what we cached as "just purchased", clear the cache so the UI
+  // catches up. We only clear on a strict downgrade — webhook lag in the
+  // upgrade direction is handled elsewhere by displaying the cached tier.
+  useEffect(() => {
+    if (!lastSuccessfulTier) return;
+    if (!currentLicense) return;
+    const rank: Record<string, number> = { free: 0, basic: 1, pro: 2, max: 3 };
+    const liveRank = rank[String(currentLicense.tier).toLowerCase()] ?? 0;
+    const cachedRank = rank[String(lastSuccessfulTier).toLowerCase()] ?? 0;
+    if (liveRank < cachedRank) {
+      try { localStorage.removeItem('justPurchasedTier'); } catch {}
+      setLastSuccessfulTier(null);
+      // Clear the success banner too — it's misleading when the tier just
+      // got pulled out from under us. Tier chip will reflect the new state
+      // independently via currentLicense.
+      setPaymentSuccess(null);
+    }
+  }, [currentLicense?.tier, lastSuccessfulTier]);
   // Flips true after handleSignup resolves so the /download view can show
   // a first-time welcome banner to Starter users. Cleared when the banner
   // is dismissed or a successful payment replaces it.
@@ -3680,8 +4166,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}`;
 
     try {
-      // Open Google sign-in in system browser
-      if (isElectron && window.electronAPI?.openExternal) {
+      // Open Google sign-in in system browser. Capability check is on
+      // window.electronAPI.openExternal directly — the top-level isElectron
+      // const is module-load-time-evaluated and historically had subtle
+      // timing/preload-injection edge cases. Optional-chaining the actual
+      // function is the durable check.
+      if (window.electronAPI?.openExternal) {
         window.electronAPI.openExternal(authUrl);
       } else {
         window.open(authUrl, '_blank');
@@ -3705,19 +4195,44 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           if (!mountedRef.current) return;
 
           if (data.status === 'success') {
+            // Defensive: server should always return a license on success,
+            // but if for any reason it's missing we'd otherwise authenticate
+            // the user and then immediately crash downstream code that reads
+            // license.tier. Surface the issue clearly instead.
+            if (!data.user || !data.license || !data.token) {
+              console.error('[google-auth] success response missing fields:', {
+                hasUser: !!data.user,
+                hasLicense: !!data.license,
+                hasToken: !!data.token,
+              });
+              setAuthError('Sign-in succeeded but server returned incomplete data. Please try again.');
+              setIsSubmitting(false);
+              return;
+            }
             // Save auth data
-            if (data.license) data.license.last_validated = Date.now();
-            licenseService.saveAuth(data.user, data.license, data.token);
+            data.license.last_validated = Date.now();
+            try {
+              licenseService.saveAuth(data.user, data.license, data.token);
+            } catch (saveErr: any) {
+              // localStorage quota / disabled / corrupt JSON. Without this
+              // try-catch, a saveAuth throw silently aborts the success path
+              // and the spinner runs forever — the "loading there itself"
+              // symptom from logout→re-login.
+              console.error('[google-auth] saveAuth threw:', saveErr);
+              setAuthError('Could not save sign-in (storage error). Please try again.');
+              setIsSubmitting(false);
+              return;
+            }
 
             setCurrentUser(data.user);
             setCurrentLicense(data.license);
             setIsSubmitting(false);
 
-            if (isElectron) {
+            if (window.electronAPI?.send) {
               // Pull the Electron window back to the foreground — the browser
               // "you can close this tab" page leaves the desktop app hidden
               // behind it otherwise.
-              try { window.electronAPI?.send('focus-main-window'); } catch {}
+              try { window.electronAPI.send('focus-main-window'); } catch {}
               onAuthenticated(data.user, data.license);
             } else {
               setView('download');
@@ -3740,7 +4255,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             setAuthError('Sign-in timed out. Please try again.');
             setIsSubmitting(false);
           }
-        } catch {
+        } catch (pollErr) {
+          // Log so we can see WHAT failed if the user reports it again.
+          // Previously this catch was silent + retried, masking real bugs
+          // (e.g., CORS, DNS, certificate errors) as "still pending".
+          console.warn('[google-auth] poll attempt failed:', pollErr);
           if (!mountedRef.current) return;
           if (attempts < maxAttempts) {
             await new Promise(r => setTimeout(r, pollInterval));
@@ -3760,10 +4279,19 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   };
 
   // ── Logout ──
+  // Resets auth-related transient state too, not just user/license/view.
+  // Without these resets, a logout that happens while isSubmitting=true
+  // (e.g., user gives up mid-Google-poll and clicks logout) leaves the
+  // next sign-in button stuck in "Waiting for sign-in..." with the spinner
+  // running and the button disabled — root cause of the v3.4.2 logout→
+  // re-login regression.
   const handleLogout = () => {
     licenseService.logout();
     setCurrentUser(null);
     setCurrentLicense(null);
+    setIsSubmitting(false);
+    setAuthError(null);
+    setForgotSent(false);
     setView('landing');
     setEmail('');
     setPassword('');

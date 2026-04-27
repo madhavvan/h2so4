@@ -292,7 +292,10 @@ router.get('/users/:id', authMiddleware, adminOnly, (req, res) => {
 // DSAR export — GDPR Article 15 data subject access request. Returns a
 // complete bundle of everything we have on a single user, with sensitive
 // server-only fields (password_hash) stripped. Intended for download as JSON.
-router.get('/users/:id/export', authMiddleware, adminOnly, (req, res) => {
+// DSAR export downloads everything we have on a user — emails, payment
+// data, full conversation history. That's a strict GDPR record + a real
+// privacy concern if a stolen admin session triggered it. Step-up gates it.
+router.get('/users/:id/export', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   try {
     const bundle = db.getUserDataExport(req.params.id);
     if (!bundle) return res.status(404).json({ error: 'User not found' });
@@ -457,7 +460,9 @@ router.post('/users/downgrade', authMiddleware, adminOnly, stepUpOnly, (req, res
 //  CREDITS + EXPIRY
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-router.post('/users/grant-credits', authMiddleware, adminOnly, (req, res) => {
+// Mutates a user's session/credit balance — money-equivalent operation
+// (admin can grant unlimited paid time). Step-up required.
+router.post('/users/grant-credits', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   try {
     const { email, credits } = req.body || {};
     const n = Number(credits);
@@ -483,7 +488,9 @@ router.post('/users/grant-credits', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-router.post('/users/extend-expiry', authMiddleware, adminOnly, (req, res) => {
+// Pushes a user's license expiry — money-equivalent (admin can grant
+// indefinite access). Step-up required.
+router.post('/users/extend-expiry', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   try {
     const { email, days } = req.body || {};
     const n = Number(days);
@@ -545,7 +552,9 @@ router.post('/users/:id/grant-comp', authMiddleware, adminOnly, stepUpOnly, (req
 //  DEVICE + SESSION MANAGEMENT
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-router.post('/users/reset-devices', authMiddleware, adminOnly, (req, res) => {
+// Wipes ALL device bindings for a user — kicks them off every machine.
+// High-impact (locks legitimate user out until they re-bind) so step-up.
+router.post('/users/reset-devices', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'email required' });
@@ -584,7 +593,10 @@ router.post('/users/:id/devices/:deviceRowId/revoke', authMiddleware, adminOnly,
   }
 });
 
-router.post('/users/force-logout', authMiddleware, adminOnly, (req, res) => {
+// Invalidates all sessions for a user — they'll be logged out everywhere.
+// Less destructive than reset-devices (re-bind not required) but still
+// disruptive mid-interview, so step-up gates it.
+router.post('/users/force-logout', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'email required' });
@@ -650,7 +662,9 @@ router.delete('/users/:id/conversations/:convId', authMiddleware, adminOnly, ste
 //  BAN / UNBAN
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-router.post('/users/ban', authMiddleware, adminOnly, (req, res) => {
+// Bans a user — revokes license, force-logs-out, blocks sign-in. Hard
+// destructive action; admin password re-confirmation gates it.
+router.post('/users/ban', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   try {
     const { email, reason } = req.body || {};
     if (!email) return res.status(400).json({ error: 'email required' });
@@ -671,7 +685,9 @@ router.post('/users/ban', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-router.post('/users/unban', authMiddleware, adminOnly, (req, res) => {
+// Unban — restoring access also matters; gate with step-up so a stolen
+// admin token can't quietly re-enable a banned account.
+router.post('/users/unban', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'email required' });
@@ -715,16 +731,34 @@ router.post('/users/:id/send-password-reset', authMiddleware, adminOnly, async (
     const { sendMail, renderPasswordResetEmail } = require('../email');
     const { subject, html, text } = renderPasswordResetEmail({ name: user.name, resetUrl });
 
-    // Fire-and-forget — we audit-log the attempt regardless of delivery
-    // result so an admin action is always traceable.
-    sendMail({ to: user.email, subject, html, text })
-      .then(result => {
-        if (!result?.ok) console.warn('[admin/send-password-reset] email failed:', result?.reason);
-      })
-      .catch(err => console.error('[admin/send-password-reset] sendMail threw:', err && err.message));
+    // AWAIT the send so we can surface the actual delivery result to the
+    // admin instead of always reporting "success" while silently failing.
+    // The token is already created either way; if email fails, the admin
+    // can copy the URL from logs or retry.
+    let mailResult;
+    try {
+      mailResult = await sendMail({ to: user.email, subject, html, text });
+    } catch (err) {
+      mailResult = { ok: false, reason: (err && err.message) || 'sendMail threw' };
+    }
 
-    writeAudit(req, 'send-password-reset', user);
-    res.json({ success: true, message: `Password reset email sent to ${user.email}` });
+    writeAudit(req, 'send-password-reset', user, {
+      mail_ok: !!mailResult?.ok,
+      mail_reason: mailResult?.reason || null,
+    });
+
+    if (!mailResult?.ok) {
+      // Still 200 — the reset TOKEN was created (admin can hand-copy if
+      // needed). But surface the email failure so admin knows the link
+      // didn't reach the user's inbox.
+      return res.json({
+        success: true,
+        delivered: false,
+        message: `Reset link generated, but EMAIL DELIVERY FAILED (${mailResult?.reason || 'unknown'}). Copy the URL manually if needed.`,
+      });
+    }
+
+    res.json({ success: true, delivered: true, message: `Password reset email sent to ${user.email}` });
   } catch (err) {
     console.error('Send password reset error:', err);
     res.status(500).json({ error: 'Failed to send password reset' });

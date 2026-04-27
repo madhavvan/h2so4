@@ -285,6 +285,24 @@ class LicenseService {
     localStorage.removeItem(this.AUTH_KEY);
     localStorage.removeItem(this.STORAGE_KEY);
     localStorage.removeItem(this.TOKEN_KEY);
+    // Per-account UX flags (tutorial completion, first-close toast shown)
+    // are scoped by user_id. Clear them on logout so a different user
+    // signing in on the same machine sees them fresh — and so a returning
+    // user gets the toast/tutorial again if they explicitly logged out.
+    try {
+      const toRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k) continue;
+        if (k.startsWith('tutorial_v1_completed_') ||
+            k.startsWith('tray_hide_toast_shown_')) {
+          toRemove.push(k);
+        }
+      }
+      toRemove.forEach(k => localStorage.removeItem(k));
+    } catch {
+      // localStorage unavailable / quota — non-fatal.
+    }
   }
 
   getToken(): string | null {

@@ -14,6 +14,7 @@ import { useDatabase, SessionSummary } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
 import { SubscriptionGate } from './SubscriptionGate';
 import { Tutorial, shouldShowTutorial, markTutorialCompleted, clearTutorialCompletion } from './Tutorial';
+import { ManageSubscription } from './ManageSubscription';
 import { licenseService, UserProfile, LicenseData, TIME_CONSTANTS } from './services/licenseService';
 import { creditTimerService } from './services/creditTimerService';
 import { pricingService } from './services/pricingService';
@@ -261,6 +262,11 @@ const CodeBlock: React.FC<{
     // read when 'done' fires (verify signals always arrive before 'done').
     // Cleared at the start of each cycle so stale verdicts don't bleed across.
     const verifyMismatchRef = useRef(false);
+    // Diagnostics from the most recent verify-mismatch — what we expected to
+    // find in the editor vs. what was actually there. Surfaced in the error
+    // toast so the user can tell focus-loss from autocomplete-collision from
+    // a genuine race, instead of seeing an opaque "interrupted" message.
+    const verifyDiagnosticsRef = useRef<{ expected?: string; actual?: string; lineIndex?: number; hint?: string } | null>(null);
     // Timer id for the post-'done' flash revert. Tracked so we can cancel it
     // on unmount (stops setState-on-unmounted warnings when the CodeBlock is
     // torn down mid-flash) and on a fresh click (stops a stale revert from
@@ -328,8 +334,17 @@ const CodeBlock: React.FC<{
                 setAtPhase('typing');
             } else if (data.phase === 'verify-mismatch') {
                 verifyMismatchRef.current = true;
+                // Capture the diagnostic payload so the toast can show
+                // expected vs. actual + a likely-cause hint when 'done' lands.
+                verifyDiagnosticsRef.current = {
+                    expected: typeof data.expected === 'string' ? data.expected : undefined,
+                    actual: typeof data.actual === 'string' ? data.actual : undefined,
+                    lineIndex: typeof data.lineIndex === 'number' ? data.lineIndex : undefined,
+                    hint: typeof data.hint === 'string' ? data.hint : undefined,
+                };
             } else if (data.phase === 'verify-ok') {
                 verifyMismatchRef.current = false;
+                verifyDiagnosticsRef.current = null;
             } else if (data.phase === 'done') {
                 if (data.aborted) {
                     // Aborted type: straight to idle. No green "Done" because
@@ -337,10 +352,31 @@ const CodeBlock: React.FC<{
                     // main never ran verification on an aborted run.
                     clearFlashTimer();
                     setAtPhase('idle');
+                    // Preflight aborts (no_target_editor, etc.) carry a hint
+                    // string that explains the actionable cause to the user.
+                    // Without surfacing it the user just sees the button reset
+                    // with no explanation of why nothing happened.
+                    if (typeof data.hint === 'string' && data.hint) {
+                        surfaceAtError(data.hint);
+                    }
                 } else if (verifyMismatchRef.current) {
                     // Actionable warning — linger longer so the user notices.
                     setAtPhase('verify-mismatch');
                     scheduleFlashRevert(3500);
+                    // Push the diagnostic into the persistent error toast as
+                    // well, so the user sees concrete evidence (expected vs
+                    // actual snippet + a likely-cause hint) and can tell why
+                    // it stopped — focus loss, autocomplete, or manual typing
+                    // during the run all surface different actuals.
+                    const diag = verifyDiagnosticsRef.current;
+                    if (diag) {
+                        const where = diag.lineIndex ? ` after line ${diag.lineIndex}` : '';
+                        const expected = diag.expected ? `Expected near cursor: ${JSON.stringify(diag.expected)}` : '';
+                        const actual = diag.actual ? `Editor tail: ${JSON.stringify(diag.actual)}` : '';
+                        const hint = diag.hint || '';
+                        const lines = [`Auto-Type stopped${where} — typed text is not in the editor.`, expected, actual, hint].filter(Boolean);
+                        surfaceAtError(lines.join('\n'));
+                    }
                 } else {
                     setAtPhase('done');
                     scheduleFlashRevert(1500);
@@ -495,7 +531,7 @@ const CodeBlock: React.FC<{
                     className="flex items-start gap-2 px-4 py-2 bg-amber-500/10 border-b border-amber-500/30 text-[11px] text-amber-200"
                 >
                     <AlertTriangle size={12} className="mt-0.5 shrink-0 text-amber-400" />
-                    <span className="flex-1 leading-snug">{atError}</span>
+                    <span className="flex-1 leading-snug whitespace-pre-line">{atError}</span>
                     <button
                         onClick={() => {
                             if (atErrorTimerRef.current !== null) {
@@ -628,6 +664,13 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
     focusables?.[0]?.focus();
 
     const onKey = (e: KeyboardEvent) => {
+      // Only respond to keys that originated INSIDE the dialog (or have no
+      // target like programmatic dispatches). Without this, an Escape press
+      // in an OAuth popup, sidebar, popout, or anywhere else in the app
+      // could close THIS modal — and worse, our stopPropagation could hide
+      // the Escape from auth callbacks / page-level handlers.
+      const target = e.target as Node | null;
+      if (target && dlg && !dlg.contains(target)) return;
       if (e.key === 'Escape') {
         e.stopPropagation();
         onClose?.();
@@ -637,7 +680,9 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
         const items = dlg.querySelectorAll<HTMLElement>(
           'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
         );
-        if (items.length === 0) return;
+        // Skip the trap entirely when there's nothing to cycle between —
+        // a single-button modal doesn't need (or want) Tab to loop on itself.
+        if (items.length <= 1) return;
         const first = items[0];
         const last = items[items.length - 1];
         if (e.shiftKey && document.activeElement === first) {
@@ -649,9 +694,12 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
         }
       }
     };
-    document.addEventListener('keydown', onKey, true);
+    // Bubbling phase (no `true`) — let page-level handlers run first. The
+    // capture-phase version we shipped briefly was stealing keys destined
+    // for inputs, focus traps inside iframes, and OS auth popups.
+    document.addEventListener('keydown', onKey);
     return () => {
-      document.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('keydown', onKey);
       // Restore focus to whatever opened the modal so the user lands back
       // where they were before.
       try { lastFocusRef.current?.focus(); } catch {}
@@ -732,6 +780,7 @@ const ChatInterface = ({
     userProfile,
     userLicense,
     onLogout,
+    onOpenManageSub,
     gate,
     creditTimer,
     effectiveTier,
@@ -1199,22 +1248,22 @@ const ChatInterface = ({
                 </div>
 
                 <div className="flex items-center gap-2 md:gap-3">
-                    {/* User tier badge */}
+                    {/* User tier badge — clickable, opens Manage Subscription */}
                     {userLicense && userLicense.tier === 'max' ? (
-                      <div className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400 hover:from-amber-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
                         <Crown size={10} /> MAX
-                      </div>
+                      </button>
                     ) : userLicense && userLicense.tier === 'pro' ? (
-                      <div className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-blue-500/10 border-blue-500/30 text-blue-400">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-blue-500/10 border-blue-500/30 text-blue-400 hover:bg-blue-500/20 transition-all cursor-pointer">
                         <Crown size={10} /> PRO
-                      </div>
+                      </button>
                     ) : userLicense && userLicense.tier === 'basic' ? (
-                      <div className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-emerald-500/10 border-emerald-500/30 text-emerald-400">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20 transition-all cursor-pointer">
                         <Zap size={10} /> BASIC
-                      </div>
+                      </button>
                     ) : userLicense ? (
-                      <button onClick={openProUpgrade} className="hidden md:flex px-3 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/30 text-blue-400 hover:from-blue-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
-                        <Crown size={10} /> Upgrade to Pro
+                      <button onClick={onOpenManageSub} className="hidden md:flex px-3 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/30 text-blue-400 hover:from-blue-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
+                        <Crown size={10} /> Upgrade
                       </button>
                     ) : null}
 
@@ -2136,6 +2185,20 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       clearTutorialCompletion(userProfile?.id);
       setTutorialOpen(true);
   }, [userProfile?.id]);
+
+  // ── Manage Subscription page (full-screen overlay) ──
+  // Opened by clicking the tier badge in the chat header. Hosts the
+  // unified billing UI: current plan + actions + comparison + account.
+  const [manageSubOpen, setManageSubOpen] = useState(false);
+  const handleSubscriptionUpgrade = useCallback((targetTier: 'basic' | 'pro' | 'max') => {
+      // Reuse the existing checkout flow exposed by SubscriptionGate via
+      // openProUpgrade. The checkout happens in browser via openExternal.
+      // The 'targetTier' is informational — server flow always picks the
+      // configured plan for the user's region. Future: pass targetTier
+      // through to /create-checkout for per-tier selection.
+      setManageSubOpen(false);
+      openProUpgrade();
+  }, []);
 
   // ── In-app update-on-close prompt ──
   // Replaces electron/main.cjs's native dialog.showMessageBox (which leaks
@@ -3852,7 +3915,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     handleClear, handleRegenerate, chatContainerRef, textareaRef, handleScroll,
     isPinned, newSinceUnpin, handleJumpToLatest,
     onOpenSettings: () => setShowSettings(true),
-    onOpenContext: () => { console.log('Opening Context'); setShowContext(true); },
+    onOpenContext: () => setShowContext(true),
     onOpenHelp: () => setShowHelp(true),
     onOpenDownload: () => { if (!isElectron) setShowDownloadModal(true); },
     isPipMode,
@@ -3894,6 +3957,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     userProfile,
     userLicense,
     onLogout,
+    onOpenManageSub: () => setManageSubOpen(true),
     gate,
     // In popout, the local useCreditTimer is a no-op (see isListening override
     // at useCreditTimer call site). Main owns the authoritative timer and
@@ -4295,12 +4359,23 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       {/* --- First-launch Tutorial (auto on first login per account, replayable from Help) --- */}
       <Tutorial isOpen={tutorialOpen} onClose={handleTutorialClose} />
 
-      {/* --- Update-on-close prompt — replaces native dialog.showMessageBox so it doesn't leak on screen-share --- */}
+      {/* --- Manage Subscription full-screen overlay (opened from tier badge) --- */}
+      <ManageSubscription
+          isOpen={manageSubOpen}
+          onClose={() => setManageSubOpen(false)}
+          userProfile={userProfile}
+          userLicense={userLicense}
+          onLogout={onLogout}
+          onUpgradeRequested={handleSubscriptionUpgrade}
+      />
+
+      {/* --- Update-on-close prompt — replaces native dialog.showMessageBox so it doesn't leak on screen-share ---
+          Backdrop click + Esc + X button all dismiss as "stay in tray" — no
+          modal trap. Install requires explicit click on the install button. */}
       <Modal
           isOpen={updatePromptOpen}
           onClose={() => { setUpdatePromptOpen(false); electronIPC.send('update-prompt-decision', { decision: 'dismiss' }); }}
           title="Update ready"
-          dismissOnBackdrop={false}
       >
           <div className="space-y-4">
               <p className="text-sm text-text">

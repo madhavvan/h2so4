@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Message, ContextFile } from '../types';
+import { syncConversationMessage, syncConversationRename } from '../services/aiProxyService';
 
 const isElectron = typeof window !== 'undefined'
   && !!window.electronAPI?.isElectron;
@@ -145,8 +146,23 @@ export function useDatabase(userId: string | null) {
 
   const addMessage = useCallback(async (msg: Message) => {
     if (!ipc || !sessionRef.current) return;
+    const session = sessionRef.current;
     setMessages(prev => [...prev, msg]);
-    await ipc.invoke('db:add-message', sessionRef.current.id, msg);
+    await ipc.invoke('db:add-message', session.id, msg);
+    // Best-effort cloud sync so admin can see the conversation in the
+    // dashboard. Fire-and-forget — never blocks the UI, never surfaces
+    // errors to the candidate. See services/aiProxyService.ts header
+    // comment on syncConversationMessage for privacy boundaries.
+    syncConversationMessage({
+      sessionId: session.id,
+      sessionName: session.name || 'Interview session',
+      message: {
+        id: String(msg.id),
+        role: String(msg.role),
+        content: String(msg.content || ''),
+        timestamp: typeof msg.timestamp === 'number' ? msg.timestamp : Date.now(),
+      },
+    }).catch(() => { /* swallow */ });
   }, []);
 
   const addContextFile = useCallback(async (file: ContextFile) => {
@@ -188,6 +204,11 @@ export function useDatabase(userId: string | null) {
   const renameSession = useCallback(async (targetId: string, newName: string) => {
     if (!ipc || !userIdRef.current) return false;
     const ok: boolean = await ipc.invoke('db:rename-session', targetId, userIdRef.current, newName);
+    if (ok) {
+      // Mirror the rename to the server so admin sees the up-to-date title.
+      // The auto-titler also flows through here once the AI generates a name.
+      syncConversationRename({ sessionId: targetId, newName }).catch(() => {});
+    }
     return ok;
   }, []);
 
