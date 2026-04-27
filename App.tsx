@@ -347,17 +347,45 @@ const CodeBlock: React.FC<{
                 verifyDiagnosticsRef.current = null;
             } else if (data.phase === 'done') {
                 if (data.aborted) {
-                    // Aborted type: straight to idle. No green "Done" because
-                    // nothing landed, and no verify-mismatch warning either —
-                    // main never ran verification on an aborted run.
+                    // Aborted run — surface a toast that explains WHY. Order
+                    // of preference (most specific first):
+                    //   1. SID drift mid-flight (verifyMismatchRef + diagnostic on either ref or broadcast)
+                    //   2. Reason field on the broadcast (preflight, native module, typing loop throw)
+                    //   3. Hint field on the broadcast
+                    //   4. Generic "stopped early" so user never sees a silent reset
                     clearFlashTimer();
                     setAtPhase('idle');
-                    // Preflight aborts (no_target_editor, etc.) carry a hint
-                    // string that explains the actionable cause to the user.
-                    // Without surfacing it the user just sees the button reset
-                    // with no explanation of why nothing happened.
-                    if (typeof data.hint === 'string' && data.hint) {
-                        surfaceAtError(data.hint);
+
+                    // Build the diagnostic string from whichever source has data.
+                    // The 'done' broadcast now mirrors the diagnostic fields from
+                    // verify-mismatch, so we can pull from `data` directly even
+                    // if the verify-mismatch event was missed during a phase
+                    // transition (the listener is re-registered on every atPhase
+                    // change and could lose an in-flight event).
+                    const diag = verifyDiagnosticsRef.current || {
+                        expected: typeof data.expected === 'string' ? data.expected : undefined,
+                        actual: typeof data.actual === 'string' ? data.actual : undefined,
+                        lineIndex: typeof data.lineIndex === 'number' ? data.lineIndex : undefined,
+                        hint: typeof data.hint === 'string' ? data.hint : undefined,
+                    };
+                    const reason = typeof data.reason === 'string' ? data.reason : '';
+
+                    if (reason === 'user_abort') {
+                        // Explicit user cancel — no toast, that's expected behavior.
+                    } else if (verifyMismatchRef.current || reason === 'sid_drift_during_typing') {
+                        const where = diag.lineIndex ? ` after line ${diag.lineIndex}` : '';
+                        const expected = diag.expected ? `Expected near cursor: ${JSON.stringify(diag.expected)}` : '';
+                        const actual = diag.actual ? `Editor tail: ${JSON.stringify(diag.actual)}` : '';
+                        const hint = diag.hint || 'Likely cause: editor lost focus, autocomplete inserted text, or you typed manually during the run.';
+                        const lines = [`Auto-Type stopped${where} — typed text is not in the editor.`, expected, actual, hint].filter(Boolean);
+                        surfaceAtError(lines.join('\n'));
+                    } else if (diag.hint) {
+                        surfaceAtError(diag.hint);
+                    } else if (reason) {
+                        surfaceAtError(`Auto-Type stopped: ${reason.replace(/_/g, ' ')}.`);
+                    } else {
+                        // Last-resort generic — silent reset is the bug we just fixed.
+                        surfaceAtError('Auto-Type stopped early. Try again — if it keeps happening, restart the app.');
                     }
                 } else if (verifyMismatchRef.current) {
                     // Actionable warning — linger longer so the user notices.
