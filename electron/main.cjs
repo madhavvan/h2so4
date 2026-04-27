@@ -824,6 +824,16 @@ async function autoTypeMaybeIndentMistake(keyboard, Key, intendedIndentSpaces, p
 
 let autoTypeAbort = false;
 let autoTypeInFlight = false;
+// Reason for the most recent abort. Tracked alongside autoTypeAbort so the
+// finally-block 'done' broadcast can tell the renderer WHY we stopped — the
+// renderer used to silently reset to idle on aborted=true with no toast,
+// leaving the user staring at a button that just gave up. Possible values:
+// 'user_abort', 'sid_drift_during_typing', 'no_target_editor',
+// 'native_module_load_failed', 'permission_denied', null.
+let autoTypeAbortReason = null;
+// Companion diagnostic blob (expected/actual snippets, line index, hint).
+// Populated when SID fires; renderer pulls it into the multi-line toast.
+let autoTypeAbortDiagnostic = null;
 
 // Broadcast progress so the clicked CodeBlock can update its button label.
 function autoTypeBroadcast(data) {
@@ -850,7 +860,10 @@ ipcMain.handle('auto-type:check-permission', () => {
 });
 
 ipcMain.on('auto-type:abort', () => {
-  if (autoTypeInFlight) autoTypeAbort = true;
+  if (autoTypeInFlight) {
+    autoTypeAbort = true;
+    autoTypeAbortReason = 'user_abort';
+  }
 });
 
 ipcMain.handle('auto-type:send', async (_event, payload) => {
@@ -870,6 +883,8 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
 
   autoTypeInFlight = true;
   autoTypeAbort = false;
+  autoTypeAbortReason = null;
+  autoTypeAbortDiagnostic = null;
   autoTypeResetCadence();
   _atLastWasTypo = false;
 
@@ -948,23 +963,33 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     const focusedProcName = uia && typeof uia.processName === 'string' ? uia.processName : '';
     // Electron spawns helper processes (renderer, gpu, utility) — they share
     // a process name but not pid. Match on either: (a) exact pid, or (b)
-    // process name that smells like our own (Electron / the productName).
+    // process name starts with our productName. We deliberately do NOT match
+    // a bare 'electron' substring — that would false-positive on every
+    // Electron-based editor (VS Code, Cursor, Atom, even some browsers'
+    // helper processes), aborting Auto-Type when the user IS in the right
+    // place. Only our own packaged binary's name should match.
+    const procNameLower = (focusedProcName || '').toLowerCase();
     const looksLikeOurProcess = (
       focusedPid === ownPid ||
-      /electron|interview\s*copilot/i.test(focusedProcName)
+      procNameLower.startsWith('interview copilot') ||
+      procNameLower.startsWith('interviewcopilot')
     );
     if (looksLikeOurProcess) {
       console.warn(`[auto-type] Preflight failed: focus is on our own process (pid=${focusedPid}, name=${focusedProcName}). Aborting before keystrokes.`);
       // Restore main window visibility before bailing — otherwise the user
       // is left with nothing on screen.
       restore.forEach(fn => { try { fn(); } catch (_) {} });
+      autoTypeAbort = true;
+      autoTypeAbortReason = 'no_target_editor';
+      autoTypeAbortDiagnostic = {
+        hint: `Auto-Type aborted: your focus is still on the ${focusedProcName || 'AI app'} window. Click into your code editor (HackerRank, VS Code, IDE) before pressing Auto-Type again.`,
+      };
       autoTypeInFlight = false;
       autoTypeBroadcast({
         phase: 'done',
         aborted: true,
         reason: 'no_target_editor',
-        // Bubble up to the renderer toast — same path SID-drift uses.
-        hint: `Auto-Type aborted: your focus is still on the ${focusedProcName || 'AI app'} window. Click into your code editor (HackerRank, VS Code, IDE) before pressing Auto-Type again.`,
+        hint: autoTypeAbortDiagnostic.hint,
       });
       return { aborted: true, reason: 'no_target_editor' };
     }
@@ -1045,10 +1070,28 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           effectiveSkipLines = Number.isInteger(aiPlan.skip_leading) ? Math.max(0, aiPlan.skip_leading) : 0;
           effectiveSkipTrailing = Number.isInteger(aiPlan.skip_trailing) ? Math.max(0, aiPlan.skip_trailing) : 0;
           wipeFirstLine = !!aiPlan.wipe_first_line;
-          cursorAction = ['use_current', 'move_to_end', 'go_to_line'].includes(aiPlan.cursor_action)
+          let proposedCursor = ['use_current', 'move_to_end', 'go_to_line'].includes(aiPlan.cursor_action)
             ? aiPlan.cursor_action : 'use_current';
           cursorTargetLine = Number.isInteger(aiPlan.target_line) ? aiPlan.target_line : 0;
           cursorTargetColumn = Number.isInteger(aiPlan.target_column) ? aiPlan.target_column : 0;
+          // ── Cursor-respect override ──
+          // The user just dropped their cursor where they want code typed. If
+          // the planner says "move to end of file" but the editor has a
+          // template with driver code BELOW the cursor (effectiveSkipTrailing
+          // > 0 means the planner itself detected post-cursor content), then
+          // moving to end would land the code BELOW the driver code — wrong
+          // place, looks like "started from beginning of new section" to the
+          // user. Same for go_to_line(0|1) — that's "jump to top," which
+          // overrides the cursor placement the user just made.
+          const editorHasContentBelowCursor = effectiveSkipTrailing > 0;
+          if (proposedCursor === 'move_to_end' && editorHasContentBelowCursor) {
+            console.log('[auto-type] cursor: planner asked move_to_end but editor has content below cursor — honoring user cursor instead');
+            proposedCursor = 'use_current';
+          } else if (proposedCursor === 'go_to_line' && cursorTargetLine <= 1) {
+            console.log(`[auto-type] cursor: planner asked go_to_line(${cursorTargetLine}) — too close to top, honoring user cursor instead`);
+            proposedCursor = 'use_current';
+          }
+          cursorAction = proposedCursor;
           wipeChars = Number.isInteger(aiPlan.wipe_chars) ? Math.max(0, Math.min(200, aiPlan.wipe_chars)) : 0;
           typePrefix = typeof aiPlan.prefix === 'string' ? aiPlan.prefix.slice(0, 200) : '';
           typeSuffix = typeof aiPlan.suffix === 'string' ? aiPlan.suffix.slice(0, 200) : '';
@@ -1217,12 +1260,25 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     // Disabled when cursor_action='go_to_line' because computing the expected
     // editor state after a mid-file insertion is more involved than the
     // simple "typed text appended at end / at cursor" cases.
-    const SID_INTERVAL_LINES = 4;
+    //
+    // ALSO disabled when effectiveSkipTrailing > 0 — the planner detected
+    // template code BELOW our typed content (driver code, closing brackets).
+    // SID's tail-comparison would look at that suffix instead of what we
+    // typed and false-fire. This was the v3.4.3 regression that aborted
+    // HackerRank typing after ~4 lines.
+    //
+    // SID_REQUIRED_DRIFT_HITS lets us tolerate a single transient mismatch
+    // (UIA returning partial text mid-render, browser editor lagging) — only
+    // abort when drift is detected on TWO consecutive checks.
+    const SID_INTERVAL_LINES = 6;
     const SID_TAIL_CHARS = 60;
+    const SID_REQUIRED_DRIFT_HITS = 2;
     const sidEnabled = uiaSnapshotBefore
-      && (cursorAction === 'use_current' || cursorAction === 'move_to_end');
+      && (cursorAction === 'use_current' || cursorAction === 'move_to_end')
+      && effectiveSkipTrailing === 0;
     let typedTailBuf = ''; // accumulates the last ~few-hundred chars we typed
     let linesSinceLastVerify = 0;
+    let consecutiveDriftHits = 0; // resets on any successful verify
 
     let prevCh = null;
     // Track the last non-skipped line so we can tell "was the previous
@@ -1362,40 +1418,57 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           try {
             const uiaCheck = await readFocusedViaUIA(800);
             if (uiaCheck && uiaCheck.ok) {
-              // Whitespace-tolerant tail comparison: take the last SID_TAIL_CHARS
-              // non-whitespace chars we typed, look for them in the last
-              // ~SID_TAIL_CHARS+80 non-whitespace chars of the actual editor.
-              // If our tail is missing → unexpected content (drift) → abort.
+              // Whitespace-tolerant comparison: take the last SID_TAIL_CHARS
+              // non-whitespace chars we typed and search for them ANYWHERE in
+              // the editor (not just the tail window — middle-of-file inserts
+              // are valid). If our tail is missing → drift candidate.
               const stripWs = (s) => s.replace(/\s+/g, '');
               const wantTail = stripWs(typedTailBuf).slice(-SID_TAIL_CHARS);
               const actualNw = stripWs(uiaCheck.text || '');
-              const actualTailWindow = actualNw.slice(-(SID_TAIL_CHARS + 80));
-              if (wantTail.length >= 8 && !actualTailWindow.includes(wantTail)) {
-                // Capture concrete diagnostics so the renderer can show the
-                // user WHY we aborted — opaque "interrupted" toasts make it
-                // impossible to tell editor-focus-loss from autocomplete
-                // interference from genuine race conditions.
+
+              // ── UIA-blind safeguard ──
+              // Browser-based editors (Monaco/CodeMirror in Chrome) sometimes
+              // return only a partial slice of the editor text via UIA — or
+              // nothing at all on a slow render. If what UIA gave us is
+              // shorter than what we've typed, the comparison is unreliable;
+              // skip rather than false-abort. We only have ground truth on
+              // editors that expose their full content via UIA (native IDEs,
+              // Notepad, electron-based editors with proper a11y).
+              const minimumExpected = stripWs(typedTailBuf).length + 8;
+              if (actualNw.length < minimumExpected) {
+                console.log(`[auto-type] SID skip: UIA returned ${actualNw.length} chars but we've typed ${stripWs(typedTailBuf).length} — editor likely UIA-blind, trusting the type continues`);
+                consecutiveDriftHits = 0;
+              } else if (wantTail.length >= 8 && !actualNw.includes(wantTail)) {
+                consecutiveDriftHits++;
                 const expectedSnippet = wantTail.slice(-50);
-                const actualSnippet = actualTailWindow.slice(-80);
-                console.warn(`[auto-type] SID drift detected after line ${li + 1} — typed tail not present in editor; aborting for recovery`);
+                const actualSnippet = actualNw.slice(-100);
+                console.warn(`[auto-type] SID drift candidate ${consecutiveDriftHits}/${SID_REQUIRED_DRIFT_HITS} after line ${li + 1} — typed tail not in editor`);
                 console.warn(`[auto-type]   wanted: ${JSON.stringify(expectedSnippet)}`);
-                console.warn(`[auto-type]   actual tail: ${JSON.stringify(actualSnippet)}`);
-                autoTypeAbort = true;
-                autoTypeBroadcast({
-                  phase: 'verify-mismatch',
-                  reason: 'sid_drift_during_typing',
-                  ratio: 0,
-                  // Surface to the renderer so the toast can show "Expected
-                  // 'foo' / Found 'bar'" instead of a generic message.
-                  expected: expectedSnippet,
-                  actual: actualSnippet,
-                  lineIndex: li + 1,
-                  // Most common root causes, ordered by likelihood — gives
-                  // the user a clear next step rather than just "something
-                  // went wrong". Renderer surfaces this as a hint line.
-                  hint: 'Likely cause: editor lost focus, autocomplete inserted text, or you typed manually during the run. Try again with the editor focused and autocomplete off.',
-                });
-                break;
+                console.warn(`[auto-type]   editor tail: ${JSON.stringify(actualSnippet)}`);
+                if (consecutiveDriftHits >= SID_REQUIRED_DRIFT_HITS) {
+                  autoTypeAbort = true;
+                  autoTypeAbortReason = 'sid_drift_during_typing';
+                  autoTypeAbortDiagnostic = {
+                    expected: expectedSnippet,
+                    actual: actualSnippet,
+                    lineIndex: li + 1,
+                    hint: 'Likely cause: editor lost focus, autocomplete inserted text, or you typed manually during the run. Try again with the editor focused and autocomplete off.',
+                  };
+                  autoTypeBroadcast({
+                    phase: 'verify-mismatch',
+                    reason: 'sid_drift_during_typing',
+                    ratio: 0,
+                    expected: expectedSnippet,
+                    actual: actualSnippet,
+                    lineIndex: li + 1,
+                    hint: autoTypeAbortDiagnostic.hint,
+                  });
+                  break;
+                }
+              } else {
+                // Successful verify — reset the consecutive-hit counter so a
+                // single transient blip doesn't carry forward to the next.
+                consecutiveDriftHits = 0;
               }
             }
           } catch (sidErr) {
@@ -1456,13 +1529,36 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     }
   } catch (err) {
     console.error('[auto-type] typing loop error:', err);
+    if (!autoTypeAbortReason) {
+      autoTypeAbortReason = 'typing_loop_threw';
+      autoTypeAbortDiagnostic = {
+        hint: `Auto-Type stopped because of an internal error: ${err && err.message ? err.message : 'unknown'}. If this keeps happening, restart the app.`,
+      };
+      autoTypeAbort = true;
+    }
   } finally {
     restore.forEach(fn => { try { fn(); } catch (_) {} });
-    autoTypeBroadcast({ phase: 'done', aborted: autoTypeAbort });
+    // Pull abort reason + diagnostic into the 'done' broadcast so the renderer
+    // never has to guess WHY a run ended. Without these fields the renderer
+    // used to silently reset to idle on aborted=true, leaving the user with
+    // no feedback (the "no indication" bug from v3.4.3).
+    autoTypeBroadcast({
+      phase: 'done',
+      aborted: autoTypeAbort,
+      reason: autoTypeAbortReason || undefined,
+      hint: autoTypeAbortDiagnostic && autoTypeAbortDiagnostic.hint
+        ? autoTypeAbortDiagnostic.hint : undefined,
+      expected: autoTypeAbortDiagnostic && autoTypeAbortDiagnostic.expected
+        ? autoTypeAbortDiagnostic.expected : undefined,
+      actual: autoTypeAbortDiagnostic && autoTypeAbortDiagnostic.actual
+        ? autoTypeAbortDiagnostic.actual : undefined,
+      lineIndex: autoTypeAbortDiagnostic && autoTypeAbortDiagnostic.lineIndex
+        ? autoTypeAbortDiagnostic.lineIndex : undefined,
+    });
     autoTypeInFlight = false;
   }
 
-  return { ok: !autoTypeAbort, aborted: autoTypeAbort };
+  return { ok: !autoTypeAbort, aborted: autoTypeAbort, reason: autoTypeAbortReason || undefined };
 });
 
 // ───────────────────────────────────────────────
