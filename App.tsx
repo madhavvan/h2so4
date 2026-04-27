@@ -2149,6 +2149,141 @@ const ConversationSidebar = ({
   );
 };
 
+// ─── Popout resize handles ────────────────────────────────────────────
+// Native OS resize is disabled on the popout BrowserWindow (resizable:false)
+// so the OS doesn't draw resize cursors on the side edges during a
+// screen-share — when the user moves their cursor from the popout to a
+// browser-based code editor, the cursor never flashes from arrow to ↔.
+// Reviewers watching the share have nothing to question.
+//
+// Resize is re-added here on the four shapes the user actually needs and
+// where the cursor doesn't normally pass during left-right traversal:
+//   • top edge (full width strip, 6px tall)
+//   • bottom edge (full width strip, 6px tall)
+//   • four corners (10x10 each)
+// The side edges (left, right) deliberately have no handle → no cursor
+// change at all on horizontal cursor paths.
+//
+// Each handle uses pointermove + setPointerCapture so the drag continues
+// even if the cursor leaves the popout window mid-resize. Coordinates
+// are sent in screen pixels (e.screenX/Y) so the popout's own coords
+// don't drift as the window moves under the cursor.
+const PopoutResizeHandles: React.FC = () => {
+  const startResize = (edge: 'top' | 'bottom' | 'tl' | 'tr' | 'bl' | 'br') =>
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const target = e.currentTarget;
+      try { target.setPointerCapture(e.pointerId); } catch {}
+
+      try {
+        window.electronAPI?.send('popout:resize-start', {
+          edge,
+          screenX: e.screenX,
+          screenY: e.screenY,
+        });
+      } catch {}
+
+      // Coalesce pointermove → setBounds via requestAnimationFrame so we
+      // fire AT MOST one IPC per frame (~60Hz). pointermove naturally
+      // streams at 120Hz+ on high-refresh displays — without this, every
+      // move fires a setBounds, and on transparent BrowserWindows the
+      // accumulated setBounds calls visibly flicker (the transparent
+      // background goes black between resizes; see electron/electron
+      // issue #29661). Latest position wins.
+      let rafPending = false;
+      let lastMoveEv: { screenX: number; screenY: number } | null = null;
+      const flushMove = () => {
+        rafPending = false;
+        if (!lastMoveEv) return;
+        const ev = lastMoveEv;
+        lastMoveEv = null;
+        try {
+          window.electronAPI?.send('popout:resize-move', {
+            screenX: ev.screenX,
+            screenY: ev.screenY,
+          });
+        } catch {}
+      };
+      const onMove = (ev: PointerEvent) => {
+        lastMoveEv = { screenX: ev.screenX, screenY: ev.screenY };
+        if (rafPending) return;
+        rafPending = true;
+        requestAnimationFrame(flushMove);
+      };
+      const onUp = () => {
+        try { target.releasePointerCapture(e.pointerId); } catch {}
+        target.removeEventListener('pointermove', onMove);
+        target.removeEventListener('pointerup', onUp);
+        target.removeEventListener('pointercancel', onUp);
+        // Flush any pending move BEFORE telling main we're done — without
+        // this the very last few pixels of drag are lost on slow setBounds
+        // paths (the user lifts fingers right as the rAF was about to fire).
+        if (rafPending) flushMove();
+        try { window.electronAPI?.send('popout:resize-end'); } catch {}
+      };
+      target.addEventListener('pointermove', onMove);
+      target.addEventListener('pointerup', onUp);
+      target.addEventListener('pointercancel', onUp);
+    };
+
+  // Inline styles — Tailwind classes don't reliably handle the small
+  // pixel dimensions / positioning we need at sub-pixel-perfect edges.
+  // zIndex puts handles above ChatInterface content but below modals.
+  const edgeBase: React.CSSProperties = {
+    position: 'fixed',
+    zIndex: 1000,
+    background: 'transparent',
+    touchAction: 'none',
+  };
+  const cornerBase: React.CSSProperties = {
+    ...edgeBase,
+    width: 10,
+    height: 10,
+  };
+
+  return (
+    <>
+      {/* Top edge — leaves 10px on each end for corners */}
+      <div
+        onPointerDown={startResize('top')}
+        style={{ ...edgeBase, top: 0, left: 10, right: 10, height: 6, cursor: 'ns-resize' }}
+        aria-hidden
+      />
+      {/* Bottom edge */}
+      <div
+        onPointerDown={startResize('bottom')}
+        style={{ ...edgeBase, bottom: 0, left: 10, right: 10, height: 6, cursor: 'ns-resize' }}
+        aria-hidden
+      />
+      {/* Top-left corner */}
+      <div
+        onPointerDown={startResize('tl')}
+        style={{ ...cornerBase, top: 0, left: 0, cursor: 'nwse-resize' }}
+        aria-hidden
+      />
+      {/* Top-right corner */}
+      <div
+        onPointerDown={startResize('tr')}
+        style={{ ...cornerBase, top: 0, right: 0, cursor: 'nesw-resize' }}
+        aria-hidden
+      />
+      {/* Bottom-left corner */}
+      <div
+        onPointerDown={startResize('bl')}
+        style={{ ...cornerBase, bottom: 0, left: 0, cursor: 'nesw-resize' }}
+        aria-hidden
+      />
+      {/* Bottom-right corner */}
+      <div
+        onPointerDown={startResize('br')}
+        style={{ ...cornerBase, bottom: 0, right: 0, cursor: 'nwse-resize' }}
+        aria-hidden
+      />
+    </>
+  );
+};
+
 function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProfile | null; userLicense: LicenseData | null; onLogout: () => void }) {
   // --- Feature Gates ---
   const gate = useFeatureGate(userLicense);
@@ -2454,6 +2589,83 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
       document.documentElement.classList.remove('electron-transparent');
       if (disposeClosed) disposeClosed();
       if (disposeOpened) disposeOpened();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Popout focus management for proctored-assessment stealth ──
+  // The popout window is created with focusable:false so that a click on
+  // an Auto-Solve / model / "Type it" button does not steal focus from
+  // whatever the user is working in (e.g., a Ropes.ai browser tab whose
+  // proctoring listens for window.onblur). That makes button clicks
+  // invisible to focus-loss detection — but it also breaks keyboard input
+  // for textareas/inputs in the popout, since a non-focusable window
+  // can't receive OS keystrokes.
+  //
+  // This effect bridges the gap: when the user clicks (or otherwise
+  // focuses) a text input inside the popout, we ask main to flip the
+  // window to focusable=true so typing works. When the input blurs we
+  // flip it back to false (debounced 200ms so rapid input-to-input
+  // transitions don't toggle).
+  //
+  // Trade-off: typing in the popout DOES cause one focus-loss event,
+  // which a strict proctor will see. That's acceptable because typing in
+  // the popout is rare + user-initiated. Button clicks (the common case)
+  // remain invisible.
+  useEffect(() => {
+    if (!isElectron || !isPopoutMode) return;
+
+    const isTypingTarget = (el: EventTarget | null): boolean => {
+      if (!el || !(el instanceof HTMLElement)) return false;
+      const tag = el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return true;
+      if (el.isContentEditable) return true;
+      return false;
+    };
+
+    let releaseTimer: ReturnType<typeof setTimeout> | null = null;
+    const cancelRelease = () => {
+      if (releaseTimer) { clearTimeout(releaseTimer); releaseTimer = null; }
+    };
+
+    const onMouseDown = (e: MouseEvent) => {
+      if (isTypingTarget(e.target)) {
+        cancelRelease();
+        try { window.electronAPI?.send('popout:set-focusable', true); } catch {}
+      }
+    };
+    const onFocusIn = (e: FocusEvent) => {
+      if (isTypingTarget(e.target)) {
+        cancelRelease();
+        try { window.electronAPI?.send('popout:set-focusable', true); } catch {}
+      }
+    };
+    const onFocusOut = (e: FocusEvent) => {
+      if (isTypingTarget(e.target)) {
+        cancelRelease();
+        // Debounce — focus rapidly bouncing between two inputs (or
+        // between an input and a contenteditable) shouldn't churn the
+        // window's focusable state. 200ms covers normal click-from-A-to-B.
+        releaseTimer = setTimeout(() => {
+          try { window.electronAPI?.send('popout:set-focusable', false); } catch {}
+        }, 200);
+      }
+    };
+
+    // Capture phase — we want to see these events even if a child
+    // handler calls stopPropagation.
+    document.addEventListener('mousedown', onMouseDown, true);
+    document.addEventListener('focusin', onFocusIn, true);
+    document.addEventListener('focusout', onFocusOut, true);
+
+    return () => {
+      cancelRelease();
+      document.removeEventListener('mousedown', onMouseDown, true);
+      document.removeEventListener('focusin', onFocusIn, true);
+      document.removeEventListener('focusout', onFocusOut, true);
+      // Best-effort reset on unmount — leaves the window in a known state
+      // if something tears down mid-input-focus.
+      try { window.electronAPI?.send('popout:set-focusable', false); } catch {}
     };
   }, []);
 
@@ -4088,8 +4300,15 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
 
         {/* ── CONTENT AREA ── */}
         {isPopoutElectron ? (
-            /* Electron pop-out: always show compact chat */
-            <ChatInterface {...sharedProps} />
+            /* Electron pop-out: always show compact chat + custom
+               resize handles (top/bottom/corners only — sides are
+               deliberately omitted so the OS resize cursor never
+               flashes when the user moves their mouse from the
+               popout to a code editor during a screen-share). */
+            <>
+              <ChatInterface {...sharedProps} />
+              <PopoutResizeHandles />
+            </>
         ) : !isPipMode ? (
             /* Main window: full app */
             <ChatInterface {...sharedProps} />
@@ -4393,7 +4612,6 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           onClose={() => setManageSubOpen(false)}
           userProfile={userProfile}
           userLicense={userLicense}
-          onLogout={onLogout}
           onUpgradeRequested={handleSubscriptionUpgrade}
       />
 

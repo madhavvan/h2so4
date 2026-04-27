@@ -4195,14 +4195,47 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}`;
 
     // Open Google sign-in in system browser. We MUST await + catch here —
-    // the previous fire-and-forget pattern silently swallowed shell errors
+    // the original fire-and-forget pattern silently swallowed shell errors
     // (default-browser misconfigured, ShellExecuteEx failure, etc.) and the
-    // spinner ran for 2 minutes with no diagnostic. The 6-second timeout
-    // catches the rarer "openExternal hangs forever" case (seen on Windows
-    // when the OS shell process is overloaded right after a logout).
+    // spinner ran for 2 minutes with no diagnostic.
+    //
+    // The robust opener (added in v3.4.6) runs in the main process and
+    // tries shell.openExternal first, then falls back to a child_process
+    // spawn (cmd /c start on Windows, open on Mac, xdg-open on Linux).
+    // That bypasses the most common Windows ShellExecute breakage. We
+    // still keep the legacy openExternal path for any older preload that
+    // somehow ships without the new method.
+    //
+    // Track failure state in a LOCAL variable, not React state — calling
+    // setGoogleManualUrl + then reading googleManualUrl in the same
+    // function execution reads the stale closure value, which was the
+    // cause of the v3.4.5 "no error reason" UI bug where a generic
+    // message overwrote the specific one.
     let openedOk = false;
+    let openErrorMsg: string | null = null;
+    let openAttempts: Array<{ method: string; ok: boolean; error?: string }> = [];
+
     try {
-      if (window.electronAPI?.openExternal) {
+      if (window.electronAPI?.openExternalRobust) {
+        const result = await window.electronAPI.openExternalRobust(authUrl);
+        openAttempts = result.attempts || [];
+        openedOk = !!result.ok;
+        if (!openedOk) {
+          // Prefer building the message from every failed attempt so the
+          // user sees BOTH what shell.openExternal said AND what the
+          // spawn fallback said. result.error from the IPC is just the
+          // last attempt's error — useful for code, but the user (and
+          // we, when triaging support tickets) want the full picture.
+          const failedErrs = openAttempts
+            .filter(a => !a.ok)
+            .map(a => a.error)
+            .filter(Boolean) as string[];
+          openErrorMsg = failedErrs.length > 0
+            ? failedErrs.join(' / ')
+            : (result.error || 'all browser-launch methods failed');
+        }
+      } else if (window.electronAPI?.openExternal) {
+        // Older preload — legacy single-path opener with our own timeout.
         const openPromise = window.electronAPI.openExternal(authUrl);
         const timeoutPromise = new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error('Browser launch timed out (6s)')), 6000)
@@ -4215,24 +4248,28 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         // can be popup-blocked; we still surface the URL so the user can
         // open it manually if the popup is suppressed.
         const opened = window.open(authUrl, '_blank');
-        openedOk = !!opened;
+        if (opened) {
+          openedOk = true;
+        } else {
+          openErrorMsg = 'browser popup was blocked';
+        }
       }
     } catch (openErr: any) {
-      console.error('[google-auth] openExternal failed:', openErr);
-      // Don't reset isSubmitting — show the manual-fallback UI so the user
-      // can copy the URL and finish in their browser. The poll will still
-      // run so that completing manually still authenticates them.
-      setGoogleManualUrl(authUrl);
-      setAuthError(
-        `Couldn't open your browser automatically (${openErr?.message || 'unknown error'}). Copy the link below and open it in any browser to continue.`
-      );
+      console.error('[google-auth] open external failed:', openErr);
+      openErrorMsg = openErr?.message || 'unknown error';
     }
 
-    if (!openedOk && !googleManualUrl) {
-      // Browser fallback got popup-blocked but didn't throw — still surface
-      // the URL.
+    if (!openedOk) {
+      // Single source of truth for the failure UI — driven by openedOk +
+      // openErrorMsg locals so we don't race React state. attempts is
+      // logged for our diagnostics; we show only the summary to the user.
+      if (openAttempts.length > 0) {
+        console.warn('[google-auth] open attempts:', openAttempts);
+      }
       setGoogleManualUrl(authUrl);
-      setAuthError('Couldn\'t open your browser automatically. Copy the link below and open it in any browser to continue.');
+      setAuthError(
+        `Couldn't open your browser automatically${openErrorMsg ? ` (${openErrorMsg})` : ''}. Copy the link below and open it in any browser to continue.`
+      );
     }
 
     // Poll for result regardless of whether openExternal succeeded — if the
@@ -4387,15 +4424,22 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  // Last-ditch: try openExternal one more time. If it
+                onClick={async () => {
+                  // Last-ditch: try the robust opener one more time. If it
                   // works, polling that's already running picks up the
-                  // success. If it fails again, the catch updates the
-                  // fallback message — at least the user sees we tried.
-                  if (window.electronAPI?.openExternal && googleManualUrl) {
-                    window.electronAPI.openExternal(googleManualUrl).catch((e: any) => {
-                      console.warn('[google-auth] retry openExternal failed:', e);
-                    });
+                  // success. We log the result either way so we can see
+                  // whether retries help (sometimes Windows shell wakes up
+                  // after the first attempt primes the protocol handler).
+                  if (!googleManualUrl) return;
+                  try {
+                    if (window.electronAPI?.openExternalRobust) {
+                      const r = await window.electronAPI.openExternalRobust(googleManualUrl);
+                      console.log('[google-auth] retry openExternalRobust:', r);
+                    } else if (window.electronAPI?.openExternal) {
+                      await window.electronAPI.openExternal(googleManualUrl);
+                    }
+                  } catch (e: any) {
+                    console.warn('[google-auth] retry open failed:', e);
                   }
                 }}
                 className="px-3 py-1.5 rounded-full text-[11.5px] font-medium transition-all hover:opacity-90"

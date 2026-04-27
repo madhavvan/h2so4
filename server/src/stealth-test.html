@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Stealth Test — Interview Copilot</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: radial-gradient(circle at 50% 0%, #0a0a14 0%, #050507 70%);
+      color: #e5e7eb;
+      min-height: 100vh;
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 28px 20px 60px;
+      line-height: 1.5;
+    }
+    h1 { margin: 0 0 6px; font-size: 24px; font-weight: 700; letter-spacing: -0.01em; }
+    .sub { color: #9ca3af; font-size: 14px; margin: 0 0 24px; }
+    .card {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 16px;
+      padding: 20px;
+      margin-bottom: 16px;
+      backdrop-filter: blur(8px);
+    }
+    .card h2 {
+      margin: 0 0 14px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .verdict {
+      padding: 28px;
+      border-radius: 14px;
+      text-align: center;
+      font-size: 22px;
+      font-weight: 700;
+      transition: all 0.25s ease;
+      letter-spacing: -0.01em;
+    }
+    .verdict.pending { background: rgba(59, 130, 246, 0.12); color: #93c5fd; border: 2px solid rgba(59, 130, 246, 0.3); }
+    .verdict.pass { background: rgba(74, 222, 128, 0.12); color: #4ade80; border: 2px solid rgba(74, 222, 128, 0.4); }
+    .verdict.warn { background: rgba(251, 191, 36, 0.12); color: #fbbf24; border: 2px solid rgba(251, 191, 36, 0.4); }
+    .verdict.fail { background: rgba(239, 68, 68, 0.12); color: #f87171; border: 2px solid rgba(239, 68, 68, 0.4); }
+    .verdict-sub { font-size: 13px; font-weight: 500; opacity: 0.85; margin-top: 8px; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 16px; }
+    .stat {
+      background: rgba(0, 0, 0, 0.25);
+      padding: 14px;
+      border-radius: 10px;
+      text-align: center;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .stat-num { font-size: 28px; font-weight: 700; color: #e5e7eb; line-height: 1; }
+    .stat-label { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.06em; margin-top: 6px; font-weight: 600; }
+    .live-state {
+      padding: 16px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .live-state.focused { background: rgba(74, 222, 128, 0.1); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.3); }
+    .live-state.blurred { background: rgba(239, 68, 68, 0.1); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .live-state.hidden { background: rgba(156, 163, 175, 0.1); color: #9ca3af; border: 1px solid rgba(156, 163, 175, 0.3); }
+    .step {
+      padding: 10px 14px;
+      border-left: 3px solid #3b82f6;
+      margin: 8px 0;
+      font-size: 14px;
+      color: #cbd5e1;
+      background: rgba(59, 130, 246, 0.04);
+      border-radius: 0 6px 6px 0;
+    }
+    .step strong { color: #93c5fd; }
+    button {
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      color: white;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 9px;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 13px;
+      box-shadow: 0 2px 8px rgba(59, 130, 246, 0.25);
+      transition: opacity 0.15s;
+    }
+    button:hover { opacity: 0.9; }
+    .log {
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-family: 'SF Mono', Monaco, Consolas, monospace;
+      font-size: 11px;
+      max-height: 220px;
+      overflow-y: auto;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .log-entry { margin: 2px 0; padding: 1px 0; }
+    .log-blur { color: #f87171; }
+    .log-focus { color: #4ade80; }
+    .log-vis { color: #93c5fd; }
+    .log-info { color: #9ca3af; }
+    .typing-area {
+      width: 100%;
+      min-height: 120px;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 10px;
+      padding: 14px;
+      color: #e5e7eb;
+      font-family: 'SF Mono', Monaco, Consolas, monospace;
+      font-size: 13px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+    .typing-area:focus { outline: 2px solid #3b82f6; border-color: transparent; }
+    .speed-readout {
+      margin-top: 12px;
+      padding: 14px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 14px;
+      background: rgba(0, 0, 0, 0.25);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+    .speed-readout strong { color: #fbbf24; font-size: 18px; }
+    code {
+      background: rgba(0, 0, 0, 0.4);
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-family: 'SF Mono', Monaco, Consolas, monospace;
+      font-size: 12px;
+      color: #93c5fd;
+    }
+    .legend { font-size: 12px; color: #6b7280; margin-top: 8px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+    .pill.green { background: rgba(74, 222, 128, 0.15); color: #4ade80; }
+    .pill.red { background: rgba(239, 68, 68, 0.15); color: #f87171; }
+    .pill.amber { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+  </style>
+</head>
+<body>
+  <h1>🔍 Interview Copilot — Stealth Test</h1>
+  <p class="sub">
+    This page mimics what proctoring platforms (Ropes.ai, HackerRank, CoderPad, etc.) listen to when they detect "the candidate left the tab."
+    If this page sees you as <span class="pill green">FOCUSED</span> while you click your popout buttons, real proctors can't see you either.
+  </p>
+
+  <!-- ========== TEST 1: Focus invisibility ========== -->
+  <div class="card">
+    <h2>① Focus invisibility — popout buttons</h2>
+
+    <div class="live-state focused" id="liveState">FOCUSED ✅</div>
+
+    <div class="stats">
+      <div class="stat"><div class="stat-num" id="blurCount">0</div><div class="stat-label">Blur Events</div></div>
+      <div class="stat"><div class="stat-num" id="focusCount">0</div><div class="stat-label">Focus Returns</div></div>
+      <div class="stat"><div class="stat-num" id="visCount">0</div><div class="stat-label">Tab Hidden</div></div>
+    </div>
+
+    <div class="verdict pending" id="verdict" style="margin-top: 16px;">
+      ⏳ Click popout buttons now — verdict updates live
+    </div>
+
+    <div class="step" style="margin-top: 16px;"><strong>Step 1:</strong> Click anywhere on this page so this tab has focus. Counters should be 0.</div>
+    <div class="step"><strong>Step 2:</strong> Open your Interview Copilot popout window (don't close this tab).</div>
+    <div class="step"><strong>Step 3:</strong> Click 3-5 buttons in the popout (model selector, Auto-Solve, Live mode, etc.). <em>Don't click any text input yet.</em></div>
+    <div class="step"><strong>Pass condition:</strong> verdict shows <span class="pill green">✅ PASS</span> with Blur Events = 0.</div>
+    <div class="step"><strong>Sanity check:</strong> Alt+Tab to a different app, then come back. Blur Events SHOULD increment by 1 (proves listener works).</div>
+
+    <button onclick="resetCounters()" style="margin-top: 14px;">Reset Counters</button>
+  </div>
+
+  <!-- ========== TEST 2: Typing input still works ========== -->
+  <div class="card">
+    <h2>② Popout text input still works</h2>
+    <div class="step"><strong>Step 4:</strong> Click a text input or textarea in your popout. Type a few characters.</div>
+    <div class="step"><strong>Expected:</strong> Blur Events = 1 (typing is user-initiated focus shift — that's correct). Text appears in the popout's input field.</div>
+    <div class="step"><strong>If text doesn't appear in popout:</strong> the dynamic focusable toggle didn't engage — tell support.</div>
+  </div>
+
+  <!-- ========== TEST 3: Typing speed ========== -->
+  <div class="card">
+    <h2>③ Auto-Type rhythm (run Auto-Type INTO this textarea)</h2>
+    <p style="font-size: 13px; color: #9ca3af; margin: 0 0 12px;">
+      Click in the textarea below to give it focus, then trigger Auto-Type from your popout with a code sample.
+      The page will measure chars/sec and pause patterns automatically.
+    </p>
+    <textarea class="typing-area" id="typingArea" placeholder="Click here, then trigger Auto-Type from your popout. Speed will be measured automatically..."></textarea>
+    <div class="speed-readout" id="speedReadout">No typing yet — click here, then run Auto-Type</div>
+    <div class="legend">
+      Expected post-fix: <strong>~3-5 chars/sec average</strong> with occasional 1-7s pauses (realistic human-coder rhythm).
+      Pre-fix: ~7-12 chars/sec (felt fast / bot-like).
+    </div>
+    <button onclick="resetTypingTest()" style="margin-top: 10px;">Reset Typing Test</button>
+  </div>
+
+  <!-- ========== Event log ========== -->
+  <div class="card">
+    <h2>📋 Event log (most recent first)</h2>
+    <div class="log" id="log"></div>
+  </div>
+
+  <script>
+    'use strict';
+    let blurCount = 0, focusCount = 0, visCount = 0;
+
+    // ─── Logging ───────────────────────────────────────────
+    function logEvent(type, msg) {
+      const entry = document.createElement('div');
+      entry.className = 'log-entry log-' + type;
+      entry.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+      const logEl = document.getElementById('log');
+      logEl.insertBefore(entry, logEl.firstChild);
+      while (logEl.children.length > 80) logEl.removeChild(logEl.lastChild);
+    }
+
+    // ─── Live state indicator ─────────────────────────────
+    function updateLiveState() {
+      const el = document.getElementById('liveState');
+      if (document.hidden) {
+        el.className = 'live-state hidden';
+        el.textContent = '👁 TAB HIDDEN';
+      } else if (!document.hasFocus()) {
+        el.className = 'live-state blurred';
+        el.textContent = '⚪ BLURRED (something else has focus)';
+      } else {
+        el.className = 'live-state focused';
+        el.textContent = '✅ FOCUSED';
+      }
+    }
+
+    // ─── Verdict ───────────────────────────────────────────
+    function updateVerdict() {
+      const el = document.getElementById('verdict');
+      if (blurCount === 0 && focusCount === 0 && visCount === 0) {
+        el.className = 'verdict pending';
+        el.innerHTML = '⏳ Click popout buttons now — verdict updates live';
+      } else if (blurCount === 0 && visCount === 0) {
+        el.className = 'verdict pass';
+        el.innerHTML = '✅ PASS — popout button clicks are invisible<div class="verdict-sub">No blur events triggered. Real proctors will see the same: nothing.</div>';
+      } else if (blurCount === 1 && visCount === 0) {
+        el.className = 'verdict warn';
+        el.innerHTML = '⚠️ 1 blur event seen<div class="verdict-sub">If that came from typing in a popout text input, this is expected and correct. If it came from clicking a button, the fix didn\'t engage.</div>';
+      } else if (visCount > 0) {
+        el.className = 'verdict warn';
+        el.innerHTML = '👁 Tab visibility changed<div class="verdict-sub">You alt-tabbed away from the browser entirely. That\'s expected behavior — real proctors would see this too. Reset and only click popout, not the desktop.</div>';
+      } else {
+        el.className = 'verdict fail';
+        el.innerHTML = '❌ FAIL — multiple blur events detected<div class="verdict-sub">Popout window may not have focusable=false applied. Confirm you\'re running v3.4.7 or later.</div>';
+      }
+    }
+
+    function refresh() {
+      document.getElementById('blurCount').textContent = blurCount;
+      document.getElementById('focusCount').textContent = focusCount;
+      document.getElementById('visCount').textContent = visCount;
+      updateLiveState();
+      updateVerdict();
+    }
+
+    function resetCounters() {
+      blurCount = 0; focusCount = 0; visCount = 0;
+      document.getElementById('log').innerHTML = '';
+      logEvent('info', '🧪 Counters reset');
+      refresh();
+    }
+
+    // ─── Listeners ─────────────────────────────────────────
+    window.addEventListener('blur', function () {
+      blurCount++;
+      logEvent('blur', '🔴 BLUR — browser tab lost focus (count: ' + blurCount + ')');
+      refresh();
+    });
+    window.addEventListener('focus', function () {
+      focusCount++;
+      logEvent('focus', '🟢 FOCUS — browser tab regained focus (count: ' + focusCount + ')');
+      refresh();
+    });
+    document.addEventListener('visibilitychange', function () {
+      visCount++;
+      logEvent('vis', '👁  visibilityState=' + document.visibilityState + ' (count: ' + visCount + ')');
+      refresh();
+    });
+
+    // ─── Typing speed test ────────────────────────────────
+    let typingStartedAt = null;
+    let typingLastInputAt = null;
+    let typingChars = 0;
+    let typingPauses = []; // gaps > 800ms
+    let pauseDetectionTimer = null;
+
+    const typingArea = document.getElementById('typingArea');
+    typingArea.addEventListener('input', function () {
+      const now = Date.now();
+      if (typingStartedAt === null) {
+        typingStartedAt = now;
+      } else if (typingLastInputAt) {
+        const gap = now - typingLastInputAt;
+        if (gap > 800) typingPauses.push(gap);
+      }
+      typingLastInputAt = now;
+      typingChars = typingArea.value.length;
+      updateSpeedReadout(false);
+
+      if (pauseDetectionTimer) clearTimeout(pauseDetectionTimer);
+      pauseDetectionTimer = setTimeout(function () {
+        updateSpeedReadout(true);
+      }, 2500);
+    });
+
+    function updateSpeedReadout(finalized) {
+      const el = document.getElementById('speedReadout');
+      if (typingStartedAt === null || typingChars < 5) {
+        el.textContent = 'No typing yet — click into the textarea, then run Auto-Type';
+        return;
+      }
+      const elapsed = ((typingLastInputAt - typingStartedAt) / 1000) || 0.001;
+      const cps = (typingChars / elapsed).toFixed(2);
+      const pauseInfo = typingPauses.length === 0
+        ? 'no pauses >800ms detected'
+        : typingPauses.length + ' pause' + (typingPauses.length === 1 ? '' : 's') + ' >800ms (longest: ' + Math.round(Math.max.apply(null, typingPauses) / 100) / 10 + 's)';
+      const verdict = (function () {
+        const n = parseFloat(cps);
+        if (n > 7) return '<span class="pill red">TOO FAST — bot-like, fix may not be applied</span>';
+        if (n >= 3 && n <= 6) return '<span class="pill green">REALISTIC HUMAN RANGE</span>';
+        if (n < 3) return '<span class="pill amber">Slower than expected — check sample length</span>';
+        return '<span class="pill amber">Borderline</span>';
+      })();
+      el.innerHTML =
+        (finalized ? 'Typing finished → ' : 'Typing in progress → ') +
+        '<strong>' + cps + ' chars/sec</strong> over ' +
+        elapsed.toFixed(1) + 's (' + typingChars + ' chars), ' + pauseInfo + '.<br/>' +
+        verdict;
+    }
+
+    function resetTypingTest() {
+      typingStartedAt = null;
+      typingLastInputAt = null;
+      typingChars = 0;
+      typingPauses = [];
+      typingArea.value = '';
+      updateSpeedReadout(false);
+    }
+
+    // ─── Init ──────────────────────────────────────────────
+    logEvent('info', '🟢 Test page ready. Open your popout and click some buttons.');
+    refresh();
+  </script>
+</body>
+</html>

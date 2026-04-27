@@ -70,9 +70,14 @@ const RENEWAL_INR_PAISE = 59900; // ₹599
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  CREATE CHECKOUT — auto-routes
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Pre-v3.4.7 read country_code from req.body first, falling back to
+// req.user.country_code. That let a US user POST `country_code: "IN"`
+// and get routed to Razorpay's INR pricing (~₹2499 for Pro vs the US
+// ~$30 USD) — direct revenue arbitrage. Now we use ONLY the server-
+// stored country_code from the JWT (set at signup, updatable via
+// /profile with proper validation). Body field is ignored.
 router.post('/create-checkout', authMiddleware, async (req, res) => {
   try {
-    const { country_code } = req.body;
     const tier = normalizeTier(req.body.tier);
 
     // ── Admin bypass ──
@@ -85,7 +90,11 @@ router.post('/create-checkout', authMiddleware, async (req, res) => {
       return await grantAdminTier(req, res, tier);
     }
 
-    const provider = getPaymentProvider(country_code || req.user.country_code || 'US');
+    // SECURITY: country_code is server-controlled — read from the JWT
+    // (set at signup, mutable only via /profile with /^[A-Z]{2}$/ check).
+    // We deliberately ignore req.body.country_code so a malicious client
+    // cannot swap their billing region to whichever currency is cheapest.
+    const provider = getPaymentProvider(req.user.country_code || 'US');
 
     if (provider === 'razorpay') {
       return await createRazorpayCheckout(req, res, tier);
@@ -346,8 +355,11 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
 // is the signal the webhook reads to branch into the renewal grant.
 router.post('/create-renewal', authMiddleware, async (req, res) => {
   try {
-    const { country_code } = req.body || {};
-    const provider = getPaymentProvider(country_code || req.user.country_code || 'US');
+    // SECURITY: Same currency-injection mitigation as /create-checkout.
+    // country_code is server-controlled (JWT, set at signup) — body is
+    // ignored. Without this, a US user could POST country_code:"IN" and
+    // pay the INR renewal (~₹599) instead of USD (~$6.99).
+    const provider = getPaymentProvider(req.user.country_code || 'US');
     if (provider === 'razorpay') {
       return await createRazorpayRenewal(req, res);
     }

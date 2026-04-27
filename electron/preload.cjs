@@ -23,6 +23,18 @@ const SEND_CHANNELS = new Set([
   'resize-popout',
   'set-always-on-top',
   'focus-main-window',
+  // Toggle popout focusability — used by the popout renderer to make
+  // the window focusable on demand when a text input is clicked, and
+  // back to non-focusable when the input blurs. See main.cjs popout
+  // constructor for why this exists (Ropes.ai-class proctoring).
+  'popout:set-focusable',
+  // Custom resize for the popout — native OS resize is disabled to
+  // prevent the side-edge resize cursor from flashing during a
+  // screen-share. Renderer-side JS handles drive these channels to
+  // implement resize on top/bottom/corners only.
+  'popout:resize-start',
+  'popout:resize-move',
+  'popout:resize-end',
   // Cross-window relays
   'relay-to-popout',
   'relay-to-main',
@@ -48,6 +60,9 @@ const INVOKE_CHANNELS = new Set([
   'auto-type:send',
   // Accessibility (focused-element OCR helper)
   'a11y:read-focused',
+  // Robust external-URL opener with shell.openExternal + child_process
+  // fallback. Used by Google sign-in to survive ShellExecute hiccups.
+  'open-external-robust',
   // Local SQLite (Electron-side conversation/session/message DB)
   'db:claim-orphan-sessions',
   'db:get-active-session',
@@ -141,10 +156,21 @@ function openExternal(url) {
   }
 }
 
+// Robust opener that goes through main-process IPC and tries multiple OS
+// launch paths. Renderer should prefer this over openExternal — the legacy
+// helper is kept only for code paths that haven't been migrated yet.
+function openExternalRobust(url) {
+  if (!INVOKE_CHANNELS.has('open-external-robust')) {
+    return Promise.reject(new Error('Channel not allowed: open-external-robust'));
+  }
+  return ipcRenderer.invoke('open-external-robust', url);
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   isElectron: true,
   send,
   on,
   invoke,
   openExternal,
+  openExternalRobust,
 });

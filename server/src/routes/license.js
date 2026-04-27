@@ -1,10 +1,9 @@
 const express = require('express');
 const { authMiddleware } = require('../middleware/auth');
+const { adminOnly, stepUpOnly, writeAudit, ADMIN_EMAILS } = require('../middleware/admin');
 const db = require('../database');
 
 const router = express.Router();
-
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 
 // ── Validate license (called by Electron app on startup + every 30 min) ──
 router.post('/validate', async (req, res) => {
@@ -129,13 +128,14 @@ router.post('/session', authMiddleware, async (req, res) => {
   }
 });
 
-// ── Revoke a license (admin only) ──
-router.post('/revoke', authMiddleware, async (req, res) => {
+// ── Revoke a license (admin only, step-up required) ──
+// Pre-v3.4.7 used a bare `ADMIN_EMAILS.includes` check with no step-up
+// reauth and no audit log — i.e. a compromised admin token could revoke
+// any license without leaving a trace. Now uses the same guard chain as
+// the destructive endpoints in admin.js (refunds, delete user) and
+// writes an audit row that the SQLite triggers protect from tampering.
+router.post('/revoke', authMiddleware, adminOnly, stepUpOnly, async (req, res) => {
   try {
-    if (!ADMIN_EMAILS.includes(req.user.email)) {
-      return res.status(403).json({ error: 'Unauthorized — admin only' });
-    }
-
     const { key, reason } = req.body;
     if (!key) return res.status(400).json({ error: 'License key required' });
 
@@ -144,6 +144,11 @@ router.post('/revoke', authMiddleware, async (req, res) => {
 
     db.revokeKey(key, req.user.email, reason);
 
+    writeAudit(req, 'license-revoke', { id: license.user_id, email: license.email }, {
+      key,
+      reason: reason || null,
+    });
+
     res.json({ success: true, message: `License ${key} revoked`, email: license.email });
   } catch (err) {
     console.error('Revoke error:', err);
@@ -151,19 +156,26 @@ router.post('/revoke', authMiddleware, async (req, res) => {
   }
 });
 
-// ── Set minimum app version (admin only) ──
-router.post('/set-min-version', authMiddleware, async (req, res) => {
+// ── Set minimum app version (admin only, step-up required) ──
+// Same hardening rationale as /revoke. Bumping min_app_version is a
+// fleet-wide forced-update — every running client below the new floor
+// is locked out on the next /validate poll. Step-up + audit prevents
+// a compromised admin token from triggering an outage silently.
+router.post('/set-min-version', authMiddleware, adminOnly, stepUpOnly, async (req, res) => {
   try {
-    if (!ADMIN_EMAILS.includes(req.user.email)) {
-      return res.status(403).json({ error: 'Unauthorized — admin only' });
-    }
-
     const { version } = req.body;
     if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
       return res.status(400).json({ error: 'Invalid version format. Use X.Y.Z' });
     }
 
+    const previousVersion = db.getConfig('min_app_version', '2.0.0');
     db.setConfig('min_app_version', version);
+
+    writeAudit(req, 'set-min-version', null, {
+      previous_version: previousVersion,
+      new_version: version,
+    });
+
     res.json({ success: true, min_version: version });
   } catch (err) {
     console.error('Set version error:', err);

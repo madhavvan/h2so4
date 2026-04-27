@@ -22,7 +22,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   X, Crown, Zap, Check, Loader2, ExternalLink, AlertTriangle,
-  Cpu, ChevronRight, Info, LogOut, ShieldCheck, UploadCloud,
+  Cpu, ChevronRight, Info, ShieldCheck, UploadCloud,
 } from 'lucide-react';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
 import { backfillAllConversations, BackfillProgress } from './services/aiProxyService';
@@ -43,7 +43,6 @@ interface ManageSubscriptionProps {
   onClose: () => void;
   userProfile: UserProfile | null;
   userLicense: LicenseData | null;
-  onLogout: () => void;
   // Triggers the existing upgrade flow (re-uses SubscriptionGate's checkout
   // path so we don't duplicate Razorpay/Stripe SDK plumbing).
   onUpgradeRequested: (targetTier: 'basic' | 'pro' | 'max') => void;
@@ -134,7 +133,6 @@ export function ManageSubscription({
   onClose,
   userProfile,
   userLicense,
-  onLogout,
   onUpgradeRequested,
 }: ManageSubscriptionProps) {
   const [sub, setSub] = useState<SubscriptionStatus | null>(null);
@@ -677,13 +675,6 @@ export function ManageSubscription({
                 )}
               </div>
             )}
-            <button
-              onClick={() => { onClose(); onLogout(); }}
-              className="w-full flex items-center gap-3 px-4 py-3 text-sm text-red-400 hover:bg-red-500/5 transition-colors text-left"
-            >
-              <LogOut size={14} />
-              Sign out
-            </button>
           </div>
         </div>
 
