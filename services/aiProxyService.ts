@@ -16,6 +16,27 @@ async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Read reasoning_effort from localStorage at request-time. Read here
+// (not via React prop) because the proxy is invoked from many places
+// (CodeBlock auto-type, conversation title, identity extract, main
+// answer flow) and prop-drilling the setting through each path would
+// mean ~12 signature updates without buying any reactivity. The setting
+// is owned by App.tsx's settings state which already mirrors to
+// localStorage on every change. Callers that need to FORCE a value
+// (internal helpers like generateConversationTitle) pass an explicit
+// override and the localStorage read is skipped.
+//
+// SECURITY: this is UI/UX plumbing only. The server enforces tier-gating
+// against the JWT — non-Max users sending 'high' from a tampered client
+// still get forced back to 'none'. Don't rely on this client-side path
+// for any access control.
+function getReasoningEffort(): 'none' | 'low' | 'medium' | 'high' {
+  if (typeof localStorage === 'undefined') return 'none';
+  const v = localStorage.getItem('REASONING_EFFORT');
+  if (v === 'low' || v === 'medium' || v === 'high') return v;
+  return 'none';
+}
+
 async function withRetry<T>(
   fn: () => Promise<T>,
   maxRetries: number = MAX_RETRIES,
@@ -533,8 +554,13 @@ async function getExtractedCards(contextFiles: ContextFile[]): Promise<Extracted
     if (!resume && !jd) return null;
     try {
       const prompt = buildExtractionPrompt(resume, jd);
+      // Internal preflight — fixed reasoning_effort so identity extraction
+      // never gets stuck on user's 'high' setting (the prompt is short and
+      // straightforward; deeper reasoning here just adds latency without
+      // improving quality).
       const text = await proxyRequest('/chat/openai', {
         messages: [{ role: 'user', content: prompt }],
+        reasoning_effort: 'medium',
       });
       const splitIdx = text.indexOf('=== WHAT THIS ROLE REWARDS ===');
       if (splitIdx === -1) return null;
@@ -705,7 +731,13 @@ export async function generateOpenAI(
   imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
   messages.push({ role: 'user', content: contentParts });
 
-  const text = await proxyRequest('/chat/openai', { messages });
+  // User-facing GPT path — honor the user's current reasoning effort.
+  // Server JWT-gates this: non-Max users get forced to 'none' regardless
+  // of what we send.
+  const text = await proxyRequest('/chat/openai', {
+    messages,
+    reasoning_effort: getReasoningEffort(),
+  });
   return (text.trim() === '...' || text.trim().toLowerCase() === 'listening...') ? 'Listening...' : text;
 }
 
@@ -831,7 +863,14 @@ export async function streamOpenAI(
   imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
   messages.push({ role: 'user', content: contentParts });
 
-  const full = await proxyStream('/stream/openai', { messages }, onToken, signal);
+  // Stream path mirrors generateOpenAI — user's reasoning_effort flows
+  // through; server enforces tier gate via JWT.
+  const full = await proxyStream(
+    '/stream/openai',
+    { messages, reasoning_effort: getReasoningEffort() },
+    onToken,
+    signal,
+  );
   if (isAutoSolve) return full;
   return (full.trim() === '...' || full.trim().toLowerCase() === 'listening...') ? 'Listening...' : full;
 }
@@ -937,8 +976,11 @@ export async function generateConversationTitle(
     const prompt = `Summarize the topic of this interview conversation in 2-5 words. Output only the title — no quotes, no period, no preamble. Title-case.
 
 ${transcript}`;
+    // Internal titling — fixed reasoning_effort so a Max user on 'high'
+    // doesn't pay 25s of GPT-thinking just to name a session.
     const text = await proxyRequest('/chat/openai', {
       messages: [{ role: 'user', content: prompt }],
+      reasoning_effort: 'low',
     });
     // Strip quotes, trailing punctuation, surrounding whitespace, "Title:"
     // prefixes some models emit despite the instruction.

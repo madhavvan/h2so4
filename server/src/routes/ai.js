@@ -57,10 +57,11 @@ router.post('/chat/gemini', async (req, res) => {
 // ── OpenAI (GPT) ──
 // GPT-5.5 reasoning_effort knob. Accepted values for gpt-5.5 are
 // `none, low, medium, high, xhigh` — `minimal` is gpt-5-only and
-// returns HTTP 400 here. We use `medium` (also the default) because
-// the user prefers the deeper reasoning quality even at the cost of
-// 2-10s of pre-token thinking time. Setting it explicitly so future
-// model upgrades don't silently drift the behavior.
+// returns HTTP 400 here. The client (App.tsx) sends the user's
+// chosen level in `req.body.reasoning_effort`; resolveReasoningEffort
+// validates the input AND tier-gates it: only Max users can pick
+// anything other than 'none'. Without the tier gate, a tampered
+// client could escalate to 'high' on a basic/pro subscription.
 //
 // We deliberately do NOT pass `verbosity` — that parameter is on
 // the Responses API surface and openai-node's chat.completions
@@ -70,12 +71,47 @@ router.post('/chat/gemini', async (req, res) => {
 // Temperature is still omitted — GPT-5.5 rejects any non-default
 // value with HTTP 400. Same for top_p / presence_penalty /
 // frequency_penalty / logprobs.
+
+// Allowed values for the chat.completions API on gpt-5.5. 'xhigh' is
+// supported by the model but intentionally not exposed to clients —
+// avoids surprise bills if a UI bug ever sent it.
+const ALLOWED_REASONING_EFFORTS = ['none', 'low', 'medium', 'high'];
+
+// Single source of truth for tier-gating + validation. Returns the
+// effort string to pass to OpenAI. Non-Max tiers always get 'none'
+// regardless of what the client sent — defense in depth, since the
+// client UI also locks the bar but a tampered client could bypass it.
+//
+// Default fallback is 'none' — matches the new product policy: every
+// non-Max tier is locked to 'none' anyway, and Max users on the new
+// client always send an explicit value. An old client that doesn't
+// send the field at all (3.4.6 and earlier) deliberately gets 'none' so
+// the new "instant first-response" baseline applies uniformly across
+// the user base — Max users on old clients briefly see this until they
+// update; they've never had reasoning-effort control before, so this
+// is a product decision, not a regression.
+function resolveReasoningEffort(req) {
+  const requested = (req.body && typeof req.body.reasoning_effort === 'string')
+    ? req.body.reasoning_effort
+    : 'none';
+  const validated = ALLOWED_REASONING_EFFORTS.includes(requested) ? requested : 'none';
+  // req.license.tier is set by requireTier middleware (mirrors the live
+  // license row, not the JWT — handles tier upgrades that landed after
+  // login without forcing re-auth).
+  const tier = req.license?.tier || 'free';
+  if (tier !== 'max' && validated !== 'none') {
+    return 'none';
+  }
+  return validated;
+}
+
 router.post('/chat/openai', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OpenAI not configured' });
 
   try {
     const { messages } = req.body;
+    const reasoningEffort = resolveReasoningEffort(req);
     const OpenAI = require('openai');
     const openai = new OpenAI({ apiKey });
 
@@ -83,7 +119,7 @@ router.post('/chat/openai', requireTier(...PAID), async (req, res) => {
       model: 'gpt-5.5',
       messages,
       max_completion_tokens: 16000,
-      reasoning_effort: 'medium',
+      reasoning_effort: reasoningEffort,
     });
 
     res.json({ text: completion.choices[0]?.message?.content || '' });
@@ -291,11 +327,10 @@ router.post('/stream/gemini', async (req, res) => {
 });
 
 // ── OpenAI (stream) ──
-// Same reasoning_effort='medium' as /chat/openai above. See the chat
-// handler comment for the full rationale (in particular: 'medium' is
-// the GPT-5.5 default, 'minimal' is gpt-5-only and would 400 here,
-// verbosity is omitted because chat.completions types reject it
-// inconsistently across SDK versions).
+// Mirrors /chat/openai: client-supplied reasoning_effort flows through
+// resolveReasoningEffort (validates the value AND tier-gates — only Max
+// users can opt into anything beyond 'none'). See the chat handler
+// comment block above for full rationale on which params are safe to pass.
 router.post('/stream/openai', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OpenAI not configured' });
@@ -303,6 +338,7 @@ router.post('/stream/openai', requireTier(...PAID), async (req, res) => {
   const sse = openSseStream(req, res);
   try {
     const { messages } = req.body;
+    const reasoningEffort = resolveReasoningEffort(req);
     const OpenAI = require('openai');
     const openai = new OpenAI({ apiKey });
 
@@ -311,7 +347,7 @@ router.post('/stream/openai', requireTier(...PAID), async (req, res) => {
         model: 'gpt-5.5',
         messages,
         max_completion_tokens: 16000,
-        reasoning_effort: 'medium',
+        reasoning_effort: reasoningEffort,
         stream: true,
       },
       { signal: sse.signal }
