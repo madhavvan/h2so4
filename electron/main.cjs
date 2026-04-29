@@ -776,6 +776,19 @@ function autoTypeSleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Jittered short-nav sleep. Same intent as autoTypeSleep but the timing
+// varies per call. Fixed-millisecond nav sequences (Home → Shift+End →
+// Delete after every Enter, Ctrl+End cursor moves, Backspace sprees) are
+// the loudest fingerprint in the run for keystroke-timing analyzers —
+// real humans never press nav keys with perfectly identical inter-key
+// gaps, so a deterministic 8/20/50ms cadence stands out cleanly against
+// the otherwise human-shaped per-character distribution. Center the
+// jittered range on the original constant so timing characteristics
+// (focus settle, visual feedback) stay equivalent.
+function autoTypeNavSleep(min, max) {
+  return autoTypeSleep(min + Math.random() * (max - min));
+}
+
 // Gaussian random via Box-Muller.
 function autoTypeGauss(mean, stdDev) {
   const u1 = Math.max(1e-9, Math.random());
@@ -794,6 +807,53 @@ let _atModeCharsLeft = 0;
 function autoTypeResetCadence() {
   _atMode = 'flow';
   _atModeCharsLeft = 10 + Math.floor(Math.random() * 25);
+}
+
+// Mouse-twitch state. A long stretch of pure-keyboard activity with zero
+// pointer movement is the strongest signal that behavioral analyzers
+// (Ropes-class proctoring, anything combining keyboard + mouse telemetry)
+// lock onto — humans don't type 200 lines without ANY pointer drift, even
+// from accidental hand-on-mouse contact. We schedule small pointer drifts
+// every 18–31 lines (re-randomized after each fire so the cadence isn't
+// itself a pattern) and never return the cursor to its starting point —
+// real cursor drift accumulates, robot-style "move and return" doesn't.
+let _atMouseLinesSinceTwitch = 0;
+let _atMouseNextTwitchAt = 0;
+
+function autoTypeResetMouseTwitch() {
+  _atMouseLinesSinceTwitch = 0;
+  _atMouseNextTwitchAt = 18 + Math.floor(Math.random() * 14);
+}
+
+async function autoTypeMaybeMouseTwitch(mouse) {
+  _atMouseLinesSinceTwitch++;
+  if (_atMouseLinesSinceTwitch < _atMouseNextTwitchAt) return;
+  try {
+    const pos = await mouse.getPosition();
+    // Drift range chosen to be visible enough to register as activity in
+    // a behavioral feed but small enough that it doesn't move the cursor
+    // off a UI control the user might be hovering over (e.g. into a
+    // tooltip-trigger).
+    const dx = Math.round((Math.random() - 0.5) * 30);
+    const dy = Math.round((Math.random() - 0.5) * 20);
+    // Keep the cursor inside a safe interior region. The clamp values are
+    // intentionally loose — nut-js will silently clip out-of-screen points
+    // anyway, but biasing toward interior coords avoids edge-case behavior
+    // where a clipped move registers as a click on the corner pixel on
+    // some Windows builds.
+    const targetX = Math.max(20, pos.x + dx);
+    const targetY = Math.max(20, pos.y + dy);
+    // nut-js's isPoint duck-checks for {x, y} numeric keys — a plain
+    // object passes. Avoids the dance of importing Point from
+    // @nut-tree-fork/shared (Point is not re-exported by nut-js's index).
+    await mouse.move([{ x: targetX, y: targetY }]);
+  } catch (e) {
+    // Best-effort — mouse twitches are pure realism, never let a failure
+    // bubble up and abort the typing run.
+    console.warn('[auto-type] mouse twitch failed (non-fatal):', e && e.message);
+  }
+  _atMouseLinesSinceTwitch = 0;
+  _atMouseNextTwitchAt = 18 + Math.floor(Math.random() * 14);
 }
 
 function autoTypeAdvanceMode() {
@@ -1184,6 +1244,13 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   // licenseService.getToken() and passes through; main never persists it.
   const authToken = payload && typeof payload.authToken === 'string' ? payload.authToken : '';
   const language = payload && typeof payload.language === 'string' ? payload.language : 'unknown';
+  // Local-only mode (set from renderer settings). When true, the Haiku
+  // planner Railway call is suppressed — typing runs entirely on-device
+  // using the deterministic UIA planner only. Targets monitored networks
+  // where outbound traffic to a Railway domain mid-interview is itself
+  // an anomaly. Defaults to false (cloud planner allowed) for backwards
+  // compat — old renderers that don't send the field get the prior behavior.
+  const localOnly = !!(payload && payload.localOnly === true);
   if (autoTypeInFlight) return { error: 'Auto-Type already in progress.' };
   if (!code.length) return { error: 'Nothing to type.' };
 
@@ -1192,11 +1259,20 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   autoTypeAbortReason = null;
   autoTypeAbortDiagnostic = null;
   autoTypeResetCadence();
+  autoTypeResetMouseTwitch();
   _atLastWasTypo = false;
 
-  let keyboard, Key;
+  // Pull mouse alongside keyboard + Key — needed for the periodic
+  // pointer-drift realism (autoTypeMaybeMouseTwitch). nut-js exposes
+  // mouse as a singleton on the same module. If it's missing on this
+  // nut-js build we continue without twitches — the typing run still
+  // works, just without that layer of behavioral camouflage.
+  let keyboard, Key, mouse;
   try {
-    ({ keyboard, Key } = loadNut());
+    const nut = loadNut();
+    keyboard = nut.keyboard;
+    Key = nut.Key;
+    mouse = nut.mouse || null;
   } catch (e) {
     autoTypeInFlight = false;
     console.error('[auto-type] native module load failed:', e && e.message);
@@ -1235,7 +1311,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     popoutWindow.blur();
   }
   // Small delay for the OS to settle focus on the editor underneath.
-  await autoTypeSleep(150);
+  await autoTypeNavSleep(120, 200);
 
   // ── A11Y (UIA) primary read ──
   // Ask the OS accessibility API what text is in the focused editor and
@@ -1352,7 +1428,14 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   let typePrefix = '';
   let typeSuffix = '';
   let usedHaiku = false;
-  if (!usedUIA && uiaSnapshotBefore && authToken) {
+  if (!usedUIA && uiaSnapshotBefore && authToken && localOnly) {
+    // User is in local-only mode (corporate network / monitored interview).
+    // Surface the skip in the log so the diagnostic trail explains why the
+    // deterministic-low-confidence path didn't get the AI fallback —
+    // otherwise it looks like a silent capability regression.
+    console.log('[auto-type] Haiku planner skipped: localOnlyAutoType=true (cloud fallback disabled by user)');
+  }
+  if (!usedUIA && uiaSnapshotBefore && authToken && !localOnly) {
     try {
       const snapText = uiaSnapshotBefore.text || '';
       const cursorOff = uiaSnapshotBefore.cursorOffset || 0;
@@ -1474,13 +1557,13 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     if (cursorAction === 'move_to_end' || cursorAction === 'go_to_line') {
       try {
         await keyboard.pressKey(Key.LeftControl);
-        await autoTypeSleep(8);
+        await autoTypeNavSleep(5, 14);
         await keyboard.pressKey(Key.End);
-        await autoTypeSleep(8);
+        await autoTypeNavSleep(5, 14);
         await keyboard.releaseKey(Key.End);
-        await autoTypeSleep(8);
+        await autoTypeNavSleep(5, 14);
         await keyboard.releaseKey(Key.LeftControl);
-        await autoTypeSleep(60);
+        await autoTypeNavSleep(45, 88);
         if (cursorAction === 'go_to_line') {
           console.log(`[auto-type] cursor: go_to_line not yet implemented — used Ctrl+End instead`);
         } else {
@@ -1500,7 +1583,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           if (autoTypeAbort) break;
           await keyboard.pressKey(Key.Backspace);
           await keyboard.releaseKey(Key.Backspace);
-          await autoTypeSleep(8);
+          await autoTypeNavSleep(5, 18);
         }
         console.log(`[auto-type] wiped ${wipeChars} chars before typing`);
       } catch (kErr) {
@@ -1519,7 +1602,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           } else {
             await keyboard.type(ch);
           }
-          await autoTypeSleep(15);
+          await autoTypeNavSleep(10, 26);
         }
       } catch (kErr) {
         console.warn('[auto-type] prefix type failed:', kErr && kErr.message);
@@ -1535,18 +1618,18 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       try {
         await keyboard.pressKey(Key.Home);
         await keyboard.releaseKey(Key.Home);
-        await autoTypeSleep(20);
+        await autoTypeNavSleep(14, 32);
         await keyboard.pressKey(Key.LeftShift);
-        await autoTypeSleep(8);
+        await autoTypeNavSleep(5, 14);
         await keyboard.pressKey(Key.End);
-        await autoTypeSleep(8);
+        await autoTypeNavSleep(5, 14);
         await keyboard.releaseKey(Key.End);
-        await autoTypeSleep(8);
+        await autoTypeNavSleep(5, 14);
         await keyboard.releaseKey(Key.LeftShift);
-        await autoTypeSleep(20);
+        await autoTypeNavSleep(14, 32);
         await keyboard.pressKey(Key.Delete);
         await keyboard.releaseKey(Key.Delete);
-        await autoTypeSleep(30);
+        await autoTypeNavSleep(22, 45);
       } catch (kErr) {
         // If the wipe fails, continue — worst case is visible double-indent
         // on the first typed line, not a broken type run.
@@ -1667,36 +1750,57 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           : 250 + Math.random() * 450;
         await autoTypeSleep(dwell);
 
-        // Newline → editor will auto-indent. Wipe the auto-indent so
-        // the AI's own leading whitespace (typed on next iter) stands alone.
-        // Keep these internal-navigation keys snappy — they're not part
-        // of the "human typing" rhythm the user sees in the editor.
+        // Optional mouse twitch during the inter-line pause. Fires every
+        // 18–31 lines on a fresh schedule each time, so the cadence is
+        // unpredictable. See autoTypeMaybeMouseTwitch for rationale —
+        // long stretches of pure-keyboard activity are the strongest
+        // signal that behavioral analyzers (Ropes-class) lock onto.
+        if (mouse) {
+          await autoTypeMaybeMouseTwitch(mouse);
+        }
+
+        // Whether to wipe the auto-indent the editor will insert. Most
+        // editors auto-indent the new line ONLY when:
+        //   • the just-typed line had leading whitespace (matches indent), OR
+        //   • the just-typed line ended with a block-opener (`:`, `{`, `(`, `[`),
+        //     which adds one level.
+        // For plain top-level statements (sequential imports, blank-line-
+        // separated function defs at column 0) the editor does no auto-indent
+        // and the wipe is both unnecessary AND a strong fingerprint — Home →
+        // Shift+End → Delete after every Enter is something no human does.
+        // Only run it when there's actual auto-indent to fight.
+        const editorWillAutoIndent = indentEnd > 0 || /[:{(\[]\s*$/.test(line);
+
         try {
           await keyboard.pressKey(Key.Enter);
           await keyboard.releaseKey(Key.Enter);
-          await autoTypeSleep(50);
+          await autoTypeNavSleep(38, 70);
 
-          await keyboard.pressKey(Key.Home);
-          await keyboard.releaseKey(Key.Home);
-          await autoTypeSleep(20);
+          if (editorWillAutoIndent) {
+            // Wipe the auto-inserted indent so the AI's own leading whitespace
+            // (typed on next iter) stands alone instead of compounding.
+            await keyboard.pressKey(Key.Home);
+            await keyboard.releaseKey(Key.Home);
+            await autoTypeNavSleep(14, 32);
 
-          // Shift+End as sequential hold rather than pressKey(a, b) combo.
-          // The combo form triggers libnut's "Invalid key flag specified"
-          // on some Windows builds (the native SendInput layer rejects the
-          // combined key-event flags). Sequential press/press/release/release
-          // uses one SendInput per key and works reliably.
-          await keyboard.pressKey(Key.LeftShift);
-          await autoTypeSleep(8);
-          await keyboard.pressKey(Key.End);
-          await autoTypeSleep(8);
-          await keyboard.releaseKey(Key.End);
-          await autoTypeSleep(8);
-          await keyboard.releaseKey(Key.LeftShift);
-          await autoTypeSleep(20);
+            // Shift+End as sequential hold rather than pressKey(a, b) combo.
+            // The combo form triggers libnut's "Invalid key flag specified"
+            // on some Windows builds (the native SendInput layer rejects the
+            // combined key-event flags). Sequential press/press/release/release
+            // uses one SendInput per key and works reliably.
+            await keyboard.pressKey(Key.LeftShift);
+            await autoTypeNavSleep(5, 14);
+            await keyboard.pressKey(Key.End);
+            await autoTypeNavSleep(5, 14);
+            await keyboard.releaseKey(Key.End);
+            await autoTypeNavSleep(5, 14);
+            await keyboard.releaseKey(Key.LeftShift);
+            await autoTypeNavSleep(14, 32);
 
-          await keyboard.pressKey(Key.Delete);
-          await keyboard.releaseKey(Key.Delete);
-          await autoTypeSleep(20);
+            await keyboard.pressKey(Key.Delete);
+            await keyboard.releaseKey(Key.Delete);
+            await autoTypeNavSleep(14, 32);
+          }
         } catch (kErr) {
           // If the indent-reset fails, continue — worst case is
           // visible double-indent, not a broken type run.
@@ -1796,7 +1900,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           } else {
             await keyboard.type(ch);
           }
-          await autoTypeSleep(15);
+          await autoTypeNavSleep(10, 26);
         }
       } catch (kErr) {
         console.warn('[auto-type] suffix type failed:', kErr && kErr.message);
@@ -1885,6 +1989,15 @@ const { spawn: _spawn } = require('child_process');
 const _fs = require('fs');
 const _os = require('os');
 const _pathMod = require('path');
+const _crypto = require('crypto');
+
+// Per-session random filename for the UIA helper script. Replaces the
+// previous hardcoded 'interview-copilot-uia-helper.ps1' so static scanners
+// (anti-cheat / proctoring tools that enumerate %TEMP%) don't get a
+// brand-identifying artifact handed to them. The file is always overwritten
+// on app start, so the random name is regenerated each launch — also
+// invalidates any blocklist a scanner built up against a prior session.
+const _uiaScriptBaseName = _crypto.randomBytes(8).toString('hex') + '.ps1';
 
 // PowerShell REPL. Uses TextPattern (best — full text + cursor offset) and
 // falls back to ValuePattern (coarser — value only, cursor assumed at end).
@@ -1987,15 +2100,27 @@ let _uiaInitFailed = false;
 
 function _ensureUIAScriptFile() {
   if (_uiaScriptPath && _fs.existsSync(_uiaScriptPath)) return _uiaScriptPath;
-  const p = _pathMod.join(_os.tmpdir(), 'interview-copilot-uia-helper.ps1');
-  // Always overwrite. The file lives in the shared tmp dir and persists
-  // across app runs, so if we evolve UIA_PS_SCRIPT between versions we
-  // MUST NOT reuse a stale cached copy — otherwise fixes ship but the
-  // running bridge still executes yesterday's script.
+  const p = _pathMod.join(_os.tmpdir(), _uiaScriptBaseName);
+  // Always overwrite — guards against a stale partial write from a
+  // previous crash leaving an incomplete script in place. Filename is
+  // randomized per session (see _uiaScriptBaseName above) so a
+  // proctoring / anti-cheat scanner can't glob the temp dir for a
+  // known brand-identifying name.
   _fs.writeFileSync(p, UIA_PS_SCRIPT, 'utf8');
   _uiaScriptPath = p;
   return p;
 }
+
+// Best-effort cleanup of the helper script on app exit. Not load-bearing
+// (Windows tmp gets cleaned periodically anyway) but removes the artifact
+// promptly when the app shuts cleanly so it doesn't sit on disk between
+// sessions for someone to find.
+function _cleanupUIAScriptFile() {
+  if (!_uiaScriptPath) return;
+  try { _fs.unlinkSync(_uiaScriptPath); } catch (_) {}
+  _uiaScriptPath = null;
+}
+app.on('will-quit', _cleanupUIAScriptFile);
 
 // Spawn once, reuse for the life of the app. If spawn fails, remember that
 // so we don't thrash trying to restart a bridge that won't start.

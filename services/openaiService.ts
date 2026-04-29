@@ -170,12 +170,25 @@ ${modeInstruction}
     messages.push({ role: "user", content: contentParts });
 
     try {
+        // Read the user's reasoning_effort the same way the proxy does.
+        // Note: this local fallback only fires when the user has plugged
+        // in their own OpenAI key (rare); in production the server proxy
+        // path is used and tier-gates via JWT. Here we trust the user's
+        // own setting since it's their own key paying for it.
+        const reasoningEffort = (() => {
+            if (typeof localStorage === 'undefined') return 'none';
+            const v = localStorage.getItem('REASONING_EFFORT');
+            if (v === 'low' || v === 'medium' || v === 'high') return v;
+            return 'none';
+        })();
+
         const completion = await this.openai.chat.completions.create({
             model: this.modelName,
             messages: messages as any,
             max_completion_tokens: 16000,
             temperature: 0.7,
             stream: false,
+            reasoning_effort: reasoningEffort,
         } as any);
 
         const text = completion.choices[0]?.message?.content || "";

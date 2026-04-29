@@ -495,11 +495,18 @@ const CodeBlock: React.FC<{
             // its own credential. Empty string if not signed in (Haiku planner
             // won't fire; deterministic UIA still runs).
             const authToken = licenseService.getToken() || '';
+            // localOnlyAutoType is read from localStorage rather than prop-
+            // drilled through MessageRenderer/CodeBlock. The setting only
+            // matters at click-time, so reading at the event boundary keeps
+            // CodeBlock's React.memo behavior intact (a settings flip
+            // shouldn't invalidate every code block in a long conversation).
+            const localOnly = localStorage.getItem('LOCAL_ONLY_AUTO_TYPE') === 'true';
             const result = await electronIPC.invoke('auto-type:send', {
                 code,
                 skipLines,
                 authToken,
                 language: language || 'unknown',
+                localOnly,
             });
             if (result && result.error) {
                 surfaceAtError(`Auto-Type failed: ${result.error}`);
@@ -1710,6 +1717,10 @@ function useFeatureGate(license: LicenseData | null) {
     canScreenCapture: gates.screenCapture,
     canAutoSolve: gates.autoSolve,
     canAutoType: gates.autoType,
+    // Whether the user can choose anything other than 'none' reasoning effort
+    // for GPT. Server enforces tier-gating regardless (JWT check), so this
+    // flag drives UI affordance only — no security weight on its own.
+    canChooseReasoningEffort: gates.reasoningEffortControl,
     canPopout: gates.popout,
     maxContextFiles: gates.contextFiles,
     maxSessions: gates.sessionsPerMonth,
@@ -2681,6 +2692,17 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     theme: (localStorage.getItem("THEME") as 'light'|'dark') || 'dark',
     fontSize: (localStorage.getItem("FONT_SIZE") as 'small'|'medium'|'large') || 'medium',
     generalMode: localStorage.getItem("GENERAL_MODE") === 'true',
+    // Default: cloud planner allowed (most users benefit from it). User
+    // toggles to true on monitored networks where outbound traffic to
+    // an unfamiliar Railway domain mid-interview is risky.
+    localOnlyAutoType: localStorage.getItem("LOCAL_ONLY_AUTO_TYPE") === 'true',
+    // GPT reasoning effort. Default 'none' for everyone — fastest baseline.
+    // Non-Max users can't change it (UI locked, server forces 'none' via
+    // JWT regardless). Max users opt up per-session as needed.
+    reasoningEffort: (() => {
+      const v = localStorage.getItem("REASONING_EFFORT");
+      return v === 'low' || v === 'medium' || v === 'high' ? v : 'none';
+    })(),
   });
 
   // Settings Modal Local State
@@ -2719,6 +2741,22 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   useEffect(() => {
       localStorage.setItem("GENERAL_MODE", String(settings.generalMode));
   }, [settings.generalMode]);
+
+  // Persist Local-Only Auto-Type so the user doesn't have to re-toggle
+  // it on every app launch when sitting on a monitored network.
+  useEffect(() => {
+      localStorage.setItem("LOCAL_ONLY_AUTO_TYPE", String(settings.localOnlyAutoType));
+  }, [settings.localOnlyAutoType]);
+
+  // Persist reasoning effort. Only persist values the server will accept
+  // — guards against a future enum tightening shipping a bad string into
+  // localStorage that then poisons every request.
+  useEffect(() => {
+      const v = settings.reasoningEffort;
+      if (v === 'none' || v === 'low' || v === 'medium' || v === 'high') {
+          localStorage.setItem("REASONING_EFFORT", v);
+      }
+  }, [settings.reasoningEffort]);
 
   // Sync temp state when settings open
   useEffect(() => {
@@ -4464,7 +4502,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                         <span className={`font-bold text-xs ${tempModel === 'claude' ? 'text-purple-500' : 'text-text'}`}>
                             Claude Sonnet 4.6 {gate.canUseModel('claude') && <span className="ml-1 text-[9px] bg-purple-500 text-white px-1.5 py-0.5 rounded-full">Web Search</span>}
                         </span>
-                        {!gate.canUseModel('claude') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
+                        {!gate.canUseModel('claude') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">MAX</span>}
                     </button>
                 </div>
             </div>
@@ -4510,14 +4548,133 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                                 key={size}
                                 onClick={() => setSettings(s => ({...s, fontSize: size}))}
                                 className={`px-3 py-1.5 rounded-md text-xs font-medium border transition-all ${
-                                    settings.fontSize === size 
-                                    ? 'bg-primary text-white border-primary' 
+                                    settings.fontSize === size
+                                    ? 'bg-primary text-white border-primary'
                                     : 'bg-transparent text-gray-500 border-border hover:border-gray-400'
                                 }`}
                             >
                                 {size.charAt(0).toUpperCase() + size.slice(1)}
                             </button>
                         ))}
+                    </div>
+                </div>
+
+                {/* Local-Only Auto-Type — Electron only (Auto-Type itself
+                    only exists in the desktop build, so the toggle is
+                    meaningless on web). Keeps editor text on-device by
+                    suppressing the Haiku planner Railway call when the
+                    deterministic UIA planner returns low confidence. */}
+                {isElectron && (
+                  <div className="flex items-center justify-between">
+                      <div className="flex flex-col">
+                          <span className="text-sm font-medium text-text">Local-Only Auto-Type</span>
+                          <span className="text-xs text-gray-500 mt-0.5">No editor text leaves your device. Use on monitored networks.</span>
+                      </div>
+                      <button
+                          role="switch"
+                          aria-checked={settings.localOnlyAutoType}
+                          onClick={() => setSettings(s => ({ ...s, localOnlyAutoType: !s.localOnlyAutoType }))}
+                          className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                              settings.localOnlyAutoType ? 'bg-primary' : 'bg-gray-600'
+                          }`}
+                      >
+                          <span
+                              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                  settings.localOnlyAutoType ? 'translate-x-6' : 'translate-x-1'
+                              }`}
+                          />
+                      </button>
+                  </div>
+                )}
+
+                {/* ── GPT Reasoning Speed ──
+                    Switch bar: None / Low / Medium / High. Max-tier only —
+                    lower tiers see the bar but only None is enabled, with
+                    Crown badges on the locked levels.
+                    Server enforces tier-gating via JWT regardless of what
+                    the client sends, so this UI is affordance-only. The
+                    contextual help below adapts to (a) tier and (b) whether
+                    the user has trained their model — explaining how
+                    Train Model + None gives instant high-quality answers. */}
+                <div className="flex flex-col gap-2 pt-1">
+                    <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-text">GPT Reasoning Speed</span>
+                        {!gate.canChooseReasoningEffort && (
+                            <span className="text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30 flex items-center gap-1">
+                                <Crown size={9} /> MAX
+                            </span>
+                        )}
+                    </div>
+                    <div className="grid grid-cols-4 gap-1.5">
+                        {(['none', 'low', 'medium', 'high'] as const).map((level) => {
+                            const isActive = settings.reasoningEffort === level;
+                            const isLockedForTier = !gate.canChooseReasoningEffort && level !== 'none';
+                            return (
+                                <button
+                                    key={level}
+                                    onClick={() => {
+                                        if (isLockedForTier) return;
+                                        setSettings(s => ({ ...s, reasoningEffort: level }));
+                                    }}
+                                    disabled={isLockedForTier}
+                                    title={
+                                        level === 'none' ? 'Skip chain-of-thought · ~1-3s answers' :
+                                        level === 'low' ? 'Light reasoning · ~3-6s answers' :
+                                        level === 'medium' ? 'Balanced reasoning · ~5-10s answers' :
+                                        'Deep reasoning · ~10-25s answers'
+                                    }
+                                    className={`relative px-2 py-1.5 rounded-md text-xs font-medium border transition-all ${
+                                        isLockedForTier
+                                            ? 'bg-transparent text-gray-700 border-border cursor-not-allowed opacity-60'
+                                            : isActive
+                                                ? 'bg-primary text-white border-primary shadow-sm'
+                                                : 'bg-transparent text-gray-500 border-border hover:border-gray-400 hover:text-gray-300'
+                                    }`}
+                                >
+                                    {level.charAt(0).toUpperCase() + level.slice(1)}
+                                    {isLockedForTier && (
+                                        <Crown size={8} className="absolute top-0.5 right-0.5 text-amber-400/70" />
+                                    )}
+                                </button>
+                            );
+                        })}
+                    </div>
+                    {/* Contextual help — adapts to tier + training status */}
+                    <div className={`text-[10px] leading-relaxed mt-0.5 px-2 py-1.5 rounded-md ${
+                        !gate.canChooseReasoningEffort
+                            ? 'bg-amber-400/5 text-amber-200/70 border border-amber-400/15'
+                            : hasTrainedCache && settings.reasoningEffort === 'none'
+                                ? 'bg-emerald-500/10 text-emerald-300/90 border border-emerald-500/20'
+                                : !hasTrainedCache && settings.reasoningEffort === 'none'
+                                    ? 'bg-orange-500/10 text-orange-300/80 border border-orange-500/20'
+                                    : 'bg-blue-500/5 text-blue-300/80 border border-blue-500/15'
+                    }`}>
+                        {!gate.canChooseReasoningEffort ? (
+                            <>
+                                <span className="font-semibold">Locked to None.</span>{' '}
+                                Upgrade to Max to control reasoning depth and unlock Train Model — pre-research your resume + JD for instant high-quality answers on None.
+                            </>
+                        ) : hasTrainedCache && settings.reasoningEffort === 'none' ? (
+                            <>
+                                <span className="font-semibold">⚡ Instant mode active.</span>{' '}
+                                Your trained tech-state card supplies the depth GPT skips — answers in ~1-3s with full grounding from your researched stack.
+                            </>
+                        ) : !hasTrainedCache && settings.reasoningEffort === 'none' ? (
+                            <>
+                                <span className="font-semibold">Fast but shallow.</span>{' '}
+                                You haven't trained yet — answers come back quickly but only from GPT's base knowledge. Train your model (above) to get instant <em>and</em> deeply-grounded answers, or pick a higher reasoning level for live deeper thinking (slower).
+                            </>
+                        ) : settings.reasoningEffort === 'high' ? (
+                            <>
+                                <span className="font-semibold">Deep reasoning · slowest.</span>{' '}
+                                GPT will think for ~10-25s before answering. Best for system-design or multi-step coding questions. {!hasTrainedCache && 'Tip: Train Model gets you instant answers without the wait.'}
+                            </>
+                        ) : (
+                            <>
+                                <span className="font-semibold">{settings.reasoningEffort === 'low' ? 'Light reasoning' : 'Balanced reasoning'}.</span>{' '}
+                                {settings.reasoningEffort === 'low' ? '~3-6s' : '~5-10s'} answers — GPT thinks before responding. {!hasTrainedCache && 'Train Model to skip the wait while keeping quality.'}
+                            </>
+                        )}
                     </div>
                 </div>
             </div>

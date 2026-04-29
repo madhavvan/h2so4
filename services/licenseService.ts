@@ -79,6 +79,10 @@ export const FEATURE_GATES = {
     contextFiles: 1,     // max files
     sessionsPerMonth: 5,
     exportHistory: false,
+    // GPT reasoning_effort is Max-only. Lower tiers are forced to 'none'
+    // both client-side (UI bar locked) and server-side (JWT tier check
+    // in /chat/openai overrides anything they send).
+    reasoningEffortControl: false,
   },
   basic: {
     // Claude is Max-only — its hosted web_search + the per-session "Train
@@ -91,6 +95,7 @@ export const FEATURE_GATES = {
     contextFiles: -1,    // unlimited
     sessionsPerMonth: -1, // session count isn't the gate — credit time is
     exportHistory: true,
+    reasoningEffortControl: false,
   },
   pro: {
     // Claude is Max-only — see comment in `basic`.
@@ -102,6 +107,7 @@ export const FEATURE_GATES = {
     contextFiles: -1,    // unlimited
     sessionsPerMonth: -1, // unlimited
     exportHistory: true,
+    reasoningEffortControl: false,
   },
   max: {
     models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
@@ -112,6 +118,11 @@ export const FEATURE_GATES = {
     contextFiles: -1,    // unlimited
     sessionsPerMonth: -1, // unlimited
     exportHistory: true,
+    // Max users get the full reasoning bar (none/low/medium/high). Pairs
+    // with Train Model: a trained Max user on 'none' answers in 1-3s
+    // because the cached tech-state card already supplies depth that
+    // reasoning would otherwise compute live.
+    reasoningEffortControl: true,
   },
 } as const;
 
