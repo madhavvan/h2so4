@@ -188,6 +188,15 @@ function enforceAlwaysOnTop() {
   if (popoutWindow && !popoutWindow.isDestroyed()) {
     // 'screen-saver' is the HIGHEST level — above all apps, even fullscreen
     popoutWindow.setAlwaysOnTop(true, 'screen-saver');
+    // Re-assert WS_EX_TOOLWINDOW. setFocusable(true) on Windows clears
+    // the toolwindow flag set by skipTaskbar:true at construction, and
+    // a subsequent setFocusable(false) does NOT put it back — once the
+    // flag is gone the popout sits in the taskbar for the rest of its
+    // lifetime, blowing the screen-share-stealth invariant. Belt-and-
+    // suspenders re-assert here so any code path that drops the flag
+    // (focus toggles, alwaysOnTop changes, content-protection, parent-
+    // window relations) gets corrected within the next event tick.
+    popoutWindow.setSkipTaskbar(true);
   }
 }
 
@@ -647,6 +656,13 @@ ipcMain.on('popout:set-focusable', (_event, focusable) => {
   if (!popoutWindow) return;
   try {
     popoutWindow.setFocusable(!!focusable);
+    // CRITICAL: setFocusable(true) on Windows rewrites GWL_EXSTYLE and
+    // strips WS_EX_TOOLWINDOW (the flag skipTaskbar:true sets at
+    // construction). A later setFocusable(false) does NOT restore it.
+    // Re-assert synchronously here, BEFORE the focus() call below — any
+    // delay would let the icon flash into the taskbar long enough for a
+    // screen-share viewer (or the user themselves) to see it.
+    popoutWindow.setSkipTaskbar(true);
     if (focusable) {
       // Bring popout to the foreground so the focused text input actually
       // receives keyboard input from the OS — without this, even a focused
