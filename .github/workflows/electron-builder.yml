@@ -1,8 +1,20 @@
 name: Build and Release Desktop App
 
+# Trigger matrix:
+#   release: created    — fires when a release is created in PUBLISHED state
+#                         (the historical default for `gh release create` flows)
+#   release: published  — fires when a draft release is flipped to published.
+#                         electron-builder's GitHub publish path always creates
+#                         the release as draft first, then we PATCH it to non-
+#                         draft. Without this trigger, the workflow never ran
+#                         for releases shipped via `npm run electron:publish`,
+#                         so Mac/Linux artifacts never made it into those tags.
+#   workflow_dispatch   — manual trigger from the Actions tab. Useful for
+#                         backfilling missing artifacts on an existing release
+#                         without cutting a new tag.
 on:
   release:
-    types: [created]
+    types: [created, published]
   workflow_dispatch:
 
 permissions:
@@ -14,51 +26,82 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # buildOnDispatch=false on Windows: we sign Windows locally via
+          # Azure Trusted Signing (CI doesn't have AZURE_CLIENT_SECRET set),
+          # so a CI rebuild would replace the signed .exe with an unsigned
+          # one that triggers SmartScreen warnings. Skip Windows on manual
+          # triggers; keep it on real release events so the first signed
+          # build in a fresh CI setup with proper secrets still works.
           - os: windows-latest
             platform: --win
+            buildOnDispatch: false
           - os: macos-latest
             platform: --mac
+            buildOnDispatch: true
           - os: ubuntu-latest
             platform: --linux
+            buildOnDispatch: true
 
     runs-on: ${{ matrix.os }}
 
     steps:
+      - name: Decide if this matrix entry should build
+        id: gate
+        # Build if: this is a real release event, OR matrix is flagged
+        # buildOnDispatch=true. Skip otherwise (i.e., Windows on manual).
+        run: |
+          if [ "${{ github.event_name }}" = "release" ] || [ "${{ matrix.buildOnDispatch }}" = "true" ]; then
+            echo "go=1" >> $GITHUB_OUTPUT
+          else
+            echo "go=0" >> $GITHUB_OUTPUT
+            echo "::notice::Skipping ${{ matrix.os }} on this trigger — locally-signed builds aren't rebuilt by CI."
+          fi
+        shell: bash
+
       - name: Checkout code
+        if: steps.gate.outputs.go == '1'
         uses: actions/checkout@v4
 
       - name: Setup Node.js
+        if: steps.gate.outputs.go == '1'
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - name: Install Linux build deps
-        if: runner.os == 'Linux'
+        if: steps.gate.outputs.go == '1' && runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfuse2
 
       - name: Install dependencies
+        if: steps.gate.outputs.go == '1'
         run: npm ci
 
       - name: Build Vite app
+        if: steps.gate.outputs.go == '1'
         run: npm run build
 
-      - name: Build Electron app
-        run: npx electron-builder ${{ matrix.platform }} ${{ github.event_name == 'release' && '--publish always' || '--publish never' }}
+      - name: Build + publish Electron app
+        # Both release and workflow_dispatch upload to the GitHub release that
+        # matches the version in package.json. workflow_dispatch is the path
+        # we use to backfill Mac/Linux on an existing release.
+        if: steps.gate.outputs.go == '1'
+        run: npx electron-builder ${{ matrix.platform }} --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
       - name: List built files
+        if: steps.gate.outputs.go == '1'
         run: ls -la dist-electron/
         shell: bash
 
-      # Note: When triggered by a release, electron-builder with --publish always
-      # automatically uploads binaries AND the auto-update manifest files (latest.yml, etc.)
-      # to GitHub Releases. The softprops action is kept as a fallback for any files
-      # that electron-builder might miss.
+      # Belt-and-suspenders: electron-builder's publish should already have
+      # attached every relevant file (binary + blockmap + latest-*.yml) to
+      # the release. softprops re-uploads anything missed without overwriting
+      # successful uploads.
       - name: Upload any additional files to release
         uses: softprops/action-gh-release@v2
-        if: github.event_name == 'release'
+        if: steps.gate.outputs.go == '1' && github.event_name == 'release'
         with:
           files: |
             dist-electron/*.yml
@@ -70,15 +113,3 @@ jobs:
             dist-electron/*.blockmap
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload as workflow artifact (for manual runs)
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch'
-        with:
-          name: build-${{ matrix.os }}
-          path: |
-            dist-electron/*.exe
-            dist-electron/*.dmg
-            dist-electron/*.zip
-            dist-electron/*.AppImage
-            dist-electron/*.deb

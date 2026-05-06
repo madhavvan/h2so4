@@ -33,7 +33,8 @@
     "publish": {
       "provider": "github",
       "owner": "madhavvan",
-      "repo": "h2so4"
+      "repo": "h2so4",
+      "releaseType": "release"
     },
     "mac": {
       "category": "public.app-category.productivity",
