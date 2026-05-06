@@ -67,6 +67,118 @@ function normalizeTier(t) {
 const RENEWAL_USD_CENTS = 699;   // $6.99
 const RENEWAL_INR_PAISE = 59900; // ₹599
 
+// ── Pricing validation ──────────────────────────────────────────────
+// Rooted bug: the client hardcoded $29/$69 in pricingService.ts but the
+// server resolved Stripe price IDs from env, so a deployment with a
+// stale STRIPE_PRICE_USD pointing at the old $50 SKU would show "$29"
+// in-app and then charge $50 at checkout. Users who caught the mismatch
+// on the Stripe page bailed and reported "can't subscribe"; the rest
+// paid the wrong amount. The previous LEGACY-FALLBACK-FIRED warning
+// just logged — it did not block the wrong charge.
+//
+// We now check the configured price ID against the published in-app
+// amount BEFORE creating a checkout session. On mismatch we refuse with
+// a clear 503 instead of letting Stripe charge a different amount than
+// the user agreed to. Stripe.prices.retrieve is fast but we cache for
+// 10 minutes so this costs ~one extra round-trip per cold env, not per
+// checkout. Cache resets on restart — which is also what ops does after
+// fixing env vars.
+//
+// EXPECTED_*_AMOUNTS must stay in sync with pricingService.ts on the
+// client. If you change a price, update both sides.
+const EXPECTED_USD_CENTS = {
+  basic: 2500, // $25 one-time (mode=payment)
+  pro:   2900, // $29/month
+  max:   6900, // $69/month
+};
+const EXPECTED_INR_PAISE = {
+  basic: 199900, // ₹1999 one-time
+  pro:   249900, // ₹2499/month
+  max:   599900, // ₹5999/month
+};
+const PRICE_VALIDATION_TTL_MS = 10 * 60 * 1000;
+const stripePriceCache = new Map(); // priceId → { amount, currency, recurring, interval, validated_at }
+const razorpayPlanCache = new Map(); // planId  → { amount, currency, period, validated_at }
+
+async function assertStripePriceMatches(stripeClient, priceId, tier) {
+  const expected = EXPECTED_USD_CENTS[tier];
+  if (!expected) return; // unknown tier — let it through (caller already validated)
+  const expectedRecurring = tier !== 'basic';
+
+  const now = Date.now();
+  let entry = stripePriceCache.get(priceId);
+  if (!entry || now - entry.validated_at > PRICE_VALIDATION_TTL_MS) {
+    const price = await stripeClient.prices.retrieve(priceId);
+    entry = {
+      amount: price.unit_amount,
+      currency: price.currency,
+      recurring: !!price.recurring,
+      interval: price.recurring?.interval || null,
+      validated_at: now,
+    };
+    stripePriceCache.set(priceId, entry);
+  }
+
+  const mismatches = [];
+  if (entry.amount !== expected) {
+    mismatches.push(`amount: expected $${(expected/100).toFixed(2)} USD, got ${(entry.currency || '?').toUpperCase()} ${(entry.amount/100).toFixed(2)}`);
+  } else if (entry.currency !== 'usd') {
+    mismatches.push(`currency: expected USD, got ${(entry.currency || '?').toUpperCase()}`);
+  }
+  if (expectedRecurring && (!entry.recurring || entry.interval !== 'month')) {
+    mismatches.push(`mode: expected monthly recurring, got ${entry.recurring ? `recurring/${entry.interval}` : 'one-time'}`);
+  } else if (!expectedRecurring && entry.recurring) {
+    mismatches.push(`mode: expected one-time, got recurring/${entry.interval}`);
+  }
+  if (mismatches.length) {
+    const err = new Error(`Stripe price misconfigured for tier=${tier}: ${mismatches.join('; ')}`);
+    err.code = 'PRICE_MISMATCH';
+    err.tier = tier;
+    err.priceId = priceId;
+    err.expected = expected;
+    err.actual = entry;
+    throw err;
+  }
+}
+
+async function assertRazorpayPlanMatches(razorpayClient, planId, tier) {
+  const expected = EXPECTED_INR_PAISE[tier];
+  if (!expected) return;
+
+  const now = Date.now();
+  let entry = razorpayPlanCache.get(planId);
+  if (!entry || now - entry.validated_at > PRICE_VALIDATION_TTL_MS) {
+    const plan = await razorpayClient.plans.fetch(planId);
+    entry = {
+      amount: plan.item?.amount,
+      currency: plan.item?.currency,
+      period: plan.period, // 'monthly', 'yearly', 'weekly', 'daily'
+      validated_at: now,
+    };
+    razorpayPlanCache.set(planId, entry);
+  }
+
+  const mismatches = [];
+  if (entry.amount !== expected) {
+    mismatches.push(`amount: expected ${expected} paise (₹${expected/100}), got ${entry.amount}`);
+  }
+  if (entry.currency !== 'INR') {
+    mismatches.push(`currency: expected INR, got ${entry.currency || '<missing>'}`);
+  }
+  if (entry.period !== 'monthly') {
+    mismatches.push(`period: expected monthly, got ${entry.period || '<missing>'}`);
+  }
+  if (mismatches.length) {
+    const err = new Error(`Razorpay plan misconfigured for tier=${tier}: ${mismatches.join('; ')}`);
+    err.code = 'PLAN_MISMATCH';
+    err.tier = tier;
+    err.planId = planId;
+    err.expected = expected;
+    err.actual = entry;
+    throw err;
+  }
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  CREATE CHECKOUT — auto-routes
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -212,9 +324,22 @@ router.post('/upgrade-tier', authMiddleware, async (req, res) => {
       return await upgradeStripeSubscription(req, res, { user, currentTier, targetTier });
     }
 
-    return res.status(400).json({
-      error: 'No payment provider on file for this account. Start a new subscription to switch tiers.',
-    });
+    // ── No payment provider on file → fall through to fresh checkout ──
+    // Happens when the user's tier was set without going through a real
+    // Stripe/Razorpay sub: an admin grant in test, a webhook that never
+    // landed, or legacy data migrated without customer_id. The old behavior
+    // was a 400 error telling the user to "start a new subscription" —
+    // technically correct but the UI couldn't act on the message. Instead
+    // we route them through the actual create-checkout flow for the target
+    // tier so they can pay and get their customer_id properly recorded.
+    // Once the webhook lands the user has a normal sub on file and future
+    // upgrades use the in-place /upgrade-tier path.
+    console.warn(`[upgrade-tier] no provider on file for ${req.user.email} (tier=${currentTier}); falling through to fresh checkout for ${targetTier}`);
+    const provider = getPaymentProvider(req.user.country_code || 'US');
+    if (provider === 'razorpay') {
+      return await createRazorpayCheckout(req, res, targetTier);
+    }
+    return await createStripeCheckout(req, res, targetTier);
   } catch (err) {
     console.error('Upgrade-tier error:', err.message, err.stack);
     res.status(500).json({ error: err.message || 'Failed to change plan. Please try again.' });
@@ -225,11 +350,20 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
   if (!stripe) {
     return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
   }
-  const newPriceId = process.env[STRIPE_PRICE_ENV[targetTier]]
-    || (targetTier === 'pro' ? process.env.STRIPE_PRICE_USD : null);
-  if (!newPriceId) {
+  // Resolve the new line item — env-driven Price ID (validated) if set,
+  // else inline price_data with the hardcoded amount. Same helper as
+  // createStripeCheckout so the two flows can never disagree on what
+  // ${targetTier} costs.
+  let newLineItem;
+  try {
+    newLineItem = await resolveStripeLineItem(stripe, targetTier);
+  } catch (err) {
+    if (err.code === 'NO_PRICE_DATA') {
+      return res.status(400).json({ error: `Unknown tier: ${targetTier}` });
+    }
+    console.error(`[upgrade-tier] resolveStripeLineItem failed for tier=${targetTier}:`, err.message || err);
     return res.status(503).json({
-      error: `Pricing for ${targetTier.toUpperCase()} is not configured yet. Contact support.`,
+      error: 'Pricing service is temporarily unavailable. Please try again in a moment.',
     });
   }
 
@@ -257,8 +391,20 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
   // fall through to the existing license tier (no change), and the upgrade
   // would silently revert on the next webhook tick.
   await stripe.subscriptions.update(subscription.id, {
-    items: [{ id: itemId, price: newPriceId }],
+    // newLineItem is { price: 'price_xxx' } when an env var is set, or
+    // { price_data: {...} } when we're using the inline default. Stripe
+    // accepts either shape on subscription updates.
+    items: [{ id: itemId, ...newLineItem }],
     proration_behavior: 'create_prorations',
+    // If the subscription was scheduled to cancel at period end (status
+    // 'canceling' on our side), an in-place tier swap implies the user
+    // wants to keep paying — flip cancel_at_period_end back to false so
+    // the sub renews after this cycle. Without this, a user who canceled
+    // then upgraded would pay the prorated diff today and STILL have
+    // their sub end at cycle close — a confusing tax on a clear retention
+    // signal. Idempotent: if cancel_at_period_end was already false, this
+    // is a no-op on Stripe's side.
+    cancel_at_period_end: false,
     metadata: {
       ...(subscription.metadata || {}),
       tier: targetTier,
@@ -298,6 +444,31 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
   if (!newPlanId) {
     return res.status(503).json({
       error: `Pricing for ${targetTier.toUpperCase()} is not configured yet. Contact support.`,
+    });
+  }
+
+  // Same plan-mismatch guard as createRazorpayCheckout — see the comment
+  // there. An in-place upgrade with a misconfigured target plan would
+  // bill the user a different amount than they agreed to.
+  try {
+    await assertRazorpayPlanMatches(razorpay, newPlanId, targetTier);
+  } catch (err) {
+    if (err.code === 'PLAN_MISMATCH') {
+      console.error('━'.repeat(60));
+      console.error(`[upgrade-tier] RAZORPAY PLAN MISMATCH — refusing to swap`);
+      console.error(`  tier:     ${err.tier}`);
+      console.error(`  planId:   ${err.planId}`);
+      console.error(`  expected: ${err.expected} paise (₹${err.expected/100})`);
+      console.error(`  actual:   ${JSON.stringify(err.actual)}`);
+      console.error(`  user:     ${req.user.email} (id ${req.user.id})`);
+      console.error('━'.repeat(60));
+      return res.status(503).json({
+        error: `Pricing for ${targetTier.toUpperCase()} is misconfigured on the server. Please contact support — we don't want to bill you the wrong amount.`,
+      });
+    }
+    console.error(`[upgrade-tier] Razorpay plan lookup failed for ${newPlanId}:`, err.message || err);
+    return res.status(503).json({
+      error: 'Pricing service is temporarily unavailable. Please try again in a moment.',
     });
   }
 
@@ -355,6 +526,23 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
 // is the signal the webhook reads to branch into the renewal grant.
 router.post('/create-renewal', authMiddleware, async (req, res) => {
   try {
+    // ── Tier gate ──
+    // Renewal is the Basic +1h top-up. ONLY Basic-tier subscribers should
+    // be able to buy it. Without this gate the endpoint accepted any
+    // authenticated user and:
+    //   • Free user → bumped to tier='basic' with 1h credit (confusing
+    //     partial Basic grant for someone who wanted Pro/Max instead)
+    //   • Pro/Max user → grantBasicRenewal preserved unlimited values so
+    //     the user paid $6.99/₹599 for nothing — pure money waste
+    // We allow ANY Basic license through (active, expired, exhausted)
+    // because the explicit user intent is "I want more time on my Basic
+    // plan." An expired-Basic user renewing is the most common case.
+    const license = db.getLicenseByUserId(req.user.id);
+    if (!license || license.tier !== 'basic') {
+      return res.status(400).json({
+        error: 'Renewal is only available to Basic plan subscribers. Buy the Basic plan to start.',
+      });
+    }
     // SECURITY: Same currency-injection mitigation as /create-checkout.
     // country_code is server-controlled (JWT, set at signup) — body is
     // ignored. Without this, a US user could POST country_code:"IN" and
@@ -373,25 +561,132 @@ router.post('/create-renewal', authMiddleware, async (req, res) => {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  STRIPE — per-tier checkout (USA + Global)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Price ID env per tier. Legacy STRIPE_PRICE_USD is honored as a fallback
-// for 'pro' so existing deployments keep working while Basic/Max prices
-// get configured.
+// Price ID env per tier. Honored when set so operators who want to manage
+// prices in the Stripe Dashboard can. When NOT set we fall through to
+// inline price_data with the hardcoded amounts in STRIPE_PRICE_DATA below
+// — no env-var configuration required for a working checkout. Legacy
+// STRIPE_PRICE_USD is still recognized as a Pro-only fallback so existing
+// deployments don't break while Basic/Max are migrated.
 const STRIPE_PRICE_ENV = {
   basic: 'STRIPE_PRICE_BASIC_USD',
   pro:   'STRIPE_PRICE_PRO_USD',
   max:   'STRIPE_PRICE_MAX_USD',
 };
 
+// Inline-Price defaults — used when the per-tier STRIPE_PRICE_*_USD env
+// var isn't set. Stripe's `price_data` parameter creates an inline Price
+// at session-create time (no pre-existing Price ID needed). This lets the
+// server be the single source of truth for pricing without requiring any
+// Stripe Dashboard setup. Renewals already use this pattern (createStripeRenewal
+// below) — extending it to /create-checkout means a fresh deploy works
+// out-of-the-box with no STRIPE_PRICE_*_USD env vars at all.
+//
+// Must stay in sync with EXPECTED_USD_CENTS above and the client's
+// pricingService.ts USD_PRICES — that's what the price-mismatch validator
+// checks when an env-driven Price IS configured.
+const STRIPE_PRICE_DATA = {
+  basic: {
+    currency: 'usd',
+    product_data: {
+      name: 'minicaai Basic',
+      description: '3 interview credits · 14-day expiry · GPT-5.5 · Grok · Llama',
+    },
+    unit_amount: 2500,
+    // No `recurring` — Basic is a one-time payment.
+  },
+  pro: {
+    currency: 'usd',
+    product_data: {
+      name: 'minicaai Pro',
+      description: 'Unlimited sessions · 4 AI models · Pop-out · Auto-Solve',
+    },
+    unit_amount: 2900,
+    recurring: { interval: 'month' },
+  },
+  max: {
+    currency: 'usd',
+    product_data: {
+      name: 'minicaai Max',
+      description: 'Pro + Claude Sonnet 4.6 + Auto-Type + Train Model',
+    },
+    unit_amount: 6900,
+    recurring: { interval: 'month' },
+  },
+};
+
+// Resolve a Stripe line_item entry for the given tier. Tries env-driven
+// Price IDs first (validating against the in-app amount before use); on
+// any failure, falls back to inline price_data with the canonical hard-
+// coded amount instead of refusing. The fall-back is the load-bearing
+// change: a stale env var (e.g. STRIPE_PRICE_USD pointing at the old
+// $50 Pro SKU) used to silently charge the wrong amount. With strict
+// validation it would 503 instead, breaking the click. Falling through
+// to price_data gives the user the correct charge AND surfaces a loud
+// warning in the server logs so the operator can clean up the env var
+// at their leisure — no hard-break, no wrong charge.
+async function resolveStripeLineItem(stripe, tier) {
+  const envVar = STRIPE_PRICE_ENV[tier];
+  const primary = envVar ? process.env[envVar] : null;
+  const legacyFallback = (tier === 'pro' && !primary)
+    ? process.env.STRIPE_PRICE_USD
+    : null;
+  const priceId = primary || legacyFallback;
+
+  if (priceId) {
+    try {
+      await assertStripePriceMatches(stripe, priceId, tier);
+      return { price: priceId };
+    } catch (err) {
+      // Validation failed (mismatch, deleted price, Stripe API blip, etc).
+      // Fall through to inline price_data with the canonical amount —
+      // user gets charged correctly, operator sees the warning. We log
+      // the actual vs expected so it's obvious what to fix in the env.
+      console.warn('━'.repeat(60));
+      console.warn(`[checkout] Stripe Price ID validation FAILED — falling back to inline price_data`);
+      console.warn(`  tier:     ${tier}`);
+      console.warn(`  priceId:  ${priceId}`);
+      console.warn(`  source:   ${primary ? envVar : 'STRIPE_PRICE_USD (legacy)'}`);
+      console.warn(`  reason:   ${err.message}`);
+      if (err.expected != null) console.warn(`  expected: $${(err.expected/100).toFixed(2)} USD`);
+      if (err.actual) console.warn(`  actual:   ${JSON.stringify(err.actual)}`);
+      console.warn(`  Action:   align ${primary ? envVar : 'STRIPE_PRICE_USD'} with the in-app price`);
+      console.warn(`            OR unset it to silence this warning (price_data default will continue to work).`);
+      console.warn('━'.repeat(60));
+      // fall through to price_data
+    }
+  }
+
+  // Default path: inline price_data. No env vars required, server is the
+  // single source of truth for the price.
+  const priceData = STRIPE_PRICE_DATA[tier];
+  if (!priceData) {
+    const err = new Error(`No price_data default for tier=${tier}`);
+    err.code = 'NO_PRICE_DATA';
+    throw err;
+  }
+  return { price_data: priceData };
+}
+
 async function createStripeCheckout(req, res, tier) {
   if (!stripe) {
     return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
   }
 
-  const priceId = process.env[STRIPE_PRICE_ENV[tier]]
-    || (tier === 'pro' ? process.env.STRIPE_PRICE_USD : null);
-  if (!priceId) {
+  let lineItem;
+  try {
+    lineItem = await resolveStripeLineItem(stripe, tier);
+  } catch (err) {
+    if (err.code === 'NO_PRICE_DATA') {
+      return res.status(400).json({ error: `Unknown tier: ${tier}` });
+    }
+    // resolveStripeLineItem swallows price-validation failures and falls
+    // back to price_data, so the only errors that propagate here are
+    // structural (unknown tier) or unexpected programming bugs. Surface
+    // them as 503 — Stripe-API outages would manifest later in
+    // sessions.create() and 5xx anyway.
+    console.error(`[checkout] resolveStripeLineItem failed for tier=${tier}:`, err.message || err);
     return res.status(503).json({
-      error: `Pricing for ${tier.toUpperCase()} is not configured yet. Contact support.`,
+      error: 'Pricing service is temporarily unavailable. Please try again in a moment.',
     });
   }
 
@@ -404,7 +699,7 @@ async function createStripeCheckout(req, res, tier) {
     mode,
     payment_method_types: ['card'],
     customer_email: req.user.email,
-    line_items: [{ price: priceId, quantity: 1 }],
+    line_items: [{ ...lineItem, quantity: 1 }],
     // `tier` rides in the URL so the frontend can show a welcome banner
     // even if the webhook hasn't landed by the time the user returns.
     success_url: `${frontendUrl}?payment=success&tier=${tier}&session_id={CHECKOUT_SESSION_ID}`,
@@ -487,6 +782,34 @@ async function createRazorpayCheckout(req, res, tier) {
       || (tier === 'pro' ? process.env.RAZORPAY_PLAN_ID : null);
 
     if (planId) {
+      // Verify the plan's amount/currency/period match the published in-app
+      // amount before creating the subscription. The Razorpay equivalent of
+      // the Stripe price-mismatch check — see assertStripePriceMatches for
+      // the rationale. Without this, an out-of-sync RAZORPAY_PLAN_ID_* env
+      // var would charge a different amount than the user agreed to.
+      try {
+        await assertRazorpayPlanMatches(razorpay, planId, tier);
+      } catch (err) {
+        if (err.code === 'PLAN_MISMATCH') {
+          console.error('━'.repeat(60));
+          console.error(`[checkout] RAZORPAY PLAN MISMATCH — refusing to charge`);
+          console.error(`  tier:     ${err.tier}`);
+          console.error(`  planId:   ${err.planId}`);
+          console.error(`  expected: ${err.expected} paise (₹${err.expected/100})`);
+          console.error(`  actual:   ${JSON.stringify(err.actual)}`);
+          console.error(`  user:     ${req.user.email} (id ${req.user.id})`);
+          console.error(`  Action:   align ${RAZORPAY_PLAN_ENV[tier] || 'RAZORPAY_PLAN_ID'} on Railway with the in-app price.`);
+          console.error('━'.repeat(60));
+          return res.status(503).json({
+            error: `Pricing for ${tier.toUpperCase()} is misconfigured on the server. Please contact support — we don't want to charge you the wrong amount.`,
+          });
+        }
+        console.error(`[checkout] Razorpay plan lookup failed for ${planId}:`, err.message || err);
+        return res.status(503).json({
+          error: 'Pricing service is temporarily unavailable. Please try again in a moment.',
+        });
+      }
+
       const subscription = await razorpay.subscriptions.create({
         plan_id: planId,
         total_count: 12, // 12 months max
@@ -899,6 +1222,14 @@ router.get('/subscription', authMiddleware, async (req, res) => {
     const customerId = user.stripe_customer_id || '';
     const provider = customerId.startsWith('rzp_') ? 'razorpay' : customerId.startsWith('cus_') ? 'stripe' : null;
 
+    // Derive cancel-pending state from the canonical license.status the
+    // webhook handler sets ('canceling' = cancel_at_period_end=true and
+    // we're still inside the paid window). Surfacing the boolean and
+    // cycle-end timestamp lets the client render an explicit "Cancellation
+    // scheduled — access until <date>" banner and a Reactivate CTA without
+    // having to round-trip Stripe on every page load.
+    const isCancelPending = license.status === 'canceling';
+
     res.json({
       status: license.status,
       tier: license.tier,
@@ -906,10 +1237,73 @@ router.get('/subscription', authMiddleware, async (req, res) => {
       expires_at: license.expires_at,
       sessions_used: license.sessions_used,
       sessions_limit: license.sessions_limit,
+      cancel_at_period_end: isCancelPending,
+      cancels_at: isCancelPending ? license.expires_at : null,
     });
   } catch (err) {
     console.error('Subscription status error:', err.message);
     res.status(500).json({ error: 'Failed to check subscription' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  REACTIVATE — un-cancel a Stripe subscription before period end
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Counterpart to the Cancel-via-portal flow. Stripe lets us reverse a
+// pending cancellation by setting cancel_at_period_end=false on a sub
+// that's still inside its paid window. We mirror the local license back
+// to status='active' so the chat-header tier badge and ManageSubscription
+// UI flip immediately without waiting for the next webhook tick.
+router.post('/reactivate-subscription', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
+
+    const user = db.getUserById(req.user.id);
+    if (!user || !user.stripe_customer_id || !user.stripe_customer_id.startsWith('cus_')) {
+      return res.status(400).json({ error: 'No Stripe subscription on file. If you canceled and the period has ended, start a new subscription instead.' });
+    }
+
+    // Pick the most recent sub. If multiple are active (shouldn't happen
+    // with /upgrade-tier doing in-place swaps, but defensively), the
+    // newest is the one the user is currently being billed for.
+    const subs = await stripe.subscriptions.list({ customer: user.stripe_customer_id, status: 'all', limit: 5 });
+    const candidate = subs.data.find(s => s.status === 'active' && s.cancel_at_period_end === true);
+    if (!candidate) {
+      // Either nothing is canceling, or the period already ended.
+      return res.status(400).json({ error: 'No active subscription is scheduled to cancel. Nothing to reactivate.' });
+    }
+
+    const updated = await stripe.subscriptions.update(candidate.id, { cancel_at_period_end: false });
+
+    // Mirror local license back to 'active'. expires_at goes back to the
+    // grant default (-1 unlimited) since the sub will renew normally now.
+    // Strict tier resolution — never default to 'pro' on a missing
+    // metadata.tier (a stripe quirk could otherwise silently upgrade a
+    // Basic buyer). Fall through to the existing license tier if metadata
+    // is missing.
+    const safeTier = (t) => VALID_TIERS.includes(t) ? t : null;
+    const tier = safeTier(candidate.metadata?.tier) || safeTier(db.getLicenseByUserId(user.id)?.tier);
+    if (tier) {
+      const grant = grantConfigForTier(tier);
+      db.updateLicenseOnPayment(user.id, {
+        tier: grant.tier,
+        status: 'active',
+        expires_at: grant.expires_at,
+        sessions_limit: grant.sessions_limit,
+      });
+    }
+
+    const license = db.getLicenseByUserId(user.id);
+    res.json({
+      provider: 'stripe-reactivate',
+      tier,
+      license: license ? { ...license, last_validated: Date.now() } : null,
+      message: 'Subscription reactivated — your plan will continue to renew normally.',
+      stripe_subscription_id: updated.id,
+    });
+  } catch (err) {
+    console.error('[reactivate-subscription] error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to reactivate. Please try again.' });
   }
 });
 
@@ -1001,6 +1395,113 @@ router.post('/cancel-razorpay', authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error('Razorpay cancel error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to cancel subscription' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  UNIFIED CANCEL — Stripe + Razorpay
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Self-service cancel that works for both providers. Mirrors the
+// admin-initiated /admin/users/:id/cancel-subscription pattern (provider
+// auto-detected from stripe_customer_id prefix).
+//
+// Why this exists alongside /cancel-razorpay: the legacy /cancel-razorpay
+// route still works for older client builds, but new clients hit this
+// endpoint regardless of provider so we don't duplicate the cancel UI
+// per-provider on the client. For Stripe users, we previously delegated
+// the cancel itself to the Customer Portal (one-click but takes them out
+// of the app); a 2026 in-app cancel button matches what Claude/Cursor/
+// Spotify all do and recovers the ~30% of cancelers who change their
+// mind via the in-app Reactivate flow before the cycle ends.
+//
+// Both providers preserve access until the current billing period ends.
+// The license is flipped to status='canceling' here so the chat-header
+// tier badge and ManageSubscription banner update immediately, without
+// waiting for the webhook to land. The webhook will confirm/reconcile
+// on its own tick.
+router.post('/cancel-subscription', authMiddleware, async (req, res) => {
+  try {
+    const user = db.getUserById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const customerId = user.stripe_customer_id || '';
+    const isRazorpay = customerId.startsWith('rzp_');
+    const isStripe = customerId.startsWith('cus_');
+    if (!isRazorpay && !isStripe) {
+      return res.status(400).json({
+        error: 'No active subscription on file. If you signed up but never paid, there is nothing to cancel.',
+      });
+    }
+
+    let periodEndMs = null;
+    let providerLabel = null;
+    let subscriptionId = null;
+
+    if (isStripe) {
+      if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+      providerLabel = 'stripe';
+      // Pick the most recent active sub. With /upgrade-tier doing in-place
+      // swaps (instead of creating parallel subs) there should only be
+      // one — but defensively cancel them all if multiple exist.
+      const subs = await stripe.subscriptions.list({ customer: customerId, status: 'active', limit: 5 });
+      if (!subs.data.length) {
+        return res.status(404).json({ error: 'No active Stripe subscription found.' });
+      }
+      let latestPeriodEnd = 0;
+      for (const sub of subs.data) {
+        const updated = await stripe.subscriptions.update(sub.id, { cancel_at_period_end: true });
+        if (updated.current_period_end && updated.current_period_end > latestPeriodEnd) {
+          latestPeriodEnd = updated.current_period_end;
+        }
+        subscriptionId = sub.id; // last one wins, used purely for receipt/log
+      }
+      periodEndMs = latestPeriodEnd > 0 ? latestPeriodEnd * 1000 : null;
+    } else {
+      if (!razorpay) return res.status(503).json({ error: 'Razorpay not configured' });
+      providerLabel = 'razorpay';
+      subscriptionId = db.getLatestRazorpaySubscriptionId(user.id);
+      if (!subscriptionId) {
+        return res.status(404).json({ error: 'No active Razorpay subscription found.' });
+      }
+      // cancel_at_cycle_end=false in Razorpay's API means "cancel at next
+      // cycle boundary" (counter-intuitive — true would cancel immediately).
+      await razorpay.subscriptions.cancel(subscriptionId, false);
+      try {
+        const sub = await razorpay.subscriptions.fetch(subscriptionId);
+        if (sub && typeof sub.current_end === 'number' && sub.current_end > 0) {
+          periodEndMs = sub.current_end * 1000;
+        }
+      } catch (fetchErr) {
+        console.warn('[cancel-subscription] razorpay fetch failed:', fetchErr.message);
+      }
+    }
+
+    // Mirror the webhook's canceling-state mutation locally so the in-app
+    // UI flips immediately instead of waiting for the webhook tick. The
+    // webhook will reconcile if anything diverges.
+    let updatedLicense = null;
+    const license = db.getLicenseByUserId(user.id);
+    if (license && periodEndMs) {
+      db.updateLicenseOnPayment(user.id, {
+        tier: license.tier,
+        status: 'canceling',
+        expires_at: periodEndMs,
+        sessions_limit: license.sessions_limit,
+      });
+      updatedLicense = db.getLicenseByUserId(user.id);
+    }
+
+    res.json({
+      success: true,
+      provider: providerLabel,
+      subscription_id: subscriptionId,
+      cancels_at: periodEndMs,
+      message: 'Your subscription will be cancelled at the end of the current billing period. You keep full access until then — and you can reactivate any time before that date from the Manage subscription screen.',
+      license: updatedLicense ? { ...updatedLicense, last_validated: Date.now() } : null,
+    });
+  } catch (err) {
+    console.error('[cancel-subscription] error:', err.message);
     res.status(500).json({ error: err.message || 'Failed to cancel subscription' });
   }
 });

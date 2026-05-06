@@ -43,6 +43,7 @@ if (process.env.STRIPE_SECRET_KEY) {
 //    dependency; webhooks may run in a separate worker in the future). ──
 const VALID_TIERS = ['basic', 'pro', 'max'];
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+const BASIC_INITIAL_CREDIT_SECONDS = 3 * 3600; // 3 hours, matches "3 credits"
 
 // Strict: returns null for unknown/missing. Every money-granting path uses
 // this — the prior version defaulted to 'pro', which silently upgraded a
@@ -51,11 +52,31 @@ function resolveTier(t) {
   return VALID_TIERS.includes(t) ? t : null;
 }
 
+// Initial license values for a fresh tier grant. Includes the credits
+// fields so a Basic checkout seeds 3 hours of session time server-side
+// (was client-only in the legacy ledger; see the database.js migration
+// comment for why that didn't propagate across devices).
 function grantConfigForTier(tier) {
   if (tier === 'basic') {
-    return { tier: 'basic', sessions_limit: 3, expires_at: Date.now() + FOURTEEN_DAYS_MS };
+    const expires_at = Date.now() + FOURTEEN_DAYS_MS;
+    return {
+      tier: 'basic',
+      sessions_limit: 3,
+      expires_at,
+      credits_remaining_seconds: BASIC_INITIAL_CREDIT_SECONDS,
+      credits_expire_at: expires_at,
+    };
   }
-  return { tier, sessions_limit: -1, expires_at: -1 };
+  // Pro/Max: -1 sentinels mirror sessions_limit / expires_at convention
+  // ("unlimited"). The client's getCreditsRemainingSeconds reads tier===basic
+  // anyway and short-circuits Pro/Max to "unlimited time".
+  return {
+    tier,
+    sessions_limit: -1,
+    expires_at: -1,
+    credits_remaining_seconds: -1,
+    credits_expire_at: -1,
+  };
 }
 
 // Reverse-lookup: given a Razorpay plan_id, return the tier it represents.
@@ -270,12 +291,30 @@ async function handleStripeEvent(event) {
       }
       const grant = grantConfigForTier(tier);
 
-      const isActive = ['active', 'trialing'].includes(subscription.status);
+      const isActiveOrTrialing = ['active', 'trialing'].includes(subscription.status);
       const isCanceling = subscription.cancel_at_period_end;
+      const periodEndMs = (subscription.current_period_end || 0) * 1000;
 
-      console.log('[WEBHOOK] Subscription updated:', customerId, 'tier:', tier, 'status:', subscription.status);
+      console.log('[WEBHOOK] Subscription updated:', customerId, 'tier:', tier, 'status:', subscription.status, 'cancel_at_period_end:', isCanceling);
 
-      if (isActive && !isCanceling) {
+      if (isActiveOrTrialing && isCanceling) {
+        // Cancel-at-period-end: user clicked Cancel but cycle hasn't ended.
+        // Status flips to 'canceling' so the client can render an explicit
+        // "Cancellation scheduled — access until <date>" banner and offer a
+        // Reactivate button. expires_at = current_period_end so the timer
+        // is honest about when access actually ends.
+        db.updateUserTier(user.id, grant.tier);
+        db.updateLicenseOnPayment(user.id, {
+          tier: grant.tier,
+          status: 'canceling',
+          expires_at: periodEndMs > 0 ? periodEndMs : grant.expires_at,
+          sessions_limit: grant.sessions_limit,
+        });
+      } else if (isActiveOrTrialing) {
+        // Normal active sub — full grant. Also clears any prior 'canceling'
+        // state (covers the case where the user cancels then reactivates
+        // via the portal — Stripe flips cancel_at_period_end back to false
+        // and we should reflect that locally).
         db.updateUserTier(user.id, grant.tier);
         db.updateLicenseOnPayment(user.id, {
           tier: grant.tier,
@@ -283,20 +322,24 @@ async function handleStripeEvent(event) {
           expires_at: grant.expires_at,
           sessions_limit: grant.sessions_limit,
         });
-      } else if (isCanceling) {
-        // Will cancel at period end — keep the paid tier until then.
-        const periodEnd = subscription.current_period_end * 1000;
-        db.updateLicenseOnPayment(user.id, {
-          tier: grant.tier,
-          status: 'active',
-          expires_at: periodEnd,
-          sessions_limit: grant.sessions_limit,
-        });
-        console.log('[WEBHOOK] Subscription canceling at period end for:', user.email);
       } else if (subscription.status === 'past_due') {
         // Grace period — Stripe's dunning will retry. Do nothing to the
         // license until `canceled` or `unpaid` arrives.
         console.log('[WEBHOOK] Subscription past_due for:', user.email);
+      } else if (subscription.status === 'paused') {
+        // Stripe collection paused (manual pause via portal/API). Treat as
+        // a soft revoke — user keeps no access while the sub is paused,
+        // but the customer/sub records stay in Stripe so a future resume
+        // restores the relationship without a fresh signup. customer.subscription.resumed
+        // (handled below) flips this back to 'active'.
+        db.updateUserTier(user.id, 'free');
+        db.updateLicenseOnPayment(user.id, {
+          tier: 'free',
+          status: 'paused',
+          expires_at: Date.now(),
+          sessions_limit: 5,
+        });
+        console.log('[WEBHOOK] Subscription paused for:', user.email);
       } else if (['canceled', 'unpaid'].includes(subscription.status)) {
         db.updateUserTier(user.id, 'free');
         db.updateLicenseOnPayment(user.id, {
@@ -305,7 +348,75 @@ async function handleStripeEvent(event) {
           expires_at: Date.now(),
           sessions_limit: 5,
         });
+      } else if (subscription.status === 'incomplete_expired') {
+        // First payment never succeeded; subscription is dead. The user
+        // never received a license for this sub, so this is purely a
+        // logging hook — no DB write needed. Without this branch the
+        // event would silently fall through (which is what we want
+        // behaviourally) but we'd lose the audit trail.
+        console.log('[WEBHOOK] Subscription incomplete_expired for:', user.email, '— never granted, no-op');
+      } else if (subscription.status === 'incomplete') {
+        // Initial sub state, before first payment confirms. We don't grant
+        // anything from this event (checkout.session.completed is the
+        // grant trigger). Just log so we can correlate failed signups.
+        console.log('[WEBHOOK] Subscription incomplete for:', user.email);
       }
+      return;
+    }
+
+    case 'customer.subscription.paused': {
+      // Dedicated event some Stripe configs send instead of (or alongside)
+      // subscription.updated with status='paused'. Same revoke behavior.
+      const subscription = event.data.object;
+      const d = db.getDB();
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(subscription.customer);
+      if (!user) return;
+      db.updateUserTier(user.id, 'free');
+      db.updateLicenseOnPayment(user.id, {
+        tier: 'free',
+        status: 'paused',
+        expires_at: Date.now(),
+        sessions_limit: 5,
+      });
+      console.log('[WEBHOOK] customer.subscription.paused for:', user.email);
+      return;
+    }
+
+    case 'customer.subscription.resumed': {
+      // Counterpart to .paused — restore the tier the metadata says this
+      // sub was for. Mirrors the active branch in subscription.updated.
+      const subscription = event.data.object;
+      const tier = resolveTier(subscription.metadata?.tier);
+      const d = db.getDB();
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(subscription.customer);
+      if (!user || !tier) return;
+      const grant = grantConfigForTier(tier);
+      db.updateUserTier(user.id, grant.tier);
+      db.updateLicenseOnPayment(user.id, {
+        tier: grant.tier,
+        status: 'active',
+        expires_at: grant.expires_at,
+        sessions_limit: grant.sessions_limit,
+      });
+      console.log('[WEBHOOK] customer.subscription.resumed for:', user.email, 'restored tier:', grant.tier);
+      return;
+    }
+
+    case 'invoice.payment_action_required': {
+      // 3DS / SCA challenge needed before Stripe can collect. The retry
+      // window is short (Stripe typically gives a few hours). Notify the
+      // user immediately so they can complete the challenge in time.
+      const invoice = event.data.object;
+      const d = db.getDB();
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(invoice.customer);
+      if (!user) return;
+      const license = db.getLicenseByUserId(user.id);
+      await notifyPaymentFailed({
+        user,
+        tier: license?.tier,
+        reason: 'Your card requires extra verification (3D Secure). Please open your billing portal and confirm the charge to keep your subscription active.',
+      });
+      console.log('[WEBHOOK] payment_action_required notified:', user.email);
       return;
     }
 
@@ -471,6 +582,65 @@ async function handleStripeEvent(event) {
         sessions_limit: 5,
       });
       console.log('[WEBHOOK] Dispute — user downgraded to free:', user.email, 'reason:', dispute.reason);
+      return;
+    }
+
+    case 'charge.dispute.closed': {
+      // Dispute resolved. If WE won (status='won'), the user filed
+      // illegitimately — keep them on free, no restoration. If we LOST
+      // ('lost'), we already revoked in .created, no extra action.
+      // If status='warning_closed' or the merchant accepted the dispute,
+      // also no restoration needed. The interesting case is when a
+      // dispute is REVERSED in our favor after we'd already revoked —
+      // that's still 'won', and we restore the user's tier so they don't
+      // lose access from a malicious chargeback that they later withdrew.
+      const dispute = event.data.object;
+      if (dispute.status !== 'won') {
+        console.log('[WEBHOOK] charge.dispute.closed not won — no action:', dispute.id, dispute.status);
+        return;
+      }
+      const d = db.getDB();
+      let user = dispute.customer
+        ? d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(dispute.customer)
+        : null;
+      if (!user && dispute.charge && stripe) {
+        try {
+          const charge = await stripe.charges.retrieve(dispute.charge);
+          if (charge && charge.customer) {
+            user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(charge.customer);
+          }
+        } catch (err) {
+          console.error('[WEBHOOK] dispute.closed: could not resolve charge', dispute.charge, err.message);
+        }
+      }
+      if (!user) return;
+      // Restore the tier from the user's most recent paid subscription.
+      // We can't read it from the dispute payload directly — query Stripe
+      // for any active subscription on this customer. If they have no
+      // active sub (e.g. it was canceled while disputed), we leave them on
+      // free; they can resubscribe.
+      let restoredTier = null;
+      try {
+        const subs = await stripe.subscriptions.list({ customer: dispute.customer || user.stripe_customer_id, status: 'active', limit: 1 });
+        if (subs.data.length > 0) {
+          restoredTier = resolveTier(subs.data[0].metadata?.tier);
+        }
+      } catch (err) {
+        console.error('[WEBHOOK] dispute.closed: could not list subs:', err.message);
+      }
+      if (!restoredTier) {
+        console.log('[WEBHOOK] dispute.closed won but no active sub to restore for:', user.email);
+        return;
+      }
+      const grant = grantConfigForTier(restoredTier);
+      db.updateUserTier(user.id, grant.tier);
+      db.updateLicenseOnPayment(user.id, {
+        tier: grant.tier,
+        status: 'active',
+        expires_at: grant.expires_at,
+        sessions_limit: grant.sessions_limit,
+      });
+      console.log('[WEBHOOK] Dispute won — restored tier for:', user.email, 'tier:', restoredTier);
       return;
     }
 

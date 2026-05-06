@@ -17,6 +17,7 @@ const webhookRoutes = require('./routes/webhooks');
 const adminRoutes = require('./routes/admin');
 const aiRoutes = require('./routes/ai');
 const conversationRoutes = require('./routes/conversations');
+const downloadRoutes = require('./routes/downloads');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -278,6 +279,10 @@ app.use('/api/v1/license', licenseRoutes);
 app.use('/api/v1/admin', adminRoutes);
 app.use('/api/v1/ai', aiRoutes);
 app.use('/api/v1/conversations', conversationRoutes);
+// Public download redirects mounted at root — explicit per-platform paths
+// inside the router (no /:platform catch-all) so unmatched paths still
+// fall through to the 404 handler below. Reachable on get.minicaai.com.
+app.use(downloadRoutes);
 
 // ── Health check ──
 app.get('/api/health', (req, res) => {
@@ -323,16 +328,18 @@ const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 // pointing at a version that doesn't have a GitHub release yet would make
 // every client see an "update available" prompt for a phantom release.
 const FALLBACK_VERSION = {
-  version: '3.4.6',
+  version: '3.4.9',
   minVersion: '2.0.0',
-  releaseDate: '2026-04-27',
-  releaseNotes: 'Stability and polish improvements.',
+  releaseDate: '2026-05-05',
+  releaseNotes: 'Subscription management improvements: in-app cancel and reactivate, refund policy modal, and signed Windows installer (no more SmartScreen warnings).',
   downloadUrl: {
-    windows: 'https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe',
-    // x64 DMG works on all Macs (Apple Silicon runs it under Rosetta). When
-    // we add per-arch detection client-side we can offer arm64 directly.
-    mac: 'https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac-x64.dmg',
-    linux: 'https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage',
+    // Routed through get.minicaai.com → 302 → GitHub release CDN. Keeps the
+    // codename out of any URL the client receives and surfaces in browser
+    // address bars / notifications. The /dl handler at routes/downloads.js
+    // owns the actual GitHub release URL.
+    windows: 'https://get.minicaai.com/windows',
+    mac: 'https://get.minicaai.com/mac',
+    linux: 'https://get.minicaai.com/linux',
   },
 };
 

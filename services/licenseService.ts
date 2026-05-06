@@ -12,10 +12,13 @@
 //    full-experience trial on first signup (acts as Basic-level features
 //    for that window) — time-gated by trial_remaining_seconds.
 //  - Basic: $25 for 3 credits (3 hours of live-session time),
-//    14-day expiry, all models, stealth, Auto-Solve. No Auto-Type.
-//    Renewal $6.99/credit. Time-gated by credits_remaining_seconds.
-//  - Pro: unlimited time, all models, most features (no Auto-Type).
-//  - Max: Pro + Auto-Type (Max-exclusive).
+//    14-day expiry, four models (Gemini, GPT, Grok, Llama — NO Claude),
+//    stealth, Auto-Solve. No Auto-Type. Renewal $6.99/credit.
+//    Time-gated by credits_remaining_seconds.
+//  - Pro: unlimited time, four models (same set as Basic — NO Claude),
+//    all features except Auto-Type and Claude.
+//  - Max: Pro + Claude Sonnet 4.6 + Auto-Type + Train Model — the only
+//    tier with all five models.
 //
 //  CREDITS vs TIME:
 //  Credits are a display abstraction — internally we track seconds.
@@ -26,7 +29,19 @@ export interface LicenseData {
   key: string;
   email: string;
   tier: 'free' | 'basic' | 'pro' | 'max';
-  status: 'active' | 'expired' | 'revoked' | 'trial';
+  // Status values mirror what the server's webhook handlers + license
+  // routes write into the licenses table. Keep this union exhaustive — a
+  // missing value here would render as 'Unknown' in the billing UI's
+  // STATUS_LABEL fallback.
+  //   active    — paying customer, sub will renew
+  //   canceling — cancel-at-period-end set; still has access until expires_at
+  //   trial     — Free user inside the 30-min trial window
+  //   expired   — sub ended (cycle close, unpaid, or natural completion)
+  //   revoked   — admin revoked or hard ban
+  //   paused    — Stripe collection paused (rare; soft revoke)
+  //   refunded  — full refund issued; access revoked
+  //   disputed  — chargeback opened; access revoked pending dispute outcome
+  status: 'active' | 'canceling' | 'trial' | 'expired' | 'revoked' | 'paused' | 'refunded' | 'disputed';
   country_code: string;
   device_id: string;
   activated_at: number;
@@ -153,7 +168,7 @@ class LicenseService {
   // Server base URL. Both renderer (Vite/Electron at localhost) and the
   // packaged Electron build hit the same Railway-hosted backend — there's
   // no separate dev origin to switch to here, so the URL is fixed.
-  private API_BASE = 'https://h2so4-production.up.railway.app';
+  private API_BASE = 'https://api.minicaai.com';
 
   // ── Device Fingerprint ──
   async getDeviceId(): Promise<string> {
@@ -321,10 +336,19 @@ class LicenseService {
   }
 
   // ── License validation ──
+  // 'canceling' is INTENTIONALLY treated as valid here — the user clicked
+  // Cancel but still has access until expires_at. The expires_at check
+  // below catches the moment access actually ends. Without this carve-out
+  // the client would lock the user out the instant they hit Cancel,
+  // which contradicts the explicit "you keep access until <date>" copy
+  // shown in ManageSubscription.
   isLicenseValid(license: LicenseData | null): boolean {
     if (!license) return false;
     if (license.status === 'revoked') return false;
     if (license.status === 'expired') return false;
+    if (license.status === 'paused') return false;
+    if (license.status === 'refunded') return false;
+    if (license.status === 'disputed') return false;
     if (license.expires_at > 0 && Date.now() > license.expires_at) return false;
     return true;
   }
@@ -716,6 +740,39 @@ class LicenseService {
         if (updatedLicense.tier !== 'free') {
           delete (updatedLicense as any).trial_remaining_seconds;
         }
+      } else if (license.tier === 'basic' && serverData.tier === 'basic') {
+        // ── Cross-device renewal-credit propagation ──
+        // The server's grantBasicRenewal extends the license's expires_at
+        // by exactly 1h on each renewal payment. We use that delta as a
+        // change-detection signal: when the server's expires_at moves
+        // forward by ~1h since our last sync, a renewal payment landed
+        // somewhere (browser, another device, even the system browser
+        // launched from Electron). Apply +3600s to the local ledger so
+        // the renewal credits land regardless of which device/window
+        // handled the payment-success URL.
+        //
+        // Idempotent: after we apply the credit, we save the new
+        // expires_at into local state. The NEXT validate compares the
+        // already-synced value with the server's same value → delta=0
+        // → no re-grant. Without consumption tracking this is the
+        // cleanest event-based propagation we can do.
+        const oldExpires = license.expires_at || 0;
+        const newExpires = serverData.expires_at || 0;
+        const ONE_HOUR_MS = 60 * 60 * 1000;
+        const deltaMs = newExpires - oldExpires;
+        if (deltaMs >= 0.5 * ONE_HOUR_MS && deltaMs <= 1.5 * ONE_HOUR_MS) {
+          // Renewal-shaped delta. Add 1h of credit time + extend the
+          // credit window. We only treat 30-90min deltas as renewals;
+          // bigger deltas are full Basic grants (handled by tierChanged
+          // when applicable) or unusual states we leave alone.
+          const ONE_HOUR_S = 3600;
+          const existingCredits = updatedLicense.credits_remaining_seconds ?? 0;
+          updatedLicense = {
+            ...updatedLicense,
+            credits_remaining_seconds: existingCredits + ONE_HOUR_S,
+            credits_expire_at: newExpires,
+          };
+        }
       }
 
       const user = this.loadAuth().user;
@@ -757,6 +814,70 @@ class LicenseService {
 
   getApiBase(): string {
     return this.API_BASE;
+  }
+
+  // ── Profile update ──
+  // Wraps PUT /api/v1/auth/profile. Server validates name (1-100 chars) and
+  // country_code (/^[A-Z]{2}$/). On success, mirrors the new user record into
+  // localStorage so every consumer (tier badge, account sheet, AI prompts
+  // that interpolate the name) sees the change without a round-trip through
+  // /me. Throws on network/validation failure so the caller can surface the
+  // error inline instead of a silent no-op.
+  //
+  // We deliberately don't accept country_code here — the existing /profile
+  // endpoint allows it, but exposing it client-side would let users swap
+  // their billing region to whichever currency is cheapest. The server's
+  // /create-checkout already ignores body.country_code in favor of the JWT
+  // value (see payments.js comment), so the abuse vector is contained, but
+  // we don't open the door on this surface either.
+  async updateProfile(updates: { name?: string }): Promise<UserProfile> {
+    const token = this.getToken();
+    if (!token) throw new Error('Not signed in');
+
+    const body: Record<string, string> = {};
+    if (typeof updates.name === 'string') {
+      const trimmed = updates.name.trim();
+      if (trimmed.length === 0) throw new Error('Name cannot be empty');
+      if (trimmed.length > 100) throw new Error('Name must be 100 characters or fewer');
+      body.name = trimmed;
+    }
+    if (Object.keys(body).length === 0) {
+      throw new Error('No changes to save');
+    }
+
+    const response = await fetch(`${this.API_BASE}/api/v1/auth/profile`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ error: 'Profile update failed' }));
+      throw new Error(err.error || 'Profile update failed');
+    }
+    const data = await response.json();
+    if (!data.user) throw new Error('Profile update returned no user');
+
+    // Merge into local state. Preserve fields the server doesn't echo
+    // (is_admin is computed server-side at /me time, not on /profile).
+    const { user: prevUser, license: prevLicense } = this.loadAuth();
+    const mergedUser: UserProfile = {
+      ...(prevUser || {} as UserProfile),
+      ...data.user,
+    };
+    if (prevLicense) {
+      this.saveAuth(mergedUser, prevLicense);
+    } else {
+      // No license yet (shouldn't happen post-auth but defensive). Persist
+      // the user portion only by writing through saveAuth's user key
+      // directly via a synthetic call — the AUTH_KEY/STORAGE_KEY pair is
+      // intended to be written together, but a missing license is a
+      // recoverable state the next /validate call will repair.
+      try { localStorage.setItem('minicaai_auth', JSON.stringify(mergedUser)); } catch {}
+    }
+    return mergedUser;
   }
 }
 

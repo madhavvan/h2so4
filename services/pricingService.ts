@@ -74,9 +74,14 @@ const BASE_FEATURES_FREE = [
   'Community support',
 ];
 
+// Model lists per tier — single source of truth so feature strings stay
+// in sync with services/licenseService.ts FEATURE_GATES.models. Saying
+// "All AI models" + listing 4 was the long-running copy bug ("for all
+// models" appeared on Pro CTAs/badges even though Claude is Max-only).
+// Spelling out the actual model count keeps marketing copy honest.
 const BASE_FEATURES_BASIC = [
   '3 interview credits (3 hours total)',
-  'All AI models (Gemini, GPT, Groq, Grok)',
+  'Four AI models — Gemini, GPT-5.5, Grok, Llama',
   'Pop-out stealth mode',
   'Auto-solve with screen analysis',
   'Resume & JD context upload',
@@ -87,7 +92,7 @@ const BASE_FEATURES_BASIC = [
 
 const BASE_FEATURES_PRO = [
   'Unlimited interview sessions',
-  'All AI models (Gemini, GPT, Groq, Grok)',
+  'Four AI models — Gemini, GPT-5.5, Grok, Llama',
   'System audio capture',
   'Auto-solve with screen analysis',
   'Resume & JD context upload',
@@ -98,8 +103,10 @@ const BASE_FEATURES_PRO = [
 
 const BASE_FEATURES_MAX = [
   'Everything in Pro',
-  'Auto-Type into any editor (HackerRank, CoderPad, etc.)',
+  'Claude Sonnet 4.6 with hosted web search — Max-only',
+  'Auto-Type into any editor (HackerRank, CoderPad, LeetCode)',
   'Human-like typing rhythm & indent handling',
+  'Train Model — pre-research the role before your interview',
   'No copy-paste detection',
   'Priority support',
 ];

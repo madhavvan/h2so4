@@ -142,7 +142,13 @@ class GeoService {
     });
   }
 
-  // Full security check — returns whether access should be blocked
+  // Geo lookup — never blocks. We're a global product; treating ipapi.co's
+  // proxy/hosting flags as gating signals locks out huge swaths of legit
+  // residential users (Indian Jio/Airtel CGNAT, EU mobile carriers, anyone
+  // on a "hosting"-classified ISP block, anyone whose timezone disagrees
+  // with their VPN-resolved country at ipapi). Geo is now used purely for
+  // pricing-region routing (US/IN); the `allowed` field stays in the shape
+  // for backwards compatibility with callers but is always true.
   async performSecurityCheck(): Promise<{
     allowed: boolean;
     country_code: string;
@@ -150,28 +156,6 @@ class GeoService {
     geo: GeoData;
   }> {
     const geo = await this.detectLocation();
-
-    // High threat — block immediately
-    if (geo.threat_level === 'high') {
-      return {
-        allowed: false,
-        country_code: geo.country_code,
-        reason: 'Connection flagged as high-risk proxy/VPN. Please disable VPN and try again.',
-        geo,
-      };
-    }
-
-    // Medium threat — allow with warning (timezone mismatch alone isn't definitive)
-    if (geo.threat_level === 'medium') {
-      // Still allow but flag for server-side verification
-      return {
-        allowed: true,
-        country_code: geo.country_code,
-        reason: 'partial_vpn_detected',
-        geo,
-      };
-    }
-
     return { allowed: true, country_code: geo.country_code, geo };
   }
 }

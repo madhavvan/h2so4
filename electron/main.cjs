@@ -207,15 +207,42 @@ function createPopoutWindow(options = {}) {
     return;
   }
 
-  const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
-  const popW = options.width || 450;
-  const popH = options.height || 700;
+  // Multi-monitor + DPI-aware default position. Centers on whichever
+  // display the user's cursor is currently on, clamped to that display's
+  // work area so the popout can never spawn off-screen.
+  //
+  // Why this changed from "anchor to bottom-right of primary display":
+  // the old math (`screenH - popH - 30` against `workAreaSize`) silently
+  // produced a NEGATIVE y on high-DPI laptops — Windows reports
+  // workAreaSize in logical pixels, which on a 1366x768 laptop at 150%
+  // scale is roughly 911x466. With popH=700 the y came out at
+  // 466 - 700 - 30 = -264, putting the popout above the visible region.
+  // Users saw the popout "open hidden / off the top of the screen."
+  //
+  // Centering on the cursor's display + Math.min clamps avoids both the
+  // negative-y bug AND the multi-monitor case where the popout would
+  // open on the primary even though the user is on a secondary screen.
+  // workArea origin can be non-zero on multi-monitor — always offset by
+  // wa.x / wa.y, never assume (0,0) is the top-left of the target display.
+  //
+  // Stealth properties (setContentProtection, focusable=false, alwaysOnTop,
+  // skipTaskbar, transparent, etc.) are independent of position — moving
+  // the spawn point from corner to center does NOT affect screen-share
+  // invisibility. The OS-level content-protection flag still excludes
+  // this HWND from capture APIs regardless of where it sits.
+  const cursorPt = screen.getCursorScreenPoint();
+  const targetDisplay = screen.getDisplayNearestPoint(cursorPt);
+  const wa = targetDisplay.workArea; // { x, y, width, height }
+  const popW = Math.min(options.width || 450, wa.width);
+  const popH = Math.min(options.height || 700, wa.height);
+  const popX = wa.x + Math.round((wa.width  - popW) / 2);
+  const popY = wa.y + Math.round((wa.height - popH) / 2);
 
   popoutWindow = new BrowserWindow({
     width: popW,
     height: popH,
-    x: screenW - popW - 30,
-    y: screenH - popH - 30,
+    x: popX,
+    y: popY,
     minWidth: 320,
     minHeight: 400,
     maxWidth: 800,
@@ -1455,7 +1482,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     try {
       const snapText = uiaSnapshotBefore.text || '';
       const cursorOff = uiaSnapshotBefore.cursorOffset || 0;
-      const planRes = await fetch('https://h2so4-production.up.railway.app/api/v1/ai/autotype-plan', {
+      const planRes = await fetch('https://api.minicaai.com/api/v1/ai/autotype-plan', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

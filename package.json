@@ -1,7 +1,7 @@
 {
   "name": "interview-copilot-ai",
   "private": true,
-  "version": "3.4.8",
+  "version": "3.4.9",
   "description": "AI-powered real-time interview assistant",
   "author": {
     "name": "Interview Copilot",
@@ -68,7 +68,13 @@
       "target": "nsis",
       "icon": "build/icon.ico",
       "artifactName": "InterviewCopilot-Setup.${ext}",
-      "verifyUpdateCodeSignature": false
+      "verifyUpdateCodeSignature": false,
+      "azureSignOptions": {
+        "endpoint": "https://eus.codesigning.azure.net/",
+        "codeSigningAccountName": "minica-signing-4729",
+        "certificateProfileName": "minicaai-prod",
+        "publisherName": "Venu Madhav Pentala"
+      }
     },
     "nsis": {
       "oneClick": true,

@@ -262,6 +262,30 @@ function getDB() {
     db.exec("UPDATE licenses SET trial_granted_at = activated_at WHERE tier = 'free' AND trial_granted_at = 0");
   }
 
+  // ── Server-tracked credits for the Basic tier ──
+  // Previously credits_remaining_seconds was a CLIENT-only ledger written to
+  // localStorage. That broke the cross-device renewal case: a user who paid
+  // for a Basic +1h renewal on one device (or via the system browser opened
+  // from Electron) saw the credit land in that device's localStorage only —
+  // their Electron app's separate storage never picked it up. Money charged,
+  // no time added on the device the user actually wanted to use. Tracking
+  // server-side and echoing on /validate fixes the propagation cleanly.
+  //
+  // For existing Basic users at migration time, we backfill from the
+  // session count: 1 unused session ≈ 1h. That's an approximation but
+  // matches the original "3 credits = 3 hours" intent. Pro/Max get -1
+  // (unlimited sentinel; mirrors sessions_limit/-expires_at convention).
+  if (!licenseCols.find(c => c.name === 'credits_remaining_seconds')) {
+    db.exec('ALTER TABLE licenses ADD COLUMN credits_remaining_seconds INTEGER DEFAULT 0');
+    db.exec("UPDATE licenses SET credits_remaining_seconds = -1 WHERE tier IN ('pro', 'max')");
+    db.exec("UPDATE licenses SET credits_remaining_seconds = MAX(0, (sessions_limit - sessions_used)) * 3600 WHERE tier = 'basic' AND credits_remaining_seconds = 0");
+  }
+  if (!licenseCols.find(c => c.name === 'credits_expire_at')) {
+    db.exec('ALTER TABLE licenses ADD COLUMN credits_expire_at INTEGER DEFAULT 0');
+    db.exec("UPDATE licenses SET credits_expire_at = -1 WHERE tier IN ('pro', 'max')");
+    db.exec("UPDATE licenses SET credits_expire_at = expires_at WHERE tier = 'basic' AND credits_expire_at = 0 AND expires_at > 0");
+  }
+
   // Defense-in-depth against the /verify-razorpay ↔ payment.captured race:
   // both paths grant the same payment if they both see "no row yet" between
   // their dedup check and their transaction. The in-transaction re-check
@@ -552,10 +576,24 @@ function updateLicenseStatus(licenseKey, status) {
   getDB().prepare('UPDATE licenses SET status = ? WHERE key = ?').run(status, licenseKey);
 }
 
-function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_limit }) {
-  getDB().prepare(`
-    UPDATE licenses SET tier = ?, status = ?, expires_at = ?, sessions_limit = ? WHERE user_id = ?
-  `).run(tier, status, expires_at, sessions_limit, userId);
+// Updates the license row on payment. Optional credits_remaining_seconds /
+// credits_expire_at are server-tracked so renewal grants propagate across
+// devices. Callers that don't care about credits (e.g. the cancel-razorpay
+// path that just pins expires_at) can omit them and the existing values
+// stay in place via COALESCE on the UPDATE side.
+function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_limit, credits_remaining_seconds, credits_expire_at }) {
+  const sets = ['tier = ?', 'status = ?', 'expires_at = ?', 'sessions_limit = ?'];
+  const args = [tier, status, expires_at, sessions_limit];
+  if (credits_remaining_seconds !== undefined) {
+    sets.push('credits_remaining_seconds = ?');
+    args.push(credits_remaining_seconds);
+  }
+  if (credits_expire_at !== undefined) {
+    sets.push('credits_expire_at = ?');
+    args.push(credits_expire_at);
+  }
+  args.push(userId);
+  getDB().prepare(`UPDATE licenses SET ${sets.join(', ')} WHERE user_id = ?`).run(...args);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1013,27 +1051,47 @@ function grantBasicRenewal(userId) {
   if (!license) return null;
 
   const ONE_HOUR_MS = 60 * 60 * 1000;
+  const ONE_HOUR_S = 3600;
   let newLimit;
   let newExpiresAt;
   let newTier = 'basic';
+  let newCreditsRemaining;
+  let newCreditsExpireAt;
 
   if (license.sessions_limit === -1 || license.expires_at === -1) {
-    // Pro/Max — leave unlimited values alone, just re-affirm active.
+    // Pro/Max — leave unlimited values alone, just re-affirm active. This
+    // branch is unreachable now that /create-renewal gates by tier='basic'
+    // (Pro/Max can't pay for a renewal in the first place), but kept as
+    // defense-in-depth so a legacy webhook re-running an old payment can't
+    // overwrite an unlimited license with a 1-hour bucket.
     newTier = license.tier;
     newLimit = license.sessions_limit;
     newExpiresAt = license.expires_at;
+    newCreditsRemaining = license.credits_remaining_seconds;
+    newCreditsExpireAt = license.credits_expire_at;
   } else {
     newLimit = (license.sessions_limit || 0) + 1;
     // Anchor from whichever is later: now, or the existing expiry. Then
-    // add 1h. An already-expired license starts its new 1h from now;
-    // a still-valid one gets its expiry pushed out by 1h.
+    // add 1h. An already-expired license starts its new 1h from now; a
+    // still-valid one gets its expiry pushed out by 1h.
     const base = Math.max(Date.now(), license.expires_at || 0);
     newExpiresAt = base + ONE_HOUR_MS;
+    // Credit time top-up. If the previous credit window already expired,
+    // start fresh from 0 (don't carry over stale time the user couldn't
+    // have used anyway). Otherwise stack on top of the existing balance.
+    const creditsValid = (license.credits_expire_at || 0) > Date.now();
+    const existingCredits = creditsValid ? (license.credits_remaining_seconds || 0) : 0;
+    newCreditsRemaining = existingCredits + ONE_HOUR_S;
+    newCreditsExpireAt = newExpiresAt;
   }
 
   getDB().prepare(`
-    UPDATE licenses SET tier = ?, status = 'active', expires_at = ?, sessions_limit = ? WHERE user_id = ?
-  `).run(newTier, newExpiresAt, newLimit, userId);
+    UPDATE licenses SET
+      tier = ?, status = 'active',
+      expires_at = ?, sessions_limit = ?,
+      credits_remaining_seconds = ?, credits_expire_at = ?
+    WHERE user_id = ?
+  `).run(newTier, newExpiresAt, newLimit, newCreditsRemaining, newCreditsExpireAt, userId);
   return getLicenseByUserId(userId);
 }
 

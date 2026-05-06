@@ -21,21 +21,29 @@
 
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
-  X, Crown, Zap, Check, Loader2, ExternalLink, AlertTriangle,
+  X, Crown, Zap, Sparkles, Check, Loader2, ExternalLink, AlertTriangle,
   Cpu, ChevronRight, Info, ShieldCheck, UploadCloud,
 } from 'lucide-react';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
 import { backfillAllConversations, BackfillProgress } from './services/aiProxyService';
+import { RefundPolicy } from './RefundPolicy';
 
-const API_BASE = 'https://h2so4-production.up.railway.app';
+const API_BASE = 'https://api.minicaai.com';
 
 interface SubscriptionStatus {
-  status: 'active' | 'trial' | 'expired' | 'revoked' | 'none';
+  status: 'active' | 'canceling' | 'trial' | 'expired' | 'revoked' | 'paused' | 'refunded' | 'disputed' | 'none';
   tier: 'free' | 'basic' | 'pro' | 'max';
   provider: 'stripe' | 'razorpay' | null;
   expires_at: number;
   sessions_used: number;
   sessions_limit: number;
+  // Surfaced by the server when a Stripe sub has cancel_at_period_end=true
+  // AND we're still inside the paid window. Lets the UI render an explicit
+  // "Cancellation scheduled — keep access until <date>" banner with a
+  // Reactivate CTA so users don't lose retention to a confused mis-read of
+  // an "Active" badge that's actually scheduled to end.
+  cancel_at_period_end?: boolean;
+  cancels_at?: number | null;
 }
 
 interface ManageSubscriptionProps {
@@ -46,6 +54,22 @@ interface ManageSubscriptionProps {
   // Triggers the existing upgrade flow (re-uses SubscriptionGate's checkout
   // path so we don't duplicate Razorpay/Stripe SDK plumbing).
   onUpgradeRequested: (targetTier: 'basic' | 'pro' | 'max') => void;
+  // Optional callback fired after the user successfully edits their
+  // profile here (display name) so MainApp can keep its userProfile state
+  // in sync without a separate fetch. licenseService already mirrors the
+  // change into localStorage; this just lets the in-memory React state
+  // catch up immediately so tier badges and AI prompts pick up the new
+  // name without a relaunch.
+  onProfileUpdated?: (user: UserProfile) => void;
+  // Optional callback fired after an in-place tier swap or self-cancel
+  // here. The server returns the new license inline; without surfacing it
+  // to the parent, the chat-header tier badge would keep showing the old
+  // tier until next reload. Pairs with onProfileUpdated.
+  onLicenseUpdated?: (license: LicenseData) => void;
+  // Basic +1h top-up. Optional so older callers don't break — when not
+  // provided, the Renew row is hidden and Basic users are pointed at the
+  // credit-exhausted modal's renew button instead.
+  onRenewRequested?: () => void;
 }
 
 const TIER_INFO: Record<string, {
@@ -67,30 +91,46 @@ const TIER_INFO: Record<string, {
     color: 'text-emerald-400',
     gradient: 'from-emerald-600/40 to-emerald-800/40',
     icon: Zap,
-    blurb: 'Time-credited access to all models except Claude.',
+    blurb: 'Time-credited access to four models. Renewable.',
   },
   pro: {
     label: 'Pro',
     color: 'text-blue-400',
     gradient: 'from-blue-600/50 to-purple-700/50',
     icon: Crown,
-    blurb: 'Unlimited time, all models except Claude. Pop-out + Auto-Solve.',
+    blurb: 'Unlimited time on Gemini, GPT-5.5, Grok, and Groq. Pop-out + Auto-Solve.',
   },
   max: {
+    // Sparkles (not Crown) is the only Max-vs-Pro visual differentiation —
+    // both stay in the existing amber-orange-purple gradient language so
+    // the in-app surface stays consistent with the chat-header Max chip
+    // and the popout Max chip. The cream/gold dialect from the marketing
+    // surface (SubscriptionGate) stays out of the in-app surfaces — see
+    // the comment block at the top of index.html for the rationale.
     label: 'Max',
     color: 'text-amber-400',
     gradient: 'from-amber-600/40 via-orange-600/40 to-purple-700/40',
-    icon: Crown,
-    blurb: 'Everything + Claude Sonnet 4.6 + Auto-Type + Train Model.',
+    icon: Sparkles,
+    blurb: 'Everything in Pro · plus Claude Sonnet 4.6, Auto-Type, and Train Model.',
   },
 };
 
 const STATUS_LABEL: Record<string, { text: string; color: string }> = {
-  active:  { text: 'Active',          color: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' },
-  trial:   { text: 'Trial',           color: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30' },
-  expired: { text: 'Expired',         color: 'bg-red-500/15 text-red-300 border-red-500/30' },
-  revoked: { text: 'Revoked',         color: 'bg-red-500/15 text-red-300 border-red-500/30' },
-  none:    { text: 'No subscription', color: 'bg-gray-500/15 text-gray-300 border-gray-500/30' },
+  active:    { text: 'Active',                color: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' },
+  trial:     { text: 'Trial',                 color: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30' },
+  // Cancel-at-period-end set on Stripe; user still inside paid window.
+  // Amber instead of green/red to read as "scheduled to end" — neither
+  // healthy nor dead — and to draw the eye to the Reactivate CTA below.
+  canceling: { text: 'Cancellation scheduled', color: 'bg-amber-500/15 text-amber-300 border-amber-500/30' },
+  expired:   { text: 'Expired',               color: 'bg-red-500/15 text-red-300 border-red-500/30' },
+  revoked:   { text: 'Revoked',               color: 'bg-red-500/15 text-red-300 border-red-500/30' },
+  // Stripe collection paused — soft revoke, can be resumed.
+  paused:    { text: 'Paused',                color: 'bg-gray-500/15 text-gray-300 border-gray-500/30' },
+  // Webhook from charge.refunded (full refund) — terminal until resub.
+  refunded:  { text: 'Refunded',              color: 'bg-red-500/15 text-red-300 border-red-500/30' },
+  // Webhook from charge.dispute.created — pending dispute outcome.
+  disputed:  { text: 'Disputed',              color: 'bg-red-500/15 text-red-300 border-red-500/30' },
+  none:      { text: 'No subscription',       color: 'bg-gray-500/15 text-gray-300 border-gray-500/30' },
 };
 
 function formatExpiry(expiresAt: number): string {
@@ -113,10 +153,22 @@ function formatCredits(seconds: number | undefined): string {
   return `${m} minutes`;
 }
 
+// Trial budgets are at most 30 minutes (TIME_CONSTANTS.TRIAL_SECONDS), so
+// hours are never relevant — we want a "Xm Ys" readout that lets a Free
+// user feel the clock running. Differs from formatCredits which is built
+// for hour-granularity Basic balances.
+function formatTrialTime(seconds: number | undefined): string {
+  if (typeof seconds !== 'number' || seconds <= 0) return '0s';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  if (m > 0) return `${m}m ${s.toString().padStart(2, '0')}s`;
+  return `${s}s`;
+}
+
 // Plan comparison rows. Keep this short — long tables intimidate users
 // scanning for the right plan at decision time.
 const FEATURE_ROWS: Array<{ label: string; values: Record<string, string | boolean> }> = [
-  { label: 'AI models',           values: { free: 'Gemini',       basic: '4 models',  pro: '4 models',          max: '5 models (incl. Claude)' } },
+  { label: 'AI models',           values: { free: 'Gemini',       basic: 'Gemini · GPT-5.5 · Grok · Groq',  pro: 'Gemini · GPT-5.5 · Grok · Groq',          max: 'All four · plus Claude Sonnet 4.6' } },
   { label: 'Sessions per month',  values: { free: '5',            basic: 'Unlimited', pro: 'Unlimited',         max: 'Unlimited' } },
   { label: 'Time per session',    values: { free: 'Credit-gated', basic: 'Credit-gated (renewable)', pro: 'Unlimited', max: 'Unlimited' } },
   { label: 'Pop-out window',      values: { free: false,          basic: true,        pro: true,                max: true } },
@@ -134,6 +186,9 @@ export function ManageSubscription({
   userProfile,
   userLicense,
   onUpgradeRequested,
+  onProfileUpdated,
+  onLicenseUpdated,
+  onRenewRequested,
 }: ManageSubscriptionProps) {
   const [sub, setSub] = useState<SubscriptionStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -141,10 +196,24 @@ export function ManageSubscription({
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [cancelConfirm, setCancelConfirm] = useState(false);
+  // Refund-policy modal state. Surfaced as an in-app overlay instead of
+  // an external link to minicaai.com so the policy a user reads matches
+  // the version of the app they're on, and works offline.
+  const [refundPolicyOpen, setRefundPolicyOpen] = useState(false);
   // Backfill state — for the "Sync chat history to cloud" action.
   const [backfillRunning, setBackfillRunning] = useState(false);
   const [backfillProgress, setBackfillProgress] = useState<BackfillProgress | null>(null);
   const [backfillResult, setBackfillResult] = useState<string | null>(null);
+  // Display-name edit state. We keep the input collapsed by default — the
+  // overwhelming majority of users won't touch it on any given visit, so
+  // showing a pencil icon and letting them click to edit keeps the section
+  // visually quiet (matches the iCloud → Apple ID pattern: read-only fields
+  // with a Edit affordance, not always-on inputs).
+  const [nameEditing, setNameEditing] = useState(false);
+  const [draftName, setDraftName] = useState('');
+  const [nameSaving, setNameSaving] = useState(false);
+  const [nameError, setNameError] = useState<string | null>(null);
+  const [nameSaved, setNameSaved] = useState(false);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -211,6 +280,46 @@ export function ManageSubscription({
     return () => document.removeEventListener('keydown', onKey);
   }, [isOpen, onClose]);
 
+  // Reactivate a Stripe subscription that's scheduled to cancel at period
+  // end. Server flips cancel_at_period_end=false on Stripe AND mirrors the
+  // local license back to status='active'. Inline so the user gets visible
+  // confirmation without bouncing out to the Stripe portal — that round
+  // trip is what made canceled-then-regretted users churn for good.
+  const handleReactivate = useCallback(async () => {
+    setActionLoading('reactivate');
+    setError(null);
+    setSuccess(null);
+    try {
+      const token = licenseService.getToken();
+      if (!token) throw new Error('Not signed in');
+      const res = await fetch(`${API_BASE}/api/v1/payments/reactivate-subscription`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'Could not reactivate subscription');
+      }
+      const data = await res.json();
+      // Mirror the in-place upgrade pattern — propagate the server's new
+      // license to the parent so the chat-header tier badge flips from
+      // "Cancellation scheduled" back to "Active" without waiting for
+      // the next /subscription poll.
+      if (data.license) {
+        const merged: LicenseData = { ...data.license, last_validated: Date.now() };
+        const saved = licenseService.loadAuth();
+        if (saved.user) licenseService.saveAuth(saved.user, merged);
+        onLicenseUpdated?.(merged);
+      }
+      setSuccess(data.message || 'Subscription reactivated — your plan will continue to renew normally.');
+      fetchSubscription();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to reactivate');
+    } finally {
+      if (mountedRef.current) setActionLoading(null);
+    }
+  }, [fetchSubscription, onLicenseUpdated]);
+
   const handleStripePortal = useCallback(async () => {
     setActionLoading('portal');
     setError(null);
@@ -242,7 +351,16 @@ export function ManageSubscription({
     }
   }, []);
 
-  const handleCancelRazorpay = useCallback(async () => {
+  // Unified cancel — works for both Stripe and Razorpay subscriptions.
+  // Server auto-detects the provider from the user's stripe_customer_id
+  // prefix and either flips Stripe's cancel_at_period_end=true or calls
+  // Razorpay's subscriptions.cancel(_, false). Either way the local
+  // license flips to status='canceling' so the Reactivate UI appears
+  // immediately. Replaces the old Stripe-users-go-to-portal flow per
+  // 2026 SaaS norms (Claude/Cursor/Spotify all do in-app cancel — only
+  // ~30% of users return after going through an external portal cancel,
+  // vs higher recovery rates with in-app Reactivate prompts).
+  const handleCancel = useCallback(async () => {
     setCancelConfirm(false);
     setActionLoading('cancel');
     setError(null);
@@ -250,7 +368,7 @@ export function ManageSubscription({
     try {
       const token = licenseService.getToken();
       if (!token) throw new Error('Not signed in');
-      const res = await fetch(`${API_BASE}/api/v1/payments/cancel-razorpay`, {
+      const res = await fetch(`${API_BASE}/api/v1/payments/cancel-subscription`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}` },
       });
@@ -259,7 +377,35 @@ export function ManageSubscription({
         throw new Error(err.error || 'Could not cancel subscription');
       }
       const data = await res.json();
-      setSuccess(data.message || 'Cancellation scheduled for end of billing cycle.');
+      // Prefer the server-returned cycle-end timestamp over the generic
+      // message — telling the user the exact date their access ends ("until
+      // Jul 15, 2026") is far more reassuring than "scheduled for end of
+      // billing cycle." Falls back to the server's message if the server
+      // didn't surface cancels_at (best-effort field).
+      const cycleEndMs: number | undefined = data?.cancels_at;
+      // Resolve tier label inside the handler (not via the render-scoped
+      // tierMeta closure) — tierMeta is computed per-render after this
+      // useCallback is defined, and capturing it would either require it
+      // in deps or risk staleness. Server tier on the response is the
+      // freshest source we have.
+      const tierFromServer = (data?.license?.tier || userLicense?.tier || 'your') as string;
+      const tierLabel = tierFromServer.charAt(0).toUpperCase() + tierFromServer.slice(1);
+      if (typeof cycleEndMs === 'number' && cycleEndMs > Date.now()) {
+        setSuccess(`Cancellation scheduled. You keep ${tierLabel} access until ${formatExpiry(cycleEndMs)}.`);
+      } else {
+        setSuccess(data.message || 'Cancellation scheduled for end of billing cycle.');
+      }
+      // Propagate the new license (with cycle-end expires_at) to parent so
+      // the chat-header tier badge + popout state catch up immediately. The
+      // server pins expires_at to the actual cycle end on cancel; without
+      // this, the in-app UI shows an indefinite "Pro Active" badge until
+      // the next 30-min revalidation tick.
+      if (data.license) {
+        const merged: LicenseData = { ...data.license, last_validated: Date.now() };
+        const saved = licenseService.loadAuth();
+        if (saved.user) licenseService.saveAuth(saved.user, merged);
+        onLicenseUpdated?.(merged);
+      }
       // Refetch to update status.
       fetchSubscription();
     } catch (e: any) {
@@ -267,7 +413,7 @@ export function ManageSubscription({
     } finally {
       if (mountedRef.current) setActionLoading(null);
     }
-  }, [fetchSubscription]);
+  }, [fetchSubscription, onLicenseUpdated]);
 
   const handleBackfillHistory = useCallback(async () => {
     if (!userProfile?.id) return;
@@ -290,6 +436,38 @@ export function ManageSubscription({
     }
   }, [userProfile?.id]);
 
+  // ── Profile name save ──
+  // Only `name` is editable here — country and email are intentionally
+  // read-only (region drives billing routing; email is the primary
+  // identifier). licenseService.updateProfile mirrors the new user record
+  // into localStorage; we also fire onProfileUpdated so MainApp's React
+  // state catches up without waiting for a re-validation tick.
+  const handleSaveName = useCallback(async () => {
+    const trimmed = draftName.trim();
+    if (!trimmed || trimmed === (userProfile?.name || '').trim()) {
+      setNameEditing(false);
+      return;
+    }
+    setNameSaving(true);
+    setNameError(null);
+    setNameSaved(false);
+    try {
+      const updated = await licenseService.updateProfile({ name: trimmed });
+      if (!mountedRef.current) return;
+      onProfileUpdated?.(updated);
+      setNameEditing(false);
+      setNameSaved(true);
+      window.setTimeout(() => {
+        if (mountedRef.current) setNameSaved(false);
+      }, 2400);
+    } catch (e: any) {
+      if (!mountedRef.current) return;
+      setNameError(e?.message || 'Could not save name');
+    } finally {
+      if (mountedRef.current) setNameSaving(false);
+    }
+  }, [draftName, userProfile?.name, onProfileUpdated]);
+
   const handleUpgradeTier = useCallback(async (targetTier: 'pro' | 'max') => {
     setActionLoading(`upgrade-${targetTier}`);
     setError(null);
@@ -297,23 +475,78 @@ export function ManageSubscription({
     try {
       const token = licenseService.getToken();
       if (!token) throw new Error('Not signed in');
+      // Bug fix: server's /upgrade-tier expects body `{ tier }` (matches
+      // /create-checkout's contract); the previous `targetTier` key was a
+      // typo that worked only because normalizeTier defaulted to the
+      // current tier on missing field — making the upgrade a silent no-op.
       const res = await fetch(`${API_BASE}/api/v1/payments/upgrade-tier`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetTier }),
+        body: JSON.stringify({ tier: targetTier }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.error || `Could not switch to ${targetTier}`);
       }
-      setSuccess(`Switched to ${targetTier.toUpperCase()}. New tier active immediately.`);
+      const data = await res.json();
+
+      // ── Fallback path: server fell through to a fresh checkout ──
+      // Triggers when the user has tier=pro/max but no stripe_customer_id
+      // on file (admin-granted, webhook miss, migrated legacy account).
+      // /upgrade-tier returns a checkout response shape instead of the
+      // sync-grant shape, and the client opens the appropriate flow.
+      if (data.checkout_url) {
+        // Stripe path — open hosted checkout in default browser
+        if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+          window.electronAPI.openExternal(data.checkout_url);
+        } else {
+          window.open(data.checkout_url, '_blank');
+        }
+        setSuccess(`Setting up payment for ${targetTier.toUpperCase()}. Complete checkout in the browser; your tier will update automatically once payment lands.`);
+        return;
+      }
+      if (data.provider === 'razorpay' && data.order_id) {
+        // Razorpay needs inline SDK checkout — that lives in SubscriptionGate.
+        // Hand off to the parent so its existing openRazorpayCheckout flow
+        // handles it. Close this modal first so we're not stacking surfaces.
+        setSuccess('Opening checkout…');
+        onClose();
+        window.setTimeout(() => onUpgradeRequested(targetTier), 200);
+        return;
+      }
+
+      // ── Sync-grant path (the common case): server already updated the
+      //    subscription in place and returned the new license. ──
+      // Use the server's tailored message (mentions proration for Stripe,
+      // cycle-end timing for Razorpay downgrades) instead of the generic
+      // "active immediately" — that string is wrong on Max→Pro.
+      setSuccess(data.message || `Switched to ${targetTier.toUpperCase()}.`);
+      // Propagate the new license to parent so the chat-header tier badge
+      // and any other consumer of userLicense flips immediately. Without
+      // this, only ManageSubscription's local sub state updates; the rest
+      // of the app stays on the old tier until next revalidation tick.
+      if (data.license) {
+        const merged: LicenseData = { ...data.license, last_validated: Date.now() };
+        const saved = licenseService.loadAuth();
+        if (saved.user) {
+          // Mirror the new tier onto the user record too — UserProfile.tier
+          // drives several gate checks (canUseFeature) that read from the
+          // user, not the license, so both must agree.
+          const updatedUser = data.tier && saved.user.tier !== data.tier
+            ? { ...saved.user, tier: data.tier as UserProfile['tier'] }
+            : saved.user;
+          licenseService.saveAuth(updatedUser, merged);
+          if (updatedUser !== saved.user) onProfileUpdated?.(updatedUser);
+        }
+        onLicenseUpdated?.(merged);
+      }
       fetchSubscription();
     } catch (e: any) {
       setError(e?.message || 'Failed to change plan');
     } finally {
       if (mountedRef.current) setActionLoading(null);
     }
-  }, [fetchSubscription]);
+  }, [fetchSubscription, onLicenseUpdated, onProfileUpdated]);
 
   if (!isOpen) return null;
 
@@ -337,6 +570,13 @@ export function ManageSubscription({
   const isPaidProvider = provider === 'stripe' || provider === 'razorpay';
   const isStripe = provider === 'stripe';
   const isRazorpay = provider === 'razorpay';
+
+  // Free-on-trial: light up the hero strip with a countdown so the user
+  // feels the 30-min taste-test clock running. Without this, a Free user
+  // sees no signal that the picker badges they encounter are tied to a
+  // wall-clock window.
+  const trialActive = tier === 'free' && licenseService.isTrialActive(userLicense);
+  const trialRemaining = trialActive ? licenseService.getTrialRemainingSeconds(userLicense) : 0;
 
   return (
     <div
@@ -377,16 +617,33 @@ export function ManageSubscription({
                       {provider === 'stripe' ? 'Stripe' : 'Razorpay'}
                     </span>
                   )}
+                  {trialActive && (
+                    <span className="text-[10px] font-bold tracking-wider uppercase px-2 py-0.5 rounded border bg-cyan-500/15 text-cyan-300 border-cyan-500/30">
+                      Trial
+                    </span>
+                  )}
                 </div>
                 <p className="text-sm text-white/70 leading-relaxed">{tierMeta.blurb}</p>
               </div>
             </div>
           </div>
 
-          {/* Plan-specific detail strip */}
-          {tier !== 'free' && (
+          {/* Plan-specific detail strip — Basic shows credit balance, Pro/Max
+              show renewal date, Free-on-trial shows the 30-min countdown. */}
+          {(tier !== 'free' || trialActive) && (
             <div className="mt-5 pt-4 border-t border-white/10 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
-              {tier === 'basic' ? (
+              {trialActive ? (
+                <>
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Trial time left</div>
+                    <div className="font-semibold text-white">{formatTrialTime(trialRemaining)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">After trial</div>
+                    <div className="font-semibold text-white">Free plan · Gemini only · 5 sessions/mo</div>
+                  </div>
+                </>
+              ) : tier === 'basic' ? (
                 <>
                   <div>
                     <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Time remaining</div>
@@ -433,111 +690,23 @@ export function ManageSubscription({
           </div>
         )}
 
-        {/* Primary actions */}
+        {/* ── Available plans (tier-driven, every user sees their valid switches) ──
+            Previously this section was provider-driven: Stripe paid users
+            saw only "Manage billing" (a Stripe Portal link), with no inline
+            upgrade/downgrade buttons. Razorpay paid users got the inline
+            menu but Stripe paid users were forced through the external
+            portal — confusing because most upgrade copy says "Upgrade to
+            Max" but the only button visible was a generic "Manage billing".
+            Now every tier shows its valid transitions as labeled buttons,
+            and the provider-specific Stripe-Portal/Razorpay-Cancel actions
+            live in a separate "Billing" section below. /upgrade-tier
+            handles both Stripe and Razorpay in-place server-side, so the
+            same handleUpgradeTier call works for either provider. */}
         <div className="space-y-3">
-          <h4 className="text-xs font-bold uppercase tracking-wider text-white/50">Actions</h4>
+          <h4 className="text-xs font-bold uppercase tracking-wider text-white/50">Available plans</h4>
 
-          {isStripe && (
-            <button
-              onClick={handleStripePortal}
-              disabled={actionLoading === 'portal'}
-              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors disabled:opacity-50"
-            >
-              <div className="flex items-center gap-3">
-                <ExternalLink size={18} className="text-blue-400" />
-                <div className="text-left">
-                  <div className="font-semibold text-white text-sm">Manage billing & payment methods</div>
-                  <div className="text-xs text-white/60">Update card, view invoices, change billing cycle, cancel — all in Stripe's hosted portal.</div>
-                </div>
-              </div>
-              {actionLoading === 'portal' ? <Loader2 size={16} className="animate-spin text-blue-400" /> : <ChevronRight size={16} className="text-white/40" />}
-            </button>
-          )}
-
-          {isRazorpay && tier !== 'free' && status === 'active' && (
-            <>
-              <div className="flex items-start gap-3 p-3 rounded-lg bg-blue-500/10 border border-blue-500/30 text-xs text-blue-200/80">
-                <Info size={14} className="shrink-0 mt-0.5" />
-                <span>
-                  Razorpay subscriptions don't have a self-serve portal. Use the buttons below to switch tiers or cancel. For card / payment-method changes, contact support — your subscription may need to be re-created.
-                </span>
-              </div>
-              {tier !== 'pro' && (
-                <button
-                  onClick={() => handleUpgradeTier('pro')}
-                  disabled={actionLoading === 'upgrade-pro'}
-                  className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors disabled:opacity-50"
-                >
-                  <div className="flex items-center gap-3">
-                    <Crown size={18} className="text-blue-400" />
-                    <div className="text-left">
-                      <div className="font-semibold text-white text-sm">{tier === 'max' ? 'Downgrade to Pro' : 'Switch to Pro'}</div>
-                      <div className="text-xs text-white/60">{tier === 'max' ? 'Effective at next renewal.' : 'Effective immediately.'}</div>
-                    </div>
-                  </div>
-                  {actionLoading === 'upgrade-pro' ? <Loader2 size={16} className="animate-spin text-blue-400" /> : <ChevronRight size={16} className="text-white/40" />}
-                </button>
-              )}
-              {tier !== 'max' && (
-                <button
-                  onClick={() => handleUpgradeTier('max')}
-                  disabled={actionLoading === 'upgrade-max'}
-                  className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors disabled:opacity-50"
-                >
-                  <div className="flex items-center gap-3">
-                    <Crown size={18} className="text-amber-400" />
-                    <div className="text-left">
-                      <div className="font-semibold text-white text-sm">Upgrade to Max</div>
-                      <div className="text-xs text-white/60">Adds Claude + Auto-Type + Train Model. Effective immediately.</div>
-                    </div>
-                  </div>
-                  {actionLoading === 'upgrade-max' ? <Loader2 size={16} className="animate-spin text-amber-400" /> : <ChevronRight size={16} className="text-white/40" />}
-                </button>
-              )}
-              {!cancelConfirm ? (
-                <button
-                  onClick={() => setCancelConfirm(true)}
-                  className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-white/[0.06] transition-colors"
-                >
-                  <div className="flex items-center gap-3">
-                    <X size={18} className="text-red-400" />
-                    <div className="text-left">
-                      <div className="font-semibold text-white text-sm">Cancel subscription</div>
-                      <div className="text-xs text-white/60">You'll keep access until the end of your current billing cycle.</div>
-                    </div>
-                  </div>
-                  <ChevronRight size={16} className="text-white/40" />
-                </button>
-              ) : (
-                <div className="p-4 rounded-xl border border-red-500/30 bg-red-500/10 space-y-3">
-                  <div className="flex items-start gap-3">
-                    <AlertTriangle size={18} className="text-red-400 shrink-0 mt-0.5" />
-                    <div>
-                      <div className="font-semibold text-red-200 text-sm">Cancel your {tierMeta.label} subscription?</div>
-                      <div className="text-xs text-red-200/80 mt-1">Your subscription will be canceled at the end of the current billing cycle. You'll keep full access until {formatExpiry(expiresAt)}. No refund for the partial period.</div>
-                    </div>
-                  </div>
-                  <div className="flex justify-end gap-2">
-                    <button
-                      onClick={() => setCancelConfirm(false)}
-                      className="px-4 py-2 rounded-lg text-sm font-medium bg-white/10 text-white hover:bg-white/15 transition-colors"
-                    >
-                      Keep subscription
-                    </button>
-                    <button
-                      onClick={handleCancelRazorpay}
-                      disabled={actionLoading === 'cancel'}
-                      className="px-4 py-2 rounded-lg text-sm font-bold bg-red-500 text-white hover:bg-red-600 disabled:opacity-50 transition-colors"
-                    >
-                      {actionLoading === 'cancel' ? 'Canceling…' : 'Yes, cancel'}
-                    </button>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-
-          {!isPaidProvider && tier === 'free' && (
+          {/* === Free tier → all paid options === */}
+          {tier === 'free' && (
             <>
               <button
                 onClick={() => onUpgradeRequested('pro')}
@@ -547,7 +716,7 @@ export function ManageSubscription({
                   <Crown size={18} className="text-blue-400" />
                   <div className="text-left">
                     <div className="font-semibold text-white text-sm">Upgrade to Pro</div>
-                    <div className="text-xs text-white/60">Unlimited time + 4 AI models + Pop-out + Auto-Solve.</div>
+                    <div className="text-xs text-white/60">Unlimited time · GPT-5.5, Grok, Llama · Pop-out · Auto-Solve</div>
                   </div>
                 </div>
                 <ChevronRight size={16} className="text-white/40" />
@@ -557,17 +726,223 @@ export function ManageSubscription({
                 className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors"
               >
                 <div className="flex items-center gap-3">
-                  <Crown size={18} className="text-amber-400" />
+                  <Sparkles size={18} className="text-amber-400" />
                   <div className="text-left">
                     <div className="font-semibold text-white text-sm">Upgrade to Max</div>
-                    <div className="text-xs text-white/60">Pro + Claude Sonnet 4.6 + Auto-Type + Train Model pipeline.</div>
+                    <div className="text-xs text-white/60">Pro + Claude Sonnet 4.6 + Auto-Type + Train Model</div>
+                  </div>
+                </div>
+                <ChevronRight size={16} className="text-white/40" />
+              </button>
+              <button
+                onClick={() => onUpgradeRequested('basic')}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors"
+              >
+                <div className="flex items-center gap-3">
+                  <Zap size={18} className="text-emerald-400" />
+                  <div className="text-left">
+                    <div className="font-semibold text-white text-sm">Get Basic</div>
+                    <div className="text-xs text-white/60">3 hours · 14-day window · GPT, Grok, Llama (no Claude)</div>
                   </div>
                 </div>
                 <ChevronRight size={16} className="text-white/40" />
               </button>
             </>
           )}
+
+          {/* === Basic tier → renew or upgrade === */}
+          {tier === 'basic' && (
+            <>
+              {onRenewRequested && (
+                <button
+                  onClick={onRenewRequested}
+                  className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors"
+                >
+                  <div className="flex items-center gap-3">
+                    <Zap size={18} className="text-emerald-400" />
+                    <div className="text-left">
+                      <div className="font-semibold text-white text-sm">Renew · +1 hour</div>
+                      <div className="text-xs text-white/60">Adds another hour of session time to your Basic plan.</div>
+                    </div>
+                  </div>
+                  <ChevronRight size={16} className="text-white/40" />
+                </button>
+              )}
+              <button
+                onClick={() => onUpgradeRequested('pro')}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors"
+              >
+                <div className="flex items-center gap-3">
+                  <Crown size={18} className="text-blue-400" />
+                  <div className="text-left">
+                    <div className="font-semibold text-white text-sm">Upgrade to Pro</div>
+                    <div className="text-xs text-white/60">Unlimited time, no expiry · keep your remaining Basic hours.</div>
+                  </div>
+                </div>
+                <ChevronRight size={16} className="text-white/40" />
+              </button>
+              <button
+                onClick={() => onUpgradeRequested('max')}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors"
+              >
+                <div className="flex items-center gap-3">
+                  <Sparkles size={18} className="text-amber-400" />
+                  <div className="text-left">
+                    <div className="font-semibold text-white text-sm">Upgrade to Max</div>
+                    <div className="text-xs text-white/60">Adds Claude + Auto-Type + Train Model.</div>
+                  </div>
+                </div>
+                <ChevronRight size={16} className="text-white/40" />
+              </button>
+            </>
+          )}
+
+          {/* === Pro tier → upgrade to Max (in-place via /upgrade-tier) ===
+              Server's upgradeStripeSubscription / upgradeRazorpaySubscription
+              both update the existing sub instead of creating a duplicate. */}
+          {tier === 'pro' && (
+            <button
+              onClick={() => handleUpgradeTier('max')}
+              disabled={actionLoading === 'upgrade-max'}
+              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors disabled:opacity-50"
+            >
+              <div className="flex items-center gap-3">
+                <Sparkles size={18} className="text-amber-400" />
+                <div className="text-left">
+                  <div className="font-semibold text-white text-sm">Upgrade to Max</div>
+                  <div className="text-xs text-white/60">Adds Claude Sonnet 4.6 + Auto-Type + Train Model. Effective immediately, prorated diff next invoice.</div>
+                </div>
+              </div>
+              {actionLoading === 'upgrade-max' ? <Loader2 size={16} className="animate-spin text-amber-400" /> : <ChevronRight size={16} className="text-white/40" />}
+            </button>
+          )}
+
+          {/* === Max tier → switch back to Pro (downgrade in-place) ===
+              On Razorpay this schedules at cycle_end (server keeps Max
+              active until then). On Stripe it prorates next invoice. */}
+          {tier === 'max' && (
+            <button
+              onClick={() => handleUpgradeTier('pro')}
+              disabled={actionLoading === 'upgrade-pro'}
+              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors disabled:opacity-50"
+            >
+              <div className="flex items-center gap-3">
+                <Crown size={18} className="text-blue-400" />
+                <div className="text-left">
+                  <div className="font-semibold text-white text-sm">Switch to Pro</div>
+                  <div className="text-xs text-white/60">Removes Claude + Auto-Type + Train Model. {isRazorpay ? 'Effective at next renewal — keep Max access until then.' : 'Effective immediately, prorated credit next invoice.'}</div>
+                </div>
+              </div>
+              {actionLoading === 'upgrade-pro' ? <Loader2 size={16} className="animate-spin text-blue-400" /> : <ChevronRight size={16} className="text-white/40" />}
+            </button>
+          )}
         </div>
+
+        {/* ── Billing section — provider-specific actions ──
+            Stripe paid users get the Customer Portal link (card / invoices /
+            cancel are all there). Razorpay paid users get an inline cancel
+            with confirm because Razorpay has no self-serve portal. Free
+            users see nothing here — there's no billing relationship yet. */}
+        {(tier === 'pro' || tier === 'max') && (
+          <div className="space-y-3">
+            <h4 className="text-xs font-bold uppercase tracking-wider text-white/50">Billing</h4>
+
+            {/* Cancel-pending state: surface explicit "scheduled to end"
+                copy + a one-click Reactivate CTA. The Stripe Portal can do
+                the same thing but it's an off-app round trip and most
+                users won't bother. Inline reactivation is the retention
+                lever — it converts canceled-then-regretted users back to
+                active without losing them to the Portal's friction. */}
+            {isStripe && status === 'canceling' && (
+              <div className="p-4 rounded-xl border border-amber-500/30 bg-amber-500/[0.06] space-y-3">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle size={18} className="text-amber-400 shrink-0 mt-0.5" />
+                  <div className="text-sm text-amber-100/90 leading-relaxed">
+                    <div className="font-semibold mb-0.5">Cancellation scheduled</div>
+                    <div className="text-amber-200/70 text-[13px]">
+                      You'll keep {tierMeta.label} access until {formatExpiry(expiresAt)}. After that the subscription stops renewing and your tier drops to Free. You can reverse this any time before then.
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={handleReactivate}
+                  disabled={actionLoading === 'reactivate'}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black text-sm font-bold transition-colors disabled:opacity-50"
+                >
+                  {actionLoading === 'reactivate' ? <><Loader2 size={14} className="animate-spin" /> Reactivating…</> : <>Resume — keep my subscription</>}
+                </button>
+              </div>
+            )}
+
+            {isStripe && (
+              <button
+                onClick={handleStripePortal}
+                disabled={actionLoading === 'portal'}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-white/[0.06] transition-colors disabled:opacity-50"
+              >
+                <div className="flex items-center gap-3">
+                  <ExternalLink size={18} className="text-white/70" />
+                  <div className="text-left">
+                    <div className="font-semibold text-white text-sm">Manage billing in Stripe</div>
+                    <div className="text-xs text-white/60">{status === 'canceling' ? 'Update card, view invoices, change billing cycle.' : 'Update card, view invoices, change billing cycle, or cancel subscription.'}</div>
+                  </div>
+                </div>
+                {actionLoading === 'portal' ? <Loader2 size={16} className="animate-spin text-white/70" /> : <ChevronRight size={16} className="text-white/40" />}
+              </button>
+            )}
+
+            {/* Cancel — available to BOTH Stripe and Razorpay subscribers
+                while the sub is still active (status='active'). Suppressed
+                when status='canceling' because the Reactivate banner above
+                already shows the cancel state and offers the inverse CTA.
+                The unified server endpoint auto-detects provider, so the
+                same UI works for everyone. */}
+            {isPaidProvider && status === 'active' && (
+              <>
+                {!cancelConfirm ? (
+                  <button
+                    onClick={() => setCancelConfirm(true)}
+                    className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-white/[0.06] transition-colors"
+                  >
+                    <div className="flex items-center gap-3">
+                      <X size={18} className="text-red-400" />
+                      <div className="text-left">
+                        <div className="font-semibold text-white text-sm">Cancel subscription</div>
+                        <div className="text-xs text-white/60">You'll keep access until the end of your current billing cycle. You can reactivate any time before then.</div>
+                      </div>
+                    </div>
+                    <ChevronRight size={16} className="text-white/40" />
+                  </button>
+                ) : (
+                  <div className="p-4 rounded-xl border border-red-500/30 bg-red-500/10 space-y-3">
+                    <div className="flex items-start gap-3">
+                      <AlertTriangle size={18} className="text-red-400 shrink-0 mt-0.5" />
+                      <div>
+                        <div className="font-semibold text-red-200 text-sm">Cancel your {tierMeta.label} subscription?</div>
+                        <div className="text-xs text-red-200/80 mt-1">Your subscription will be canceled at the end of the current billing cycle. You'll keep full access until {formatExpiry(expiresAt)}. No refund for the partial period. You can reactivate at any time before {formatExpiry(expiresAt)} to keep your subscription going.</div>
+                      </div>
+                    </div>
+                    <div className="flex justify-end gap-2">
+                      <button
+                        onClick={() => setCancelConfirm(false)}
+                        className="px-4 py-2 rounded-lg text-sm font-medium bg-white/10 text-white hover:bg-white/15 transition-colors"
+                      >
+                        Keep subscription
+                      </button>
+                      <button
+                        onClick={handleCancel}
+                        disabled={actionLoading === 'cancel'}
+                        className="px-4 py-2 rounded-lg text-sm font-bold bg-red-500 text-white hover:bg-red-600 disabled:opacity-50 transition-colors"
+                      >
+                        {actionLoading === 'cancel' ? 'Canceling…' : 'Yes, cancel'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
 
         {/* Plan comparison */}
         <div className="space-y-3">
@@ -618,17 +993,93 @@ export function ManageSubscription({
         <div className="space-y-3">
           <h4 className="text-xs font-bold uppercase tracking-wider text-white/50">Account</h4>
           <div className="rounded-xl border border-white/10 bg-white/[0.02] divide-y divide-white/5">
+            {/* Display name — read-only by default, click to edit. We keep
+                the row visually quiet (no always-on input) so the section
+                doesn't shout "edit me"; the pencil affordance is enough. */}
+            <div className="px-4 py-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Display name</div>
+                  {nameEditing ? (
+                    <input
+                      type="text"
+                      value={draftName}
+                      onChange={(e) => setDraftName(e.target.value)}
+                      autoFocus
+                      maxLength={100}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') { e.preventDefault(); handleSaveName(); }
+                        else if (e.key === 'Escape') { e.preventDefault(); setNameEditing(false); setNameError(null); }
+                      }}
+                      className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-2.5 py-1.5 text-sm text-white outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20"
+                      placeholder="Your name"
+                    />
+                  ) : (
+                    <div className="text-sm text-white truncate">{userProfile?.name || '—'}</div>
+                  )}
+                  <div className="text-[11px] text-white/40 mt-1">
+                    Used in your interview answers and our support chat.
+                  </div>
+                  {nameError && (
+                    <div className="text-[11px] text-red-400 mt-1.5 flex items-center gap-1">
+                      <AlertTriangle size={11} /> {nameError}
+                    </div>
+                  )}
+                  {nameSaved && !nameError && (
+                    <div className="text-[11px] text-emerald-300 mt-1.5 flex items-center gap-1">
+                      <Check size={11} /> Saved
+                    </div>
+                  )}
+                </div>
+                <div className="shrink-0 flex items-center gap-2">
+                  {nameEditing ? (
+                    <>
+                      <button
+                        onClick={() => { setNameEditing(false); setNameError(null); }}
+                        disabled={nameSaving}
+                        className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 text-white/70 hover:text-white disabled:opacity-50 transition-colors"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleSaveName}
+                        disabled={nameSaving || !draftName.trim() || draftName.trim() === (userProfile?.name || '').trim()}
+                        className="px-3 py-1 rounded-md text-[11px] font-bold bg-blue-500/20 hover:bg-blue-500/30 border border-blue-500/30 text-blue-200 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5"
+                      >
+                        {nameSaving && <Loader2 size={11} className="animate-spin" />}
+                        Save
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={() => { setDraftName(userProfile?.name || ''); setNameError(null); setNameEditing(true); }}
+                      className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 text-white/70 hover:text-white transition-colors"
+                    >
+                      Edit
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
             <div className="flex items-center justify-between px-4 py-3">
-              <div>
+              <div className="min-w-0">
                 <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Email</div>
-                <div className="text-sm text-white">{userProfile?.email || '—'}</div>
+                <div className="text-sm text-white truncate">{userProfile?.email || '—'}</div>
               </div>
               {userProfile?.oauth_provider === 'google' && (
-                <span className="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded border border-white/15 text-white/70">
+                <span className="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded border border-white/15 text-white/70 shrink-0">
                   Google
                 </span>
               )}
             </div>
+            {(userProfile?.created_at ?? 0) > 0 && (
+              <div className="px-4 py-3">
+                <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Member since</div>
+                <div className="text-sm text-white">
+                  {new Date(userProfile!.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}
+                </div>
+              </div>
+            )}
             {userProfile?.country_code && (
               <div className="px-4 py-3">
                 <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Region (for billing)</div>
@@ -687,23 +1138,20 @@ export function ManageSubscription({
           <div className="flex items-center gap-3">
             <a href="mailto:support@minicaai.com" className="hover:text-white transition-colors">Contact support</a>
             <span className="text-white/20">·</span>
-            <a
-              href="https://minicaai.com/refund-policy"
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={(e) => {
-                if (window.electronAPI?.openExternal) {
-                  e.preventDefault();
-                  window.electronAPI.openExternal('https://minicaai.com/refund-policy');
-                }
-              }}
+            <button
+              type="button"
+              onClick={() => setRefundPolicyOpen(true)}
               className="hover:text-white transition-colors"
             >
               Refund policy
-            </a>
+            </button>
           </div>
         </div>
       </div>
+
+      {/* Refund-policy overlay — z-index higher than this surface's
+          z-[99999] so it cleanly stacks on top of the billing page. */}
+      <RefundPolicy isOpen={refundPolicyOpen} onClose={() => setRefundPolicyOpen(false)} />
     </div>
   );
 }

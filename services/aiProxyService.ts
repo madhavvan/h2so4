@@ -6,7 +6,7 @@
 import { licenseService } from './licenseService';
 import { Message, ContextFile } from '../types';
 
-const API_BASE = 'https://h2so4-production.up.railway.app';
+const API_BASE = 'https://api.minicaai.com';
 
 // ── Retry configuration for resilient AI requests ──
 const MAX_RETRIES = 3;

@@ -61,3 +61,8 @@ Desktop.ini
 # Local backup snapshots created by tooling — never commit
 .claude-revert-backup-*/
 .sixth/
+
+# Code-signing artifacts — Azure Trusted Signing dlib + extracted .nupkg.
+# Downloaded by scripts/install-signing-dlib.ps1 on the build machine.
+# Never commit binaries.
+.signing/

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search, Copy, ChevronUp } from 'lucide-react';
 // Phosphor duotone — used on the public landing + auth surfaces for the
 // editorial, premium feel that lucide's flat strokes can't quite reach.
@@ -24,6 +24,13 @@ import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import { geoService, GeoData } from './services/geoService';
 import { pricingService, RegionPricing, PricingTier } from './services/pricingService';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
+// Same component the Electron desktop chat-header uses. On the web post-
+// auth download surface we render it as a modal so paid users have full
+// parity with the desktop billing UI (cancel/reactivate/tier-swap, plan
+// comparison, refund-policy, profile-edit) instead of being forced to
+// either bounce out to the Stripe portal or wait until they install
+// the desktop binary.
+import { ManageSubscription as ManageSubscriptionModal } from './ManageSubscription';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '179380214544-5r338sqpqr6ke6tnsf165ic7qi9th0ht.apps.googleusercontent.com';
 
@@ -65,6 +72,35 @@ const loadRazorpayScript = (): Promise<void> => {
   });
   return razorpayScriptPromise;
 };
+
+// ── useIsMobile ──
+// Drives the iPhone-feel landing surface. 767px is Tailwind's md/sm boundary —
+// anything below md falls into the LandingMobile layout. We listen for media-
+// query changes so a desktop window dragged narrow flips in real time, and
+// an iPad rotated to portrait gets the mobile treatment too. SSR-guarded for
+// parity with the rest of the file (we never run server-rendered today, but
+// a future static-export of the marketing surface would otherwise crash).
+function useIsMobile(): boolean {
+  const [isMobile, setIsMobile] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return window.matchMedia('(max-width: 767px)').matches;
+  });
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mq = window.matchMedia('(max-width: 767px)');
+    const onChange = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    // matchMedia listener API is unified since iOS 14 / Chrome 39 — but
+    // Electron renderers can pre-date this on long-lived installs, so keep
+    // the legacy addListener path as a fallback.
+    if (mq.addEventListener) mq.addEventListener('change', onChange);
+    else (mq as any).addListener?.(onChange);
+    return () => {
+      if (mq.removeEventListener) mq.removeEventListener('change', onChange);
+      else (mq as any).removeListener?.(onChange);
+    };
+  }, []);
+  return isMobile;
+}
 
 // ── Animated background ──
 // Memoized: mounted ~13× across views; re-evaluates 3 infinite CSS keyframes
@@ -536,7 +572,7 @@ const TutorialCard = ({ step, title, desc, duration }: { step: string; title: st
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  ADMIN DASHBOARD — Live data from server
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-const API_BASE = 'https://h2so4-production.up.railway.app';
+const API_BASE = 'https://api.minicaai.com';
 
 type Tier = 'free' | 'basic' | 'pro' | 'max';
 const TIERS: Tier[] = ['free', 'basic', 'pro', 'max'];
@@ -3295,11 +3331,3556 @@ const ImpersonationTokenModal = ({ email, token, onClose, onMessage }: { email: 
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  LANDING — MOBILE (iPhone-feel)
+//
+//  Same content + same routing actions as the desktop landing in
+//  SubscriptionGateInner's view === 'landing' branch, but every interaction
+//  is mobile-native:
+//    • Slim translucent app-bar with safe-area-inset-top
+//    • Hamburger → bottom sheet (drag-to-dismiss, springy slide)
+//    • Hero CTAs stacked vertically in the thumb-zone
+//    • Capabilities: 2-col app-icon grid with rise-in stagger as cards
+//      enter the viewport (IntersectionObserver)
+//    • How-it-works + Pricing: horizontal paged swipers with dot indicators
+//    • Sticky bottom CTA past the hero — blurred translucent, iOS toolbar
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+interface LandingMobileProps {
+  setView: (v: View) => void;
+  geo: GeoData | null;
+  pricing: RegionPricing | null;
+  handleTierSelect: (tier: PricingTier) => Promise<void> | void;
+  isSubmitting: boolean;
+  currentUser: UserProfile | null;
+  setAuthError: (err: string | null) => void;
+}
+
+// Static content. Lifted out of the component so the [data-rise]
+// IntersectionObserver doesn't re-run when an unrelated state update
+// re-renders the parent.
+const MOBILE_CAPABILITIES = [
+  { Icon: PhHeadphones, title: 'Hears the interviewer', body: 'System-audio capture transcribes every question with sub-second latency.' },
+  { Icon: PhCpu,        title: 'Reasons in your voice', body: 'Picks the right model and shapes the answer to your résumé and the role.' },
+  { Icon: PhShield,     title: 'Invisible on the call', body: 'Window content is excluded from screen-share at the OS level.' },
+  { Icon: PhMonitor,    title: 'Reads the screen',      body: 'Auto-Solve captures the editor and types the answer on demand.' },
+  { Icon: PhChart,      title: 'Holds your context',    body: 'Resume, JD, notes stay in working memory across the whole interview.' },
+  { Icon: PhBolt,       title: 'Pop-out + PiP',         body: 'A glanceable window that floats over Zoom, Meet, or Teams.' },
+] as const;
+
+const MOBILE_STEPS = [
+  { n: '01', title: 'Install the desktop app',          body: 'Download for macOS, Windows, or Linux. Sign in once. Your license binds to this device.' },
+  { n: '02', title: 'Drop in your résumé and the JD',   body: 'A single drag. The copilot extracts your story and the role in one preflight call.' },
+  { n: '03', title: 'Open your interview',              body: 'Start the mic. Answers stream as the interviewer speaks. Glance at the popout, deliver in your voice.' },
+] as const;
+
+const MOBILE_TRUST = [
+  { Icon: PhShield, label: 'Device-bound licenses',      body: 'A license activates on the device that bought it. No silent sharing.' },
+  { Icon: PhLock,   label: 'Server-validated sessions',  body: 'Every active interview is checked against our backend in real time.' },
+  { Icon: PhGlobe,  label: 'Regional pricing, enforced', body: 'No VPN-shopping for cheaper tiers. Your country, your fair price.' },
+] as const;
+
+const LandingMobile: React.FC<LandingMobileProps> = ({
+  setView, geo, pricing, handleTierSelect, isSubmitting, currentUser, setAuthError,
+}) => {
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [sheetClosing, setSheetClosing] = useState(false);
+  const [showStickyCTA, setShowStickyCTA] = useState(false);
+  const heroSentinelRef = useRef<HTMLDivElement>(null);
+
+  const stepsScrollRef = useRef<HTMLDivElement>(null);
+  const [stepIdx, setStepIdx] = useState(0);
+  const pricingScrollRef = useRef<HTMLDivElement>(null);
+  const [pricingIdx, setPricingIdx] = useState(0);
+
+  // Sheet drag-to-dismiss state. Refs rather than state because we mutate
+  // every move event — re-rendering the entire mobile landing on every
+  // pixel of finger travel would jank the drag.
+  const sheetRef = useRef<HTMLDivElement>(null);
+  const dragStartYRef = useRef<number | null>(null);
+  const dragOffsetRef = useRef<number>(0);
+
+  // Sticky bottom CTA appears once the hero CTAs have scrolled past. Using
+  // an IntersectionObserver with a small negative top margin so the sticky
+  // CTA appears just before the hero CTAs leave the screen — feels like
+  // "the CTA followed me down" rather than "a new bar appeared."
+  useEffect(() => {
+    const sentinel = heroSentinelRef.current;
+    if (!sentinel) return;
+    const io = new IntersectionObserver(
+      ([entry]) => setShowStickyCTA(!entry.isIntersecting),
+      { rootMargin: '-60px 0px 0px 0px' }
+    );
+    io.observe(sentinel);
+    return () => io.disconnect();
+  }, []);
+
+  // Stagger entrance for [data-rise] elements as they enter the viewport.
+  // Threshold 0.05 + small bottom margin so cards animate JUST before they
+  // appear — feels organic, not "popcorn-on-scroll." We unobserve once
+  // animated so a fast scroll-back-up doesn't replay the entrance.
+  useEffect(() => {
+    const cards = document.querySelectorAll('[data-rise]:not(.ios-rise-active)');
+    if (cards.length === 0) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        entries.forEach(e => {
+          if (e.isIntersecting) {
+            (e.target as HTMLElement).classList.add('ios-rise-active');
+            io.unobserve(e.target);
+          }
+        });
+      },
+      { rootMargin: '0px 0px -8% 0px', threshold: 0.05 }
+    );
+    cards.forEach(c => io.observe(c));
+    return () => io.disconnect();
+  }, []);
+
+  // Track the steps pager via raw scrollLeft. rAF-throttled so a fast
+  // momentum scroll doesn't fire the state setter on every frame and
+  // re-render the whole landing.
+  useEffect(() => {
+    const el = stepsScrollRef.current;
+    if (!el) return;
+    let raf = 0;
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        if (el.clientWidth > 0) setStepIdx(Math.round(el.scrollLeft / el.clientWidth));
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, []);
+
+  // Same pattern for the pricing pager. Re-runs when `pricing` changes
+  // (initial load), since the pager DOM only exists once tiers are present.
+  useEffect(() => {
+    const el = pricingScrollRef.current;
+    if (!el) return;
+    let raf = 0;
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        if (el.clientWidth > 0) setPricingIdx(Math.round(el.scrollLeft / el.clientWidth));
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [pricing]);
+
+  // Two-stage close so the sheet can play its exit animation before the
+  // node unmounts. 300ms matches .ios-sheet-exit's duration in index.html
+  // (var(--dur-dismiss) = 380ms) minus a small head-start for the backdrop
+  // fade — that mismatched timing is the iOS "world re-emerges first" detail.
+  const closeSheet = useCallback(() => {
+    if (sheetClosing) return;
+    setSheetClosing(true);
+    window.setTimeout(() => {
+      setSheetOpen(false);
+      setSheetClosing(false);
+    }, 300);
+  }, [sheetClosing]);
+
+  // Lock body scroll while sheet is open. iOS specifically: position:fixed
+  // on body without saving/restoring scrollY would jump the page back to
+  // top on close — preserve via the inset hack. We deliberately use the
+  // body element (not the scrolling container) because the landing is the
+  // top-level fixed/inset-0 div; document.body still receives the touch
+  // chain in browsers that haven't adopted overscroll-behavior fully.
+  useEffect(() => {
+    if (!sheetOpen) return;
+    const y = window.scrollY;
+    const prevPos = document.body.style.position;
+    const prevTop = document.body.style.top;
+    const prevWidth = document.body.style.width;
+    document.body.style.position = 'fixed';
+    document.body.style.top = `-${y}px`;
+    document.body.style.width = '100%';
+    return () => {
+      document.body.style.position = prevPos;
+      document.body.style.top = prevTop;
+      document.body.style.width = prevWidth;
+      window.scrollTo(0, y);
+    };
+  }, [sheetOpen]);
+
+  // Esc closes the sheet — mostly for desktop dev-tools testing of the
+  // mobile layout, but harmless on phones (no Esc key in iOS keyboards).
+  useEffect(() => {
+    if (!sheetOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeSheet(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [sheetOpen, closeSheet]);
+
+  // Drag-to-dismiss the sheet. Y-axis only; clamp at 0 so an upward drag
+  // doesn't pull the sheet above its rest position (feels stuck — iOS
+  // does the same). 80px commit threshold matches iOS Maps / Apple Music.
+  const onSheetTouchStart = (e: React.TouchEvent) => {
+    if (sheetClosing) return;
+    dragStartYRef.current = e.touches[0].clientY;
+    dragOffsetRef.current = 0;
+    if (sheetRef.current) sheetRef.current.style.transition = 'none';
+  };
+  const onSheetTouchMove = (e: React.TouchEvent) => {
+    if (dragStartYRef.current === null) return;
+    const dy = e.touches[0].clientY - dragStartYRef.current;
+    dragOffsetRef.current = Math.max(0, dy);
+    if (sheetRef.current) {
+      sheetRef.current.style.transform = `translateY(${dragOffsetRef.current}px)`;
+    }
+  };
+  const onSheetTouchEnd = () => {
+    if (dragStartYRef.current === null) return;
+    dragStartYRef.current = null;
+    const offset = dragOffsetRef.current;
+    dragOffsetRef.current = 0;
+    if (!sheetRef.current) return;
+    sheetRef.current.style.transition = 'transform 280ms var(--spring-summon)';
+    if (offset > 80) {
+      sheetRef.current.style.transform = 'translateY(100%)';
+      window.setTimeout(() => {
+        setSheetOpen(false);
+        if (sheetRef.current) {
+          sheetRef.current.style.transform = '';
+          sheetRef.current.style.transition = '';
+        }
+      }, 280);
+    } else {
+      // Snap back via spring.
+      sheetRef.current.style.transform = 'translateY(0)';
+      window.setTimeout(() => {
+        if (sheetRef.current) sheetRef.current.style.transition = '';
+      }, 280);
+    }
+  };
+
+  const scrollPagerTo = (ref: React.RefObject<HTMLDivElement | null>, idx: number) => {
+    const el = ref.current;
+    if (!el) return;
+    el.scrollTo({ left: idx * el.clientWidth, behavior: 'smooth' });
+  };
+
+  const handleSupport = () => {
+    if (currentUser) setView('support');
+    else { setAuthError('Please sign in to access support'); setView('login'); }
+  };
+
+  const dotStyle = (active: boolean): React.CSSProperties => ({
+    width: active ? 22 : 6,
+    height: 6,
+    borderRadius: 999,
+    background: active ? 'var(--ink)' : 'var(--cream-line)',
+    transition: 'width 280ms var(--ease-ios), background 280ms var(--ease-ios)',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+  });
+
+  return (
+    <div
+      className="fixed inset-0 overflow-y-auto"
+      style={{
+        background: 'var(--cream)',
+        color: 'var(--ink)',
+        fontFamily: 'var(--sans)',
+        WebkitOverflowScrolling: 'touch' as any,
+      }}
+    >
+      {/* ── App-bar — slim, safe-area-respectful, blurred translucent ── */}
+      <header
+        className="sticky top-0 z-30 backdrop-blur-md pt-safe"
+        style={{
+          background: 'color-mix(in oklab, var(--cream) 88%, transparent)',
+          borderBottom: '1px solid var(--cream-line)',
+        }}
+      >
+        <div className="flex items-center justify-between px-5" style={{ height: 56 }}>
+          <Logo size="sm" theme="light" />
+          <button
+            onClick={() => setSheetOpen(true)}
+            className="ios-press w-11 h-11 -mr-2 flex flex-col items-center justify-center gap-1.5"
+            aria-label="Open menu"
+            style={{ color: 'var(--ink)' }}
+          >
+            <span className="block w-5 h-[1.5px] rounded-full" style={{ background: 'currentColor' }} />
+            <span className="block w-5 h-[1.5px] rounded-full" style={{ background: 'currentColor' }} />
+          </button>
+        </div>
+      </header>
+
+      {/* ── Hero ── */}
+      <section className="px-5 pt-9 pb-10">
+        <div className="inline-flex items-center gap-1.5 mb-7" style={{ color: 'var(--ink-muted)' }}>
+          <PhSparkle size={12} weight="duotone" style={{ color: 'var(--accent)' }} />
+          <span className="text-[11px] font-medium uppercase tracking-[0.18em]">
+            Real-time interview intelligence
+          </span>
+        </div>
+        <h1
+          className="text-[40px] leading-[1.04] mb-6"
+          style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.025em' }}
+        >
+          Walk into every interview <em style={{ fontStyle: 'italic', fontWeight: 400 }}>already prepared</em>.
+        </h1>
+        <p
+          className="text-[16px] mb-8"
+          style={{ color: 'var(--ink-soft)', lineHeight: 1.55, letterSpacing: '-0.005em' }}
+        >
+          A quiet copilot that listens to your interview, holds your résumé and the role in mind, and shapes an answer in your voice — character-by-character, in real time.
+        </p>
+        <div className="flex flex-col gap-2.5">
+          <button
+            onClick={() => setView('signup')}
+            className="ios-press w-full inline-flex items-center justify-center gap-2 px-6 py-3.5 rounded-full text-[15px] font-medium"
+            style={{ background: 'var(--ink)', color: 'var(--cream)', letterSpacing: '-0.005em' }}
+          >
+            Start free
+            <PhArrowRight size={15} weight="bold" />
+          </button>
+          <button
+            onClick={() => setView('tutorials')}
+            className="ios-press w-full px-6 py-3.5 rounded-full text-[15px] font-medium"
+            style={{ background: 'transparent', color: 'var(--ink)', border: '1px solid var(--cream-line)' }}
+          >
+            See how it works
+          </button>
+        </div>
+        {/* Sentinel — sticky CTA appears once this scrolls past the top. */}
+        <div ref={heroSentinelRef} aria-hidden className="h-px mt-8" />
+        {/* Trust strip — horizontal scroll on extra-narrow screens so the
+            three chips never wrap into vertical stack. */}
+        <div
+          className="flex items-center gap-5 pt-7 mt-3 text-[12.5px] font-medium overflow-x-auto"
+          style={{
+            borderTop: '1px solid var(--cream-line)',
+            color: 'var(--ink-muted)',
+            scrollbarWidth: 'none' as any,
+          }}
+        >
+          <span className="flex items-center gap-1.5 shrink-0">
+            <PhUsers size={14} weight="duotone" />10,000+ candidates
+          </span>
+          <span className="flex items-center gap-1.5 shrink-0">
+            <PhStar size={14} weight="duotone" />4.9 / 5 rating
+          </span>
+          <span className="flex items-center gap-1.5 shrink-0">
+            <PhGlobe size={14} weight="duotone" />50+ countries
+          </span>
+        </div>
+      </section>
+
+      {/* ── Capabilities — 2-col app-icon grid with rise-in stagger ── */}
+      <section className="px-5 py-12" style={{ borderTop: '1px solid var(--cream-line)' }}>
+        <span className="text-[11px] font-medium uppercase tracking-[0.18em]" style={{ color: 'var(--ink-muted)' }}>
+          Capabilities
+        </span>
+        <h2
+          className="text-[28px] leading-[1.1] mt-3 mb-7"
+          style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.02em' }}
+        >
+          Built for the moment that decides the offer.
+        </h2>
+        <div className="grid grid-cols-2 gap-3">
+          {MOBILE_CAPABILITIES.map((c, i) => {
+            const Icon = c.Icon;
+            return (
+              <div
+                key={c.title}
+                data-rise
+                style={{
+                  animationDelay: `${i * 60}ms`,
+                  background: 'var(--cream-soft)',
+                  border: '1px solid var(--cream-line)',
+                  minHeight: 160,
+                }}
+                className="ios-press rounded-3xl p-4"
+              >
+                <Icon size={24} weight="duotone" style={{ color: 'var(--accent)' }} />
+                <h3
+                  className="mt-3 text-[15px]"
+                  style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.01em', color: 'var(--ink)' }}
+                >
+                  {c.title}
+                </h3>
+                <p className="mt-1.5 text-[12.5px]" style={{ color: 'var(--ink-soft)', lineHeight: 1.5 }}>
+                  {c.body}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* ── How it works — paged swiper ── */}
+      <section className="py-12" style={{ borderTop: '1px solid var(--cream-line)' }}>
+        <div className="px-5">
+          <span className="text-[11px] font-medium uppercase tracking-[0.18em]" style={{ color: 'var(--ink-muted)' }}>
+            How it works
+          </span>
+          <h2
+            className="text-[28px] leading-[1.1] mt-3 mb-6"
+            style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.02em' }}
+          >
+            Three steps. Then you forget it's there.
+          </h2>
+        </div>
+        <div ref={stepsScrollRef} className="ios-pager pb-1">
+          {MOBILE_STEPS.map((s) => (
+            <div
+              key={s.n}
+              className="ios-pager-item rounded-3xl p-7"
+              style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)', minHeight: 240 }}
+            >
+              <div
+                className="text-[13px] font-medium tabular-nums tracking-[0.06em] mb-5"
+                style={{ color: 'var(--ink-muted)' }}
+              >
+                {s.n}
+              </div>
+              <h3
+                className="text-[22px] leading-[1.15] mb-3"
+                style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.015em' }}
+              >
+                {s.title}
+              </h3>
+              <p className="text-[14.5px]" style={{ color: 'var(--ink-soft)', lineHeight: 1.6 }}>
+                {s.body}
+              </p>
+            </div>
+          ))}
+        </div>
+        <div className="flex justify-center gap-1.5 mt-5">
+          {MOBILE_STEPS.map((_, i) => (
+            <button
+              key={i}
+              onClick={() => scrollPagerTo(stepsScrollRef, i)}
+              aria-label={`Step ${i + 1}`}
+              className="ios-press"
+              style={dotStyle(i === stepIdx)}
+            />
+          ))}
+        </div>
+      </section>
+
+      {/* ── Pricing — paged swiper ── */}
+      <section id="pricing" className="py-12" style={{ borderTop: '1px solid var(--cream-line)' }}>
+        <div className="px-5">
+          <span className="text-[11px] font-medium uppercase tracking-[0.18em]" style={{ color: 'var(--ink-muted)' }}>
+            Pricing
+          </span>
+          <h2
+            className="text-[28px] leading-[1.1] mt-3 mb-3"
+            style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.02em' }}
+          >
+            Pay for the interviews you take.
+          </h2>
+          {geo && (
+            <p className="text-[13px] mb-6" style={{ color: 'var(--ink-muted)' }}>
+              Pricing for {geo.country_name}. We adjust regionally so the offer is always fair.
+            </p>
+          )}
+        </div>
+        {pricing && (
+          <>
+            <div ref={pricingScrollRef} className="ios-pager pb-1">
+              {pricing.tiers.map((tier) => (
+                <div key={tier.id} className="ios-pager-item">
+                  <PricingCard tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
+                </div>
+              ))}
+            </div>
+            <div className="flex justify-center gap-1.5 mt-5">
+              {pricing.tiers.map((_, i) => (
+                <button
+                  key={i}
+                  onClick={() => scrollPagerTo(pricingScrollRef, i)}
+                  aria-label={`Tier ${i + 1}`}
+                  className="ios-press"
+                  style={dotStyle(i === pricingIdx)}
+                />
+              ))}
+            </div>
+          </>
+        )}
+      </section>
+
+      {/* ── Trust ── */}
+      <section className="px-5 py-12" style={{ borderTop: '1px solid var(--cream-line)' }}>
+        <div>
+          {MOBILE_TRUST.map(({ Icon, label, body }, i) => (
+            <div
+              key={label}
+              className="flex items-start gap-4 pt-7 pb-7"
+              style={i < MOBILE_TRUST.length - 1 ? { borderBottom: '1px solid var(--cream-line)' } : undefined}
+            >
+              <Icon size={22} weight="duotone" style={{ color: 'var(--ink)', flexShrink: 0, marginTop: 2 }} />
+              <div>
+                <h4
+                  className="text-[15px] font-medium"
+                  style={{ color: 'var(--ink)', letterSpacing: '-0.005em' }}
+                >
+                  {label}
+                </h4>
+                <p
+                  className="mt-1 text-[13.5px]"
+                  style={{ color: 'var(--ink-muted)', lineHeight: 1.55 }}
+                >
+                  {body}
+                </p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* ── Closing CTA ── */}
+      <section className="px-5 py-14 text-center" style={{ borderTop: '1px solid var(--cream-line)' }}>
+        <h2
+          className="text-[34px] leading-[1.08] mb-7"
+          style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.02em' }}
+        >
+          Your next interview is on Tuesday.<br />
+          <em style={{ fontStyle: 'italic' }}>Be ready by Monday.</em>
+        </h2>
+        <button
+          onClick={() => setView('signup')}
+          className="ios-press w-full inline-flex items-center justify-center gap-2 px-7 py-4 rounded-full text-[15px] font-medium"
+          style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+        >
+          Start free
+          <PhArrowRight size={15} weight="bold" />
+        </button>
+        <p className="mt-5 text-[12.5px]" style={{ color: 'var(--ink-muted)' }}>
+          No card. 30-minute trial. Upgrade only if it earned the offer.
+        </p>
+      </section>
+
+      {/* ── Footer — minimal, centered, with sticky-CTA spacer at the bottom ── */}
+      <footer
+        className="px-5 py-9 flex flex-col items-center gap-4 text-[12.5px]"
+        style={{ borderTop: '1px solid var(--cream-line)', color: 'var(--ink-muted)' }}
+      >
+        <Logo size="sm" theme="light" />
+        <div className="flex items-center gap-3">
+          <span>© {new Date().getFullYear()} minicaai</span>
+          <span aria-hidden>·</span>
+          <span>Privacy</span>
+          <span aria-hidden>·</span>
+          <span>Terms</span>
+        </div>
+        <button
+          onClick={handleSupport}
+          className="ios-press"
+          style={{ color: 'var(--ink-muted)' }}
+        >
+          Support
+        </button>
+        {/* Spacer so the sticky bottom CTA never covers the last footer line. */}
+        <div style={{ height: 96 }} />
+      </footer>
+
+      {/* ── Sticky bottom CTA — fades in once hero scrolled past, blurred ── */}
+      <div
+        aria-hidden={!showStickyCTA}
+        style={{
+          position: 'fixed',
+          left: 0,
+          right: 0,
+          bottom: 0,
+          zIndex: 20,
+          paddingBottom: 'max(env(safe-area-inset-bottom), 16px)',
+          paddingTop: 12,
+          paddingLeft: 20,
+          paddingRight: 20,
+          background: 'color-mix(in oklab, var(--cream) 85%, transparent)',
+          backdropFilter: 'blur(14px)',
+          WebkitBackdropFilter: 'blur(14px)',
+          borderTop: '1px solid var(--cream-line)',
+          opacity: showStickyCTA ? 1 : 0,
+          pointerEvents: showStickyCTA ? 'auto' : 'none',
+          transform: showStickyCTA ? 'translateY(0)' : 'translateY(12px)',
+          transition: 'opacity 240ms var(--ease-ios), transform 280ms var(--spring-summon)',
+        }}
+      >
+        <button
+          onClick={() => setView('signup')}
+          className="ios-press w-full inline-flex items-center justify-center gap-2 py-3.5 rounded-full text-[15px] font-medium"
+          style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+        >
+          Start free
+          <PhArrowRight size={15} weight="bold" />
+        </button>
+      </div>
+
+      {/* ── Sheet menu (mounted only when open; two-stage close before unmount) ── */}
+      {sheetOpen && (
+        <>
+          <div
+            className={sheetClosing ? 'ios-fade-exit' : 'ios-fade-enter'}
+            onClick={closeSheet}
+            style={{
+              position: 'fixed',
+              inset: 0,
+              zIndex: 40,
+              background: 'rgba(20, 20, 19, 0.42)',
+              backdropFilter: 'blur(2px)',
+              WebkitBackdropFilter: 'blur(2px)',
+            }}
+          />
+          <div
+            ref={sheetRef}
+            className={sheetClosing ? 'ios-sheet-exit' : 'ios-sheet-enter'}
+            style={{
+              position: 'fixed',
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 41,
+              background: 'var(--cream)',
+              borderTopLeftRadius: 22,
+              borderTopRightRadius: 22,
+              paddingBottom: 'max(env(safe-area-inset-bottom), 18px)',
+              boxShadow: '0 -10px 40px rgba(20, 20, 19, 0.08)',
+              borderTop: '1px solid var(--cream-line)',
+            }}
+            onTouchStart={onSheetTouchStart}
+            onTouchMove={onSheetTouchMove}
+            onTouchEnd={onSheetTouchEnd}
+          >
+            {/* Drag handle */}
+            <div className="flex justify-center pt-3 pb-2">
+              <div style={{ width: 38, height: 5, borderRadius: 999, background: 'var(--cream-line)' }} />
+            </div>
+            <div className="px-2 pt-3 pb-4">
+              <button
+                onClick={() => { closeSheet(); setView('tutorials'); }}
+                className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[16px] font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
+                How it works
+              </button>
+              <button
+                onClick={() => {
+                  closeSheet();
+                  // Defer the scroll until the sheet is gone — otherwise the
+                  // body-scroll-lock cleanup fights the smooth scroll-into-view.
+                  window.setTimeout(() => {
+                    document.getElementById('pricing')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                  }, 320);
+                }}
+                className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[16px] font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
+                Pricing
+              </button>
+              <button
+                onClick={() => { closeSheet(); setView('login'); }}
+                className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[16px] font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
+                Sign in
+              </button>
+              <button
+                onClick={() => { closeSheet(); setView('signup'); }}
+                className="ios-press w-full inline-flex items-center justify-center gap-2 mt-2 px-6 py-3.5 rounded-full text-[15px] font-medium"
+                style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+              >
+                Get started
+                <PhArrowRight size={15} weight="bold" />
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  AUTH — MOBILE (login / signup / forgot_password)
+//
+//  Single component, mode-switched. Stays mounted across login ↔ signup ↔
+//  forgot_password transitions so the entrance spring plays once and mode
+//  changes feel instant, not "every tap reslides up." Cancel triggers a
+//  two-stage close (.ios-sheet-exit) before setView('landing') unmounts.
+//
+//  All form handlers + the Google flows are passed in from
+//  SubscriptionGateInner — this component owns nothing about auth state,
+//  just the chrome and motion. That keeps validation + Stripe-checkout-
+//  on-success paths in one place and lets us swap UI without touching
+//  auth logic.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+type AuthMode = 'login' | 'signup' | 'forgot_password';
+
+interface AuthMobileProps {
+  mode: AuthMode;
+  email: string; setEmail: (s: string) => void;
+  password: string; setPassword: (s: string) => void;
+  name: string; setName: (s: string) => void;
+  showPassword: boolean; setShowPassword: (b: boolean) => void;
+  handleLogin: (e: React.FormEvent) => void | Promise<void>;
+  handleSignup: (e: React.FormEvent) => void | Promise<void>;
+  handleForgotPassword: (e: React.FormEvent) => void | Promise<void>;
+  handleGoogleSuccess: (cred: any) => void | Promise<void>;
+  handleGoogleError: () => void;
+  handleGoogleElectron: () => void | Promise<void>;
+  renderGoogleFallback: () => React.ReactNode;
+  isSubmitting: boolean;
+  googleSubmitting: boolean;
+  authError: string | null;
+  setAuthError: (e: string | null) => void;
+  forgotSent: boolean;
+  setForgotSent: (b: boolean) => void;
+  geo: GeoData | null;
+  pricing: RegionPricing | null;
+  setView: (v: View) => void;
+}
+
+const AuthMobile: React.FC<AuthMobileProps> = ({
+  mode, email, setEmail, password, setPassword, name, setName,
+  showPassword, setShowPassword,
+  handleLogin, handleSignup, handleForgotPassword,
+  handleGoogleSuccess, handleGoogleError, handleGoogleElectron, renderGoogleFallback,
+  isSubmitting, googleSubmitting, authError, setAuthError,
+  forgotSent, setForgotSent, geo, pricing, setView,
+}) => {
+  const [isClosing, setIsClosing] = useState(false);
+
+  // Cancel/back to landing — two-stage so the .ios-sheet-exit animation lands
+  // before React unmounts. 320ms matches --dur-dismiss (380) minus a small
+  // head-start so the cream peek behind feels like it's already there when
+  // the sheet finishes leaving.
+  const dismissToLanding = useCallback(() => {
+    if (isClosing) return;
+    setIsClosing(true);
+    window.setTimeout(() => {
+      setAuthError(null);
+      setForgotSent(false);
+      setView('landing');
+    }, 320);
+  }, [isClosing, setAuthError, setForgotSent, setView]);
+
+  // Within-auth navigation (login → signup → forgot_password and back).
+  // No exit animation — AuthMobile stays mounted, only the mode prop and the
+  // visible fields change. Feels like an iOS segmented switch, not a sheet.
+  const switchMode = (next: AuthMode) => {
+    setAuthError(null);
+    setForgotSent(false);
+    setView(next);
+  };
+
+  // Esc → cancel. Mostly for desktop dev-tools mobile emulation; harmless on
+  // phones (iOS soft keyboard has no Esc key).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') dismissToLanding(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [dismissToLanding]);
+
+  const headline =
+    mode === 'login' ? 'Welcome back.' :
+    mode === 'signup' ? 'Create your account.' :
+    forgotSent ? 'Check your email.' :
+    'Forgot your password?';
+
+  const subhead =
+    mode === 'login' ? 'Sign in to continue with your interview copilot.' :
+    mode === 'signup' ? 'Free 30-minute trial. No card. Upgrade only if it earned the offer.' :
+    forgotSent ? `If an account exists for ${email}, a reset link is on its way. The link expires in one hour.` :
+    "Enter the email you signed up with and we'll send you a link to reset your password.";
+
+  const onSubmit =
+    mode === 'login' ? handleLogin :
+    mode === 'signup' ? handleSignup :
+    handleForgotPassword;
+
+  const showCells = mode === 'login' || mode === 'signup' || (mode === 'forgot_password' && !forgotSent);
+
+  return (
+    <div
+      className={isClosing ? 'fixed inset-0 ios-sheet-exit' : 'fixed inset-0 ios-sheet-enter'}
+      style={{
+        background: 'var(--cream)',
+        color: 'var(--ink)',
+        fontFamily: 'var(--sans)',
+        overflowY: 'auto',
+        WebkitOverflowScrolling: 'touch' as any,
+      }}
+    >
+      {/* ── Top bar ── slim, blurred translucent, safe-area-respectful.
+          Cancel on the left for login/signup (iOS pattern); on
+          forgot_password we swap to a "Sign in" back chevron. The X icon
+          on the right is redundant with Cancel for iOS users but covers
+          web users and Android users who pattern-match X-top-right as
+          the universal close affordance. Both buttons fire the same
+          dismissToLanding callback. */}
+      <div
+        className="sticky top-0 z-10 backdrop-blur-md pt-safe"
+        style={{
+          background: 'color-mix(in oklab, var(--cream) 88%, transparent)',
+        }}
+      >
+        <div className="flex items-center justify-between px-2" style={{ height: 48 }}>
+          <button
+            onClick={mode === 'forgot_password' ? () => switchMode('login') : dismissToLanding}
+            className="ios-press inline-flex items-center gap-1 px-3 py-2 text-[15px]"
+            style={{ color: 'var(--ink)' }}
+          >
+            {mode === 'forgot_password' && <ArrowLeft size={17} />}
+            {mode === 'forgot_password' ? 'Sign in' : 'Cancel'}
+          </button>
+          {/* Hide the X on forgot_password — Cancel/back-chevron carries
+              that flow alone, and an X here would race with the back
+              chevron meaning. */}
+          {mode !== 'forgot_password' && (
+            <button
+              onClick={dismissToLanding}
+              aria-label="Close"
+              className="ios-press w-9 h-9 mr-1 flex items-center justify-center rounded-full"
+              style={{ color: 'var(--ink-muted)' }}
+            >
+              <X size={18} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* ── Headline + subhead ── */}
+      <div className="px-5 pt-2 pb-7">
+        <Logo size="md" theme="light" />
+        <h2
+          className="mt-7 text-[28px]"
+          style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em', lineHeight: 1.15 }}
+        >
+          {headline}
+        </h2>
+        <p className="mt-2 text-[14.5px]" style={{ color: 'var(--ink-muted)', lineHeight: 1.55 }}>
+          {subhead}
+        </p>
+      </div>
+
+      {mode === 'forgot_password' && forgotSent ? (
+        // ── Forgot-password success — no form, single CTA back to sign in. ──
+        <div className="px-5">
+          <button
+            type="button"
+            onClick={() => switchMode('login')}
+            className="ios-press w-full py-3.5 rounded-full text-[15px] font-medium"
+            style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+          >
+            Back to sign in
+          </button>
+        </div>
+      ) : (
+        <form onSubmit={onSubmit} className="px-5 space-y-4">
+          {/* ── iOS grouped-cells: rounded card with hairline dividers between
+              rows. Pattern matches Settings.app — labels above values, every
+              cell tappable, dividers indented from the card edge. ── */}
+          {showCells && (
+            <div
+              style={{
+                background: 'var(--cream-soft)',
+                border: '1px solid var(--cream-line)',
+                borderRadius: 16,
+                overflow: 'hidden',
+              }}
+            >
+              {mode === 'signup' && (
+                <>
+                  <div className="px-4 pt-3 pb-3">
+                    <label className="text-[10.5px] uppercase tracking-[0.18em] block mb-0.5" style={{ color: 'var(--ink-muted)' }}>NAME</label>
+                    <input
+                      type="text"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      placeholder="Your name"
+                      className="block w-full text-[16px] bg-transparent outline-none"
+                      style={{ color: 'var(--ink)', minHeight: 24 }}
+                      autoFocus
+                      autoComplete="name"
+                    />
+                  </div>
+                  <div className="h-px mx-4" style={{ background: 'var(--cream-line)' }} />
+                </>
+              )}
+              <div className="px-4 pt-3 pb-3">
+                <label className="text-[10.5px] uppercase tracking-[0.18em] block mb-0.5" style={{ color: 'var(--ink-muted)' }}>EMAIL</label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="you@example.com"
+                  className="block w-full text-[16px] bg-transparent outline-none"
+                  style={{ color: 'var(--ink)', minHeight: 24 }}
+                  autoFocus={mode !== 'signup'}
+                  autoComplete="email"
+                  inputMode="email"
+                  required
+                />
+              </div>
+              {(mode === 'login' || mode === 'signup') && (
+                <>
+                  <div className="h-px mx-4" style={{ background: 'var(--cream-line)' }} />
+                  <div className="px-4 pt-3 pb-3 relative">
+                    <label className="text-[10.5px] uppercase tracking-[0.18em] block mb-0.5" style={{ color: 'var(--ink-muted)' }}>PASSWORD</label>
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder={mode === 'login' ? 'Enter your password' : 'At least 8 characters'}
+                      className="block w-full text-[16px] bg-transparent outline-none pr-7"
+                      style={{ color: 'var(--ink)', minHeight: 24 }}
+                      autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                      required
+                      minLength={mode === 'signup' ? 8 : undefined}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute right-3 ios-press"
+                      style={{ color: 'var(--ink-muted)', bottom: 14 }}
+                      aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    >
+                      {showPassword ? <EyeOff size={17} /> : <Eye size={17} />}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* ── Inline error ── iOS-style alert pill, accent-tinted. */}
+          {authError && (
+            <div
+              className="flex items-start gap-2 px-3 py-2.5 rounded-xl text-[13px]"
+              style={{
+                background: 'color-mix(in oklab, var(--accent) 10%, transparent)',
+                border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)',
+                color: 'var(--accent)',
+              }}
+            >
+              <AlertTriangle size={14} style={{ marginTop: 1, flexShrink: 0 }} />
+              <span style={{ lineHeight: 1.45 }}>{authError}</span>
+            </div>
+          )}
+
+          {/* ── Forgot-password row (login only) ── */}
+          {mode === 'login' && (
+            <div className="flex justify-end pt-1">
+              <button
+                type="button"
+                onClick={() => switchMode('forgot_password')}
+                className="ios-press text-[13px] font-medium"
+                style={{ color: 'var(--accent)' }}
+              >
+                Forgot password?
+              </button>
+            </div>
+          )}
+
+          {/* ── Primary CTA ── */}
+          <button
+            type="submit"
+            disabled={isSubmitting || googleSubmitting}
+            className="ios-press w-full inline-flex items-center justify-center gap-2 py-3.5 rounded-full text-[15px] font-medium disabled:opacity-60"
+            style={{ background: 'var(--ink)', color: 'var(--cream)', letterSpacing: '-0.005em' }}
+          >
+            {isSubmitting && <Loader2 size={16} className="animate-spin" />}
+            {mode === 'login' ? 'Sign in' : mode === 'signup' ? 'Create account' : 'Send reset link'}
+            {!isSubmitting && <PhArrowRight size={14} weight="bold" />}
+          </button>
+
+          {mode === 'signup' && (
+            <p className="text-[11px] text-center leading-relaxed pt-1" style={{ color: 'var(--ink-faint)' }}>
+              By creating an account, you agree to our Terms and Privacy Policy.
+            </p>
+          )}
+        </form>
+      )}
+
+      {/* ── Google sign-in (login + signup only; not on forgot_password) ── */}
+      {GOOGLE_CLIENT_ID && (mode === 'login' || mode === 'signup') && (
+        <div className="px-5 mt-7">
+          <div className="flex items-center gap-3">
+            <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
+            <span className="text-[10px] uppercase tracking-[0.18em]" style={{ color: 'var(--ink-faint)' }}>or</span>
+            <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
+          </div>
+          {isElectron ? (
+            <button
+              type="button"
+              onClick={handleGoogleElectron}
+              disabled={isSubmitting || googleSubmitting}
+              className="ios-press mt-5 w-full py-3.5 px-4 rounded-full text-[14px] font-medium flex items-center justify-center gap-3 disabled:opacity-60"
+              style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+            >
+              {googleSubmitting ? (
+                <Loader2 size={16} className="animate-spin" />
+              ) : (
+                <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+              )}
+              {googleSubmitting
+                ? (mode === 'login' ? 'Waiting for sign-in...' : 'Waiting for sign-up...')
+                : 'Continue with Google'}
+            </button>
+          ) : (
+            <div className="mt-5 flex justify-center [&_iframe]:rounded-full">
+              <GoogleLogin
+                onSuccess={handleGoogleSuccess}
+                onError={handleGoogleError}
+                theme="outline"
+                size="large"
+                width="320"
+                text={mode === 'login' ? 'signin_with' : 'signup_with'}
+                shape="pill"
+              />
+            </div>
+          )}
+          {isElectron && renderGoogleFallback()}
+        </div>
+      )}
+
+      {/* ── Mode switcher ── */}
+      <div className="px-5 mt-8 text-center text-[13.5px]" style={{ color: 'var(--ink-muted)' }}>
+        {mode === 'login' ? (
+          <>
+            No account?{' '}
+            <button onClick={() => switchMode('signup')} className="ios-press font-medium" style={{ color: 'var(--ink)' }}>
+              Create one
+            </button>
+          </>
+        ) : mode === 'signup' ? (
+          <>
+            Already have an account?{' '}
+            <button onClick={() => switchMode('login')} className="ios-press font-medium" style={{ color: 'var(--ink)' }}>
+              Sign in
+            </button>
+          </>
+        ) : (
+          <>
+            Remembered it?{' '}
+            <button onClick={() => switchMode('login')} className="ios-press font-medium" style={{ color: 'var(--ink)' }}>
+              Sign in
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* ── Geo footer ── safe-area pad so the home indicator stays clear. */}
+      {geo && (
+        <div
+          className="px-5 mt-7 flex items-center justify-center gap-1.5 text-[11px]"
+          style={{
+            color: 'var(--ink-faint)',
+            paddingBottom: 'max(env(safe-area-inset-bottom), 32px)',
+          }}
+        >
+          {mode === 'signup' ? (
+            <>
+              <PhGlobe size={11} weight="duotone" />
+              {geo.country_name}
+              {pricing && <> &middot; {pricing.currencySymbol} {pricing.currency}</>}
+            </>
+          ) : (
+            <>
+              <PhLock size={11} weight="duotone" />
+              Secure connection from {geo.country_name}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  TUTORIALS — MOBILE
+//
+//  iPhone-feel rebuild of the tutorials view. Cream surface (matches
+//  mobile landing/auth) instead of the desktop dark theme — keeps the
+//  whole mobile funnel visually coherent. Vertical list of 8 step-cards
+//  with stagger-rise entrance, sheet-up entry, sheet-down dismiss back
+//  to landing or download depending on auth state.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+interface TutorialsMobileProps {
+  setView: (v: View) => void;
+  currentUser: UserProfile | null;
+}
+
+const TUTORIAL_STEPS = [
+  { step: '01', title: 'Download & Install',  desc: 'Install minicaai on Windows, macOS, or Linux and launch it.', duration: '1 min' },
+  { step: '02', title: 'Create Your Account', desc: 'Sign up, verify your email, and activate your license key.',   duration: '1 min' },
+  { step: '03', title: 'Upload Resume & JD',  desc: 'Add your résumé and job description for contextual AI answers.', duration: '1 min' },
+  { step: '04', title: 'Start an Interview',  desc: 'Share system audio, enable auto-mode, and let minicaai listen.', duration: '2 min' },
+  { step: '05', title: 'Pop-out Mode',        desc: 'Launch the invisible overlay that floats over Zoom, Meet, Teams. (Pro)', duration: '1 min' },
+  { step: '06', title: 'Auto-Solve',          desc: 'Capture the editor and let AI solve coding problems on demand. (Pro)', duration: '2 min' },
+  { step: '07', title: 'Switch AI Models',    desc: 'Pick between Gemini, GPT, Claude, Grok, Llama for different strengths.', duration: '1 min' },
+  { step: '08', title: 'Manage Subscription', desc: 'Upgrade, manage billing, and view usage stats.', duration: '1 min' },
+] as const;
+
+const TutorialsMobile: React.FC<TutorialsMobileProps> = ({ setView, currentUser }) => {
+  const [isClosing, setIsClosing] = useState(false);
+
+  const dismiss = useCallback(() => {
+    if (isClosing) return;
+    setIsClosing(true);
+    window.setTimeout(() => setView(currentUser ? 'download' : 'landing'), 320);
+  }, [isClosing, setView, currentUser]);
+
+  // Stagger entrance for cards as they enter the viewport.
+  useEffect(() => {
+    const cards = document.querySelectorAll('[data-rise]:not(.ios-rise-active)');
+    if (cards.length === 0) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        entries.forEach(e => {
+          if (e.isIntersecting) {
+            (e.target as HTMLElement).classList.add('ios-rise-active');
+            io.unobserve(e.target);
+          }
+        });
+      },
+      { rootMargin: '0px 0px -8% 0px', threshold: 0.05 }
+    );
+    cards.forEach(c => io.observe(c));
+    return () => io.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') dismiss(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [dismiss]);
+
+  return (
+    <div
+      className={isClosing ? 'fixed inset-0 ios-sheet-exit' : 'fixed inset-0 ios-sheet-enter'}
+      style={{
+        background: 'var(--cream)',
+        color: 'var(--ink)',
+        fontFamily: 'var(--sans)',
+        overflowY: 'auto',
+        WebkitOverflowScrolling: 'touch' as any,
+      }}
+    >
+      {/* Top bar */}
+      <div
+        className="sticky top-0 z-10 backdrop-blur-md pt-safe"
+        style={{ background: 'color-mix(in oklab, var(--cream) 88%, transparent)' }}
+      >
+        <div className="flex items-center justify-between px-2" style={{ height: 48 }}>
+          <button
+            onClick={dismiss}
+            className="ios-press inline-flex items-center gap-1 px-3 py-2 text-[15px]"
+            style={{ color: 'var(--ink)' }}
+          >
+            <ArrowLeft size={17} />
+            {currentUser ? 'Download' : 'Home'}
+          </button>
+          <Logo size="sm" theme="light" />
+          <div style={{ width: 88 }} />
+        </div>
+      </div>
+
+      {/* Hero */}
+      <section className="px-5 pt-8 pb-8">
+        <div className="inline-flex items-center gap-1.5 mb-5" style={{ color: 'var(--ink-muted)' }}>
+          <PhSparkle size={12} weight="duotone" style={{ color: 'var(--accent)' }} />
+          <span className="text-[11px] font-medium uppercase tracking-[0.18em]">Getting Started</span>
+        </div>
+        <h1
+          className="text-[34px] leading-[1.05] mb-4"
+          style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.025em' }}
+        >
+          Learn minicaai in <em style={{ fontStyle: 'italic', fontWeight: 400 }}>5 minutes</em>.
+        </h1>
+        <p className="text-[15.5px]" style={{ color: 'var(--ink-soft)', lineHeight: 1.55 }}>
+          Eight short tutorials that walk you through every feature, end to end.
+        </p>
+      </section>
+
+      {/* Tutorial cards */}
+      <section className="px-5 pb-10">
+        <div className="space-y-3">
+          {TUTORIAL_STEPS.map((s, i) => (
+            <div
+              key={s.step}
+              data-rise
+              style={{
+                animationDelay: `${i * 50}ms`,
+                background: 'var(--cream-soft)',
+                border: '1px solid var(--cream-line)',
+              }}
+              className="ios-press rounded-3xl p-5"
+            >
+              <div className="flex items-start justify-between mb-2">
+                <span className="text-[12px] font-medium tabular-nums tracking-[0.1em]" style={{ color: 'var(--ink-muted)' }}>
+                  {s.step}
+                </span>
+                <span className="inline-flex items-center gap-1 text-[11px]" style={{ color: 'var(--ink-faint)' }}>
+                  <Clock size={10} /> {s.duration}
+                </span>
+              </div>
+              <h3
+                className="text-[18px] mb-1.5"
+                style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.015em' }}
+              >
+                {s.title}
+              </h3>
+              <p className="text-[13.5px]" style={{ color: 'var(--ink-soft)', lineHeight: 1.55 }}>
+                {s.desc}
+              </p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* CTA */}
+      <section className="px-5" style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 40px)' }}>
+        <button
+          onClick={() => setView(currentUser ? 'download' : 'signup')}
+          className="ios-press w-full inline-flex items-center justify-center gap-2 px-7 py-4 rounded-full text-[15px] font-medium"
+          style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+        >
+          {currentUser ? 'Go to Download' : 'Get Started'}
+          <PhArrowRight size={15} weight="bold" />
+        </button>
+      </section>
+    </div>
+  );
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PRICING — MOBILE
+//
+//  Re-uses the existing PricingCard component (same tier visuals, "Most
+//  chosen" pill, regional formatting) inside a horizontal paged swiper —
+//  same pattern as the landing's pricing section. Drops the desktop
+//  feature-comparison table (info redundant with PricingCard) and replaces
+//  it with an iOS-style accordion FAQ. Skips comparison on purpose.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+interface PricingMobileProps {
+  setView: (v: View) => void;
+  geo: GeoData | null;
+  pricing: RegionPricing | null;
+  handleTierSelect: (tier: PricingTier) => Promise<void> | void;
+  isSubmitting: boolean;
+  currentUser: UserProfile | null;
+}
+
+const PRICING_FAQ = [
+  { q: 'Can I share the app with others?',  a: 'No. Each license is bound to a specific device. Shared copies will not authenticate and will be locked.' },
+  { q: 'What happens if I use a VPN?',      a: 'VPN and proxy connections are detected and blocked. You must use a direct connection from your registered country.' },
+  { q: 'Can I cancel anytime?',             a: 'Yes. Cancel from your account settings. Access continues until the end of your billing period.' },
+  { q: 'What if I change devices?',         a: 'Contact our live support to transfer your license. Each Pro account supports up to 3 devices.' },
+] as const;
+
+const PricingMobile: React.FC<PricingMobileProps> = ({
+  setView, geo, pricing, handleTierSelect, isSubmitting, currentUser,
+}) => {
+  const [isClosing, setIsClosing] = useState(false);
+  const [pricingIdx, setPricingIdx] = useState(0);
+  const [openFaqIdx, setOpenFaqIdx] = useState<number | null>(null);
+  const pricingScrollRef = useRef<HTMLDivElement>(null);
+
+  const dismiss = useCallback(() => {
+    if (isClosing) return;
+    setIsClosing(true);
+    window.setTimeout(() => setView(currentUser ? 'download' : 'landing'), 320);
+  }, [isClosing, setView, currentUser]);
+
+  useEffect(() => {
+    const el = pricingScrollRef.current;
+    if (!el) return;
+    let raf = 0;
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        if (el.clientWidth > 0) setPricingIdx(Math.round(el.scrollLeft / el.clientWidth));
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [pricing]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') dismiss(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [dismiss]);
+
+  const dotStyle = (active: boolean): React.CSSProperties => ({
+    width: active ? 22 : 6,
+    height: 6,
+    borderRadius: 999,
+    background: active ? 'var(--ink)' : 'var(--cream-line)',
+    transition: 'width 280ms var(--ease-ios), background 280ms var(--ease-ios)',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+  });
+
+  const scrollPagerTo = (idx: number) => {
+    const el = pricingScrollRef.current;
+    if (!el) return;
+    el.scrollTo({ left: idx * el.clientWidth, behavior: 'smooth' });
+  };
+
+  return (
+    <div
+      className={isClosing ? 'fixed inset-0 ios-sheet-exit' : 'fixed inset-0 ios-sheet-enter'}
+      style={{
+        background: 'var(--cream)',
+        color: 'var(--ink)',
+        fontFamily: 'var(--sans)',
+        overflowY: 'auto',
+        WebkitOverflowScrolling: 'touch' as any,
+      }}
+    >
+      {/* Top bar */}
+      <div
+        className="sticky top-0 z-10 backdrop-blur-md pt-safe"
+        style={{ background: 'color-mix(in oklab, var(--cream) 88%, transparent)' }}
+      >
+        <div className="flex items-center justify-between px-2" style={{ height: 48 }}>
+          <button
+            onClick={dismiss}
+            className="ios-press inline-flex items-center gap-1 px-3 py-2 text-[15px]"
+            style={{ color: 'var(--ink)' }}
+          >
+            <ArrowLeft size={17} />
+            {currentUser ? 'Download' : 'Home'}
+          </button>
+          <Logo size="sm" theme="light" />
+          {!currentUser ? (
+            <button
+              onClick={() => setView('login')}
+              className="ios-press px-3 py-2 text-[14px] font-medium"
+              style={{ color: 'var(--ink)' }}
+            >
+              Sign in
+            </button>
+          ) : (
+            <div style={{ width: 64 }} />
+          )}
+        </div>
+      </div>
+
+      {/* Hero */}
+      <section className="px-5 pt-8 pb-7">
+        <div className="inline-flex items-center gap-1.5 mb-5" style={{ color: 'var(--ink-muted)' }}>
+          <PhSparkle size={12} weight="duotone" style={{ color: 'var(--accent)' }} />
+          <span className="text-[11px] font-medium uppercase tracking-[0.18em]">Pricing</span>
+        </div>
+        <h1
+          className="text-[34px] leading-[1.05] mb-4"
+          style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.025em' }}
+        >
+          Choose your plan.
+        </h1>
+        <p className="text-[15.5px]" style={{ color: 'var(--ink-soft)', lineHeight: 1.55 }}>
+          Start free, upgrade when you're ready. Cancel anytime.
+        </p>
+        {geo && (
+          <p className="mt-3 text-[12.5px]" style={{ color: 'var(--ink-muted)' }}>
+            Pricing for {geo.country_name}
+            {pricing ? <> &middot; {pricing.currencySymbol} {pricing.currency}</> : null}
+          </p>
+        )}
+      </section>
+
+      {/* Pricing pager */}
+      {pricing && (
+        <section className="pb-10">
+          <div ref={pricingScrollRef} className="ios-pager pb-1">
+            {pricing.tiers.map((tier) => (
+              <div key={tier.id} className="ios-pager-item">
+                <PricingCard tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
+              </div>
+            ))}
+          </div>
+          <div className="flex justify-center gap-1.5 mt-5">
+            {pricing.tiers.map((_, i) => (
+              <button
+                key={i}
+                onClick={() => scrollPagerTo(i)}
+                aria-label={`Tier ${i + 1}`}
+                className="ios-press"
+                style={dotStyle(i === pricingIdx)}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* FAQ accordion */}
+      <section className="px-5 pb-10" style={{ borderTop: '1px solid var(--cream-line)' }}>
+        <h2
+          className="text-[26px] leading-[1.1] pt-10 mb-6"
+          style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.02em' }}
+        >
+          Frequently asked.
+        </h2>
+        <div
+          style={{
+            background: 'var(--cream-soft)',
+            border: '1px solid var(--cream-line)',
+            borderRadius: 16,
+            overflow: 'hidden',
+          }}
+        >
+          {PRICING_FAQ.map((item, i) => {
+            const open = openFaqIdx === i;
+            return (
+              <React.Fragment key={i}>
+                {i > 0 && <div className="h-px mx-4" style={{ background: 'var(--cream-line)' }} />}
+                <button
+                  onClick={() => setOpenFaqIdx(open ? null : i)}
+                  className="ios-press w-full text-left px-4 py-4 flex items-start justify-between gap-3"
+                  aria-expanded={open}
+                >
+                  <span className="text-[14.5px] font-medium" style={{ color: 'var(--ink)' }}>
+                    {item.q}
+                  </span>
+                  <ChevronDown
+                    size={16}
+                    style={{
+                      color: 'var(--ink-muted)',
+                      transition: 'transform 280ms var(--ease-ios)',
+                      transform: open ? 'rotate(180deg)' : 'rotate(0)',
+                      flexShrink: 0,
+                      marginTop: 2,
+                    }}
+                  />
+                </button>
+                {open && (
+                  <div className="px-4 pb-4 -mt-1">
+                    <p className="text-[13.5px]" style={{ color: 'var(--ink-soft)', lineHeight: 1.6 }}>
+                      {item.a}
+                    </p>
+                  </div>
+                )}
+              </React.Fragment>
+            );
+          })}
+        </div>
+      </section>
+
+      <div style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 32px)' }} />
+    </div>
+  );
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  DOWNLOAD — MOBILE (post-auth dashboard for browser users)
+//
+//  Cream surface (matches the rest of the mobile funnel; desktop stays
+//  dark). Top app-bar shows tier badge + avatar that opens an account
+//  bottom-sheet (Tutorials / Admin / Sign out — moves the desktop's
+//  inline icons into a tappable sheet). Tier-aware action: Pro/Max
+//  active chip, Basic with renew CTA, free with Upgrade. Cancel-
+//  subscription confirm renders as a bottom sheet (native iOS
+//  destructive-action pattern) instead of a centered dialog.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+interface DownloadMobileProps {
+  setView: (v: View) => void;
+  currentUser: UserProfile | null;
+  setCurrentUser: (user: UserProfile | null) => void;
+  currentLicense: LicenseData | null;
+  handleLogout: () => void;
+  justSignedUp: boolean;
+  setJustSignedUp: (b: boolean) => void;
+  paymentError: string | null;
+  paymentSuccess: string | null;
+  paymentLoading: boolean;
+  geo: GeoData | null;
+  // Regional pricing payload — feeds PlanSheetMobile's per-tier price labels.
+  pricing: RegionPricing | null;
+  lastSuccessfulTier: string | null;
+  cancelConfirm: boolean;
+  setCancelConfirm: (b: boolean) => void;
+  handleManageSubscription: () => Promise<void> | void;
+  handleCancelSubscription: () => Promise<void> | void;
+  initiateRenewal: () => Promise<void> | void;
+  initiateCheckout: (tier?: 'basic' | 'pro' | 'max') => Promise<void> | void;
+  basicExpiryLabel: (expiresAt: number | undefined | null) => string | null;
+}
+
+const DOWNLOAD_PLATFORMS = [
+  { name: 'Windows', sub: 'Windows 10+ (.exe)',     href: 'https://get.minicaai.com/windows', Icon: Monitor    },
+  { name: 'macOS',   sub: 'macOS 10.15+ (.dmg)',    href: 'https://get.minicaai.com/mac',   Icon: Cpu        },
+  { name: 'Linux',   sub: 'Any distro (.AppImage)', href: 'https://get.minicaai.com/linux', Icon: Headphones },
+] as const;
+
+const POST_DOWNLOAD_STEPS = [
+  'Install and open the app',
+  'Sign in with the same email you just registered',
+  'Your license activates automatically on this device',
+  'Upload your résumé and start your first session',
+];
+
+const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
+  const {
+    setView, currentUser, setCurrentUser, currentLicense, handleLogout, justSignedUp, setJustSignedUp,
+    paymentError, paymentSuccess, paymentLoading, geo, pricing, lastSuccessfulTier,
+    cancelConfirm, setCancelConfirm, handleManageSubscription, handleCancelSubscription,
+    initiateRenewal, initiateCheckout, basicExpiryLabel,
+  } = props;
+
+  const [showAccountSheet, setShowAccountSheet] = useState(false);
+  // Plan & billing sheet — opens from "Change plan" pill, the account-sheet
+  // entry, or any inline upgrade affordance. Single sheet handles every
+  // possible switch path; see PlanSheetMobile for the action-routing logic.
+  const [planSheetOpen, setPlanSheetOpen] = useState(false);
+  // Profile sheet — opens from the account sheet's "Profile" item or the
+  // avatar tap in the top bar. Owns its own draft state internally so name
+  // edits survive the user briefly closing/re-opening the sheet within a
+  // single intent.
+  const [profileSheetOpen, setProfileSheetOpen] = useState(false);
+
+  // Effective-tier resolution — mirrors the desktop's IIFE logic. Admin always
+  // renders as Max; otherwise prefer the live license tier; fall back to the
+  // tier the user just paid for (covers the post-payment window where the
+  // webhook hasn't landed and currentLicense.tier is still 'free').
+  const isAdminUser = !!currentUser && licenseService.isDeveloper(currentUser.email);
+  const licenseTier = currentLicense?.tier;
+  const paidLicense =
+    licenseTier === 'max' || licenseTier === 'pro' || licenseTier === 'basic'
+      ? licenseTier : null;
+  const fallbackTier = paidLicense
+    ? paidLicense
+    : (lastSuccessfulTier === 'max' || lastSuccessfulTier === 'pro' || lastSuccessfulTier === 'basic'
+        ? lastSuccessfulTier
+        : null);
+  const effectiveTier = isAdminUser ? 'max' : fallbackTier;
+
+  const tierBadge = (() => {
+    if (!currentLicense) return null;
+    const t = currentLicense.tier;
+    const labelMap: Record<string, string> = { max: 'MAX', pro: 'PRO', basic: 'BASIC', free: 'FREE' };
+    const colorMap: Record<string, { bg: string; color: string }> = {
+      max:   { bg: 'rgba(245, 158, 11, 0.15)', color: '#b45309' },
+      pro:   { bg: 'rgba(59, 130, 246, 0.15)', color: '#1d4ed8' },
+      basic: { bg: 'rgba(16, 185, 129, 0.15)', color: '#047857' },
+      free:  { bg: 'var(--cream-soft)',        color: 'var(--ink-muted)' },
+    };
+    return { label: labelMap[t] || 'FREE', ...(colorMap[t] || colorMap.free) };
+  })();
+
+  return (
+    <div
+      className="fixed inset-0 ios-sheet-enter overflow-y-auto"
+      style={{
+        background: 'var(--cream)',
+        color: 'var(--ink)',
+        fontFamily: 'var(--sans)',
+        WebkitOverflowScrolling: 'touch' as any,
+      }}
+    >
+      {/* Top bar */}
+      <div
+        className="sticky top-0 z-30 backdrop-blur-md pt-safe"
+        style={{
+          background: 'color-mix(in oklab, var(--cream) 88%, transparent)',
+          borderBottom: '1px solid var(--cream-line)',
+        }}
+      >
+        <div className="flex items-center justify-between px-5" style={{ height: 56 }}>
+          <Logo size="sm" theme="light" />
+          {currentUser && (
+            <button
+              onClick={() => setShowAccountSheet(true)}
+              className="ios-press flex items-center gap-2"
+              aria-label="Account menu"
+            >
+              {tierBadge && (
+                <span
+                  className="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider"
+                  style={{ background: tierBadge.bg, color: tierBadge.color }}
+                >
+                  {tierBadge.label}
+                </span>
+              )}
+              <div
+                className="w-8 h-8 rounded-full flex items-center justify-center"
+                style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
+              >
+                <span className="text-[12px] font-medium" style={{ color: 'var(--ink)' }}>
+                  {currentUser.name?.[0]?.toUpperCase() || currentUser.email[0].toUpperCase()}
+                </span>
+              </div>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Hero — big icon */}
+      <section className="px-5 pt-9 pb-6 text-center">
+        <div
+          className="w-20 h-20 mx-auto rounded-3xl flex items-center justify-center mb-6"
+          style={{
+            background: 'var(--ink)',
+            boxShadow: '0 12px 28px rgba(20, 20, 19, 0.16)',
+          }}
+        >
+          <Download size={32} style={{ color: 'var(--cream)' }} />
+        </div>
+        <h1
+          className="text-[30px] leading-[1.08] mb-3"
+          style={{ fontFamily: 'var(--serif)', fontWeight: 400, letterSpacing: '-0.025em' }}
+        >
+          Download minicaai.
+        </h1>
+        <p
+          className="text-[14.5px] mx-auto"
+          style={{ color: 'var(--ink-soft)', lineHeight: 1.55, maxWidth: '92%' }}
+        >
+          Runs as a desktop app — invisible to screen sharing, system audio capture, always-on-top overlay.
+        </p>
+      </section>
+
+      {/* Web-not-available chip */}
+      <section className="px-5 pb-5 flex justify-center">
+        <div
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[12px]"
+          style={{
+            background: 'color-mix(in oklab, var(--accent) 8%, transparent)',
+            border: '1px solid color-mix(in oklab, var(--accent) 30%, transparent)',
+            color: 'var(--accent)',
+          }}
+        >
+          <AlertTriangle size={11} />
+          The web version is not available
+        </div>
+      </section>
+
+      {/* Welcome banner for fresh signups still on free */}
+      {justSignedUp && (!currentLicense || currentLicense.tier === 'free') && (
+        <section className="px-5 pb-5">
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-start gap-3 px-4 py-3 rounded-2xl"
+            style={{
+              background: 'color-mix(in oklab, var(--accent) 8%, transparent)',
+              border: '1px solid color-mix(in oklab, var(--accent) 30%, transparent)',
+            }}
+          >
+            <Sparkles size={14} className="mt-0.5 shrink-0" style={{ color: 'var(--accent)' }} />
+            <div className="flex-1">
+              <div className="text-[14px] font-medium" style={{ color: 'var(--ink)' }}>Welcome to minicaai.</div>
+              <div className="text-[12.5px] mt-0.5" style={{ color: 'var(--ink-muted)', lineHeight: 1.5 }}>
+                Your 30-minute free trial is running. Download below to start your first session.
+              </div>
+            </div>
+            <button
+              onClick={() => setJustSignedUp(false)}
+              aria-label="Dismiss"
+              className="ios-press shrink-0"
+              style={{ color: 'var(--ink-faint)' }}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        </section>
+      )}
+
+      {/* Payment error / success banners */}
+      {paymentError && (
+        <section className="px-5 pb-3">
+          <div
+            className="flex items-center gap-2 px-4 py-3 rounded-2xl text-[13px]"
+            style={{
+              background: 'color-mix(in oklab, var(--accent) 10%, transparent)',
+              border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)',
+              color: 'var(--accent)',
+            }}
+          >
+            <AlertTriangle size={14} /> {paymentError}
+          </div>
+        </section>
+      )}
+      {paymentSuccess && (
+        <section className="px-5 pb-3">
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-start gap-2 px-4 py-3 rounded-2xl text-[13px]"
+            style={{
+              background: 'rgba(16, 185, 129, 0.1)',
+              border: '1px solid rgba(16, 185, 129, 0.3)',
+              color: '#047857',
+            }}
+          >
+            <Check size={14} style={{ marginTop: 1 }} /> {paymentSuccess}
+          </div>
+        </section>
+      )}
+
+      {/* Download cards */}
+      <section className="px-5 pt-4 pb-8">
+        <div className="space-y-3">
+          {DOWNLOAD_PLATFORMS.map(({ name, sub, href, Icon }) => (
+            <a
+              key={name}
+              href={href}
+              className="ios-press flex items-center justify-between gap-4 px-4 py-4 rounded-3xl"
+              style={{
+                background: 'var(--cream-soft)',
+                border: '1px solid var(--cream-line)',
+                color: 'var(--ink)',
+                textDecoration: 'none',
+              }}
+            >
+              <div className="flex items-center gap-4 min-w-0">
+                <div
+                  className="shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center"
+                  style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)' }}
+                >
+                  <Icon size={20} style={{ color: 'var(--ink)' }} />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[15px] font-medium truncate" style={{ color: 'var(--ink)' }}>{name}</div>
+                  <div className="text-[12px] mt-0.5" style={{ color: 'var(--ink-muted)' }}>{sub}</div>
+                </div>
+              </div>
+              <Download size={18} className="shrink-0" style={{ color: 'var(--ink-muted)' }} />
+            </a>
+          ))}
+        </div>
+      </section>
+
+      {/* Tier-aware action */}
+      <section className="px-5 pb-10">
+        {(() => {
+          if (effectiveTier === 'max' || effectiveTier === 'pro') {
+            const isMax = effectiveTier === 'max';
+            return (
+              <div className="space-y-3">
+                <div
+                  className="px-5 py-3.5 rounded-full text-center text-[14px] font-medium inline-flex items-center justify-center gap-2 w-full"
+                  style={{
+                    background: isMax ? 'rgba(245, 158, 11, 0.12)' : 'rgba(59, 130, 246, 0.12)',
+                    border: '1px solid ' + (isMax ? 'rgba(245, 158, 11, 0.35)' : 'rgba(59, 130, 246, 0.35)'),
+                    color: isMax ? '#b45309' : '#1d4ed8',
+                  }}
+                >
+                  {isMax ? <Crown size={14} /> : <Check size={14} />}
+                  {isAdminUser ? 'Admin · Max Active' : (isMax ? 'Max Active' : 'Pro Active')}
+                </div>
+                {/* Inline Pro→Max upgrade — one-tap path to the highest tier
+                    without leaving the page. Routes through initiateCheckout
+                    which detects the existing Pro sub and posts to
+                    /upgrade-tier instead of creating a second subscription. */}
+                {!isAdminUser && !isMax && (
+                  <button
+                    onClick={() => initiateCheckout('max')}
+                    disabled={paymentLoading}
+                    className="ios-press w-full inline-flex items-center justify-center gap-2 px-4 py-3.5 rounded-full text-[14px] font-medium disabled:opacity-50"
+                    style={{
+                      background: 'rgba(245, 158, 11, 0.12)',
+                      border: '1px solid rgba(245, 158, 11, 0.35)',
+                      color: '#b45309',
+                    }}
+                  >
+                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Crown size={14} />}
+                    Upgrade to Max
+                  </button>
+                )}
+                {!isAdminUser && geo?.country_code !== 'IN' && (
+                  <button
+                    onClick={handleManageSubscription}
+                    disabled={paymentLoading}
+                    className="ios-press w-full inline-flex items-center justify-center gap-2 px-4 py-3.5 rounded-full text-[14px] font-medium disabled:opacity-50"
+                    style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+                  >
+                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Settings size={14} />}
+                    Manage subscription
+                    <ExternalLink size={12} className="opacity-60" />
+                  </button>
+                )}
+                {!isAdminUser && geo?.country_code === 'IN' && (
+                  <button
+                    onClick={() => setCancelConfirm(true)}
+                    disabled={paymentLoading}
+                    className="ios-press w-full inline-flex items-center justify-center gap-2 px-4 py-3.5 rounded-full text-[14px] font-medium disabled:opacity-50"
+                    style={{ background: 'transparent', border: '1px solid var(--cream-line)', color: 'var(--ink-muted)' }}
+                  >
+                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <XCircle size={14} />}
+                    Cancel subscription
+                  </button>
+                )}
+              </div>
+            );
+          }
+          if (effectiveTier === 'basic') {
+            // Renew is gated STRICTLY on the live license tier — not on
+            // effectiveTier, which falls back to lastSuccessfulTier from
+            // localStorage during the post-Stripe webhook-lag window. In
+            // that window the user just bought Basic; offering Renew is
+            // both confusing UX and would be rejected server-side by the
+            // /create-renewal tier gate. We still render the "Basic Active"
+            // chip optimistically (effectiveTier covers the lag), just
+            // without the renew button until the license confirms Basic.
+            const isConfirmedBasic = currentLicense?.tier === 'basic';
+            const r = pricingService.getBasicRenewalPrice(geo?.country_code || 'US');
+            return (
+              <div className="space-y-3">
+                <div
+                  className="px-5 py-3.5 rounded-full text-center text-[14px] font-medium inline-flex items-center justify-center gap-2 w-full"
+                  style={{
+                    background: 'rgba(16, 185, 129, 0.1)',
+                    border: '1px solid rgba(16, 185, 129, 0.3)',
+                    color: '#047857',
+                  }}
+                >
+                  <Sparkles size={14} /> Basic Active
+                </div>
+                {currentLicense && basicExpiryLabel(currentLicense.expires_at) && (
+                  <div className="flex items-center justify-center gap-1 text-[12px]" style={{ color: 'var(--ink-muted)' }}>
+                    <Clock size={11} />
+                    {basicExpiryLabel(currentLicense.expires_at)}
+                  </div>
+                )}
+                {isConfirmedBasic && (
+                  <button
+                    onClick={initiateRenewal}
+                    disabled={paymentLoading}
+                    className="ios-press w-full inline-flex items-center justify-center gap-2 py-3.5 rounded-full text-[14px] font-medium disabled:opacity-50"
+                    style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+                  >
+                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+                    {`Renew +1h · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`}
+                  </button>
+                )}
+              </div>
+            );
+          }
+          return (
+            <button
+              onClick={() => initiateCheckout('pro')}
+              disabled={paymentLoading}
+              className="ios-press w-full inline-flex items-center justify-center gap-2 py-4 rounded-full text-[15px] font-medium disabled:opacity-50"
+              style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+            >
+              {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Crown size={14} />}
+              Upgrade to Pro
+            </button>
+          );
+        })()}
+      </section>
+
+      {/* Manage subscription — universal entry to PlanSheetMobile. Visible
+          to every tier and every state (no justSignedUp gate — even brand
+          new users need an obvious path to switch/cancel). Styled as a real
+          button (cream-soft background + hairline border) so it reads as an
+          action, not a label. The label is "Manage subscription" instead of
+          "Change plan" to match what users search for when they want to
+          cancel — that's the word every billing flow on the internet uses. */}
+      <section className="px-5 pb-10 -mt-4">
+        <button
+          onClick={() => setPlanSheetOpen(true)}
+          className="ios-press w-full inline-flex items-center justify-between gap-2 py-3.5 px-5 rounded-full text-[14px] font-medium"
+          style={{
+            background: 'var(--cream-soft)',
+            border: '1px solid var(--cream-line)',
+            color: 'var(--ink)',
+          }}
+          aria-label="Manage subscription"
+        >
+          <span className="inline-flex items-center gap-2">
+            <Settings size={14} style={{ color: 'var(--ink-muted)' }} />
+            Manage subscription
+          </span>
+          <ChevronRight size={14} style={{ color: 'var(--ink-muted)' }} />
+        </button>
+      </section>
+
+      {/* Post-download steps */}
+      <section className="px-5 pb-10" style={{ borderTop: '1px solid var(--cream-line)' }}>
+        <h3 className="pt-8 text-[16px] font-medium mb-4 flex items-center gap-2" style={{ color: 'var(--ink)' }}>
+          <BookOpen size={14} style={{ color: 'var(--accent)' }} /> After downloading
+        </h3>
+        <ol className="space-y-3">
+          {POST_DOWNLOAD_STEPS.map((step, i) => (
+            <li key={i} className="flex items-start gap-3 text-[13.5px]" style={{ color: 'var(--ink-soft)' }}>
+              <span
+                className="text-[10px] font-bold tabular-nums px-1.5 py-0.5 rounded shrink-0 mt-0.5"
+                style={{ background: 'var(--cream-soft)', color: 'var(--accent)' }}
+              >
+                {i + 1}
+              </span>
+              <span style={{ lineHeight: 1.6 }}>{step}</span>
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      {/* Tutorials secondary action */}
+      <section className="px-5 pb-10">
+        <button
+          onClick={() => setView('tutorials')}
+          className="ios-press w-full inline-flex items-center justify-center gap-2 py-3.5 rounded-full text-[14px] font-medium"
+          style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+        >
+          <BookOpen size={14} /> View tutorials
+        </button>
+      </section>
+
+      <div style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 24px)' }} />
+
+      {/* Account bottom-sheet */}
+      {showAccountSheet && (
+        <>
+          <div
+            className="ios-fade-enter"
+            onClick={() => setShowAccountSheet(false)}
+            style={{
+              position: 'fixed',
+              inset: 0,
+              zIndex: 40,
+              background: 'rgba(20, 20, 19, 0.42)',
+              backdropFilter: 'blur(2px)',
+              WebkitBackdropFilter: 'blur(2px)',
+            }}
+          />
+          <div
+            className="ios-sheet-enter"
+            style={{
+              position: 'fixed',
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 41,
+              background: 'var(--cream)',
+              borderTopLeftRadius: 22,
+              borderTopRightRadius: 22,
+              paddingBottom: 'max(env(safe-area-inset-bottom), 18px)',
+              boxShadow: '0 -10px 40px rgba(20, 20, 19, 0.08)',
+              borderTop: '1px solid var(--cream-line)',
+            }}
+          >
+            <div className="flex justify-center pt-3 pb-2">
+              <div style={{ width: 38, height: 5, borderRadius: 999, background: 'var(--cream-line)' }} />
+            </div>
+            <div className="px-2 pt-2 pb-4">
+              {currentUser && (
+                <div className="px-4 py-3 mb-2">
+                  <div className="text-[12px]" style={{ color: 'var(--ink-muted)' }}>Signed in as</div>
+                  <div className="text-[15px] font-medium mt-0.5 truncate" style={{ color: 'var(--ink)' }}>
+                    {currentUser.email}
+                  </div>
+                </div>
+              )}
+              <button
+                onClick={() => {
+                  setShowAccountSheet(false);
+                  // Defer to let the account sheet's exit animation land
+                  // before the profile sheet's entrance starts — without
+                  // this stagger the two animations interrupt each other.
+                  window.setTimeout(() => setProfileSheetOpen(true), 360);
+                }}
+                className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[15px] font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
+                Profile
+              </button>
+              {currentUser && licenseService.isDeveloper(currentUser.email) && (
+                <button
+                  onClick={() => { setShowAccountSheet(false); setView('admin'); }}
+                  className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[15px] font-medium"
+                  style={{ color: 'var(--ink)' }}
+                >
+                  Admin
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  setShowAccountSheet(false);
+                  // Defer the plan-sheet open until the account sheet's exit
+                  // animation has settled — overlapping sheet animations
+                  // cause one to interrupt the other and produce a visible
+                  // jank. 360ms is .ios-fade-exit (220) + a small buffer.
+                  window.setTimeout(() => setPlanSheetOpen(true), 360);
+                }}
+                className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[15px] font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
+                Plan &amp; billing
+              </button>
+              <button
+                onClick={() => { setShowAccountSheet(false); setView('tutorials'); }}
+                className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[15px] font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
+                Tutorials
+              </button>
+              <button
+                onClick={() => { setShowAccountSheet(false); handleLogout(); }}
+                className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[15px] font-medium"
+                style={{ color: 'var(--accent)' }}
+              >
+                Sign out
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Profile sheet — identity surface (display name, email, sign-in
+          method, country, member since). Editable name flows through
+          licenseService.updateProfile which mirrors into localStorage; we
+          surface the new user via setCurrentUser so tier badges, account
+          sheets, and AI prompts all see the change immediately. */}
+      <ProfileSheetMobile
+        open={profileSheetOpen}
+        onClose={() => setProfileSheetOpen(false)}
+        currentUser={currentUser}
+        setCurrentUser={setCurrentUser}
+        currentLicense={currentLicense}
+        geo={geo}
+        onLogout={handleLogout}
+        onOpenPlanSheet={() => setPlanSheetOpen(true)}
+      />
+
+      {/* Plan & billing sheet — every switch path lives here. Opening it
+          closes the account sheet first (see the Account Plan&billing
+          handler above) so we never have two sheets stacked. Cancel from
+          inside this sheet bridges to the Razorpay confirm sheet below via
+          onRequestCancel. */}
+      <PlanSheetMobile
+        open={planSheetOpen}
+        onClose={() => setPlanSheetOpen(false)}
+        currentUser={currentUser}
+        currentLicense={currentLicense}
+        geo={geo}
+        pricing={pricing}
+        paymentLoading={paymentLoading}
+        paymentError={paymentError}
+        paymentSuccess={paymentSuccess}
+        initiateCheckout={initiateCheckout}
+        initiateRenewal={initiateRenewal}
+        handleManageSubscription={handleManageSubscription}
+        onRequestCancel={() => setCancelConfirm(true)}
+        basicExpiryLabel={basicExpiryLabel}
+      />
+
+      {/* Cancel-subscription confirm bottom sheet (Razorpay/India only) */}
+      {cancelConfirm && (
+        <>
+          <div
+            className="ios-fade-enter"
+            onClick={() => setCancelConfirm(false)}
+            style={{
+              position: 'fixed',
+              inset: 0,
+              zIndex: 50,
+              background: 'rgba(20, 20, 19, 0.42)',
+              backdropFilter: 'blur(2px)',
+              WebkitBackdropFilter: 'blur(2px)',
+            }}
+          />
+          <div
+            className="ios-sheet-enter"
+            style={{
+              position: 'fixed',
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 51,
+              background: 'var(--cream)',
+              borderTopLeftRadius: 22,
+              borderTopRightRadius: 22,
+              paddingBottom: 'max(env(safe-area-inset-bottom), 18px)',
+              boxShadow: '0 -10px 40px rgba(20, 20, 19, 0.08)',
+              borderTop: '1px solid var(--cream-line)',
+            }}
+          >
+            <div className="flex justify-center pt-3 pb-2">
+              <div style={{ width: 38, height: 5, borderRadius: 999, background: 'var(--cream-line)' }} />
+            </div>
+            <div className="px-5 pt-4 pb-4">
+              <h3
+                className="text-[20px] mb-2"
+                style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em', color: 'var(--ink)' }}
+              >
+                Cancel subscription?
+              </h3>
+              <p className="text-[13.5px] mb-5" style={{ color: 'var(--ink-soft)', lineHeight: 1.55 }}>
+                Your plan stays active until the end of the current billing cycle. You won't be charged again after that, and you can resubscribe any time.
+              </p>
+              <div className="flex flex-col gap-2.5">
+                <button
+                  onClick={handleCancelSubscription}
+                  className="ios-press w-full py-3.5 rounded-full text-[14.5px] font-medium"
+                  style={{ background: 'var(--accent)', color: 'var(--cream)' }}
+                >
+                  Cancel at cycle end
+                </button>
+                <button
+                  onClick={() => setCancelConfirm(false)}
+                  className="ios-press w-full py-3.5 rounded-full text-[14.5px] font-medium"
+                  style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+                >
+                  Keep subscription
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PROFILE — MOBILE
+//
+//  iPhone-feel user-profile sheet. Top-tier-app pattern (Anthropic / xAI /
+//  Apple ID): hero card with avatar + name + email, iOS Settings cells for
+//  details, single "Save" affordance that only appears when dirty, sign-out
+//  at the bottom. Editable fields go through licenseService.updateProfile
+//  which posts to PUT /api/v1/auth/profile and mirrors the response into
+//  localStorage so every consumer sees the new name immediately — tier
+//  badges, account sheet, AI prompts that interpolate the candidate name.
+//
+//  Read-only fields show context the user CAN'T change here for a reason:
+//  email is the primary identifier (changing requires support); country
+//  drives billing region (UI-changeable would be a price-arbitrage vector
+//  flagged in the server payments.js comment); sign-in method shows whether
+//  they came in via Google or password.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+interface ProfileSheetMobileProps {
+  open: boolean;
+  onClose: () => void;
+  currentUser: UserProfile | null;
+  setCurrentUser: (user: UserProfile | null) => void;
+  currentLicense: LicenseData | null;
+  geo: GeoData | null;
+  onLogout: () => void;
+  onOpenPlanSheet: () => void;
+}
+
+// Coarse country-code → display-name map. Covers the top markets we see in
+// telemetry. Falls through to the raw code for anything else (rather than
+// "Unknown") so the user always sees something meaningful.
+const COUNTRY_NAME: Record<string, string> = {
+  US: 'United States', IN: 'India', GB: 'United Kingdom', CA: 'Canada',
+  AU: 'Australia', DE: 'Germany', FR: 'France', NL: 'Netherlands',
+  SG: 'Singapore', AE: 'United Arab Emirates', BR: 'Brazil', MX: 'Mexico',
+  JP: 'Japan', KR: 'South Korea', IE: 'Ireland', ES: 'Spain', IT: 'Italy',
+  SE: 'Sweden', NO: 'Norway', DK: 'Denmark', FI: 'Finland', NZ: 'New Zealand',
+  CH: 'Switzerland', AT: 'Austria', BE: 'Belgium', PL: 'Poland', PT: 'Portugal',
+  IL: 'Israel', ZA: 'South Africa', PH: 'Philippines', ID: 'Indonesia',
+  TH: 'Thailand', VN: 'Vietnam', TR: 'Turkey', AR: 'Argentina', CL: 'Chile',
+};
+
+// Stable color hash for the initials avatar — same email always renders in
+// the same color so users recognize their own avatar across sessions.
+const AVATAR_COLORS = [
+  { bg: 'rgba(245, 158, 11, 0.18)', fg: '#b45309' }, // amber
+  { bg: 'rgba(59, 130, 246, 0.18)', fg: '#1d4ed8' }, // blue
+  { bg: 'rgba(16, 185, 129, 0.18)', fg: '#047857' }, // emerald
+  { bg: 'rgba(168, 85, 247, 0.18)', fg: '#7c3aed' }, // purple
+  { bg: 'rgba(236, 72, 153, 0.18)', fg: '#be185d' }, // pink
+  { bg: 'rgba(20, 184, 166, 0.18)', fg: '#0f766e' }, // teal
+];
+
+function avatarColorFor(seed: string): { bg: string; fg: string } {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) {
+    h = ((h << 5) - h + seed.charCodeAt(i)) | 0;
+  }
+  return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
+}
+
+const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
+  open, onClose, currentUser, setCurrentUser, currentLicense, geo,
+  onLogout, onOpenPlanSheet,
+}) => {
+  // Sheet open/close state machine — same pattern as PlanSheetMobile so the
+  // exit animation lands before the node unmounts.
+  const [shouldRender, setShouldRender] = useState(open);
+  const [isClosing, setIsClosing] = useState(false);
+  const [draftName, setDraftName] = useState(currentUser?.name || '');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saveSuccess, setSaveSuccess] = useState(false);
+  const [signOutConfirm, setSignOutConfirm] = useState(false);
+
+  // Open/close state machine. Crucially does NOT depend on currentUser.name —
+  // when name updates after a successful save, this effect must NOT re-run
+  // and reset saveSuccess to false; otherwise the "Profile saved" emerald
+  // banner vanishes the instant the new name lands in parent state.
+  useEffect(() => {
+    if (open) {
+      setShouldRender(true);
+      setIsClosing(false);
+      // Re-seed the draft from current state every time we transition from
+      // closed → open. Without this, a user who edits → cancels → re-opens
+      // would see their abandoned edit. We use a ref-style read of the name
+      // via a separate effect below so this dep stays stable.
+      setError(null);
+      setSaveSuccess(false);
+    } else if (shouldRender) {
+      setIsClosing(true);
+      const t = window.setTimeout(() => {
+        setShouldRender(false);
+        setIsClosing(false);
+      }, 320);
+      return () => window.clearTimeout(t);
+    }
+  }, [open, shouldRender]);
+
+  // Re-seed draftName ONLY on the closed → open transition. Tracking the
+  // previous open value via ref prevents the seed from re-firing when
+  // currentUser.name updates (post-save) while the sheet is still open.
+  const prevOpenRef = useRef(open);
+  useEffect(() => {
+    if (open && !prevOpenRef.current) {
+      setDraftName(currentUser?.name || '');
+    }
+    prevOpenRef.current = open;
+  }, [open, currentUser?.name]);
+
+  // Defensive close if somehow open was set without a current user. Done
+  // inside an effect (not during render) so we don't trigger React's
+  // "setState during render" warning. Real-world this should never happen
+  // — every open call site checks currentUser first — but the guard is
+  // cheap insurance.
+  useEffect(() => {
+    if (open && !currentUser) onClose();
+  }, [open, currentUser, onClose]);
+
+  useEffect(() => {
+    if (!shouldRender) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [shouldRender, onClose]);
+
+  if (!shouldRender) return null;
+  if (!currentUser) return null;
+
+  const trimmedDraft = draftName.trim();
+  const isDirty = trimmedDraft !== (currentUser.name || '').trim();
+  const isValid = trimmedDraft.length > 0 && trimmedDraft.length <= 100;
+  const canSave = isDirty && isValid && !saving;
+
+  const initials = (() => {
+    const source = currentUser.name || currentUser.email || '?';
+    const parts = source.trim().split(/\s+/).slice(0, 2);
+    return parts.map(p => p[0]?.toUpperCase()).filter(Boolean).join('') || '?';
+  })();
+  const palette = avatarColorFor(currentUser.email || currentUser.id || 'x');
+  const hasGooglePhoto = currentUser.oauth_provider === 'google' && !!currentUser.avatar_url;
+
+  const memberSince = currentUser.created_at
+    ? new Date(currentUser.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })
+    : '—';
+  const signInMethod = currentUser.oauth_provider === 'google' ? 'Google' : 'Email & password';
+  const countryDisplay = (() => {
+    const code = currentUser.country_code || geo?.country_code || '';
+    if (!code) return '—';
+    return COUNTRY_NAME[code] ? `${COUNTRY_NAME[code]} (${code})` : code;
+  })();
+
+  const tierMeta = tierMetaForPlanSheet(currentLicense?.tier || 'free');
+
+  const handleSave = async () => {
+    if (!canSave) return;
+    setSaving(true);
+    setError(null);
+    setSaveSuccess(false);
+    try {
+      const updated = await licenseService.updateProfile({ name: trimmedDraft });
+      setCurrentUser(updated);
+      setSaveSuccess(true);
+      // Self-clear the success affordance after a moment so it doesn't stick
+      // around once the user has registered the change.
+      window.setTimeout(() => setSaveSuccess(false), 2400);
+    } catch (e: any) {
+      setError(e?.message || 'Could not save profile');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDiscard = () => {
+    setDraftName(currentUser.name || '');
+    setError(null);
+  };
+
+  return (
+    <>
+      <div
+        className={isClosing ? 'ios-fade-exit' : 'ios-fade-enter'}
+        onClick={onClose}
+        style={{
+          position: 'fixed',
+          inset: 0,
+          zIndex: 70,
+          background: 'rgba(20, 20, 19, 0.32)',
+        }}
+      />
+      <div
+        className={isClosing ? 'ios-sheet-exit' : 'ios-sheet-enter'}
+        style={{
+          position: 'fixed',
+          left: 0,
+          right: 0,
+          bottom: 0,
+          top: 0,
+          zIndex: 71,
+          background: 'var(--cream)',
+          color: 'var(--ink)',
+          fontFamily: 'var(--sans)',
+          overflowY: 'auto',
+          WebkitOverflowScrolling: 'touch' as any,
+        }}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Profile"
+      >
+        {/* Top bar */}
+        <div
+          className="sticky top-0 z-10 backdrop-blur-md pt-safe"
+          style={{
+            background: 'color-mix(in oklab, var(--cream) 92%, transparent)',
+            borderBottom: '1px solid var(--cream-line)',
+          }}
+        >
+          <div className="flex items-center justify-between px-3" style={{ height: 56 }}>
+            <button
+              onClick={isDirty ? handleDiscard : onClose}
+              className="ios-press inline-flex items-center px-3 py-2 text-[15px]"
+              style={{ color: 'var(--ink)' }}
+            >
+              {isDirty ? 'Discard' : 'Done'}
+            </button>
+            <div className="text-[15px] font-medium" style={{ color: 'var(--ink)' }}>
+              Profile
+            </div>
+            <button
+              onClick={handleSave}
+              disabled={!canSave}
+              className="ios-press inline-flex items-center justify-center px-3 py-2 text-[15px] font-semibold disabled:opacity-40"
+              style={{ color: canSave ? 'var(--accent)' : 'var(--ink-faint)', minWidth: 64 }}
+            >
+              {saving ? <Loader2 size={16} className="animate-spin" /> : 'Save'}
+            </button>
+          </div>
+        </div>
+
+        {/* Hero — avatar + name + email + tier */}
+        <section className="px-5 pt-9 pb-4 text-center">
+          <div className="flex justify-center mb-4">
+            {hasGooglePhoto ? (
+              <img
+                src={currentUser.avatar_url}
+                alt=""
+                referrerPolicy="no-referrer"
+                style={{
+                  width: 88,
+                  height: 88,
+                  borderRadius: 999,
+                  border: '1px solid var(--cream-line)',
+                  background: 'var(--cream-soft)',
+                  objectFit: 'cover',
+                }}
+              />
+            ) : (
+              <div
+                className="flex items-center justify-center"
+                style={{
+                  width: 88,
+                  height: 88,
+                  borderRadius: 999,
+                  background: palette.bg,
+                  color: palette.fg,
+                  border: '1px solid var(--cream-line)',
+                  fontFamily: 'var(--serif)',
+                  fontSize: 32,
+                  fontWeight: 500,
+                  letterSpacing: '-0.01em',
+                }}
+              >
+                {initials}
+              </div>
+            )}
+          </div>
+          <h2
+            className="text-[26px] leading-[1.1] mb-1"
+            style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em' }}
+          >
+            {currentUser.name || 'Your profile'}
+          </h2>
+          <p className="text-[13.5px]" style={{ color: 'var(--ink-muted)' }}>
+            {currentUser.email}
+          </p>
+          {/* Tier chip — tappable, opens Plan sheet so the user can switch.
+              Same chip-for-chip relationship as Apple's "Apple ID → iCloud +
+              Subscriptions" pattern, where the upper-level identity surface
+              hands off to the billing surface. */}
+          <button
+            onClick={() => { onClose(); window.setTimeout(onOpenPlanSheet, 360); }}
+            className="ios-press inline-flex items-center gap-2 mt-4 px-3 py-1.5 rounded-full text-[12.5px] font-medium"
+            style={{
+              background: tierMeta.bg,
+              color: tierMeta.color,
+              border: tierMeta.label === 'Free' ? '1px solid var(--cream-line)' : 'none',
+            }}
+          >
+            {tierMeta.label === 'Free' ? <Sparkles size={11} /> : <Crown size={11} />}
+            {tierMeta.label} plan
+            <ChevronRight size={11} style={{ opacity: 0.7 }} />
+          </button>
+        </section>
+
+        {/* Inline banners */}
+        {error && (
+          <section className="px-5 pt-3">
+            <div
+              className="flex items-start gap-2 px-4 py-3 rounded-2xl text-[13px]"
+              style={{
+                background: 'color-mix(in oklab, var(--accent) 10%, transparent)',
+                border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)',
+                color: 'var(--accent)',
+              }}
+            >
+              <AlertTriangle size={14} style={{ marginTop: 1, flexShrink: 0 }} /> {error}
+            </div>
+          </section>
+        )}
+        {saveSuccess && !error && (
+          <section className="px-5 pt-3">
+            <div
+              role="status"
+              aria-live="polite"
+              className="flex items-start gap-2 px-4 py-3 rounded-2xl text-[13px]"
+              style={{
+                background: 'rgba(16, 185, 129, 0.12)',
+                border: '1px solid rgba(16, 185, 129, 0.35)',
+                color: '#047857',
+              }}
+            >
+              <Check size={14} style={{ marginTop: 1, flexShrink: 0 }} /> Profile saved
+            </div>
+          </section>
+        )}
+
+        {/* Editable details — iOS grouped cells */}
+        <section className="px-5 pt-7">
+          <div className="px-1 mb-3 text-[11px] font-medium uppercase tracking-[0.18em]" style={{ color: 'var(--ink-muted)' }}>
+            Account
+          </div>
+          <div
+            style={{
+              background: 'var(--cream-soft)',
+              border: '1px solid var(--cream-line)',
+              borderRadius: 16,
+              overflow: 'hidden',
+            }}
+          >
+            {/* Display name — editable */}
+            <div className="px-4 pt-3 pb-3">
+              <label className="text-[10.5px] uppercase tracking-[0.18em] block mb-0.5" style={{ color: 'var(--ink-muted)' }}>
+                Display name
+              </label>
+              <input
+                type="text"
+                value={draftName}
+                onChange={(e) => setDraftName(e.target.value)}
+                placeholder="Your name"
+                className="block w-full text-[16px] bg-transparent outline-none"
+                style={{ color: 'var(--ink)', minHeight: 24 }}
+                maxLength={100}
+                autoComplete="name"
+              />
+              <div className="flex items-center justify-between mt-1.5">
+                <p className="text-[11px]" style={{ color: 'var(--ink-faint)' }}>
+                  Used in your interview answers and our support chat.
+                </p>
+                <span className="text-[10.5px] tabular-nums" style={{ color: trimmedDraft.length > 100 ? 'var(--accent)' : 'var(--ink-faint)' }}>
+                  {trimmedDraft.length}/100
+                </span>
+              </div>
+            </div>
+
+            {/* Email — readonly */}
+            <div className="h-px mx-4" style={{ background: 'var(--cream-line)' }} />
+            <div className="px-4 pt-3 pb-3 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <label className="text-[10.5px] uppercase tracking-[0.18em] block mb-0.5" style={{ color: 'var(--ink-muted)' }}>
+                  Email
+                </label>
+                <div className="text-[15px] truncate" style={{ color: 'var(--ink)' }}>{currentUser.email}</div>
+              </div>
+              <span className="text-[11px] shrink-0" style={{ color: 'var(--ink-faint)' }}>Contact support to change</span>
+            </div>
+
+            {/* Sign-in method — readonly */}
+            <div className="h-px mx-4" style={{ background: 'var(--cream-line)' }} />
+            <div className="px-4 pt-3 pb-3">
+              <label className="text-[10.5px] uppercase tracking-[0.18em] block mb-0.5" style={{ color: 'var(--ink-muted)' }}>
+                Sign-in method
+              </label>
+              <div className="flex items-center gap-2 text-[15px]" style={{ color: 'var(--ink)' }}>
+                {currentUser.oauth_provider === 'google' && (
+                  <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/>
+                    <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                    <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+                    <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+                  </svg>
+                )}
+                {signInMethod}
+              </div>
+            </div>
+
+            {/* Country (region) — readonly */}
+            <div className="h-px mx-4" style={{ background: 'var(--cream-line)' }} />
+            <div className="px-4 pt-3 pb-3">
+              <label className="text-[10.5px] uppercase tracking-[0.18em] block mb-0.5" style={{ color: 'var(--ink-muted)' }}>
+                Region · billing
+              </label>
+              <div className="text-[15px]" style={{ color: 'var(--ink)' }}>{countryDisplay}</div>
+              <p className="text-[11px] mt-1" style={{ color: 'var(--ink-faint)' }}>
+                Drives your local pricing. Contact support to change.
+              </p>
+            </div>
+
+            {/* Member since — readonly */}
+            <div className="h-px mx-4" style={{ background: 'var(--cream-line)' }} />
+            <div className="px-4 pt-3 pb-3">
+              <label className="text-[10.5px] uppercase tracking-[0.18em] block mb-0.5" style={{ color: 'var(--ink-muted)' }}>
+                Member since
+              </label>
+              <div className="text-[15px]" style={{ color: 'var(--ink)' }}>{memberSince}</div>
+            </div>
+          </div>
+        </section>
+
+        {/* Plan link */}
+        <section className="px-5 pt-7">
+          <div className="px-1 mb-3 text-[11px] font-medium uppercase tracking-[0.18em]" style={{ color: 'var(--ink-muted)' }}>
+            Subscription
+          </div>
+          <button
+            onClick={() => { onClose(); window.setTimeout(onOpenPlanSheet, 360); }}
+            className="ios-press w-full text-left flex items-center gap-3 px-4 py-3.5 rounded-2xl"
+            style={{
+              background: 'var(--cream-soft)',
+              border: '1px solid var(--cream-line)',
+            }}
+          >
+            <div
+              className="shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center"
+              style={{ background: tierMeta.bg }}
+            >
+              {(currentLicense?.tier === 'max' || currentLicense?.tier === 'pro')
+                ? <Crown size={20} style={{ color: tierMeta.color }} />
+                : <Zap size={20} style={{ color: tierMeta.color }} />}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-[15px] font-medium" style={{ color: 'var(--ink)' }}>
+                Plan &amp; billing
+              </div>
+              <div className="text-[12.5px] mt-0.5" style={{ color: 'var(--ink-muted)' }}>
+                Currently on {tierMeta.label}. Switch, upgrade, or cancel.
+              </div>
+            </div>
+            <ChevronRight size={16} style={{ color: 'var(--ink-muted)' }} />
+          </button>
+        </section>
+
+        {/* Sign out */}
+        <section className="px-5 pt-7 pb-2">
+          {!signOutConfirm ? (
+            <button
+              onClick={() => setSignOutConfirm(true)}
+              className="ios-press w-full text-center px-5 py-3.5 rounded-2xl text-[15px] font-medium"
+              style={{
+                background: 'var(--cream-soft)',
+                border: '1px solid var(--cream-line)',
+                color: 'var(--accent)',
+              }}
+            >
+              Sign out
+            </button>
+          ) : (
+            <div
+              className="rounded-2xl p-4"
+              style={{
+                background: 'color-mix(in oklab, var(--accent) 8%, transparent)',
+                border: '1px solid color-mix(in oklab, var(--accent) 30%, transparent)',
+              }}
+            >
+              <p className="text-[13.5px] mb-3" style={{ color: 'var(--ink)', lineHeight: 1.5 }}>
+                Sign out of this device? You can sign back in any time with the same email.
+              </p>
+              <div className="flex flex-col gap-2">
+                <button
+                  onClick={() => { onLogout(); onClose(); }}
+                  className="ios-press w-full py-3 rounded-full text-[14.5px] font-medium"
+                  style={{ background: 'var(--accent)', color: 'var(--cream)' }}
+                >
+                  Yes, sign out
+                </button>
+                <button
+                  onClick={() => setSignOutConfirm(false)}
+                  className="ios-press w-full py-3 rounded-full text-[14.5px] font-medium"
+                  style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+
+        <div style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 32px)' }} />
+      </div>
+    </>
+  );
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PLAN & BILLING — MOBILE
+//
+//  Browser-mobile equivalent of ManageSubscription.tsx (which is
+//  Electron-only). Users get a single, friction-free surface to:
+//    • see their current plan + status + provider + expiry
+//    • upgrade / switch / downgrade across all valid paths
+//    • renew Basic +1h
+//    • open Stripe Customer Portal (Stripe users)
+//    • cancel via Razorpay self-cancel (Indian users)
+//
+//  Routing rules — every action goes through the same handlers
+//  SubscriptionGate already uses, so server endpoints stay untouched:
+//    Free → Basic / Pro / Max     → initiateCheckout(tier)  [/create-checkout]
+//    Basic → Renew                → initiateRenewal()       [/create-renewal]
+//    Basic → Pro / Max            → initiateCheckout(tier)  [/create-checkout — new sub]
+//    Pro → Max (in-place)         → initiateCheckout('max') [/upgrade-tier — detected]
+//    Max → Pro (downgrade)        → initiateCheckout('pro') [/upgrade-tier — detected]
+//    Stripe paid → "Manage"       → handleManageSubscription() [Stripe Portal]
+//    Razorpay paid → "Cancel"     → onRequestCancel() — opens existing cancel sheet
+//
+//  Provider detection: fetches /subscription on open (authoritative — the
+//  server reads it from stripe_customer_id prefix). Falls back to geo
+//  while loading (geo.country_code === 'IN' → razorpay).
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const API_BASE_PLAN = 'https://api.minicaai.com';
+
+interface PlanSheetMobileProps {
+  open: boolean;
+  onClose: () => void;
+  currentUser: UserProfile | null;
+  currentLicense: LicenseData | null;
+  geo: GeoData | null;
+  pricing: RegionPricing | null;
+  paymentLoading: boolean;
+  paymentError: string | null;
+  paymentSuccess: string | null;
+  initiateCheckout: (tier?: 'basic' | 'pro' | 'max') => Promise<void> | void;
+  initiateRenewal: () => Promise<void> | void;
+  handleManageSubscription: () => Promise<void> | void;
+  onRequestCancel: () => void;
+  basicExpiryLabel: (expiresAt: number | undefined | null) => string | null;
+}
+
+interface PlanRow {
+  key: string;
+  Icon: React.ComponentType<{ size?: number; style?: React.CSSProperties }>;
+  iconBg: string;
+  iconColor: string;
+  title: string;
+  subtitle: string;
+  price?: string;
+  effective?: string;
+  variant?: 'default' | 'primary';
+  onClick: () => Promise<void> | void;
+}
+
+function tierMetaForPlanSheet(tier: string) {
+  switch (tier) {
+    case 'max':   return { label: 'Max',   bg: 'rgba(245, 158, 11, 0.12)', color: '#b45309', accent: '#d97706' };
+    case 'pro':   return { label: 'Pro',   bg: 'rgba(59, 130, 246, 0.12)', color: '#1d4ed8', accent: '#2563eb' };
+    case 'basic': return { label: 'Basic', bg: 'rgba(16, 185, 129, 0.12)', color: '#047857', accent: '#059669' };
+    default:      return { label: 'Free',  bg: 'var(--cream-soft)',         color: 'var(--ink-muted)', accent: 'var(--ink-muted)' };
+  }
+}
+
+const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
+  open, onClose, currentUser, currentLicense, geo, pricing,
+  paymentLoading, paymentError, paymentSuccess,
+  initiateCheckout, initiateRenewal, handleManageSubscription,
+  onRequestCancel, basicExpiryLabel,
+}) => {
+  // Shouldn't-render-but-still-animate dance: when `open` flips false we
+  // hold the node in the tree just long enough for .ios-sheet-exit to play,
+  // then drop it.
+  const [shouldRender, setShouldRender] = useState(open);
+  const [isClosing, setIsClosing] = useState(false);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [serverStatus, setServerStatus] = useState<{
+    provider?: 'stripe' | 'razorpay' | null;
+    tier?: string;
+    status?: string;
+    expires_at?: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setShouldRender(true);
+      setIsClosing(false);
+    } else if (shouldRender) {
+      setIsClosing(true);
+      const t = window.setTimeout(() => {
+        setShouldRender(false);
+        setIsClosing(false);
+      }, 320);
+      return () => window.clearTimeout(t);
+    }
+  }, [open, shouldRender]);
+
+  // Fetch live status when opening — provider is the load-bearing field
+  // (drives Stripe-Portal vs Razorpay-Cancel choice). We tolerate failure
+  // (network/auth blip) by falling through to geo-based inference below.
+  useEffect(() => {
+    if (!open || !currentUser) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const token = licenseService.getToken();
+        if (!token) return;
+        const res = await fetch(`${API_BASE_PLAN}/api/v1/payments/subscription`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setServerStatus(data);
+      } catch { /* fall through */ }
+    })();
+    return () => { cancelled = true; };
+  }, [open, currentUser]);
+
+  useEffect(() => {
+    if (!shouldRender) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [shouldRender, onClose]);
+
+  if (!shouldRender) return null;
+
+  // Effective tier resolution — admin always renders as Max so the sheet
+  // shows the same buttons / state ManageSubscription does for admins.
+  const isAdminUser = !!currentUser && licenseService.isDeveloper(currentUser.email);
+  const tier = (isAdminUser ? 'max' : (currentLicense?.tier || 'free')) as 'free' | 'basic' | 'pro' | 'max';
+  const status = currentLicense?.status || 'none';
+
+  // Provider — server is authoritative; geo is a fallback during the brief
+  // window before /subscription resolves.
+  const provider: 'stripe' | 'razorpay' | null =
+    (serverStatus?.provider as any) ||
+    (geo?.country_code === 'IN' ? 'razorpay' : 'stripe');
+  const isStripe = provider === 'stripe';
+  const isRazorpay = provider === 'razorpay';
+
+  const tierMeta = tierMetaForPlanSheet(tier);
+
+  // Resolve display price for a given tier from the regional pricing payload.
+  // Returns null if pricing hasn't loaded — rows guard against null below.
+  const findTierPrice = (id: 'basic' | 'pro' | 'max'): string | null => {
+    const t = pricing?.tiers.find(x => x.id === id);
+    if (!t) return null;
+    const period = t.period === 'month' ? '/mo' : t.period === 'year' ? '/yr' : '';
+    return pricingService.formatPrice(t.price, t.currencySymbol, t.currency) + period;
+  };
+
+  const renewalPriceLabel = (() => {
+    if (!geo) return null;
+    const r = pricingService.getBasicRenewalPrice(geo.country_code || 'US');
+    return pricingService.formatPrice(r.price, r.currencySymbol, r.currency);
+  })();
+
+  const wrapAction = (key: string, fn: () => Promise<void> | void) => async () => {
+    if (paymentLoading || pendingAction) return;
+    setPendingAction(key);
+    try {
+      await fn();
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  // Build the action list per current tier. Order: most-likely-target first
+  // (matches Anthropic / xAI ergonomics — primary action up top).
+  const actions: PlanRow[] = [];
+
+  if (tier === 'free') {
+    const proPrice = findTierPrice('pro');
+    const maxPrice = findTierPrice('max');
+    const basicTier = pricing?.tiers.find(t => t.id === 'basic');
+    const basicPrice = basicTier ? pricingService.formatPrice(basicTier.price, basicTier.currencySymbol, basicTier.currency) : null;
+
+    actions.push({
+      key: 'upgrade-pro',
+      Icon: Crown, iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb',
+      title: 'Upgrade to Pro',
+      subtitle: 'Unlimited time · 4 AI models · Pop-out · Auto-Solve',
+      price: proPrice || undefined,
+      variant: 'primary',
+      onClick: wrapAction('upgrade-pro', () => initiateCheckout('pro')),
+    });
+    actions.push({
+      key: 'upgrade-max',
+      Icon: Crown, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
+      title: 'Upgrade to Max',
+      subtitle: 'Pro + Claude Sonnet 4.6 + Auto-Type + Train Model',
+      price: maxPrice || undefined,
+      onClick: wrapAction('upgrade-max', () => initiateCheckout('max')),
+    });
+    if (basicTier) {
+      actions.push({
+        key: 'upgrade-basic',
+        Icon: Zap, iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857',
+        title: 'Get Basic',
+        subtitle: '3 hours · 14-day window · GPT, Grok, Llama (no Claude)',
+        price: basicPrice || undefined,
+        onClick: wrapAction('upgrade-basic', () => initiateCheckout('basic')),
+      });
+    }
+  }
+
+  if (tier === 'basic') {
+    actions.push({
+      key: 'renew',
+      Icon: Zap, iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857',
+      title: 'Renew · +1 hour',
+      subtitle: 'Adds another hour of session time',
+      price: renewalPriceLabel || undefined,
+      variant: 'primary',
+      onClick: wrapAction('renew', () => initiateRenewal()),
+    });
+    actions.push({
+      key: 'upgrade-pro',
+      Icon: Crown, iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb',
+      title: 'Upgrade to Pro',
+      subtitle: 'Unlimited time, no expiry · keep your remaining Basic hours',
+      price: findTierPrice('pro') || undefined,
+      onClick: wrapAction('upgrade-pro', () => initiateCheckout('pro')),
+    });
+    actions.push({
+      key: 'upgrade-max',
+      Icon: Crown, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
+      title: 'Upgrade to Max',
+      subtitle: 'Adds Claude, Auto-Type, Train Model',
+      price: findTierPrice('max') || undefined,
+      onClick: wrapAction('upgrade-max', () => initiateCheckout('max')),
+    });
+  }
+
+  if (tier === 'pro' && !isAdminUser) {
+    actions.push({
+      key: 'upgrade-max',
+      Icon: Crown, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
+      title: 'Upgrade to Max',
+      subtitle: 'Adds Claude + Auto-Type + Train Model',
+      price: findTierPrice('max') || undefined,
+      effective: 'Effective immediately · prorated diff next invoice',
+      variant: 'primary',
+      onClick: wrapAction('upgrade-max', () => initiateCheckout('max')),
+    });
+  }
+
+  if (tier === 'max' && !isAdminUser) {
+    actions.push({
+      key: 'downgrade-pro',
+      Icon: Crown, iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb',
+      title: 'Switch to Pro',
+      subtitle: 'Removes Claude + Auto-Type + Train Model',
+      price: findTierPrice('pro') || undefined,
+      effective: 'Effective at next renewal · keep Max access until then',
+      onClick: wrapAction('downgrade-pro', () => initiateCheckout('pro')),
+    });
+  }
+
+  // Manage section — Stripe portal vs Razorpay cancel.
+  const showStripeManage = (tier === 'pro' || tier === 'max') && !isAdminUser && isStripe;
+  const showRazorpayCancel = (tier === 'pro' || tier === 'max') && !isAdminUser && isRazorpay;
+
+  return (
+    <>
+      <div
+        className={isClosing ? 'ios-fade-exit' : 'ios-fade-enter'}
+        onClick={onClose}
+        style={{
+          position: 'fixed',
+          inset: 0,
+          zIndex: 60,
+          background: 'rgba(20, 20, 19, 0.32)',
+        }}
+      />
+      <div
+        className={isClosing ? 'ios-sheet-exit' : 'ios-sheet-enter'}
+        style={{
+          position: 'fixed',
+          left: 0,
+          right: 0,
+          bottom: 0,
+          top: 0,
+          zIndex: 61,
+          background: 'var(--cream)',
+          color: 'var(--ink)',
+          fontFamily: 'var(--sans)',
+          overflowY: 'auto',
+          WebkitOverflowScrolling: 'touch' as any,
+        }}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Plan and billing"
+      >
+        {/* Top bar */}
+        <div
+          className="sticky top-0 z-10 backdrop-blur-md pt-safe"
+          style={{
+            background: 'color-mix(in oklab, var(--cream) 92%, transparent)',
+            borderBottom: '1px solid var(--cream-line)',
+          }}
+        >
+          <div className="flex items-center justify-between px-3" style={{ height: 56 }}>
+            <div style={{ width: 36 }} />
+            <div className="text-[15px] font-medium" style={{ color: 'var(--ink)' }}>
+              Plan &amp; billing
+            </div>
+            <button
+              onClick={onClose}
+              className="ios-press w-9 h-9 -mr-1 flex items-center justify-center"
+              aria-label="Close"
+              style={{ color: 'var(--ink)' }}
+            >
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+
+        {/* Hero — current plan card */}
+        <section className="px-5 pt-6 pb-2">
+          <div
+            className="rounded-3xl p-5"
+            style={{
+              background: tierMeta.bg,
+              border: `1px solid ${tier === 'free' ? 'var(--cream-line)' : 'transparent'}`,
+              color: 'var(--ink)',
+            }}
+          >
+            <div className="flex items-start gap-4">
+              <div
+                className="shrink-0 w-12 h-12 rounded-2xl flex items-center justify-center"
+                style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)' }}
+              >
+                {tier === 'max' || tier === 'pro' ? (
+                  <Crown size={22} style={{ color: tierMeta.color }} />
+                ) : tier === 'basic' ? (
+                  <Zap size={22} style={{ color: tierMeta.color }} />
+                ) : (
+                  <Sparkles size={22} style={{ color: tierMeta.color }} />
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h3
+                    className="text-[20px]"
+                    style={{
+                      fontFamily: 'var(--serif)',
+                      fontWeight: 500,
+                      letterSpacing: '-0.015em',
+                      color: tierMeta.color,
+                    }}
+                  >
+                    {isAdminUser ? 'Admin · Max' : tierMeta.label}
+                  </h3>
+                  <span
+                    className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded"
+                    style={{
+                      background: 'var(--cream)',
+                      color: 'var(--ink-muted)',
+                      border: '1px solid var(--cream-line)',
+                    }}
+                  >
+                    {status === 'active' ? 'Active' : status === 'trial' ? 'Trial' : status === 'expired' ? 'Expired' : status === 'revoked' ? 'Revoked' : 'Free'}
+                  </span>
+                  {provider && tier !== 'free' && !isAdminUser && (
+                    <span
+                      className="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded"
+                      style={{
+                        background: 'var(--cream)',
+                        color: 'var(--ink-muted)',
+                        border: '1px solid var(--cream-line)',
+                      }}
+                    >
+                      {provider === 'stripe' ? 'Stripe' : 'Razorpay'}
+                    </span>
+                  )}
+                </div>
+                {tier === 'basic' && currentLicense && basicExpiryLabel(currentLicense.expires_at) && (
+                  <div className="flex items-center gap-1 text-[12.5px] mt-2" style={{ color: 'var(--ink-soft)' }}>
+                    <Clock size={11} />
+                    {basicExpiryLabel(currentLicense.expires_at)}
+                  </div>
+                )}
+                {(tier === 'pro' || tier === 'max') && currentLicense?.expires_at && currentLicense.expires_at > 0 && !isAdminUser && (
+                  <div className="text-[12.5px] mt-2" style={{ color: 'var(--ink-soft)' }}>
+                    Renews {new Date(currentLicense.expires_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
+                  </div>
+                )}
+                {tier === 'free' && (
+                  <p className="text-[13px] mt-1.5" style={{ color: 'var(--ink-soft)', lineHeight: 1.5 }}>
+                    5 sessions / month · Gemini only.
+                  </p>
+                )}
+                {currentUser && (
+                  <p className="text-[12px] mt-2 truncate" style={{ color: 'var(--ink-faint)' }}>
+                    {currentUser.email}
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Banners */}
+        {paymentError && (
+          <section className="px-5 pt-3">
+            <div
+              className="flex items-start gap-2 px-4 py-3 rounded-2xl text-[13px]"
+              style={{
+                background: 'color-mix(in oklab, var(--accent) 10%, transparent)',
+                border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)',
+                color: 'var(--accent)',
+              }}
+            >
+              <AlertTriangle size={14} style={{ marginTop: 1, flexShrink: 0 }} /> {paymentError}
+            </div>
+          </section>
+        )}
+        {paymentSuccess && (
+          <section className="px-5 pt-3">
+            <div
+              className="flex items-start gap-2 px-4 py-3 rounded-2xl text-[13px]"
+              style={{
+                background: 'rgba(16, 185, 129, 0.12)',
+                border: '1px solid rgba(16, 185, 129, 0.35)',
+                color: '#047857',
+              }}
+            >
+              <Check size={14} style={{ marginTop: 1, flexShrink: 0 }} /> {paymentSuccess}
+            </div>
+          </section>
+        )}
+
+        {/* Available plans / actions */}
+        {actions.length > 0 && (
+          <section className="px-5 pt-7">
+            <div className="px-1 mb-3 text-[11px] font-medium uppercase tracking-[0.18em]" style={{ color: 'var(--ink-muted)' }}>
+              Available plans
+            </div>
+            <div
+              style={{
+                background: 'var(--cream-soft)',
+                border: '1px solid var(--cream-line)',
+                borderRadius: 18,
+                overflow: 'hidden',
+              }}
+            >
+              {actions.map((a, i) => {
+                const Icon = a.Icon;
+                const inFlight = pendingAction === a.key;
+                const dimmed = (paymentLoading || !!pendingAction) && !inFlight;
+                return (
+                  <React.Fragment key={a.key}>
+                    {i > 0 && <div className="h-px ml-16" style={{ background: 'var(--cream-line)' }} />}
+                    <button
+                      onClick={a.onClick}
+                      disabled={paymentLoading || !!pendingAction}
+                      className="ios-press w-full text-left flex items-center gap-3 px-4 py-3.5"
+                      style={{
+                        opacity: dimmed ? 0.5 : 1,
+                        background: a.variant === 'primary' ? 'rgba(20, 20, 19, 0.025)' : 'transparent',
+                      }}
+                    >
+                      <div
+                        className="shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center"
+                        style={{ background: a.iconBg }}
+                      >
+                        <Icon size={20} style={{ color: a.iconColor }} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[15px] font-medium truncate" style={{ color: 'var(--ink)' }}>
+                            {a.title}
+                          </span>
+                          {a.price && (
+                            <span className="text-[13px] tabular-nums shrink-0" style={{ color: 'var(--ink-soft)' }}>
+                              {a.price}
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[12.5px] mt-0.5" style={{ color: 'var(--ink-muted)', lineHeight: 1.45 }}>
+                          {a.subtitle}
+                        </div>
+                        {a.effective && (
+                          <div className="text-[11.5px] mt-1" style={{ color: 'var(--ink-faint)' }}>
+                            {a.effective}
+                          </div>
+                        )}
+                      </div>
+                      <div className="shrink-0 flex items-center justify-center" style={{ width: 18, color: 'var(--ink-muted)' }}>
+                        {inFlight ? <Loader2 size={16} className="animate-spin" /> : <ChevronRight size={16} />}
+                      </div>
+                    </button>
+                  </React.Fragment>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* Manage section */}
+        {(showStripeManage || showRazorpayCancel) && (
+          <section className="px-5 pt-7">
+            <div className="px-1 mb-3 text-[11px] font-medium uppercase tracking-[0.18em]" style={{ color: 'var(--ink-muted)' }}>
+              Manage
+            </div>
+            <div
+              style={{
+                background: 'var(--cream-soft)',
+                border: '1px solid var(--cream-line)',
+                borderRadius: 18,
+                overflow: 'hidden',
+              }}
+            >
+              {showStripeManage && (
+                <button
+                  onClick={wrapAction('manage', () => handleManageSubscription())}
+                  disabled={paymentLoading || !!pendingAction}
+                  className="ios-press w-full text-left flex items-center gap-3 px-4 py-3.5"
+                  style={{ opacity: (paymentLoading || pendingAction) && pendingAction !== 'manage' ? 0.5 : 1 }}
+                >
+                  <div
+                    className="shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center"
+                    style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)' }}
+                  >
+                    <ExternalLink size={18} style={{ color: 'var(--ink)' }} />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[15px] font-medium" style={{ color: 'var(--ink)' }}>
+                      Manage in Stripe
+                    </div>
+                    <div className="text-[12.5px] mt-0.5" style={{ color: 'var(--ink-muted)', lineHeight: 1.45 }}>
+                      Update card, view invoices, change billing cycle, cancel
+                    </div>
+                  </div>
+                  <div className="shrink-0 flex items-center justify-center" style={{ width: 18, color: 'var(--ink-muted)' }}>
+                    {pendingAction === 'manage' ? <Loader2 size={16} className="animate-spin" /> : <ChevronRight size={16} />}
+                  </div>
+                </button>
+              )}
+              {showRazorpayCancel && (
+                <>
+                  {showStripeManage && <div className="h-px ml-16" style={{ background: 'var(--cream-line)' }} />}
+                  <button
+                    onClick={() => { onClose(); window.setTimeout(() => onRequestCancel(), 360); }}
+                    disabled={paymentLoading || !!pendingAction}
+                    className="ios-press w-full text-left flex items-center gap-3 px-4 py-3.5"
+                  >
+                    <div
+                      className="shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center"
+                      style={{ background: 'color-mix(in oklab, var(--accent) 10%, transparent)' }}
+                    >
+                      <XCircle size={18} style={{ color: 'var(--accent)' }} />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[15px] font-medium" style={{ color: 'var(--accent)' }}>
+                        Cancel subscription
+                      </div>
+                      <div className="text-[12.5px] mt-0.5" style={{ color: 'var(--ink-muted)', lineHeight: 1.45 }}>
+                        Keep access through your current cycle, then stop
+                      </div>
+                    </div>
+                    <ChevronRight size={16} style={{ color: 'var(--ink-muted)' }} />
+                  </button>
+                </>
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* Footer */}
+        <section className="px-5 pt-8 pb-2 text-center">
+          <div className="flex items-center justify-center gap-3 text-[12px]" style={{ color: 'var(--ink-faint)' }}>
+            <PhLock size={11} weight="duotone" />
+            <span>
+              Payments secured by {isStripe ? 'Stripe' : isRazorpay ? 'Razorpay' : 'our payment partners'}
+            </span>
+          </div>
+          <div className="flex items-center justify-center gap-3 text-[12px] mt-2" style={{ color: 'var(--ink-muted)' }}>
+            <a
+              href="mailto:support@minicaai.com"
+              className="ios-press"
+              style={{ color: 'var(--ink-muted)' }}
+            >
+              Contact support
+            </a>
+            <span aria-hidden style={{ color: 'var(--ink-faint)' }}>·</span>
+            <a
+              href="https://minicaai.com/refund-policy"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="ios-press"
+              style={{ color: 'var(--ink-muted)' }}
+            >
+              Refund policy
+            </a>
+          </div>
+        </section>
+
+        <div style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 32px)' }} />
+      </div>
+    </>
+  );
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SUPPORT — MOBILE (live WebSocket chat)
+//
+//  Full-screen iPhone-feel chat. Cream surface, iOS-Messages-style bubbles
+//  (squared tail-corner toward sender, rounded everywhere else), bottom-
+//  anchored input bar that respects safe-area-inset-bottom, and proper
+//  iOS soft-keyboard handling via VisualViewport API — when the keyboard
+//  slides up, the chat container's height shrinks to match the visible
+//  area so the input bar lifts above the keyboard instead of being
+//  covered by it.
+//
+//  Mirrors the desktop view's WebSocket lifecycle exactly: welcome agent
+//  message + ws connect on first mount (guarded by chatMessages.length
+//  === 0); send appends + ws.send if connected; close clears messages +
+//  closes ws + navigates back to landing.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+interface SupportMobileProps {
+  setView: (v: View) => void;
+  currentUser: UserProfile;  // dispatch ensures non-null before mount
+  chatMessages: Array<{ from: 'user' | 'agent'; text: string; time: string }>;
+  setChatMessages: React.Dispatch<React.SetStateAction<Array<{ from: 'user' | 'agent'; text: string; time: string }>>>;
+  chatInput: string;
+  setChatInput: (s: string) => void;
+  chatEndRef: React.RefObject<HTMLDivElement | null>;
+  chatWsRef: React.MutableRefObject<WebSocket | null>;
+}
+
+const SupportMobile: React.FC<SupportMobileProps> = ({
+  setView, currentUser, chatMessages, setChatMessages,
+  chatInput, setChatInput, chatEndRef, chatWsRef,
+}) => {
+  const [isClosing, setIsClosing] = useState(false);
+  // visualViewport.height — shrinks when soft keyboard opens. We pin the
+  // chat container height to this so the bottom input bar lifts above the
+  // keyboard. Falls back to 100vh on browsers without VisualViewport
+  // (Safari < 13, very old Android Chrome) — those users get the desktop-
+  // ish experience where the input bar can be obscured by the keyboard.
+  const [vvHeight, setVvHeight] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.visualViewport) return;
+    const update = () => setVvHeight(window.visualViewport!.height);
+    update();
+    window.visualViewport.addEventListener('resize', update);
+    window.visualViewport.addEventListener('scroll', update);
+    return () => {
+      window.visualViewport?.removeEventListener('resize', update);
+      window.visualViewport?.removeEventListener('scroll', update);
+    };
+  }, []);
+
+  // When the keyboard opens, scroll the latest message into view so it isn't
+  // hidden behind the now-shorter messages region.
+  useEffect(() => {
+    if (vvHeight === null) return;
+    const t = window.setTimeout(() => {
+      chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }, 80);
+    return () => window.clearTimeout(t);
+  }, [vvHeight, chatEndRef]);
+
+  // First-mount init: welcome message + ws connect. Same guard the desktop
+  // uses (chatMessages.length === 0) so re-mounts within the same parent
+  // session don't re-greet or open a duplicate ws. The cleanup-on-unmount
+  // is handled by dismiss() and the re-open guard, mirroring desktop.
+  useEffect(() => {
+    if (chatMessages.length > 0) return;
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    setChatMessages([{
+      from: 'agent',
+      text: `Hi ${currentUser.name || 'there'}! I'm Hari, your support agent. How can I help you today?`,
+      time,
+    }]);
+    const serverUrl = import.meta.env.VITE_SERVER_URL || 'https://api.minicaai.com';
+    const wsUrl = serverUrl.replace(/^http/, 'ws') + '/ws/support';
+    try {
+      const ws = new WebSocket(wsUrl);
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'join', user: currentUser.email, name: currentUser.name }));
+      };
+      ws.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.type === 'message') {
+            const msgTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            setChatMessages(prev => [...prev, { from: 'agent', text: data.text, time: msgTime }]);
+            window.setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
+          }
+        } catch { /* ignore malformed frames */ }
+      };
+      ws.onerror = () => { /* swallow — onclose will follow */ };
+      ws.onclose = () => { /* no auto-reconnect (matches desktop behavior) */ };
+      chatWsRef.current = ws;
+    } catch {
+      // ws constructor threw — likely blocked by CSP or invalid URL.
+      // We still leave the welcome message; user just can't send messages
+      // until they reload.
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const sendMessage = () => {
+    const text = chatInput.trim();
+    if (!text) return;
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    setChatMessages(prev => [...prev, { from: 'user', text, time }]);
+    setChatInput('');
+    if (chatWsRef.current?.readyState === WebSocket.OPEN) {
+      chatWsRef.current.send(JSON.stringify({ type: 'message', text, user: currentUser.email }));
+    }
+    window.setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
+  };
+
+  const dismiss = useCallback(() => {
+    if (isClosing) return;
+    setIsClosing(true);
+    window.setTimeout(() => {
+      if (chatWsRef.current) {
+        try { chatWsRef.current.close(); } catch { /* already closed */ }
+        chatWsRef.current = null;
+      }
+      setChatMessages([]);
+      setView('landing');
+    }, 320);
+  }, [isClosing, chatWsRef, setChatMessages, setView]);
+
+  // Esc to close — desktop dev-tools mobile emulation aid.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') dismiss(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [dismiss]);
+
+  return (
+    <div
+      className={isClosing ? 'ios-sheet-exit' : 'ios-sheet-enter'}
+      style={{
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        height: vvHeight ? `${vvHeight}px` : '100vh',
+        background: 'var(--cream)',
+        color: 'var(--ink)',
+        fontFamily: 'var(--sans)',
+        display: 'flex',
+        flexDirection: 'column',
+      }}
+    >
+      {/* App-bar — back button left, agent identity centered. iOS Messages
+          puts the contact info center-aligned in the title; we mirror that. */}
+      <div
+        className="pt-safe shrink-0"
+        style={{
+          background: 'color-mix(in oklab, var(--cream) 92%, transparent)',
+          backdropFilter: 'blur(12px)',
+          WebkitBackdropFilter: 'blur(12px)',
+          borderBottom: '1px solid var(--cream-line)',
+        }}
+      >
+        <div className="flex items-center px-3" style={{ height: 56 }}>
+          <button
+            onClick={dismiss}
+            className="ios-press w-9 h-9 -ml-1 flex items-center justify-center"
+            aria-label="Close support"
+            style={{ color: 'var(--ink)' }}
+          >
+            <ArrowLeft size={19} />
+          </button>
+          <div className="flex-1 flex items-center justify-center gap-2.5">
+            <div
+              className="w-9 h-9 rounded-full flex items-center justify-center shrink-0"
+              style={{
+                background: 'linear-gradient(135deg, #34d399, #059669)',
+                boxShadow: '0 2px 8px rgba(5, 150, 105, 0.18)',
+              }}
+            >
+              <Headphones size={16} className="text-white" />
+            </div>
+            <div className="flex flex-col items-start">
+              <div className="text-[14.5px] font-medium leading-tight" style={{ color: 'var(--ink)' }}>Hari</div>
+              <div className="flex items-center gap-1 text-[10.5px] leading-none mt-0.5" style={{ color: '#059669' }}>
+                <span
+                  className="w-1.5 h-1.5 rounded-full animate-pulse"
+                  style={{ background: '#10b981' }}
+                />
+                Live · Support
+              </div>
+            </div>
+          </div>
+          {/* Right-side spacer matches the back button's width so the agent
+              identity stays optically centered. */}
+          <div style={{ width: 36 }} />
+        </div>
+      </div>
+
+      {/* Messages — flex-1 so it absorbs all leftover height. Chat scrolls
+          here, not the outer container, so the input bar stays anchored. */}
+      <div
+        className="flex-1 overflow-y-auto px-4 py-4"
+        style={{ WebkitOverflowScrolling: 'touch' as any }}
+      >
+        <div className="max-w-3xl mx-auto" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {chatMessages.map((msg, i) => {
+            const prev = chatMessages[i - 1];
+            const showTime = !prev || prev.from !== msg.from || prev.time !== msg.time;
+            const isUser = msg.from === 'user';
+            return (
+              <div key={i} className="animate-in" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+                  <div
+                    style={{
+                      maxWidth: '80%',
+                      padding: '9px 14px',
+                      borderRadius: 22,
+                      // iOS bubble tail: corner toward sender slightly squared.
+                      borderBottomRightRadius: isUser ? 6 : 22,
+                      borderBottomLeftRadius:  isUser ? 22 : 6,
+                      background: isUser ? 'var(--ink)' : 'var(--cream-soft)',
+                      color: isUser ? 'var(--cream)' : 'var(--ink)',
+                      border: isUser ? 'none' : '1px solid var(--cream-line)',
+                    }}
+                  >
+                    <p className="text-[14.5px]" style={{ lineHeight: 1.4, margin: 0 }}>{msg.text}</p>
+                  </div>
+                </div>
+                {showTime && (
+                  <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} px-2`}>
+                    <span className="text-[10px]" style={{ color: 'var(--ink-faint)' }}>{msg.time}</span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <div ref={chatEndRef} />
+        </div>
+      </div>
+
+      {/* Input bar — anchored to bottom of the flex container. Bottom padding
+          uses safe-area-inset so the home indicator never sits on the input.
+          font-size: 16px on the input is critical — anything below triggers
+          iOS Safari's auto-zoom-on-focus, which jumps the layout. */}
+      <div
+        className="shrink-0"
+        style={{
+          background: 'color-mix(in oklab, var(--cream) 96%, transparent)',
+          borderTop: '1px solid var(--cream-line)',
+          paddingBottom: 'max(env(safe-area-inset-bottom), 12px)',
+          paddingTop: 12,
+          paddingLeft: 12,
+          paddingRight: 12,
+        }}
+      >
+        <form
+          onSubmit={(e) => { e.preventDefault(); sendMessage(); }}
+          className="flex items-center gap-2 max-w-3xl mx-auto"
+        >
+          <input
+            type="text"
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            placeholder="Message"
+            className="flex-1 px-4 py-3 rounded-full text-[16px] outline-none"
+            style={{
+              background: 'var(--cream-soft)',
+              border: '1px solid var(--cream-line)',
+              color: 'var(--ink)',
+            }}
+            inputMode="text"
+            enterKeyHint="send"
+          />
+          <button
+            type="submit"
+            disabled={!chatInput.trim()}
+            className="ios-press w-11 h-11 rounded-full flex items-center justify-center disabled:opacity-40 shrink-0"
+            style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+            aria-label="Send message"
+          >
+            <Send size={16} />
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  MAIN GATE COMPONENT
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticated }) => {
   const [view, setView] = useState<View>('landing');
+  // iPhone-feel landing on phones; desktop landing unchanged. Flips live on
+  // window resize / orientation change so DevTools mobile-emulation toggles
+  // and tablet rotations Just Work.
+  const isMobile = useIsMobile();
+  // Desktop profile sheet — opened from the /download nav's email click.
+  // Mobile uses its own copy inside DownloadMobile; desktop drives this
+  // top-level state so the cream-themed full-screen sheet can present over
+  // the dark /download page like a proper iOS modal.
+  const [desktopProfileOpen, setDesktopProfileOpen] = useState(false);
+  // Web Manage Subscription modal — opens the same in-app billing UI
+  // (cancel / reactivate / tier-swap / refund policy / profile) used by
+  // the Electron desktop chat-header. Without this, web users had no
+  // path to manage their subscription besides the Stripe Customer Portal,
+  // which doesn't surface the cancel-pending state or expose Reactivate.
+  const [webManageSubOpen, setWebManageSubOpen] = useState(false);
   const [geo, setGeo] = useState<GeoData | null>(null);
   const [pricing, setPricing] = useState<RegionPricing | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -3400,9 +6981,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       case 'basic':
         return 'Payment successful — 3 interview credits unlocked (valid 14 days).';
       case 'pro':
-        return 'Payment successful — Pro activated. Unlimited sessions and all models unlocked.';
+        // Pro does NOT include Claude (that's Max-exclusive). Saying "all
+        // models" was a long-running copy bug that promised something
+        // Pro doesn't deliver. The honest line lists what's actually new
+        // vs. Free / Basic without naming Claude.
+        return 'Payment successful — Pro activated. Unlimited sessions, GPT-5.5, Grok, and Llama unlocked.';
       case 'max':
-        return 'Payment successful — Max activated. Auto-Type plus everything in Pro is now live.';
+        return 'Payment successful — Max activated. Claude Sonnet 4.6, Auto-Type, and everything in Pro is now live.';
       default:
         return 'Payment successful — your plan is active.';
     }
@@ -3671,6 +7256,18 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
       if (isElectron) {
         onAuthenticated(user, license);
+      } else if (selectedProUpgrade) {
+        // Plan-aware redirect: existing user clicked a paid plan on the
+        // landing page, hit the auth wall, switched to Login (because they
+        // already had an account), and just logged in. Honor their original
+        // plan choice and route them straight to checkout — same path
+        // signup and Google-OAuth take. Without this branch, returning users
+        // got dumped on the download page after login and had to click the
+        // plan a second time, which made the funnel feel broken.
+        setSelectedProUpgrade(false);
+        const tier = pendingCheckoutTier;
+        setTimeout(() => initiateCheckout(tier), 300);
+        setView('download');
       } else {
         setView('download');
       }
@@ -3691,7 +7288,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setAuthError(null);
 
     try {
-      const serverUrl = 'https://h2so4-production.up.railway.app';
+      const serverUrl = 'https://api.minicaai.com';
       const res = await fetch(`${serverUrl}/api/v1/auth/forgot-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3726,12 +7323,108 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     }
   };
 
+  // ── Post-checkout polling (Electron desktop flow) ───────────────────
+  // When we open Stripe checkout in the system browser instead of taking
+  // over the renderer, the renderer never receives Stripe's success_url
+  // redirect — that URL loads in the user's browser, not the app. So the
+  // app learns about the upgrade through the server: we poll license
+  // validation (cheap, already used by the periodic revalidation tick)
+  // until the server reflects the new tier, then mirror the SYNC_GRANT
+  // path's local-state update so the in-app UI flips without a relaunch.
+  //
+  // 10-minute cap because most webhooks land in <30s. After that either
+  // the user abandoned the browser flow, the webhook stalled, or there's
+  // a routing mismatch (rare). We surface a clear "still waiting" message
+  // instead of spinning forever — relaunching the app picks up the new
+  // license on the next validateWithServer tick regardless.
+  const pollForUpgrade = async (targetTier: 'basic' | 'pro' | 'max'): Promise<void> => {
+    const POLL_INTERVAL_MS = 4000;
+    const POLL_TIMEOUT_MS = 10 * 60 * 1000;
+    const startedAt = Date.now();
+    return new Promise<void>((resolve) => {
+      const tick = async () => {
+        if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+          setPaymentError('Still waiting for payment confirmation. If you finished checkout, restart the app to sync your plan.');
+          resolve();
+          return;
+        }
+        try {
+          const updated = await licenseService.validateWithServer();
+          if (updated && updated.tier === targetTier && updated.status === 'active') {
+            const baseUser = currentUser || licenseService.loadAuth().user;
+            if (baseUser) {
+              const updatedUser: UserProfile = { ...baseUser, tier: updated.tier as UserProfile['tier'] };
+              setCurrentUser(updatedUser);
+              setCurrentLicense(updated);
+              licenseService.saveAuth(updatedUser, updated);
+              try { localStorage.setItem('justPurchasedTier', updated.tier); } catch {}
+              setLastSuccessfulTier(updated.tier);
+            }
+            surfacePaymentSuccess(welcomeForTier(updated.tier));
+            setPendingCheckoutTier('pro');
+            setSelectedProUpgrade(false);
+            setView('download');
+            resolve();
+            return;
+          }
+        } catch { /* network blip — keep polling */ }
+        window.setTimeout(tick, POLL_INTERVAL_MS);
+      };
+      // Initial wait — Stripe's webhook needs a moment after payment.
+      window.setTimeout(tick, POLL_INTERVAL_MS);
+    });
+  };
+
+  // Renewals don't change `tier` — they extend `expires_at` by ~1h via
+  // grantBasicRenewal on the server. We watch for a forward delta on the
+  // license's expires_at; validateWithServer's renewal-credit propagation
+  // path (services/licenseService.ts) lands the +3600s credit locally as
+  // soon as the matching delta is detected, so we just refresh React
+  // state when it does. 30-min lower bound on the delta absorbs clock
+  // skew but stays well above any non-renewal noise.
+  const pollForRenewal = async (): Promise<void> => {
+    const POLL_INTERVAL_MS = 4000;
+    const POLL_TIMEOUT_MS = 10 * 60 * 1000;
+    const RENEWAL_THRESHOLD_MS = 30 * 60 * 1000;
+    const startedAt = Date.now();
+    const baselineExpires = currentLicense?.expires_at || 0;
+    return new Promise<void>((resolve) => {
+      const tick = async () => {
+        if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+          setPaymentError('Still waiting for renewal confirmation. If you finished checkout, restart the app to sync your credits.');
+          resolve();
+          return;
+        }
+        try {
+          const updated = await licenseService.validateWithServer();
+          if (updated && (updated.expires_at || 0) >= baselineExpires + RENEWAL_THRESHOLD_MS) {
+            setCurrentLicense(updated);
+            surfacePaymentSuccess(welcomeForRenewal());
+            resolve();
+            return;
+          }
+        } catch { /* network blip */ }
+        window.setTimeout(tick, POLL_INTERVAL_MS);
+      };
+      window.setTimeout(tick, POLL_INTERVAL_MS);
+    });
+  };
+
   // ── Initiate payment checkout (Stripe or Razorpay based on geo) ──
   const initiateCheckout = async (tier: 'basic' | 'pro' | 'max' = pendingCheckoutTier) => {
     setPaymentLoading(true);
     setPaymentError(null);
 
     try {
+      // Region detection must complete before checkout. Without this guard a
+      // click before /geo resolves defaults country_code to 'US' below, which
+      // routes Indian users to Stripe USD ($29) instead of Razorpay INR
+      // (₹2499) — they see ₹2499 in-app, click, then land on Stripe at $29
+      // with no INR option. Source of the "wrong currency" bug reports.
+      if (!geo) {
+        throw new Error('Detecting your region — please try again in a moment.');
+      }
+
       // Retry token fetch — it may not be in localStorage yet after signup
       let token = licenseService.getToken();
       if (!token) {
@@ -3778,7 +7471,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       const timeoutId = window.setTimeout(() => controller.abort(), 30000);
       let response: Response;
       try {
-        response = await fetch(`https://h2so4-production.up.railway.app${endpointPath}`, {
+        response = await fetch(`https://api.minicaai.com${endpointPath}`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -3852,8 +7545,41 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         setSelectedProUpgrade(false);
         setView('download');
       } else if (data.provider === 'stripe') {
-        // Stripe — redirect to hosted checkout
-        window.location.href = data.checkout_url;
+        // Stripe — open hosted checkout. The flow forks on Electron vs web
+        // because navigating the renderer (window.location.href) inside a
+        // packaged desktop app strands the user on Stripe's success URL
+        // when payment completes — that URL is the marketing website, which
+        // doesn't share auth state with the Electron app. The user would
+        // see "Pro Active" only after relaunching. Instead, on Electron we
+        // hand the URL to the system browser and poll the server for the
+        // upgrade so the in-app UI updates without a relaunch.
+        if (isElectron && window.electronAPI) {
+          // Use openExternalRobust — it has shell.openExternal with a 6s
+          // timeout race and a child_process `cmd /c start` fallback for
+          // when ShellExecuteW silently fails (corrupt default-browser
+          // registration, AV interference, OS shell process busy). The
+          // legacy openExternal can claim success and yet not actually
+          // surface a window — users would see "checkout opened in your
+          // browser" with nothing actually opening.
+          let opened: { ok: boolean; method?: string } = { ok: false };
+          try {
+            opened = window.electronAPI.openExternalRobust
+              ? await window.electronAPI.openExternalRobust(data.checkout_url)
+              : (await window.electronAPI.openExternal(data.checkout_url), { ok: true, method: 'shell.openExternal-legacy' });
+          } catch (e) {
+            opened = { ok: false };
+          }
+          if (opened.ok) {
+            surfacePaymentSuccess(`Complete payment in your browser (${opened.method}) — your plan will update automatically once it lands. Keep this window open.`);
+          } else {
+            // Surface the URL on the error path so the user can copy &
+            // paste manually instead of being stranded.
+            setPaymentError(`Couldn't open the browser automatically. Open this URL to pay: ${data.checkout_url}`);
+          }
+          await pollForUpgrade(tier);
+        } else {
+          window.location.href = data.checkout_url;
+        }
       } else if (data.provider === 'razorpay') {
         // Razorpay — open inline checkout modal
         await openRazorpayCheckout(data);
@@ -3875,6 +7601,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setPaymentLoading(true);
     setPaymentError(null);
     try {
+      // Same region-required guard as initiateCheckout — see the comment
+      // there for the rationale (geo race → wrong-currency charge).
+      if (!geo) {
+        throw new Error('Detecting your region — please try again in a moment.');
+      }
       let token = licenseService.getToken();
       if (!token) {
         await new Promise(r => setTimeout(r, 500));
@@ -3887,7 +7618,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       const timeoutId = window.setTimeout(() => controller.abort(), 30000);
       let response: Response;
       try {
-        response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-renewal', {
+        response = await fetch('https://api.minicaai.com/api/v1/payments/create-renewal', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
           body: JSON.stringify({ country_code: countryCode }),
@@ -3909,7 +7640,32 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       const data = await response.json();
 
       if (data.provider === 'stripe') {
-        window.location.href = data.checkout_url;
+        // Same Electron-vs-web fork as the subscription flow — see the
+        // long comment at the matching block in initiateCheckout. Without
+        // this, a desktop user clicking Renew gets stranded on the website
+        // after Stripe's redirect. pollForRenewal watches expires_at on
+        // the cached license — when validateWithServer detects the +1h
+        // delta from grantBasicRenewal, the +3600s credit lands locally.
+        if (isElectron && window.electronAPI) {
+          // Same robust opener path as initiateCheckout — see the comment
+          // there for the rationale.
+          let opened: { ok: boolean; method?: string } = { ok: false };
+          try {
+            opened = window.electronAPI.openExternalRobust
+              ? await window.electronAPI.openExternalRobust(data.checkout_url)
+              : (await window.electronAPI.openExternal(data.checkout_url), { ok: true, method: 'shell.openExternal-legacy' });
+          } catch (e) {
+            opened = { ok: false };
+          }
+          if (opened.ok) {
+            surfacePaymentSuccess(`Complete payment in your browser (${opened.method}) — your renewal credit will land here automatically once it does. Keep this window open.`);
+          } else {
+            setPaymentError(`Couldn't open the browser automatically. Open this URL to pay: ${data.checkout_url}`);
+          }
+          await pollForRenewal();
+        } else {
+          window.location.href = data.checkout_url;
+        }
       } else if (data.provider === 'razorpay') {
         await openRazorpayCheckout(data);
       }
@@ -3931,7 +7687,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     try {
       const token = licenseService.getToken();
       if (!token) throw new Error('Please sign in first');
-      const res = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/portal', {
+      const res = await fetch('https://api.minicaai.com/api/v1/payments/portal', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}` },
       });
@@ -3962,7 +7718,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     try {
       const token = licenseService.getToken();
       if (!token) throw new Error('Please sign in first');
-      const res = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/cancel-razorpay', {
+      const res = await fetch('https://api.minicaai.com/api/v1/payments/cancel-razorpay', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}` },
       });
@@ -3998,7 +7754,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             // Payment successful — verify on server
             try {
               const token = licenseService.getToken();
-              const verifyRes = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/verify-razorpay', {
+              const verifyRes = await fetch('https://api.minicaai.com/api/v1/payments/verify-razorpay', {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
@@ -4191,7 +7947,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     googlePollAbortRef.current = false;
 
     const sessionId = crypto.randomUUID();
-    const serverUrl = 'https://h2so4-production.up.railway.app';
+    const serverUrl = 'https://api.minicaai.com';
     const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}`;
 
     // Open Google sign-in in system browser. We MUST await + catch here —
@@ -4519,7 +8275,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           </div>
           <h2 className="text-xl font-bold text-white mb-3">Update Required</h2>
           <p className="text-gray-400 text-sm mb-8 leading-relaxed">{error}</p>
-          <a href="https://github.com/madhavvan/h2so4/releases/latest" className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm transition-all shadow-lg shadow-blue-500/25">
+          <a href="https://get.minicaai.com" className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold text-sm transition-all shadow-lg shadow-blue-500/25">
             Download Latest Version <ArrowRight size={14} />
           </a>
         </div>
@@ -4555,6 +8311,9 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
   // ── TUTORIALS VIEW ──
   if (view === 'tutorials') {
+    if (isMobile) {
+      return <TutorialsMobile setView={setView} currentUser={currentUser} />;
+    }
     return (
       <div className="fixed inset-0 bg-[#050507] text-white overflow-y-auto">
         <AnimatedBackground />
@@ -4599,6 +8358,32 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
   // ── DOWNLOAD VIEW (after auth — browser only) ──
   if (view === 'download' && !isElectron) {
+    if (isMobile) {
+      return (
+        <DownloadMobile
+          setView={setView}
+          currentUser={currentUser}
+          setCurrentUser={setCurrentUser}
+          currentLicense={currentLicense}
+          handleLogout={handleLogout}
+          justSignedUp={justSignedUp}
+          setJustSignedUp={setJustSignedUp}
+          paymentError={paymentError}
+          paymentSuccess={paymentSuccess}
+          paymentLoading={paymentLoading}
+          geo={geo}
+          pricing={pricing}
+          lastSuccessfulTier={lastSuccessfulTier}
+          cancelConfirm={cancelConfirm}
+          setCancelConfirm={setCancelConfirm}
+          handleManageSubscription={handleManageSubscription}
+          handleCancelSubscription={handleCancelSubscription}
+          initiateRenewal={initiateRenewal}
+          initiateCheckout={initiateCheckout}
+          basicExpiryLabel={basicExpiryLabel}
+        />
+      );
+    }
     return (
       <div className="fixed inset-0 bg-[#050507] text-white overflow-y-auto">
         <AnimatedBackground />
@@ -4609,10 +8394,61 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           <div className="flex items-center gap-3">
             {currentUser && (
               <>
-                <span className="text-xs text-gray-500">{currentUser.email}</span>
+                {/* Email tappable — opens the profile sheet. The button
+                    style stays subtle (text-only with hover lift) so the
+                    nav doesn't read like an action bar; the email is still
+                    primarily a status indicator, just a discoverable one. */}
+                <button
+                  onClick={() => setDesktopProfileOpen(true)}
+                  className="text-xs text-gray-500 hover:text-white transition-colors flex items-center gap-1.5"
+                  aria-label="Open profile"
+                  title="Open profile"
+                >
+                  {currentUser.avatar_url && currentUser.oauth_provider === 'google' ? (
+                    <img
+                      src={currentUser.avatar_url}
+                      alt=""
+                      referrerPolicy="no-referrer"
+                      style={{ width: 18, height: 18, borderRadius: 999, border: '1px solid rgba(255,255,255,0.1)' }}
+                    />
+                  ) : (
+                    <span
+                      className="inline-flex items-center justify-center font-medium"
+                      style={{
+                        width: 18,
+                        height: 18,
+                        borderRadius: 999,
+                        background: 'rgba(255,255,255,0.08)',
+                        border: '1px solid rgba(255,255,255,0.1)',
+                        fontSize: 9,
+                        color: 'rgba(255,255,255,0.7)',
+                      }}
+                    >
+                      {(currentUser.name?.[0] || currentUser.email[0]).toUpperCase()}
+                    </span>
+                  )}
+                  {currentUser.email}
+                </button>
                 <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${currentLicense?.tier === 'max' ? 'bg-amber-500/20 text-amber-400' : currentLicense?.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : currentLicense?.tier === 'basic' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-500/20 text-gray-400'}`}>
                   {currentLicense?.tier || 'free'}
                 </span>
+                {/* Explicit "Subscription" link in the nav — labeled, not
+                    hidden behind an icon. This is the single discoverable
+                    path to upgrade / downgrade / cancel that every user
+                    can find. Routes to /pricing which now shows the full
+                    4-tier comparison + per-tier checkout buttons that pipe
+                    through the same handlers as the cards. Cancel + manage
+                    are also reachable from the desktop profile sheet's
+                    "Plan & billing" row, but this is the obvious nav-level
+                    one. */}
+                <button
+                  onClick={() => setWebManageSubOpen(true)}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] text-gray-300 hover:text-white transition-all flex items-center gap-1.5"
+                  aria-label="Manage subscription"
+                  title="Manage subscription"
+                >
+                  <Settings size={12} /> Subscription
+                </button>
                 {licenseService.isDeveloper(currentUser.email) && (
                   <button onClick={() => setView('admin')} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-all">
                     Admin
@@ -4625,6 +8461,52 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             )}
           </div>
         </nav>
+
+        {/* Web Manage Subscription — same component the Electron chat-
+            header opens. Gives web users full parity: cancel + reactivate
+            + tier swaps + refund policy + profile edit + status banners.
+            onUpgradeRequested closes the modal and routes through the
+            existing initiateCheckout path so the post-checkout polling
+            and Stripe-vs-Razorpay forks still work. */}
+        <ManageSubscriptionModal
+          isOpen={webManageSubOpen}
+          onClose={() => setWebManageSubOpen(false)}
+          userProfile={currentUser}
+          userLicense={currentLicense}
+          onUpgradeRequested={(targetTier) => {
+            setWebManageSubOpen(false);
+            // Small defer so the modal exit animation lands before
+            // checkout takes the renderer over via Stripe redirect.
+            window.setTimeout(() => initiateCheckout(targetTier), 200);
+          }}
+          onProfileUpdated={(updated) => setCurrentUser(updated)}
+          onLicenseUpdated={(updated) => setCurrentLicense(updated)}
+          onRenewRequested={() => {
+            setWebManageSubOpen(false);
+            window.setTimeout(() => initiateRenewal(), 200);
+          }}
+        />
+
+        {/* Desktop profile sheet — same component used by DownloadMobile
+            but parented to SubscriptionGateInner so the cream surface
+            covers the dark /download page like a proper iOS-style modal. */}
+        <ProfileSheetMobile
+          open={desktopProfileOpen}
+          onClose={() => setDesktopProfileOpen(false)}
+          currentUser={currentUser}
+          setCurrentUser={setCurrentUser}
+          currentLicense={currentLicense}
+          geo={geo}
+          onLogout={handleLogout}
+          onOpenPlanSheet={() => {
+            // Close the profile sheet first, then defer the view change so
+            // the .ios-sheet-exit animation has time to play (320ms) before
+            // the /download branch unmounts and takes the sheet with it.
+            // Without the defer the sheet hard-cuts to the pricing page.
+            setDesktopProfileOpen(false);
+            window.setTimeout(() => setView('pricing'), 360);
+          }}
+        />
 
         <div className="relative z-10 max-w-3xl mx-auto px-6 pt-16 pb-20 text-center">
           <div className="w-20 h-20 mx-auto rounded-3xl bg-gradient-to-br from-blue-500 via-blue-600 to-purple-600 flex items-center justify-center mb-8 shadow-2xl shadow-blue-500/30">
@@ -4668,7 +8550,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
           {/* Download buttons */}
           <div className="space-y-3 max-w-md mx-auto mb-12">
-            <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe"
+            <a href="https://get.minicaai.com/windows"
               className="flex items-center justify-between p-4 rounded-xl border border-white/[0.08] bg-white/[0.02] hover:border-blue-500/40 hover:bg-blue-500/[0.04] transition-all group">
               <div className="flex items-center gap-4">
                 <div className="p-2.5 bg-blue-500/10 rounded-xl group-hover:bg-blue-500/20 transition-colors">
@@ -4682,7 +8564,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               <Download size={16} className="text-gray-600 group-hover:text-blue-400 transition-colors" />
             </a>
 
-            <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac.dmg"
+            <a href="https://get.minicaai.com/mac"
               className="flex items-center justify-between p-4 rounded-xl border border-white/[0.08] bg-white/[0.02] hover:border-purple-500/40 hover:bg-purple-500/[0.04] transition-all group">
               <div className="flex items-center gap-4">
                 <div className="p-2.5 bg-purple-500/10 rounded-xl group-hover:bg-purple-500/20 transition-colors">
@@ -4696,7 +8578,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               <Download size={16} className="text-gray-600 group-hover:text-purple-400 transition-colors" />
             </a>
 
-            <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage"
+            <a href="https://get.minicaai.com/linux"
               className="flex items-center justify-between p-4 rounded-xl border border-white/[0.08] bg-white/[0.02] hover:border-orange-500/40 hover:bg-orange-500/[0.04] transition-all group">
               <div className="flex items-center gap-4">
                 <div className="p-2.5 bg-orange-500/10 rounded-xl group-hover:bg-orange-500/20 transition-colors">
@@ -4815,6 +8697,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               }
 
               if (effectiveTier === 'basic') {
+                // Same gating rationale as DownloadMobile: Renew is only
+                // shown when the LIVE license confirms Basic, not via the
+                // optimistic lastSuccessfulTier fallback during webhook
+                // lag. Server's /create-renewal would reject in that
+                // window anyway; hiding the button avoids a click→error
+                // round trip.
+                const isConfirmedBasic = currentLicense?.tier === 'basic';
                 return (
                   <>
                     <div className="flex flex-col items-center gap-1.5">
@@ -4834,18 +8723,20 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                         </div>
                       )}
                     </div>
-                    <button
-                      onClick={initiateRenewal}
-                      disabled={paymentLoading}
-                      className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center gap-2 disabled:opacity-50"
-                      aria-label="Renew +1 interview (1 hour)"
-                    >
-                      {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
-                      {(() => {
-                        const r = pricingService.getBasicRenewalPrice(geo?.country_code || 'US');
-                        return `Renew +1h · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
-                      })()}
-                    </button>
+                    {isConfirmedBasic && (
+                      <button
+                        onClick={initiateRenewal}
+                        disabled={paymentLoading}
+                        className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center gap-2 disabled:opacity-50"
+                        aria-label="Renew +1 interview (1 hour)"
+                      >
+                        {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+                        {(() => {
+                          const r = pricingService.getBasicRenewalPrice(geo?.country_code || 'US');
+                          return `Renew +1h · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
+                        })()}
+                      </button>
+                    )}
                   </>
                 );
               }
@@ -4921,10 +8812,52 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     />;
   }
 
+  // Mobile auth dispatch helper — common props bag for the three view
+  // branches (login / signup / forgot_password). Defined once so the three
+  // branches stay tidy. The closure captures handlers by name (resolved at
+  // INVOCATION time), so it's safe to declare here even though the actual
+  // handler `const`s like renderGoogleFallback are declared in source-order.
+  const renderAuthMobile = (m: AuthMode) => (
+    <AuthMobile
+      mode={m}
+      email={email} setEmail={setEmail}
+      password={password} setPassword={setPassword}
+      name={name} setName={setName}
+      showPassword={showPassword} setShowPassword={setShowPassword}
+      handleLogin={handleLogin}
+      handleSignup={handleSignup}
+      handleForgotPassword={handleForgotPassword}
+      handleGoogleSuccess={handleGoogleSuccess}
+      handleGoogleError={handleGoogleError}
+      handleGoogleElectron={handleGoogleElectron}
+      renderGoogleFallback={renderGoogleFallback}
+      isSubmitting={isSubmitting}
+      googleSubmitting={googleSubmitting}
+      authError={authError} setAuthError={setAuthError}
+      forgotSent={forgotSent} setForgotSent={setForgotSent}
+      geo={geo}
+      pricing={pricing}
+      setView={setView}
+    />
+  );
+
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   //  LANDING PAGE
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'landing') {
+    if (isMobile) {
+      return (
+        <LandingMobile
+          setView={setView}
+          geo={geo}
+          pricing={pricing}
+          handleTierSelect={handleTierSelect}
+          isSubmitting={isSubmitting}
+          currentUser={currentUser}
+          setAuthError={setAuthError}
+        />
+      );
+    }
     return (
       <div
         className="fixed inset-0 overflow-y-auto"
@@ -5319,6 +9252,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   //  LOGIN — cream-on-ink, editorial typography
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'login') {
+    if (isMobile) return renderAuthMobile('login');
     return (
       <div
         className="fixed inset-0 flex items-center justify-center p-6 overflow-y-auto"
@@ -5326,12 +9260,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       >
         <div className="w-full max-w-md">
           <div
-            className="relative rounded-3xl p-9 pt-7"
+            className="auth-card relative rounded-3xl p-9 pt-7"
             style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
           >
             <button
               onClick={() => setView('landing')}
-              className="absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center transition-colors hover:opacity-80"
+              className="auth-close absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center"
               style={{ color: 'var(--ink-muted)' }}
               aria-label="Close"
             >
@@ -5357,10 +9291,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="you@example.com"
-                  className="w-full px-4 py-3 rounded-xl text-[14px] focus:outline-none transition-all"
+                  className="auth-input w-full px-4 py-3 rounded-xl text-[14px]"
                   style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   required
                   autoFocus
+                  autoComplete="email"
                 />
               </div>
               <div>
@@ -5369,7 +9304,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   <button
                     type="button"
                     onClick={() => { setAuthError(null); setForgotSent(false); setView('forgot_password'); }}
-                    className="text-[12px] font-medium transition-colors hover:opacity-100"
+                    className="auth-link text-[12px] font-medium"
                     style={{ color: 'var(--accent)' }}
                   >
                     Forgot password?
@@ -5381,15 +9316,18 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Enter your password"
-                    className="w-full px-4 py-3 pr-10 rounded-xl text-[14px] focus:outline-none transition-all"
+                    className="auth-input w-full px-4 py-3 pr-10 rounded-xl text-[14px]"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                     required
+                    autoComplete="current-password"
                   />
                   <button
                     type="button"
                     onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 transition-colors hover:opacity-100"
+                    className="auth-close absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full flex items-center justify-center"
                     style={{ color: 'var(--ink-muted)' }}
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    tabIndex={-1}
                   >
                     {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
@@ -5397,21 +9335,26 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </div>
               {authError && (
                 <div
-                  className="flex items-center gap-2 px-3 py-2.5 rounded-lg text-[12.5px]"
+                  className="flex items-start gap-2 px-3 py-2.5 rounded-lg text-[12.5px]"
+                  role="alert"
                   style={{ background: 'color-mix(in oklab, var(--accent) 10%, transparent)', border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)', color: 'var(--accent)' }}
                 >
-                  <AlertTriangle size={13} /> {authError}
+                  <AlertTriangle size={13} style={{ marginTop: 1, flexShrink: 0 }} />
+                  <span style={{ lineHeight: 1.45 }}>{authError}</span>
                 </div>
               )}
               <button
                 type="submit"
-                disabled={isSubmitting || googleSubmitting}
-                className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90 inline-flex items-center justify-center gap-2 disabled:opacity-60"
+                disabled={isSubmitting || googleSubmitting || !email.trim() || !password.trim()}
+                className="auth-submit w-full py-3 rounded-full text-[14px] font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                 style={{ background: 'var(--ink)', color: 'var(--cream)' }}
               >
+                {/* Always render an icon slot (spinner during submit, arrow
+                    otherwise) so the button width and text position stay
+                    fixed across states — no layout shift on click. */}
                 {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
-                Sign in
-                {!isSubmitting && <PhArrowRight size={14} weight="bold" />}
+                <span>Sign in</span>
+                {!isSubmitting ? <PhArrowRight size={14} weight="bold" /> : null}
               </button>
             </form>
 
@@ -5427,15 +9370,15 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   <button
                     onClick={handleGoogleElectron}
                     disabled={isSubmitting || googleSubmitting}
-                    className="mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-60 hover:opacity-90"
+                    className="auth-submit mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   >
                     {googleSubmitting ? (
                       <Loader2 size={16} className="animate-spin" />
                     ) : (
-                      <svg width="17" height="17" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+                      <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
                     )}
-                    {googleSubmitting ? 'Waiting for sign-in...' : 'Continue with Google'}
+                    {googleSubmitting ? 'Waiting for sign-in…' : 'Continue with Google'}
                   </button>
                 ) : (
                   <div className="mt-5 flex justify-center [&_iframe]:rounded-full">
@@ -5444,7 +9387,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                       onError={handleGoogleError}
                       theme="outline"
                       size="large"
-                      width="350"
+                      width="384"
                       text="signin_with"
                       shape="pill"
                     />
@@ -5456,7 +9399,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
             <div className="mt-7 text-center text-[13px]" style={{ color: 'var(--ink-muted)' }}>
               No account?{' '}
-              <button onClick={() => setView('signup')} className="font-medium" style={{ color: 'var(--ink)' }}>
+              <button
+                onClick={() => setView('signup')}
+                className="auth-link font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
                 Create one
               </button>
             </div>
@@ -5475,6 +9422,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   //  FORGOT PASSWORD — cream theme, restrained
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'forgot_password') {
+    if (isMobile) return renderAuthMobile('forgot_password');
     return (
       <div
         className="fixed inset-0 flex items-center justify-center p-6 overflow-y-auto"
@@ -5482,12 +9430,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       >
         <div className="w-full max-w-md">
           <div
-            className="relative rounded-3xl p-9 pt-7"
+            className="auth-card relative rounded-3xl p-9 pt-7"
             style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
           >
             <button
               onClick={() => { setAuthError(null); setForgotSent(false); setView('login'); }}
-              className="absolute top-4 left-4 w-8 h-8 rounded-full flex items-center justify-center transition-colors hover:opacity-80"
+              className="auth-close absolute top-4 left-4 w-8 h-8 rounded-full flex items-center justify-center"
               style={{ color: 'var(--ink-muted)' }}
               aria-label="Back to sign in"
             >
@@ -5495,7 +9443,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             </button>
             <button
               onClick={() => { setAuthError(null); setForgotSent(false); setView('landing'); }}
-              className="absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center transition-colors hover:opacity-80"
+              className="auth-close absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center"
               style={{ color: 'var(--ink-muted)' }}
               aria-label="Close"
             >
@@ -5531,34 +9479,37 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     placeholder="you@example.com"
-                    className="w-full px-4 py-3 rounded-xl text-[14px] focus:outline-none transition-all"
+                    className="auth-input w-full px-4 py-3 rounded-xl text-[14px]"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                     required
                     autoFocus
+                    autoComplete="email"
                   />
                 </div>
                 {authError && (
                   <div
-                    className="flex items-center gap-2 px-3 py-2.5 rounded-lg text-[12.5px]"
+                    className="flex items-start gap-2 px-3 py-2.5 rounded-lg text-[12.5px]"
+                    role="alert"
                     style={{ background: 'color-mix(in oklab, var(--accent) 10%, transparent)', border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)', color: 'var(--accent)' }}
                   >
-                    <AlertTriangle size={13} /> {authError}
+                    <AlertTriangle size={13} style={{ marginTop: 1, flexShrink: 0 }} />
+                    <span style={{ lineHeight: 1.45 }}>{authError}</span>
                   </div>
                 )}
                 <button
                   type="submit"
-                  disabled={isSubmitting}
-                  className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90 inline-flex items-center justify-center gap-2 disabled:opacity-60"
+                  disabled={isSubmitting || !email.trim()}
+                  className="auth-submit w-full py-3 rounded-full text-[14px] font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{ background: 'var(--ink)', color: 'var(--cream)' }}
                 >
                   {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
-                  Send reset link
+                  <span>Send reset link</span>
                 </button>
               </form>
             ) : (
               <button
                 onClick={() => { setForgotSent(false); setAuthError(null); setView('login'); }}
-                className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90"
+                className="auth-submit w-full py-3 rounded-full text-[14px] font-medium"
                 style={{ background: 'var(--ink)', color: 'var(--cream)' }}
               >
                 Back to sign in
@@ -5569,7 +9520,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               Remembered it?{' '}
               <button
                 onClick={() => { setAuthError(null); setForgotSent(false); setView('login'); }}
-                className="font-medium"
+                className="auth-link font-medium"
                 style={{ color: 'var(--ink)' }}
               >
                 Sign in
@@ -5585,6 +9536,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   //  SIGNUP — cream-on-ink, editorial typography
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'signup') {
+    if (isMobile) return renderAuthMobile('signup');
     return (
       <div
         className="fixed inset-0 flex items-center justify-center p-6 overflow-y-auto"
@@ -5592,12 +9544,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       >
         <div className="w-full max-w-md">
           <div
-            className="relative rounded-3xl p-9 pt-7"
+            className="auth-card relative rounded-3xl p-9 pt-7"
             style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
           >
             <button
               onClick={() => setView('landing')}
-              className="absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center transition-colors hover:opacity-80"
+              className="auth-close absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center"
               style={{ color: 'var(--ink-muted)' }}
               aria-label="Close"
             >
@@ -5623,9 +9575,10 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="Your name"
-                  className="w-full px-4 py-3 rounded-xl text-[14px] focus:outline-none transition-all"
+                  className="auth-input w-full px-4 py-3 rounded-xl text-[14px]"
                   style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   autoFocus
+                  autoComplete="name"
                 />
               </div>
               <div>
@@ -5635,9 +9588,10 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="you@example.com"
-                  className="w-full px-4 py-3 rounded-xl text-[14px] focus:outline-none transition-all"
+                  className="auth-input w-full px-4 py-3 rounded-xl text-[14px]"
                   style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   required
+                  autoComplete="email"
                 />
               </div>
               <div>
@@ -5648,16 +9602,19 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Create a password (min 8 chars)"
-                    className="w-full px-4 py-3 pr-10 rounded-xl text-[14px] focus:outline-none transition-all"
+                    className="auth-input w-full px-4 py-3 pr-10 rounded-xl text-[14px]"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                     required
                     minLength={8}
+                    autoComplete="new-password"
                   />
                   <button
                     type="button"
                     onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 transition-colors hover:opacity-100"
+                    className="auth-close absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full flex items-center justify-center"
                     style={{ color: 'var(--ink-muted)' }}
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    tabIndex={-1}
                   >
                     {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
@@ -5665,21 +9622,23 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </div>
               {authError && (
                 <div
-                  className="flex items-center gap-2 px-3 py-2.5 rounded-lg text-[12.5px]"
+                  className="flex items-start gap-2 px-3 py-2.5 rounded-lg text-[12.5px]"
+                  role="alert"
                   style={{ background: 'color-mix(in oklab, var(--accent) 10%, transparent)', border: '1px solid color-mix(in oklab, var(--accent) 35%, transparent)', color: 'var(--accent)' }}
                 >
-                  <AlertTriangle size={13} /> {authError}
+                  <AlertTriangle size={13} style={{ marginTop: 1, flexShrink: 0 }} />
+                  <span style={{ lineHeight: 1.45 }}>{authError}</span>
                 </div>
               )}
               <button
                 type="submit"
-                disabled={isSubmitting || googleSubmitting}
-                className="w-full py-3 rounded-full text-[14px] font-medium transition-all hover:opacity-90 inline-flex items-center justify-center gap-2 disabled:opacity-60"
+                disabled={isSubmitting || googleSubmitting || !email.trim() || !password.trim()}
+                className="auth-submit w-full py-3 rounded-full text-[14px] font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                 style={{ background: 'var(--ink)', color: 'var(--cream)' }}
               >
                 {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
-                Create account
-                {!isSubmitting && <PhArrowRight size={14} weight="bold" />}
+                <span>Create account</span>
+                {!isSubmitting ? <PhArrowRight size={14} weight="bold" /> : null}
               </button>
               <p className="text-[11px] text-center leading-relaxed" style={{ color: 'var(--ink-faint)' }}>
                 By creating an account, you agree to our Terms and Privacy Policy.
@@ -5698,15 +9657,15 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   <button
                     onClick={handleGoogleElectron}
                     disabled={isSubmitting || googleSubmitting}
-                    className="mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium transition-all flex items-center justify-center gap-3 disabled:opacity-60 hover:opacity-90"
+                    className="auth-submit mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   >
                     {googleSubmitting ? (
                       <Loader2 size={16} className="animate-spin" />
                     ) : (
-                      <svg width="17" height="17" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+                      <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
                     )}
-                    {googleSubmitting ? 'Waiting for sign-up...' : 'Continue with Google'}
+                    {googleSubmitting ? 'Waiting for sign-up…' : 'Continue with Google'}
                   </button>
                 ) : (
                   <div className="mt-5 flex justify-center [&_iframe]:rounded-full">
@@ -5715,7 +9674,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                       onError={handleGoogleError}
                       theme="outline"
                       size="large"
-                      width="350"
+                      width="384"
                       text="signup_with"
                       shape="pill"
                     />
@@ -5727,7 +9686,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
             <div className="mt-7 text-center text-[13px]" style={{ color: 'var(--ink-muted)' }}>
               Already have an account?{' '}
-              <button onClick={() => setView('login')} className="font-medium" style={{ color: 'var(--ink)' }}>
+              <button
+                onClick={() => setView('login')}
+                className="auth-link font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
                 Sign in
               </button>
             </div>
@@ -5751,6 +9714,21 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       setView('login');
       setAuthError('Please sign in to access support');
       return null;
+    }
+
+    if (isMobile) {
+      return (
+        <SupportMobile
+          setView={setView}
+          currentUser={currentUser}
+          chatMessages={chatMessages}
+          setChatMessages={setChatMessages}
+          chatInput={chatInput}
+          setChatInput={setChatInput}
+          chatEndRef={chatEndRef}
+          chatWsRef={chatWsRef}
+        />
+      );
     }
 
     const sendChatMessage = () => {
@@ -5779,7 +9757,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       }]);
 
       // Connect WebSocket for live chat
-      const serverUrl = import.meta.env.VITE_SERVER_URL || 'https://h2so4-production.up.railway.app';
+      const serverUrl = import.meta.env.VITE_SERVER_URL || 'https://api.minicaai.com';
       const wsUrl = serverUrl.replace(/^http/, 'ws') + '/ws/support';
       try {
         const ws = new WebSocket(wsUrl);
@@ -5873,6 +9851,18 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   //  PRICING PAGE (Free + Pro only)
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'pricing') {
+    if (isMobile) {
+      return (
+        <PricingMobile
+          setView={setView}
+          geo={geo}
+          pricing={pricing}
+          handleTierSelect={handleTierSelect}
+          isSubmitting={isSubmitting}
+          currentUser={currentUser}
+        />
+      );
+    }
     return (
       <div className="fixed inset-0 bg-[#050507] text-white overflow-y-auto">
         <AnimatedBackground />
@@ -5904,25 +9894,40 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             </div>
           )}
 
-          {/* Comparison table */}
-          <div className="mt-16 max-w-2xl mx-auto">
+          {/* Comparison table — all four tiers. The previous Free-vs-Pro
+              two-column layout dated from when the product only had two
+              paid tiers, and silently hid Basic + Max. That made "All 4
+              models" on Pro read like "all models" to a user who hadn't
+              seen Max — exactly the source of the long-running "Subscribe
+              to Pro for all models" confusion. */}
+          <div className="mt-16 max-w-3xl mx-auto">
             <h3 className="text-lg font-bold text-center mb-8">Feature comparison</h3>
             <div className="border border-white/[0.06] rounded-xl overflow-hidden">
+              <div className="grid grid-cols-5 text-xs bg-white/[0.03]">
+                <div className="px-3 py-3 text-gray-500 font-medium">Feature</div>
+                <div className="px-3 py-3 text-gray-400 text-center font-bold uppercase tracking-wider">Free</div>
+                <div className="px-3 py-3 text-emerald-400 text-center font-bold uppercase tracking-wider">Basic</div>
+                <div className="px-3 py-3 text-blue-400 text-center font-bold uppercase tracking-wider">Pro</div>
+                <div className="px-3 py-3 text-amber-400 text-center font-bold uppercase tracking-wider">Max</div>
+              </div>
               {[
-                { feature: 'Interview sessions', free: '5/month', pro: 'Unlimited' },
-                { feature: 'AI Models', free: 'Gemini only', pro: 'All 4 models' },
-                { feature: 'Screen capture', free: '—', pro: 'Yes' },
-                { feature: 'Auto-solve', free: '—', pro: 'Yes' },
-                { feature: 'Pop-out overlay', free: '—', pro: 'Yes' },
-                { feature: 'Context files', free: '1 file', pro: 'Unlimited' },
-                { feature: 'Session history', free: '—', pro: 'Yes' },
-                { feature: 'Support', free: 'Community', pro: 'Priority' },
-                { feature: 'Device binding', free: '1 device', pro: '2 devices' },
-              ].map(({ feature, free, pro }, i) => (
-                <div key={i} className={`grid grid-cols-3 text-sm ${i > 0 ? 'border-t border-white/[0.04]' : ''}`}>
-                  <div className="px-4 py-3 text-gray-400 font-medium">{feature}</div>
-                  <div className="px-4 py-3 text-gray-500 text-center">{free}</div>
-                  <div className="px-4 py-3 text-blue-400 text-center font-medium">{pro}</div>
+                { feature: 'Interview sessions', free: '5/mo', basic: '3 (14d)', pro: 'Unlimited', max: 'Unlimited' },
+                { feature: 'AI Models',          free: 'Gemini', basic: '4 models', pro: '4 models', max: '5 incl. Claude' },
+                { feature: 'Auto-Type',          free: '—',      basic: '—',         pro: '—',        max: 'Yes' },
+                { feature: 'Train Model',        free: '—',      basic: '—',         pro: '—',        max: 'Yes' },
+                { feature: 'Screen capture',     free: '—',      basic: 'Yes',       pro: 'Yes',      max: 'Yes' },
+                { feature: 'Auto-solve',         free: '—',      basic: 'Yes',       pro: 'Yes',      max: 'Yes' },
+                { feature: 'Pop-out overlay',    free: '—',      basic: 'Yes',       pro: 'Yes',      max: 'Yes' },
+                { feature: 'Context files',      free: '1',      basic: 'Unlimited', pro: 'Unlimited', max: 'Unlimited' },
+                { feature: 'Session history',    free: '—',      basic: 'Yes',       pro: 'Yes',      max: 'Yes' },
+                { feature: 'Support',            free: 'Community', basic: 'Email',  pro: 'Priority', max: 'Priority' },
+              ].map(({ feature, free, basic, pro, max }, i) => (
+                <div key={i} className="grid grid-cols-5 text-xs border-t border-white/[0.04]">
+                  <div className="px-3 py-2.5 text-gray-300 font-medium">{feature}</div>
+                  <div className="px-3 py-2.5 text-gray-500 text-center">{free}</div>
+                  <div className="px-3 py-2.5 text-emerald-300/80 text-center">{basic}</div>
+                  <div className="px-3 py-2.5 text-blue-300/80 text-center">{pro}</div>
+                  <div className="px-3 py-2.5 text-amber-300 text-center font-medium">{max}</div>
                 </div>
               ))}
             </div>

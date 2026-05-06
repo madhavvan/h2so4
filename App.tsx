@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, LogOut, Crown, Sparkles } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, LogOut, Crown, Sparkles, Loader2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -669,6 +669,35 @@ const MessageRenderer = React.memo(({ content, fontSize, canAutoType, isStreamin
                                 {children}
                             </code>
                         );
+                    },
+                    a({ href, children, ...props }: any) {
+                        // Intercept the in-app `[Label](upgrade)` link the AI
+                        // emits when a feature is gated behind a paid tier
+                        // (see the Auto-Solve gate message). Without this it
+                        // would render as plain <a href="upgrade"> and a click
+                        // navigates the renderer to a broken relative URL —
+                        // "http://localhost:3005/upgrade" in dev or
+                        // "file:///.../upgrade" packaged — stranding the user
+                        // on a 404 inside the desktop window. We dispatch a
+                        // window event the App wrapper picks up to open
+                        // ManageSubscription; using an event keeps this
+                        // memoized component free of new props that would
+                        // bust its React.memo on every render.
+                        if (href === 'upgrade') {
+                            return (
+                                <a
+                                    href="#upgrade"
+                                    onClick={(e) => {
+                                        e.preventDefault();
+                                        window.dispatchEvent(new CustomEvent('app:open-manage-subscription'));
+                                    }}
+                                    className="text-blue-400 hover:text-blue-300 font-bold underline cursor-pointer"
+                                >
+                                    {children}
+                                </a>
+                            );
+                        }
+                        return <a href={href} {...props}>{children}</a>;
                     }
                 }}
             >
@@ -864,15 +893,15 @@ const ChatInterface = ({
     // ends up z-buried under the popout window. A portal'd DOM popover lives
     // inside the BrowserWindow's compositor surface, so it inherits
     // setContentProtection (invisible to screen share) and can't be z-buried.
-    const MODEL_OPTIONS = [
-        { value: 'gemini' as const, label: 'Gemini' },
-        { value: 'groq' as const, label: 'Groq' },
-        { value: 'openai' as const, label: 'GPT' },
-        { value: 'xai' as const, label: 'Grok' },
-        { value: 'claude' as const, label: 'Claude' },
-    ];
+    // Display data lives in MODEL_REGISTRY (top of file); compact rows are
+    // rendered via <ModelPickerCard variant="compact" />.
     const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
-    const [modelMenuPos, setModelMenuPos] = useState<{ top: number; right: number } | null>(null);
+    // Either top OR bottom is set (not both) — top means "popover hangs
+    // below the button", bottom means "popover floats above the button".
+    // We flip when there isn't enough room below (the input-area picker
+    // sits near the bottom of the chat window, so the down-opening default
+    // would clip the lower rows off-screen).
+    const [modelMenuPos, setModelMenuPos] = useState<{ top?: number; bottom?: number; right: number } | null>(null);
     const modelButtonRef = useRef<HTMLButtonElement>(null);
     const modelMenuRef = useRef<HTMLDivElement>(null);
 
@@ -903,10 +932,27 @@ const ChatInterface = ({
         const btn = modelButtonRef.current;
         if (!btn) return;
         const rect = btn.getBoundingClientRect();
-        setModelMenuPos({
-            top: rect.bottom + 4,
-            right: window.innerWidth - rect.right,
-        });
+        // Flip up when there isn't enough room below the trigger. The
+        // input-area picker sits near the bottom of the chat window, so a
+        // down-opening popover would clip the lower rows. 5 rows × ~30px
+        // + ~16px padding ≈ 170px; we use 200 as a safety margin so the
+        // last row doesn't graze the viewport edge.
+        const POPOVER_H = 200;
+        const GAP = 4;
+        const spaceBelow = window.innerHeight - rect.bottom;
+        const spaceAbove = rect.top;
+        const openUpward = spaceBelow < POPOVER_H + GAP && spaceAbove > spaceBelow;
+        setModelMenuPos(
+            openUpward
+                ? {
+                    bottom: window.innerHeight - rect.top + GAP,
+                    right: window.innerWidth - rect.right,
+                  }
+                : {
+                    top: rect.bottom + GAP,
+                    right: window.innerWidth - rect.right,
+                  }
+        );
         setIsModelMenuOpen(true);
     };
 
@@ -952,7 +998,7 @@ const ChatInterface = ({
                             (340px) doesn't wrap the controls onto two rows. */}
                         {sizeIndex >= 1 && effectiveTier === 'max' && (
                           <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400">
-                            <Crown size={9} /> MAX
+                            <Sparkles size={9} /> MAX
                           </div>
                         )}
                         {sizeIndex >= 1 && effectiveTier === 'pro' && (
@@ -992,55 +1038,43 @@ const ChatInterface = ({
                               aria-haspopup="listbox"
                               aria-expanded={isModelMenuOpen}
                           >
-                              {(MODEL_OPTIONS.find(o => o.value === settings.selectedModel)?.label) ?? 'Gemini'}
+                              {MODEL_REGISTRY[settings.selectedModel as ModelKey]?.short ?? 'Gemini'}
                           </button>
                           <ChevronDown size={10} className="absolute right-1 top-1/2 -translate-y-1/2 pointer-events-none opacity-70" />
                           {isModelMenuOpen && modelMenuPos && createPortal(
                             <div
                               ref={modelMenuRef}
                               role="listbox"
-                              className="fixed z-[9999] py-1 rounded-md border text-[10px] min-w-[110px]"
+                              className="fixed z-[9999] py-1.5 px-1 rounded-lg border min-w-[160px] overflow-y-auto custom-scrollbar"
                               style={{
                                   top: modelMenuPos.top,
+                                  bottom: modelMenuPos.bottom,
                                   right: modelMenuPos.right,
-                                  background: 'rgba(10, 10, 30, 0.92)',
+                                  maxHeight: 'calc(100vh - 24px)',
+                                  background: 'rgba(10, 10, 30, 0.94)',
                                   borderColor: 'var(--glass-border)',
-                                  boxShadow: '0 6px 24px rgba(0, 0, 0, 0.55)',
+                                  boxShadow: '0 10px 32px rgba(0, 0, 0, 0.60)',
+                                  backdropFilter: 'blur(8px)',
                                   WebkitAppRegion: 'no-drag',
                               } as any}
                             >
-                              {MODEL_OPTIONS.map(opt => {
-                                  const allowed = gate.canUseModel(opt.value);
-                                  const selected = opt.value === settings.selectedModel;
-                                  return (
-                                      <div
-                                          key={opt.value}
-                                          role="option"
-                                          aria-selected={selected}
-                                          aria-disabled={!allowed}
-                                          onClick={() => {
-                                              if (!allowed) return;
-                                              setSelectedModel(opt.value);
-                                              setIsModelMenuOpen(false);
-                                          }}
-                                          className={`px-2 py-1 flex items-center justify-between gap-2 ${
-                                              allowed
-                                                  ? 'hover:bg-white/10 cursor-pointer text-white'
-                                                  : 'text-white/40 cursor-not-allowed'
-                                          }`}
-                                      >
-                                          <span className="flex items-center gap-1">
-                                              <Check size={9} className={selected ? 'opacity-90' : 'opacity-0'} />
-                                              <span>{opt.label}</span>
-                                          </span>
-                                          {!allowed && (
-                                              <span className={`text-[8px] font-bold tracking-wider ${opt.value === 'claude' ? 'text-orange-400/90' : 'text-amber-400/80'}`}>
-                                                  {opt.value === 'claude' ? 'MAX' : 'PRO'}
-                                              </span>
-                                          )}
-                                      </div>
-                                  );
-                              })}
+                              {MODEL_ORDER.map(key => (
+                                <ModelPickerCard
+                                  key={key}
+                                  modelKey={key}
+                                  selected={key === settings.selectedModel}
+                                  allowed={gate.canUseModel(key)}
+                                  variant="compact"
+                                  onSelect={() => {
+                                    setSelectedModel(key);
+                                    setIsModelMenuOpen(false);
+                                  }}
+                                  onLockedClick={() => {
+                                    setIsModelMenuOpen(false);
+                                    onOpenManageSub?.();
+                                  }}
+                                />
+                              ))}
                             </div>,
                             document.body
                           )}
@@ -1283,10 +1317,14 @@ const ChatInterface = ({
                 </div>
 
                 <div className="flex items-center gap-2 md:gap-3">
-                    {/* User tier badge — clickable, opens Manage Subscription */}
+                    {/* User tier badge — clickable, opens Manage Subscription.
+                        Sparkles (not Crown) so Max reads as a different rank
+                        than Pro. Matches the existing in-app Max gradient
+                        (amber-500/10 → purple-500/10) the rest of the app
+                        uses everywhere else for Max. */}
                     {userLicense && userLicense.tier === 'max' ? (
                       <button onClick={onOpenManageSub} title="Manage subscription" className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400 hover:from-amber-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
-                        <Crown size={10} /> MAX
+                        <Sparkles size={10} /> MAX
                       </button>
                     ) : userLicense && userLicense.tier === 'pro' ? (
                       <button onClick={onOpenManageSub} title="Manage subscription" className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-blue-500/10 border-blue-500/30 text-blue-400 hover:bg-blue-500/20 transition-all cursor-pointer">
@@ -1342,6 +1380,16 @@ const ChatInterface = ({
                     )}
                     <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Audio Help"><HelpCircle size={20} /></button>
                     <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Files (Knowledge Base)"><FileText size={20} /></button>
+                    {/* Subscription / billing — always-visible header entry to
+                        ManageSubscription. Until now the only path was the
+                        text-[10px] tier badge above, which is `hidden md:flex`
+                        and looks like a status pill (not an action). Putting
+                        it in the icon row alongside Settings/Help means
+                        users can find upgrade/downgrade/cancel from any
+                        window size, regardless of license state. The Crown
+                        icon matches the universal "premium" affordance the
+                        app uses elsewhere. */}
+                    <button onClick={onOpenManageSub} className="p-2 text-gray-400 hover:text-amber-400 hover:bg-amber-500/10 border border-transparent hover:border-amber-500/20 rounded-lg transition-all" aria-label="Manage subscription" title="Manage subscription"><Crown size={20} /></button>
                     <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border text-gray-400 hover:text-text hover:bg-surface`} aria-label="Settings"><Settings size={20} /></button>
                     <button onClick={onLogout} className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 rounded-lg transition-all" aria-label="Logout"><LogOut size={20} /></button>
                 </div>
@@ -1479,23 +1527,65 @@ const ChatInterface = ({
                                         {isListening ? 'ON' : 'OFF'}
                                     </button>
 
-                                    {/* --- QUICK MODEL SWITCHER --- */}
+                                    {/* --- QUICK MODEL SWITCHER ---
+                                        Custom popover instead of native <select>.
+                                        Stealth fix: a native <select> dropdown
+                                        opens its own Win32 HWND that is NOT
+                                        covered by setContentProtection, so it
+                                        could leak the option list on screen
+                                        share. The portal'd popover lives in the
+                                        same compositor surface as the rest of
+                                        the renderer and inherits content
+                                        protection. */}
                                     <div className="h-5 w-[1px] bg-gray-500/20 mx-1"></div>
-                                    <div className="relative group">
-                                        <select
-                                            value={settings.selectedModel}
-                                            onChange={handleModelChange}
+                                    <div className="relative">
+                                        <button
+                                            ref={modelButtonRef}
+                                            type="button"
+                                            onClick={toggleModelMenu}
                                             className="appearance-none bg-surface text-text text-[10px] md:text-xs font-bold px-2.5 py-1 pr-6 rounded-md border border-border hover:border-primary focus:outline-none focus:ring-1 focus:ring-primary transition-all cursor-pointer"
+                                            aria-haspopup="listbox"
+                                            aria-expanded={isModelMenuOpen}
                                         >
-                                            <option value="gemini" className="bg-white dark:bg-gray-800 text-black dark:text-white">Gemini 3.1 Flash</option>
-                                            <option value="groq" disabled={!gate.canUseModel('groq')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Groq{!gate.canUseModel('groq') ? ' — PRO' : ''}</option>
-                                            <option value="openai" disabled={!gate.canUseModel('openai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">GPT-5.5{!gate.canUseModel('openai') ? ' — PRO' : ''}</option>
-                                            <option value="xai" disabled={!gate.canUseModel('xai')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Grok (xAI){!gate.canUseModel('xai') ? ' — PRO' : ''}</option>
-                                            <option value="claude" disabled={!gate.canUseModel('claude')} className="bg-white dark:bg-gray-800 text-black dark:text-white">Claude Sonnet 4.6{!gate.canUseModel('claude') ? ' — MAX' : ''}</option>
-                                        </select>
-                                        <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500">
-                                            <ChevronDown size={10} />
-                                        </div>
+                                            {MODEL_REGISTRY[settings.selectedModel as ModelKey]?.label ?? 'Gemini 3.1 Flash'}
+                                        </button>
+                                        <ChevronDown size={10} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500" />
+                                        {isModelMenuOpen && modelMenuPos && createPortal(
+                                            <div
+                                                ref={modelMenuRef}
+                                                role="listbox"
+                                                className="fixed z-[9999] py-1.5 px-1 rounded-lg border min-w-[200px] overflow-y-auto custom-scrollbar"
+                                                style={{
+                                                    top: modelMenuPos.top,
+                                                    bottom: modelMenuPos.bottom,
+                                                    right: modelMenuPos.right,
+                                                    maxHeight: 'calc(100vh - 24px)',
+                                                    background: 'rgba(10, 10, 30, 0.94)',
+                                                    borderColor: 'var(--border-color)',
+                                                    boxShadow: '0 10px 32px rgba(0, 0, 0, 0.40)',
+                                                    backdropFilter: 'blur(8px)',
+                                                } as React.CSSProperties}
+                                            >
+                                                {MODEL_ORDER.map(key => (
+                                                    <ModelPickerCard
+                                                        key={key}
+                                                        modelKey={key}
+                                                        selected={key === settings.selectedModel}
+                                                        allowed={gate.canUseModel(key)}
+                                                        variant="compact"
+                                                        onSelect={() => {
+                                                            setSelectedModel(key);
+                                                            setIsModelMenuOpen(false);
+                                                        }}
+                                                        onLockedClick={() => {
+                                                            setIsModelMenuOpen(false);
+                                                            onOpenManageSub?.();
+                                                        }}
+                                                    />
+                                                ))}
+                                            </div>,
+                                            document.body
+                                        )}
                                     </div>
                                 </div>
                                 
@@ -1730,6 +1820,201 @@ function useFeatureGate(license: LicenseData | null) {
   };
 }
 
+// ── MODEL_REGISTRY ──
+// Single source of truth for model display metadata across all three pickers
+// (popout header dropdown, input-area chip popover, settings panel cards).
+// Previously each surface drifted its own copy/colors — popout said "GPT",
+// input said "GPT-5.5", settings said something else again.
+//
+// `tier` here is the MINIMUM tier that can use the model — gates
+// (FEATURE_GATES.models in licenseService) remain authoritative for the
+// can-use check; this is purely display: which lock badge to show, how
+// rich a treatment the card gets, and which upgrade tier to point users
+// at when they click a locked card.
+type ModelKey = 'gemini' | 'groq' | 'openai' | 'xai' | 'claude';
+
+interface ModelMeta {
+  short: string;          // Compact label for popout header (≤7 chars)
+  label: string;          // Full label for settings cards
+  monogram: string;       // 1-char glyph for the colored chip
+  tier: 'free' | 'basic' | 'pro' | 'max';
+  brand: { fg: string; chip: string; accent: string };
+  tagline: string;        // One-line description on the rich card
+  badge?: { text: string; kind: 'recommended' | 'flagship' };
+}
+
+const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
+  gemini: {
+    short: 'Gemini',
+    label: 'Gemini 3.1 Flash',
+    monogram: 'G',
+    tier: 'free',
+    brand: { fg: '#60a5fa', chip: 'rgba(59, 130, 246, 0.18)', accent: '#3b82f6' },
+    tagline: 'Fast and free — included on every plan.',
+  },
+  groq: {
+    short: 'Groq',
+    label: 'Groq Llama 3',
+    monogram: 'Q',
+    tier: 'basic',
+    brand: { fg: '#fb923c', chip: 'rgba(249, 115, 22, 0.18)', accent: '#f97316' },
+    tagline: 'Llama 3 on Groq — sub-second answers.',
+  },
+  openai: {
+    short: 'GPT',
+    label: 'GPT-5.5',
+    monogram: '5',
+    tier: 'basic',
+    brand: { fg: '#34d399', chip: 'rgba(16, 185, 129, 0.18)', accent: '#10b981' },
+    tagline: 'OpenAI flagship — best for code and system design.',
+    badge: { text: 'Recommended', kind: 'recommended' },
+  },
+  xai: {
+    short: 'Grok',
+    label: 'Grok (xAI)',
+    monogram: 'X',
+    tier: 'basic',
+    brand: { fg: '#e4e4e7', chip: 'rgba(228, 228, 231, 0.16)', accent: '#a1a1aa' },
+    tagline: 'Real-time knowledge from xAI — Grok.',
+  },
+  claude: {
+    short: 'Claude',
+    label: 'Claude Sonnet 4.6',
+    monogram: 'C',
+    tier: 'max',
+    // Max card uses CSS-driven gold/cream tokens (see .mp-card-max in
+    // index.html); these brand fields are kept for any non-card surface
+    // that still references them inline.
+    brand: { fg: '#e9c876', chip: 'rgba(201, 165, 92, 0.16)', accent: '#c9a55c' },
+    tagline: 'Web Search · Train Model · Auto-Type — Max flagship.',
+    badge: { text: 'Flagship', kind: 'flagship' },
+  },
+};
+
+const MODEL_ORDER: ModelKey[] = ['gemini', 'groq', 'openai', 'xai', 'claude'];
+
+// Lock-badge text shown on a model the current user cannot access. We
+// collapse Basic/Pro into a single "PRO" prompt because Pro is the
+// headline upgrade — Basic is the cheap credit-pack and rarely the path
+// most Free users want when they see a locked model.
+function lockBadgeFor(modelTier: ModelMeta['tier']): 'PRO' | 'MAX' | null {
+  if (modelTier === 'max') return 'MAX';
+  if (modelTier === 'basic' || modelTier === 'pro') return 'PRO';
+  return null;
+}
+
+// ── ModelPickerCard ──
+// Unified card used by all three model pickers. variant='compact' is the
+// dense row in the popout/input popover; variant='full' is the rich card
+// in the settings panel. The `compact` prop on the full variant shrinks
+// padding + monogram + hides the tagline, so four non-Max cards fit in a
+// 2x2 grid above Claude's full-width showcase without overflowing the
+// settings modal. Locked cards stay visible (so the user can see what's
+// gated) but click-through to onLockedClick — caller wires that to the
+// ManageSubscription modal so the picker doubles as a sales surface,
+// instead of being silently inert for non-subscribers.
+function ModelPickerCard({
+  modelKey,
+  selected,
+  allowed,
+  variant,
+  compact = false,
+  onSelect,
+  onLockedClick,
+}: {
+  modelKey: ModelKey;
+  selected: boolean;
+  allowed: boolean;
+  variant: 'compact' | 'full';
+  /** Only meaningful when variant='full' — renders a denser 2-col-grid
+   *  card (smaller monogram, no tagline). Used for non-Max models in the
+   *  settings panel so the full-width Claude card stays the showcase. */
+  compact?: boolean;
+  onSelect: () => void;
+  onLockedClick?: () => void;
+}) {
+  const meta = MODEL_REGISTRY[modelKey];
+  const isMax = meta.tier === 'max';
+  const lockBadge = !allowed ? lockBadgeFor(meta.tier) : null;
+  const handleClick = () => {
+    if (allowed) onSelect();
+    else onLockedClick?.();
+  };
+
+  if (variant === 'compact') {
+    return (
+      <div
+        role="option"
+        aria-selected={selected}
+        aria-disabled={!allowed}
+        onClick={handleClick}
+        className={`mp-row${isMax ? ' mp-row-max' : ''}${selected ? ' is-selected' : ''}${!allowed ? ' is-locked' : ''}`}
+      >
+        <span
+          className={`mp-mono${isMax ? ' mp-mono-max' : ''}`}
+          style={!isMax ? {
+            background: meta.brand.chip,
+            color: meta.brand.fg,
+            borderColor: meta.brand.accent,
+          } : undefined}
+          aria-hidden="true"
+        >
+          {meta.monogram}
+        </span>
+        <span className="mp-name">{meta.short}</span>
+        {selected && <Check size={9} className="mp-check" aria-hidden="true" />}
+        {lockBadge && (
+          <span className={`mp-locked${isMax ? ' mp-locked-max' : ''}`}>{lockBadge}</span>
+        )}
+      </div>
+    );
+  }
+
+  // variant === 'full' — settings panel rich card
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      className={`mp-card${isMax ? ' mp-card-max' : ''}${compact ? ' is-compact' : ''}${selected ? ' is-selected' : ''}${!allowed ? ' is-locked' : ''}`}
+      style={!isMax ? {
+        // Brand-color hairline left rail + accent on selected
+        ['--mp-accent' as any]: meta.brand.accent,
+        ['--mp-fg' as any]: meta.brand.fg,
+        ['--mp-chip' as any]: meta.brand.chip,
+      } : undefined}
+      aria-pressed={selected}
+    >
+      <span className={`mp-card-mono${isMax ? ' mp-card-mono-max' : ''}`} aria-hidden="true">
+        {meta.monogram}
+      </span>
+      <span className="mp-card-body">
+        <span className="mp-card-title">
+          <span className="mp-card-name">{meta.label}</span>
+          {meta.badge && allowed && (
+            <span className={`mp-card-badge mp-card-badge-${meta.badge.kind}`}>
+              {meta.badge.kind === 'flagship' && <span aria-hidden="true">✦</span>}
+              {meta.badge.text}
+            </span>
+          )}
+        </span>
+        <span className="mp-card-tag">{meta.tagline}</span>
+      </span>
+      <span className="mp-card-right">
+        {selected ? (
+          <span className={`mp-card-active${isMax ? ' mp-card-active-max' : ''}`}>
+            <Check size={11} strokeWidth={3} /> Active
+          </span>
+        ) : !allowed ? (
+          <span className={`mp-card-lock${isMax ? ' mp-card-lock-max' : ''}`}>
+            {isMax ? <span aria-hidden="true">✦</span> : null}
+            {isMax ? 'MAX' : 'PRO'}
+          </span>
+        ) : null}
+      </span>
+    </button>
+  );
+}
+
 // Format seconds as "1h 23m" / "23m 05s" / "45s" for chips and modals
 function formatTimeRemaining(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
@@ -1907,40 +2192,397 @@ const ExhaustedModal = ({
   );
 };
 
-// ── Upgrade to Pro — opens Stripe checkout in browser ──
+// Module-scope polling state to dedupe concurrent post-checkout polls.
+// Without this, a user clicking Upgrade twice (or both Renew and Upgrade
+// in quick succession) would fire two simultaneous validateWithServer
+// loops — wasteful, and the second would race the first to fire onSuccess.
+let externalCheckoutPollActive = false;
+
+// ── Post-checkout polling for the external-browser flow ─────────────
+// When openProUpgrade hands the Stripe URL to the system browser via
+// electronAPI.openExternal, the renderer never receives Stripe's
+// success_url redirect — that URL loads in the user's browser, not the
+// app. So we poll license/validate (the same endpoint the periodic
+// revalidation tick uses) until the server reflects the new tier, then
+// fire onSuccess so the caller can refresh React state from localStorage
+// (validateWithServer already wrote there).
+//
+// 10-minute cap: most webhooks land in <30s. After that either the user
+// abandoned the browser flow, the webhook stalled, or there's a routing
+// mismatch (rare). Falling back to the next periodic revalidation tick
+// (or app restart) reconciles regardless.
+//
+// Fire-and-forget — the caller doesn't await this. Buttons close their
+// modals immediately; the tier badge in the chat header flips when the
+// poll detects the upgrade.
+async function pollForExternalUpgrade(
+  targetTier: 'basic' | 'pro' | 'max',
+  onSuccess?: (info: { tier: string }) => void,
+) {
+  if (externalCheckoutPollActive) return;
+  externalCheckoutPollActive = true;
+  const POLL_INTERVAL_MS = 4000;
+  const POLL_TIMEOUT_MS = 10 * 60 * 1000;
+  const startedAt = Date.now();
+  try {
+    // Initial wait — Stripe's webhook needs a moment after payment.
+    await new Promise<void>(r => setTimeout(r, POLL_INTERVAL_MS));
+    while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
+      try {
+        const updated = await licenseService.validateWithServer();
+        if (updated && updated.tier === targetTier && updated.status === 'active') {
+          // validateWithServer already wrote to localStorage. Mark the
+          // just-purchased tier so the post-checkout welcome banner
+          // surfaces, then notify the caller to refresh React state.
+          try { localStorage.setItem('justPurchasedTier', updated.tier); } catch {}
+          onSuccess?.({ tier: updated.tier });
+          emitCheckoutStatus({
+            kind: 'completed',
+            tier: updated.tier,
+            mode: 'subscription',
+            message: `${updated.tier.toUpperCase()} activated — your plan is live.`,
+          });
+          return;
+        }
+      } catch { /* network blip — keep polling */ }
+      await new Promise<void>(r => setTimeout(r, POLL_INTERVAL_MS));
+    }
+    console.warn(`[openProUpgrade] poll timed out after ${POLL_TIMEOUT_MS/1000}s waiting for tier=${targetTier}`);
+    emitCheckoutStatus({
+      kind: 'timeout',
+      tier: targetTier,
+      mode: 'subscription',
+      message: `Still waiting for ${targetTier.toUpperCase()} payment confirmation. If you finished checkout in your browser, restart the app to sync.`,
+    });
+  } finally {
+    externalCheckoutPollActive = false;
+  }
+}
+
+// Renewals don't change `tier` — they extend `expires_at` by ~1h via
+// grantBasicRenewal on the server. We watch for a forward delta on the
+// license's expires_at; validateWithServer's renewal-credit propagation
+// path lands the +3600s credit locally as soon as the matching delta is
+// detected. 30-min lower bound on the delta absorbs clock skew but stays
+// well above any non-renewal noise.
+async function pollForExternalRenewal(onSuccess?: () => void) {
+  if (externalCheckoutPollActive) return;
+  externalCheckoutPollActive = true;
+  const POLL_INTERVAL_MS = 4000;
+  const POLL_TIMEOUT_MS = 10 * 60 * 1000;
+  const RENEWAL_THRESHOLD_MS = 30 * 60 * 1000;
+  const startedAt = Date.now();
+  const baselineExpires = licenseService.loadAuth().license?.expires_at || 0;
+  try {
+    await new Promise<void>(r => setTimeout(r, POLL_INTERVAL_MS));
+    while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
+      try {
+        const updated = await licenseService.validateWithServer();
+        if (updated && (updated.expires_at || 0) >= baselineExpires + RENEWAL_THRESHOLD_MS) {
+          onSuccess?.();
+          emitCheckoutStatus({
+            kind: 'completed',
+            mode: 'renewal',
+            message: 'Renewal credit added — +1 hour now available.',
+          });
+          return;
+        }
+      } catch { /* network blip */ }
+      await new Promise<void>(r => setTimeout(r, POLL_INTERVAL_MS));
+    }
+    console.warn(`[openProRenewal] poll timed out after ${POLL_TIMEOUT_MS/1000}s`);
+    emitCheckoutStatus({
+      kind: 'timeout',
+      mode: 'renewal',
+      message: 'Still waiting for renewal confirmation. If you finished checkout in your browser, restart the app to sync.',
+    });
+  } finally {
+    externalCheckoutPollActive = false;
+  }
+}
+
+// ── Upgrade plan — opens Stripe/Razorpay checkout in browser ──
 // No native alerts inside — alert()/confirm() are OS dialogs that bypass
 // setContentProtection and leak on screen share. Failures log to console;
 // the Upgrade button itself is already tier-gated in render so the
 // no-token branch is a defensive no-op in practice.
-async function openProUpgrade() {
+//
+// targetTier: which plan the user clicked. Defaults to 'pro' so existing
+// callers that don't pass an arg keep their behavior. Critically, this
+// fixes a long-standing bug where `ManageSubscription`'s "Upgrade to Max"
+// button went through here and silently fell back to Pro because the tier
+// wasn't passed through to /create-checkout.
+//
+// For paid users already on Pro/Max who pick the OTHER recurring tier,
+// route to /upgrade-tier instead — same logic SubscriptionGate's
+// initiateCheckout uses. Without this, a Pro user clicking "Upgrade to Max"
+// from ManageSubscription would create a SECOND Stripe subscription
+// alongside the existing one and double-bill until support intervened.
+//
+// onSuccess: callback fired AFTER the upgrade lands. Two firing paths:
+//   - Synthetic-grant (admin-grant, stripe-upgrade, razorpay-upgrade) —
+//     fires immediately because the server completed the swap inline.
+//   - External-browser checkout (provider='stripe' for new subs) —
+//     fires from pollForExternalUpgrade once the server reflects the new
+//     tier. Without this, a free user clicking "Upgrade to Pro" from
+//     ManageSubscription pays in their browser, the renderer never sees
+//     the redirect, and the chat-header tier badge stays "Free" until the
+//     next periodic revalidation tick (or app restart).
+// Surface checkout status to the user via a window event picked up by the
+// CheckoutToast in the App component. Without these events, every step of
+// the flow (fetch start, fetch error, browser-opened, sync-grant, polling
+// success/timeout) was silent — when something failed the user only saw
+// the modal close and was left staring at the chat interface, which is
+// exactly the "why am I being directed to chat?" symptom users hit.
+//
+// `url` is included on 'opened' and on 'error'-with-URL events so the
+// toast can render a Copy-URL button. shell.openExternal can claim
+// success and yet not actually surface a window (default-browser
+// registration corrupted, AV blocking, OS shell process busy) — when
+// that happens the user has no way to recover unless we hand them the
+// URL to paste manually. Cheap belt-and-suspenders.
+function emitCheckoutStatus(detail: {
+  kind: 'connecting' | 'opened' | 'sync-grant' | 'completed' | 'timeout' | 'error' | 'no-token';
+  tier?: string;
+  message?: string;
+  mode?: 'subscription' | 'renewal';
+  url?: string;
+}) {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent('app:checkout-status', { detail }));
+}
+
+// Open an external URL with full diagnostic visibility. Prefers the IPC
+// 'open-external-robust' channel (shell.openExternal with 6s timeout +
+// child_process spawn fallback — see electron/main.cjs ipcMain.handle
+// for the rationale). Falls back to the legacy openExternal or window.open
+// only when the robust channel isn't available.
+async function tryOpenCheckoutUrl(url: string): Promise<{
+  ok: boolean;
+  method: string;
+  error?: string;
+  attempts?: Array<{ method: string; ok: boolean; error?: string }>;
+}> {
+  if (typeof window === 'undefined') {
+    return { ok: false, method: 'none', error: 'No window context' };
+  }
+  if (window.electronAPI?.openExternalRobust) {
+    try {
+      const result = await window.electronAPI.openExternalRobust(url);
+      return result;
+    } catch (e: any) {
+      return { ok: false, method: 'invoke-failed', error: e?.message || String(e) };
+    }
+  }
+  if (window.electronAPI?.openExternal) {
+    try {
+      await window.electronAPI.openExternal(url);
+      return { ok: true, method: 'shell.openExternal-legacy' };
+    } catch (e: any) {
+      return { ok: false, method: 'shell.openExternal-legacy', error: e?.message || String(e) };
+    }
+  }
+  // Web fallback — popup blocker may return null.
+  const w = window.open(url, '_blank');
+  return w ? { ok: true, method: 'window.open' } : { ok: false, method: 'window.open', error: 'Popup blocked' };
+}
+
+async function openProUpgrade(
+  targetTier: 'basic' | 'pro' | 'max' = 'pro',
+  onSuccess?: (info: { tier: string; message?: string }) => void,
+) {
   const { licenseService } = await import('./services/licenseService');
   const token = licenseService.getToken();
   if (!token) {
     console.warn('[openProUpgrade] No auth token — aborting.');
+    emitCheckoutStatus({ kind: 'no-token', mode: 'subscription', message: 'Please sign in first to start a subscription.' });
     return;
   }
+
+  const tierLabel = targetTier.toUpperCase();
+  emitCheckoutStatus({ kind: 'connecting', tier: targetTier, mode: 'subscription', message: `Connecting to checkout for ${tierLabel}…` });
+
   try {
-    // Use the user's actual country code for geo-routed payments (Stripe vs Razorpay)
     const saved = licenseService.loadAuth();
     const countryCode = saved.user?.country_code || 'US';
 
-    const response = await fetch('https://h2so4-production.up.railway.app/api/v1/payments/create-checkout', {
+    // In-place tier swap detection — mirror SubscriptionGate.initiateCheckout.
+    // Only Pro↔Max qualifies: Basic isn't recurring (one-time), Free has no
+    // sub to update.
+    const liveTier = saved.license?.tier;
+    const isLiveActive = saved.license?.status === 'active';
+    const isRecurringTier = (t: string | undefined): boolean => t === 'pro' || t === 'max';
+    const isInPlaceUpgrade =
+      isLiveActive &&
+      isRecurringTier(liveTier) &&
+      isRecurringTier(targetTier) &&
+      liveTier !== targetTier;
+
+    const endpointPath = isInPlaceUpgrade
+      ? '/api/v1/payments/upgrade-tier'
+      : '/api/v1/payments/create-checkout';
+    const requestBody = isInPlaceUpgrade
+      ? { tier: targetTier }
+      : { country_code: countryCode, tier: targetTier };
+
+    const response = await fetch(`https://api.minicaai.com${endpointPath}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(requestBody),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Failed to start checkout');
+
+    // Synthetic-grant providers (admin-grant, stripe-upgrade, razorpay-upgrade)
+    // don't redirect — they've already mutated the subscription server-side
+    // and returned the new license inline. Update local auth optimistically
+    // and let the caller know.
+    const SYNC_GRANT_PROVIDERS = ['admin-grant', 'stripe-upgrade', 'razorpay-upgrade'];
+    if (SYNC_GRANT_PROVIDERS.includes(data.provider)) {
+      const grantedTier = data.tier || targetTier;
+      if (saved.user) {
+        const updatedUser = { ...saved.user, tier: grantedTier };
+        const updatedLicense = data.license
+          ? { ...data.license, last_validated: Date.now() }
+          : { ...saved.license!, tier: grantedTier, last_validated: Date.now() };
+        licenseService.saveAuth(updatedUser, updatedLicense);
+      }
+      try { localStorage.setItem('justPurchasedTier', grantedTier); } catch {}
+      onSuccess?.({ tier: grantedTier, message: data.message });
+      emitCheckoutStatus({
+        kind: 'sync-grant',
+        tier: grantedTier,
+        mode: 'subscription',
+        message: data.message || `${grantedTier.toUpperCase()} activated.`,
+      });
+      return;
+    }
+
+    if (data.checkout_url) {
+      // Try the robust opener (shell.openExternal w/ 6s timeout, then
+      // child_process `cmd /c start` fallback). The legacy openExternal
+      // can silently fail on Windows when default-browser registration
+      // is corrupted, when ShellExecuteW hangs, or when AV interferes —
+      // openExternalRobust survives those. Either way we surface the URL
+      // in the toast so the user always has a Copy-URL fallback in case
+      // openExternalRobust thinks it succeeded but no window appears.
+      const opened = await tryOpenCheckoutUrl(data.checkout_url);
+      if (!opened.ok) {
+        const detail = opened.attempts?.length
+          ? ` Tried: ${opened.attempts.map(a => `${a.method}${a.ok ? ' ok' : ` failed (${a.error})`}`).join('; ')}`
+          : opened.error ? ` (${opened.error})` : '';
+        emitCheckoutStatus({
+          kind: 'error',
+          tier: targetTier,
+          mode: 'subscription',
+          message: `Couldn't open the browser automatically.${detail} Use the Copy URL button to open it yourself.`,
+          url: data.checkout_url,
+        });
+        // Don't return — still poll, since the user might paste the URL
+        // and complete payment manually.
+      } else {
+        emitCheckoutStatus({
+          kind: 'opened',
+          tier: targetTier,
+          mode: 'subscription',
+          message: `Stripe checkout opened in your browser for ${tierLabel} (${opened.method}). Switch to your browser to complete payment — your plan will update here automatically. If you don't see a browser window, use Copy URL.`,
+          url: data.checkout_url,
+        });
+      }
+      // Fire-and-forget poll — the renderer never sees Stripe's success
+      // redirect (it lands in the user's browser), so we have to learn
+      // about the upgrade from the server. See pollForExternalUpgrade
+      // for the rationale and timing.
+      pollForExternalUpgrade(targetTier, onSuccess);
+    } else {
+      // Server returned 200 but with neither a sync-grant provider nor a
+      // checkout_url. Without this branch the user would see no feedback
+      // at all — looking exactly like "nothing happened". Most likely a
+      // server-side misconfiguration (e.g. unknown provider field).
+      emitCheckoutStatus({
+        kind: 'error',
+        tier: targetTier,
+        mode: 'subscription',
+        message: 'Checkout response was missing a payment URL. Please try again or contact support.',
+      });
+    }
+  } catch (err: any) {
+    console.error('[openProUpgrade] Checkout failed:', err?.message || err);
+    emitCheckoutStatus({
+      kind: 'error',
+      tier: targetTier,
+      mode: 'subscription',
+      message: err?.message || 'Failed to start checkout. Please try again.',
+    });
+  }
+}
+
+// ── Basic +1h renewal — opens the renewal-specific checkout ──
+// Distinct from openProUpgrade because the server treats it differently:
+// /create-renewal grants +1 hour for the renewal price (~$6.99 / ₹599),
+// whereas /create-checkout would charge full Basic ($25 / ₹2099) and
+// reset to a fresh 3h/14d plan. Wiring the Basic out-of-credits "Renew"
+// button to openProUpgrade silently double-billed users — the cure here
+// is a sibling function that hits the right endpoint.
+async function openProRenewal(onSuccess?: () => void) {
+  const { licenseService } = await import('./services/licenseService');
+  const token = licenseService.getToken();
+  if (!token) {
+    console.warn('[openProRenewal] No auth token — aborting.');
+    emitCheckoutStatus({ kind: 'no-token', mode: 'renewal', message: 'Please sign in first to renew.' });
+    return;
+  }
+  emitCheckoutStatus({ kind: 'connecting', mode: 'renewal', message: 'Connecting to renewal checkout…' });
+  try {
+    const saved = licenseService.loadAuth();
+    const countryCode = saved.user?.country_code || 'US';
+
+    const response = await fetch('https://api.minicaai.com/api/v1/payments/create-renewal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
       body: JSON.stringify({ country_code: countryCode }),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error || 'Failed to start checkout');
+    if (!response.ok) throw new Error(data.error || 'Failed to start renewal');
     if (data.checkout_url) {
-      // Open in default browser (works in Electron and web)
-      if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
-        window.electronAPI.openExternal(data.checkout_url);
+      const opened = await tryOpenCheckoutUrl(data.checkout_url);
+      if (!opened.ok) {
+        const detail = opened.attempts?.length
+          ? ` Tried: ${opened.attempts.map(a => `${a.method}${a.ok ? ' ok' : ` failed (${a.error})`}`).join('; ')}`
+          : opened.error ? ` (${opened.error})` : '';
+        emitCheckoutStatus({
+          kind: 'error',
+          mode: 'renewal',
+          message: `Couldn't open the browser automatically.${detail} Use the Copy URL button to open it yourself.`,
+          url: data.checkout_url,
+        });
+        // Still poll — the user may complete via the copied URL.
       } else {
-        window.open(data.checkout_url, '_blank');
+        emitCheckoutStatus({
+          kind: 'opened',
+          mode: 'renewal',
+          message: `Renewal checkout opened in your browser (${opened.method}). Switch to your browser to complete the payment — your credit will land here automatically. If you don't see a browser window, use Copy URL.`,
+          url: data.checkout_url,
+        });
       }
+      // Fire-and-forget poll — same rationale as openProUpgrade. The
+      // renewal credit lands locally via validateWithServer's expires_at
+      // delta detection; onSuccess just refreshes React state.
+      pollForExternalRenewal(onSuccess);
+    } else {
+      emitCheckoutStatus({
+        kind: 'error',
+        mode: 'renewal',
+        message: 'Renewal response was missing a payment URL. Please try again or contact support.',
+      });
     }
   } catch (err: any) {
-    console.error('[openProUpgrade] Checkout failed:', err?.message || err);
+    console.error('[openProRenewal] Renewal failed:', err?.message || err);
+    emitCheckoutStatus({
+      kind: 'error',
+      mode: 'renewal',
+      message: err?.message || 'Failed to start renewal. Please try again.',
+    });
   }
 }
 
@@ -2295,7 +2937,7 @@ const PopoutResizeHandles: React.FC = () => {
   );
 };
 
-function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProfile | null; userLicense: LicenseData | null; onLogout: () => void }) {
+function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLicense }: { userProfile: UserProfile | null; userLicense: LicenseData | null; onLogout: () => void; setUserProfile: (u: UserProfile | null) => void; setUserLicense: (l: LicenseData | null) => void }) {
   // --- Feature Gates ---
   const gate = useFeatureGate(userLicense);
 
@@ -2364,15 +3006,82 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   // Opened by clicking the tier badge in the chat header. Hosts the
   // unified billing UI: current plan + actions + comparison + account.
   const [manageSubOpen, setManageSubOpen] = useState(false);
-  const handleSubscriptionUpgrade = useCallback((targetTier: 'basic' | 'pro' | 'max') => {
-      // Reuse the existing checkout flow exposed by SubscriptionGate via
-      // openProUpgrade. The checkout happens in browser via openExternal.
-      // The 'targetTier' is informational — server flow always picks the
-      // configured plan for the user's region. Future: pass targetTier
-      // through to /create-checkout for per-tier selection.
-      setManageSubOpen(false);
-      openProUpgrade();
+  // Open the billing surface in response to the in-app upgrade link the
+  // AI emits in feature-gate messages (see MessageRenderer's custom `a`
+  // component). Without this listener those links would do nothing — the
+  // renderer can't reach setManageSubOpen through React.memo'd children
+  // without plumbing the setter through props and busting memoization.
+  useEffect(() => {
+    const handler = () => setManageSubOpen(true);
+    window.addEventListener('app:open-manage-subscription', handler);
+    return () => window.removeEventListener('app:open-manage-subscription', handler);
   }, []);
+
+  // ── Checkout-status toast ─────────────────────────────────────────
+  // Visible feedback for every step of the upgrade/renewal flow. Without
+  // this the user clicked a plan, the modal closed, and nothing visible
+  // happened — they'd describe it as "directing me to the chat interface"
+  // because the chat is what's behind the closed modal. Sources of the
+  // silence: browser opens but in the background (Focus Assist), fetch
+  // fails silently (no token / network error / server validator rejecting
+  // a misconfigured price), or admin-grant short-circuits without a
+  // browser open at all. Each of those now dispatches an event the toast
+  // surfaces with a clear message so the user can see what happened.
+  type CheckoutToast = {
+    kind: 'connecting' | 'opened' | 'sync-grant' | 'completed' | 'timeout' | 'error' | 'no-token';
+    tier?: string;
+    message?: string;
+    mode?: 'subscription' | 'renewal';
+    url?: string;
+    expiresAt: number;
+  };
+  const [checkoutToast, setCheckoutToast] = useState<CheckoutToast | null>(null);
+  const [checkoutUrlCopied, setCheckoutUrlCopied] = useState(false);
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {};
+      // 'opened' stays visible the longest because the user is supposed to
+      // alt-tab to their browser to pay — disappearing in 4s would lose
+      // the breadcrumb. 'error' / 'timeout' stay long enough to be read
+      // and acted on. Transient steps decay quickly.
+      const dismissAfterMs =
+        detail.kind === 'opened' ? 45000 :
+        detail.kind === 'connecting' ? 10000 :
+        detail.kind === 'error' ? 12000 :
+        detail.kind === 'no-token' ? 8000 :
+        detail.kind === 'timeout' ? 15000 :
+        detail.kind === 'sync-grant' || detail.kind === 'completed' ? 6000 :
+        6000;
+      setCheckoutToast({ ...detail, expiresAt: Date.now() + dismissAfterMs });
+    };
+    window.addEventListener('app:checkout-status', handler);
+    return () => window.removeEventListener('app:checkout-status', handler);
+  }, []);
+  // Auto-dismiss when expiresAt passes. Separate effect so each new toast
+  // resets the timer cleanly rather than racing the previous one's stale
+  // setTimeout closure.
+  useEffect(() => {
+    if (!checkoutToast) return;
+    const remaining = checkoutToast.expiresAt - Date.now();
+    if (remaining <= 0) { setCheckoutToast(null); return; }
+    const t = window.setTimeout(() => setCheckoutToast(null), remaining);
+    return () => window.clearTimeout(t);
+  }, [checkoutToast]);
+  const handleSubscriptionUpgrade = useCallback((targetTier: 'basic' | 'pro' | 'max') => {
+      // Reuse the checkout flow in openProUpgrade. The checkout happens in
+      // the browser via openExternal for /create-checkout, or completes
+      // server-side and updates local state for /upgrade-tier. The
+      // onSuccess callback fires for synthetic-grant providers (admin-grant,
+      // stripe-upgrade, razorpay-upgrade) — without it the chat-header tier
+      // badge would stay on the old tier until the next 30-min revalidation
+      // tick because openProUpgrade only updates localStorage.
+      setManageSubOpen(false);
+      openProUpgrade(targetTier, () => {
+          const saved = licenseService.loadAuth();
+          if (saved.user) setUserProfile(saved.user);
+          if (saved.license) setUserLicense(saved.license);
+      });
+  }, [setUserProfile, setUserLicense]);
 
   // ── In-app update-on-close prompt ──
   // Replaces electron/main.cjs's native dialog.showMessageBox (which leaks
@@ -2552,7 +3261,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
   useEffect(() => {
     const checkServerVersion = async () => {
       try {
-        const res = await fetch(`https://h2so4-production.up.railway.app/api/v1/app-version?v=${APP_VERSION}`);
+        const res = await fetch(`https://api.minicaai.com/api/v1/app-version?v=${APP_VERSION}`);
         if (res.ok) {
           const data = await res.json();
           setServerVersionInfo(data);
@@ -3217,11 +3926,20 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         const fallback = gate.getDefaultModel();
         setSettings(prev => ({ ...prev, selectedModel: fallback as any }));
         localStorage.setItem("SELECTED_MODEL", fallback);
-        // Notify user
+        // Notify user — tier-aware so we don't promise the wrong upgrade.
+        // Claude is Max-only; the other paid models (GPT, Grok, Groq) are
+        // Basic+. Sending a Pro user to "Upgrade to Pro" because they
+        // tried Claude would be a confusing dead-end (they're already
+        // Pro and Pro doesn't unlock Claude).
+        const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+        const requiredTier = currentModel === 'claude' ? 'Max' : 'Pro';
+        const reasonClause = currentModel === 'claude'
+          ? `is a Max-only model`
+          : `requires a paid plan`;
         const gateMsg: Message = {
           id: Date.now().toString(),
           role: 'model',
-          content: `**${currentModel.charAt(0).toUpperCase() + currentModel.slice(1)}** is a Pro-only model. Switched to **${fallback.charAt(0).toUpperCase() + fallback.slice(1)}**. Upgrade to Pro to unlock all AI models.`,
+          content: `**${cap(currentModel)}** ${reasonClause}. Switched to **${cap(fallback)}**. [Upgrade to ${requiredTier}](upgrade) to use it.`,
           timestamp: Date.now()
         };
         if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
@@ -3652,15 +4370,42 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [creditTimer.hourBoundary, creditTimer.lowWarning, creditTimer.exhausted, creditTimer.source, gate.actualTier, userProfile?.country_code]);
 
+  // Refresh React state from the localStorage that licenseService just
+  // updated. Used as the onSuccess callback for the post-checkout polling
+  // helpers below — without this, the chat-header tier badge and other
+  // userLicense consumers stay on the OLD tier until the next periodic
+  // revalidation tick fires (or the user restarts the app).
+  const refreshAuthFromStorage = useCallback(() => {
+    const saved = licenseService.loadAuth();
+    if (saved.user) setUserProfile(saved.user);
+    if (saved.license) setUserLicense(saved.license);
+  }, [setUserProfile, setUserLicense]);
+
   const handleRenewCredit = useCallback(async () => {
-    // v1: reuse the same checkout entry point. Server-side will eventually
-    // differentiate renewal charges from full-plan purchases.
-    try { await openProUpgrade(); } catch (e) { console.warn('renew failed:', e); }
-  }, []);
+    // Routes to /create-renewal (the +1h top-up) so a Basic user clicking
+    // "Renew" on the out-of-credits prompt pays the renewal price and gets
+    // 1 added hour — not a fresh full-plan purchase at the regular price.
+    try { await openProRenewal(refreshAuthFromStorage); } catch (e) { console.warn('renew failed:', e); }
+  }, [refreshAuthFromStorage]);
 
   const handleOpenUpgrade = useCallback(async () => {
-    try { await openProUpgrade(); } catch (e) { console.warn('upgrade failed:', e); }
-  }, []);
+    // The action must match the label the user actually saw:
+    //   • Free / trial → ExhaustedModal label is "See plans". Open the plan
+    //     picker (ManageSubscription) so they can compare and choose Basic
+    //     vs Pro vs Max — anything else would be picking for them.
+    //   • Basic out-of-credits → label is "Upgrade to Pro (Unlimited)".
+    //     Go straight to Pro checkout — that's exactly what the button
+    //     promises, and it's the most common upgrade path from Basic.
+    //   • Pro / Max → shouldn't happen (these tiers have unlimited time
+    //     and won't see the modal), but route to the plan picker anyway
+    //     as a defensive default in case the modal slips through.
+    const liveTier = userLicense?.tier;
+    if (liveTier === 'basic') {
+      try { await openProUpgrade('pro', refreshAuthFromStorage); } catch (e) { console.warn('upgrade failed:', e); }
+      return;
+    }
+    setManageSubOpen(true);
+  }, [userLicense?.tier, refreshAuthFromStorage]);
 
   const handleManualSend = () => {
     if (isPopoutThinClient) {
@@ -4203,7 +4948,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
         const gateMsg: Message = {
           id: Date.now().toString(),
           role: 'model',
-          content: '**Pop-out Mode** is a Pro feature. Upgrade to Pro to use the invisible overlay during interviews.',
+          content: '**Pop-out Mode** is a Pro feature. [Upgrade to Pro](upgrade) to use the invisible overlay during interviews.',
           timestamp: Date.now()
         };
         if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
@@ -4402,108 +5147,73 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
             
             {/* Model Selection */}
             <div className="bg-surface/50 border border-border p-3 rounded-lg space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
                     <label className="text-sm font-bold text-text flex items-center gap-2">
                         <Cpu size={16} /> AI Model Selection
                     </label>
-                    {/* Max users get no upgrade-nag label — they have everything.
-                        Pro users get a soft suggestion. Free/Basic get the upgrade prompt. */}
-                    {gate.isMax ? null : gate.isPro ? (
-                      <span className="text-[10px] text-green-400 font-medium bg-green-400/10 px-2 py-0.5 rounded-full border border-green-400/20">
-                        For better experience choose GPT-5.5
+                    {/* Tier-aware upgrade prompt. Max → "Full access" pill (no
+                        nag, just confirmation). Pro → Claude path. Basic → both
+                        paths (Pro for unlimited time, Max for Claude). Free →
+                        same dual hint, framed for a brand-new user. Replaces
+                        the old single-pill "Upgrade to Max for all models"
+                        which was misleading because Pro also has 4 models —
+                        the only model going from Pro→Max unlocks is Claude. */}
+                    {gate.isMax ? (
+                      <span className="text-[10px] font-semibold tracking-[0.10em] uppercase text-[#f4dba0] bg-[rgba(201,165,92,0.10)] px-2.5 py-0.5 rounded-full border border-[rgba(201,165,92,0.45)] flex items-center gap-1">
+                        <Sparkles size={9} /> Full access
+                      </span>
+                    ) : gate.isPro ? (
+                      <span className="text-[10px] text-amber-300 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/25 flex items-center gap-1">
+                        <Crown size={9} /> Max adds Claude with Web Search
+                      </span>
+                    ) : gate.isBasic ? (
+                      <span className="text-[10px] text-amber-300 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/25 flex items-center gap-1">
+                        <Crown size={9} /> Pro · unlimited · Max adds Claude
                       </span>
                     ) : (
-                      <span className="text-[10px] text-amber-400 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/20 flex items-center gap-1">
-                        <Crown size={8} /> Upgrade to Pro for all models
+                      <span className="text-[10px] text-amber-300 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/25 flex items-center gap-1">
+                        <Crown size={9} /> Pro unlocks 4 models · Max adds Claude
                       </span>
                     )}
                 </div>
-                <div className="flex flex-wrap gap-2">
-                    <button
-                        onClick={() => setTempModel('gemini')}
-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all hover:shadow-md flex items-center gap-2 ${
-                            tempModel === 'gemini' 
-                            ? 'bg-blue-500/10 border-blue-500 shadow-sm' 
-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100'
-                        }`}
-                    >
-                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'gemini' ? 'bg-blue-500' : 'bg-gray-400'}`}></div>
-                        <span className={`font-bold text-xs ${tempModel === 'gemini' ? 'text-blue-500' : 'text-text'}`}>
-                            Gemini 3.1 Flash
-                        </span>
-                    </button>
-
-                    <button
-                        onClick={() => gate.canUseModel('groq') && setTempModel('groq')}
-                        disabled={!gate.canUseModel('groq')}
-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all flex items-center gap-2 ${
-                            !gate.canUseModel('groq')
-                            ? 'bg-background border-border opacity-40 cursor-not-allowed'
-                            : tempModel === 'groq'
-                            ? 'bg-orange-500/10 border-orange-500 shadow-sm'
-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100 hover:shadow-md'
-                        }`}
-                    >
-                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'groq' ? 'bg-orange-500' : 'bg-gray-400'}`}></div>
-                        <span className={`font-bold text-xs ${tempModel === 'groq' ? 'text-orange-500' : 'text-text'}`}>
-                            Groq
-                        </span>
-                        {!gate.canUseModel('groq') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
-                    </button>
-
-                    <button
-                        onClick={() => gate.canUseModel('openai') && setTempModel('openai')}
-                        disabled={!gate.canUseModel('openai')}
-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all flex items-center gap-2 ${
-                            !gate.canUseModel('openai')
-                            ? 'bg-background border-border opacity-40 cursor-not-allowed'
-                            : tempModel === 'openai'
-                            ? 'bg-green-500/10 border-green-500 shadow-sm'
-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100 hover:shadow-md'
-                        }`}
-                    >
-                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'openai' ? 'bg-green-500' : 'bg-gray-400'}`}></div>
-                        <span className={`font-bold text-xs ${tempModel === 'openai' ? 'text-green-500' : 'text-text'}`}>
-                            GPT-5.5 {gate.canUseModel('openai') && <span className="ml-1 text-[9px] bg-green-500 text-white px-1.5 py-0.5 rounded-full">Recommended</span>}
-                        </span>
-                        {!gate.canUseModel('openai') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
-                    </button>
-
-                    <button
-                        onClick={() => gate.canUseModel('xai') && setTempModel('xai')}
-                        disabled={!gate.canUseModel('xai')}
-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all flex items-center gap-2 ${
-                            !gate.canUseModel('xai')
-                            ? 'bg-background border-border opacity-40 cursor-not-allowed'
-                            : tempModel === 'xai'
-                            ? 'bg-gray-500/10 border-gray-500 shadow-sm'
-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100 hover:shadow-md'
-                        }`}
-                    >
-                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'xai' ? 'bg-white' : 'bg-gray-400'}`}></div>
-                        <span className={`font-bold text-xs ${tempModel === 'xai' ? 'text-text' : 'text-text'}`}>
-                            Grok (xAI)
-                        </span>
-                        {!gate.canUseModel('xai') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">PRO</span>}
-                    </button>
-
-                    <button
-                        onClick={() => gate.canUseModel('claude') && setTempModel('claude')}
-                        disabled={!gate.canUseModel('claude')}
-                        className={`relative px-3 py-1.5 rounded-full border text-left transition-all flex items-center gap-2 ${
-                            !gate.canUseModel('claude')
-                            ? 'bg-background border-border opacity-40 cursor-not-allowed'
-                            : tempModel === 'claude'
-                            ? 'bg-purple-500/10 border-purple-500 shadow-sm'
-                            : 'bg-background border-border hover:border-gray-400 opacity-60 hover:opacity-100 hover:shadow-md'
-                        }`}
-                    >
-                        <div className={`w-1.5 h-1.5 rounded-full ${tempModel === 'claude' ? 'bg-purple-500' : 'bg-gray-400'}`}></div>
-                        <span className={`font-bold text-xs ${tempModel === 'claude' ? 'text-purple-500' : 'text-text'}`}>
-                            Claude Sonnet 4.6 {gate.canUseModel('claude') && <span className="ml-1 text-[9px] bg-purple-500 text-white px-1.5 py-0.5 rounded-full">Web Search</span>}
-                        </span>
-                        {!gate.canUseModel('claude') && <span className="ml-1 text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30">MAX</span>}
-                    </button>
+                {/* Layout — 2x2 grid for Gemini / Groq / GPT / Grok in
+                    compact form, then Claude full-width below as the
+                    showcase Max card. Keeps every model visible without
+                    scrolling the settings modal, while preserving the
+                    visual climax: Claude alone occupies a full row with
+                    the metallic rim and serif name. CSS lives in
+                    index.html under .mp-card / .mp-card.is-compact /
+                    .mp-card-max. Locked cards open ManageSubscription so
+                    the picker doubles as a sales path. */}
+                <div className="space-y-2.5">
+                    <div className="grid grid-cols-2 gap-2">
+                        {(['gemini', 'groq', 'openai', 'xai'] as ModelKey[]).map(key => (
+                            <ModelPickerCard
+                                key={key}
+                                modelKey={key}
+                                selected={tempModel === key}
+                                allowed={gate.canUseModel(key)}
+                                variant="full"
+                                compact
+                                onSelect={() => setTempModel(key)}
+                                onLockedClick={() => {
+                                    setShowSettings(false);
+                                    setManageSubOpen(true);
+                                }}
+                            />
+                        ))}
+                    </div>
+                    <ModelPickerCard
+                        modelKey="claude"
+                        selected={tempModel === 'claude'}
+                        allowed={gate.canUseModel('claude')}
+                        variant="full"
+                        onSelect={() => setTempModel('claude')}
+                        onLockedClick={() => {
+                            setShowSettings(false);
+                            setManageSubOpen(true);
+                        }}
+                    />
                 </div>
             </div>
 
@@ -4770,7 +5480,90 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
           userProfile={userProfile}
           userLicense={userLicense}
           onUpgradeRequested={handleSubscriptionUpgrade}
+          onProfileUpdated={(updated) => setUserProfile(updated)}
+          onLicenseUpdated={(updated) => setUserLicense(updated)}
+          onRenewRequested={() => { setManageSubOpen(false); openProRenewal(refreshAuthFromStorage); }}
       />
+
+      {/* --- Checkout-status toast — visible feedback for the upgrade flow ---
+          Z-index above ManageSubscription's z-99999 so the user sees status
+          regardless of which surface they clicked from. Without this, the
+          modal closing was the only visible signal that anything happened.
+
+          When a URL is attached we render Copy URL + Open in browser
+          buttons so the user always has a manual fallback — shell.openExternal
+          can claim success and yet not surface a browser window (default-
+          browser registration corrupted, AV blocking, OS shell process
+          busy). The user can copy the URL into the browser of their
+          choice instead of being stranded. */}
+      {checkoutToast && (
+        <div
+          className="fixed left-1/2 top-4 -translate-x-1/2 z-[100000] max-w-lg w-[92vw] sm:w-auto pointer-events-none"
+          role="status"
+          aria-live="polite"
+        >
+          <div
+            className={`pointer-events-auto rounded-xl shadow-2xl px-4 py-3 text-sm font-medium border backdrop-blur-md ${
+              checkoutToast.kind === 'error' || checkoutToast.kind === 'no-token'
+                ? 'bg-red-600/95 border-red-400 text-white shadow-red-500/30'
+              : checkoutToast.kind === 'sync-grant' || checkoutToast.kind === 'completed'
+                ? 'bg-emerald-600/95 border-emerald-400 text-white shadow-emerald-500/30'
+              : checkoutToast.kind === 'timeout'
+                ? 'bg-amber-600/95 border-amber-400 text-white shadow-amber-500/30'
+              : 'bg-blue-600/95 border-blue-400 text-white shadow-blue-500/30'
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              <div className="shrink-0 mt-0.5">
+                {checkoutToast.kind === 'connecting' || checkoutToast.kind === 'opened' ? (
+                  <Loader2 size={16} className="animate-spin" />
+                ) : checkoutToast.kind === 'error' || checkoutToast.kind === 'no-token' || checkoutToast.kind === 'timeout' ? (
+                  <AlertTriangle size={16} />
+                ) : (
+                  <Check size={16} />
+                )}
+              </div>
+              <span className="flex-1 leading-snug break-words">{checkoutToast.message}</span>
+              <button
+                onClick={() => setCheckoutToast(null)}
+                className="shrink-0 -mr-1 -mt-0.5 p-1 rounded hover:bg-white/15 transition-colors"
+                aria-label="Dismiss"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            {checkoutToast.url && (
+              <div className="mt-3 pt-3 border-t border-white/20 flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(checkoutToast.url!);
+                      setCheckoutUrlCopied(true);
+                      window.setTimeout(() => setCheckoutUrlCopied(false), 2200);
+                    } catch (e) {
+                      console.warn('[checkout-toast] clipboard write failed:', e);
+                    }
+                  }}
+                  className="px-3 py-1.5 rounded-md text-xs font-bold bg-white/15 hover:bg-white/25 transition-colors flex items-center gap-1.5"
+                >
+                  {checkoutUrlCopied ? <><Check size={12} /> Copied</> : <><Copy size={12} /> Copy URL</>}
+                </button>
+                <button
+                  onClick={async () => {
+                    const result = await tryOpenCheckoutUrl(checkoutToast.url!);
+                    if (!result.ok) {
+                      console.warn('[checkout-toast] retry openExternalRobust failed:', result);
+                    }
+                  }}
+                  className="px-3 py-1.5 rounded-md text-xs font-bold bg-white/15 hover:bg-white/25 transition-colors flex items-center gap-1.5"
+                >
+                  <ExternalLink size={12} /> Try again
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* --- Update-on-close prompt — replaces native dialog.showMessageBox so it doesn't leak on screen-share ---
           Backdrop click + Esc + X button all dismiss as "stay in tray" — no
@@ -5125,7 +5918,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                 </p>
 
                 <div className="grid grid-cols-1 gap-3 pt-4">
-                    <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Setup.exe" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-blue-500 hover:bg-blue-500/5 transition-all group">
+                    <a href="https://get.minicaai.com/windows" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-blue-500 hover:bg-blue-500/5 transition-all group">
                         <div className="flex items-center gap-4">
                             <div className="p-2 bg-blue-500/10 rounded-lg group-hover:bg-blue-500/20 transition-colors">
                                 <Monitor size={24} className="text-blue-400 group-hover:text-blue-500" />
@@ -5138,7 +5931,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                         <Download size={18} className="text-gray-500 group-hover:text-blue-500 transition-colors" />
                     </a>
 
-                    <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Mac.dmg" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-purple-500 hover:bg-purple-500/5 transition-all group">
+                    <a href="https://get.minicaai.com/mac" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-purple-500 hover:bg-purple-500/5 transition-all group">
                         <div className="flex items-center gap-4">
                             <div className="p-2 bg-purple-500/10 rounded-lg group-hover:bg-purple-500/20 transition-colors">
                                 <Laptop size={24} className="text-purple-400 group-hover:text-purple-500" />
@@ -5151,7 +5944,7 @@ function MainApp({ userProfile, userLicense, onLogout }: { userProfile: UserProf
                         <Download size={18} className="text-gray-500 group-hover:text-purple-500 transition-colors" />
                     </a>
 
-                    <a href="https://github.com/madhavvan/h2so4/releases/latest/download/InterviewCopilot-Linux.AppImage" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-orange-500 hover:bg-orange-500/5 transition-all group">
+                    <a href="https://get.minicaai.com/linux" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 rounded-xl border border-border bg-surface hover:border-orange-500 hover:bg-orange-500/5 transition-all group">
                         <div className="flex items-center gap-4">
                             <div className="p-2 bg-orange-500/10 rounded-lg group-hover:bg-orange-500/20 transition-colors">
                                 <Terminal size={24} className="text-orange-400 group-hover:text-orange-500" />
@@ -5311,5 +6104,5 @@ export default function App() {
     );
   }
 
-  return <MainApp userProfile={user} userLicense={license} onLogout={handleLogout} />;
+  return <MainApp userProfile={user} userLicense={license} onLogout={handleLogout} setUserProfile={setUser} setUserLicense={setLicense} />;
 }

@@ -1,0 +1,5 @@
+{
+  "Endpoint": "https://eus.codesigning.azure.net/",
+  "CodeSigningAccountName": "minica-signing-4729",
+  "CertificateProfileName": "minicaai-prod"
+}

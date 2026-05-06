@@ -701,7 +701,13 @@ function fallbackToMasterKey(res, masterKey, reason) {
   return res.json({ key: masterKey });
 }
 
-router.get('/deepgram-key', async (req, res) => {
+// Both GET and POST are bound to the same handler. Older app builds
+// (pre-3.4.x) called this with POST; current client uses GET. Routing
+// both methods to the same handler keeps users on outdated binaries
+// from breaking on speech-to-text setup until auto-update catches up.
+// Safe to drop the POST binding once log telemetry shows zero POST
+// traffic for several weeks.
+const deepgramKeyHandler = async (req, res) => {
   const masterKey = process.env.DEEPGRAM_API_KEY;
   if (!masterKey) return res.status(503).json({ error: 'Deepgram not configured' });
 
@@ -790,6 +796,9 @@ router.get('/deepgram-key', async (req, res) => {
     // can keep transcribing while Deepgram is unreachable.
     return fallbackToMasterKey(res, masterKey, `mint exception: ${e.message}`);
   }
-});
+};
+
+router.get('/deepgram-key', deepgramKeyHandler);
+router.post('/deepgram-key', deepgramKeyHandler);
 
 module.exports = router;

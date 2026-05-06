@@ -62,6 +62,37 @@
         --dur-ios-fast:   180ms;
         --dur-ios:        260ms;
         --dur-ios-slow:   420ms;
+
+        /* ── Spring physics for the iOS-mobile landing experience ──
+           cubic-bezier curves above are great for hover/press; springs are
+           what makes "open/close" feel like an iOS app. Sampled from a
+           damped harmonic oscillator (mass 1, stiffness 180, damping 18 →
+           damping ratio ~0.67) — the canonical "lands with a tiny
+           overshoot" feel. CSS linear() is supported in Chrome 113+,
+           Safari 17.2+, Firefox 112+; older engines fall through to the
+           cubic-bezier defaults via the @supports guard below. */
+        --spring-summon:  linear(
+          0, 0.026, 0.097, 0.211, 0.358, 0.524, 0.687, 0.825,
+          0.923, 0.984, 1.018, 1.034, 1.038, 1.034, 1.026,
+          1.018, 1.011, 1.005, 1.001, 1
+        );
+        --spring-dismiss: linear(
+          0, 0.022, 0.082, 0.18, 0.31, 0.456, 0.6, 0.728, 0.83,
+          0.906, 0.957, 0.985, 0.998, 1.003, 1.003, 1.001, 1
+        );
+        --dur-summon:  340ms;
+        --dur-dismiss: 380ms;
+      }
+      /* Fallback for engines that don't support linear() — linear() resolves
+         to a comma-separated list of stops; a non-supporting parser drops
+         the value and the variable becomes empty. Provide a cubic-bezier
+         tail that approximates the overshoot well enough for the rare
+         visitor on a dated browser. */
+      @supports not (transition-timing-function: linear(0, 1)) {
+        :root {
+          --spring-summon:  cubic-bezier(0.16, 1.18, 0.3, 1);
+          --spring-dismiss: cubic-bezier(0.32, 0.72, 0, 1);
+        }
       }
 
       .dark {
@@ -171,6 +202,165 @@
         animation: ios-bubble-in var(--dur-ios) var(--ease-ios-out) both;
       }
 
+      /* ── iOS mobile-landing motion primitives ──
+         Used by the LandingMobile component in SubscriptionGate.tsx.
+         Platform-neutral so the same classes work on minicaai.com from a
+         phone browser AND inside the Electron renderer when its window is
+         sized down to a phone-width viewport (e.g. dragged narrow on a
+         desktop, or a future PWA install). */
+
+      /* Card / section rise-in. Cards start invisible (data-rise selector
+         below) and only animate when the IntersectionObserver tags them
+         with .ios-rise-active. Stagger via inline animation-delay on each
+         card so the row of capability tiles enters in a chevron, not a
+         block — matches iOS Settings/Mail-row behavior. */
+      [data-rise] {
+        opacity: 0;
+        transform: translateY(14px) scale(0.985);
+      }
+      [data-rise].ios-rise-active {
+        animation: ios-rise-in var(--dur-summon) var(--spring-summon) forwards;
+      }
+      @keyframes ios-rise-in {
+        from { opacity: 0; transform: translateY(14px) scale(0.985); }
+        to   { opacity: 1; transform: translateY(0)    scale(1);     }
+      }
+
+      /* Bottom-sheet slide. .ios-sheet-enter on first paint, .ios-sheet-exit
+         when dismissed; the React component re-renders with the right class
+         and unmounts the node only after the animation lands (see
+         closeSheet() in SubscriptionGate.tsx). */
+      @keyframes ios-sheet-up   { from { transform: translateY(100%); } to { transform: translateY(0);    } }
+      @keyframes ios-sheet-down { from { transform: translateY(0);    } to { transform: translateY(100%); } }
+      .ios-sheet-enter { animation: ios-sheet-up   var(--dur-summon)  var(--spring-summon) forwards; }
+      .ios-sheet-exit  { animation: ios-sheet-down var(--dur-dismiss) var(--ease-ios-in)   forwards; }
+
+      /* Backdrop fade — paired with sheet animation. Slightly faster on the
+         way out so the world re-emerges before the sheet finishes leaving;
+         that mismatched timing is the iOS detail people feel but can't name. */
+      @keyframes ios-fade-in  { from { opacity: 0; } to { opacity: 1; } }
+      @keyframes ios-fade-out { from { opacity: 1; } to { opacity: 0; } }
+      .ios-fade-enter { animation: ios-fade-in  240ms var(--ease-ios)    forwards; }
+      .ios-fade-exit  { animation: ios-fade-out 220ms var(--ease-ios-in) forwards; }
+
+      /* Press affordance — used on every interactive surface in the mobile
+         landing. Subtler than the global button:active scale(0.965) above
+         because mobile cards are bigger; over-scaling reads as wobble. */
+      .ios-press {
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+        transition:
+          transform 220ms var(--ease-ios),
+          opacity   220ms var(--ease-ios),
+          background-color 240ms var(--ease-ios);
+      }
+      .ios-press:active {
+        transform: scale(0.97);
+        opacity: 0.92;
+      }
+
+      /* Horizontal paged swiper — used by How-it-works and Pricing pagers.
+         scroll-snap-stop:always prevents momentum from flicking past two
+         cards in one fling, which makes the dot indicator track honestly. */
+      .ios-pager {
+        display: flex;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scroll-snap-type: x mandatory;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+        scroll-padding: 0 1.25rem;
+        scroll-behavior: smooth;
+      }
+      .ios-pager::-webkit-scrollbar { display: none; }
+      .ios-pager-item {
+        scroll-snap-align: center;
+        scroll-snap-stop: always;
+        flex: 0 0 calc(100% - 2.5rem);
+        margin-left: 1.25rem;
+      }
+      .ios-pager-item:last-child { margin-right: 1.25rem; }
+
+      /* Safe-area passthroughs so the layout respects notch / home-indicator
+         on real iPhones. Use max() with 0px so non-supporting browsers (and
+         Android viewports without env-inset values) still produce a sane 0. */
+      .pt-safe { padding-top:    max(env(safe-area-inset-top),    0px); }
+      .pb-safe { padding-bottom: max(env(safe-area-inset-bottom), 0px); }
+
+      /* ── Auth form primitives (login / signup / forgot_password) ──
+         These live as a shared class layer because the inputs use inline
+         CSS variables for theme tokens (var(--cream), var(--accent), etc.)
+         and Tailwind's :focus utilities can't reference those at runtime.
+         Keeping the focus / link / animation styles here also means we
+         don't have to repeat the same bag of style overrides on every
+         input across three nearly-identical views. */
+
+      /* Input focus state — the default focus:outline-none on auth inputs
+         strips the browser ring without a replacement, leaving keyboard
+         users with no signal of which field is active. We replace it with
+         an accent-colored border + soft halo. */
+      .auth-input {
+        transition:
+          border-color 200ms var(--ease-ios),
+          box-shadow 200ms var(--ease-ios),
+          background-color 200ms var(--ease-ios);
+      }
+      .auth-input:focus {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
+        outline: none;
+      }
+      .auth-input::placeholder {
+        color: var(--ink-faint);
+      }
+
+      /* Inline link styling — the "Forgot password?" / "Create one" /
+         "Sign in" buttons inside text. Color shift on hover plus a subtle
+         underline so they actually read as clickable. */
+      .auth-link {
+        transition: color 200ms var(--ease-ios), opacity 200ms var(--ease-ios);
+        text-underline-offset: 3px;
+        text-decoration-thickness: 1px;
+      }
+      .auth-link:hover {
+        text-decoration: underline;
+      }
+
+      /* Top-right close (X) button — was using hover:opacity-80 on already-
+         muted text, which just made it less visible on hover. Replace with
+         a proper background fade + color shift. */
+      .auth-close {
+        transition:
+          background-color 200ms var(--ease-ios),
+          color 200ms var(--ease-ios);
+      }
+      .auth-close:hover {
+        background-color: color-mix(in oklab, var(--ink) 6%, transparent);
+        color: var(--ink) !important;
+      }
+
+      /* Submit button — keeps the icon slot ALWAYS rendered (spinner OR
+         arrow) so the button width / text position doesn't shift between
+         idle and loading states. */
+      .auth-submit {
+        transition:
+          opacity 200ms var(--ease-ios),
+          transform 200ms var(--ease-ios);
+      }
+      .auth-submit:hover:not(:disabled) {
+        opacity: 0.92;
+      }
+
+      /* Auth card entrance — gentle fade + lift when the view first mounts
+         so navigating from landing → login doesn't feel like a hard cut. */
+      @keyframes auth-card-in {
+        from { opacity: 0; transform: translateY(8px) scale(0.99); }
+        to   { opacity: 1; transform: translateY(0)   scale(1);    }
+      }
+      .auth-card {
+        animation: auth-card-in 320ms var(--ease-ios-out) both;
+      }
+
       /* Electron pop-out window transparency */
       html.electron-transparent,
       html.electron-transparent body {
@@ -191,6 +381,353 @@
       html.popout-mode input[type="email"],
       html.popout-mode input[type="password"] {
         cursor: text !important;
+      }
+
+      /* ── Model picker — compact rows (popout + input-area popovers) ──
+         Same component, two variants (variant="compact" here; variant="full"
+         is .mp-card below). Compact rows live inside a portal'd popover that
+         shares the popout window's compositor surface — we keep the styling
+         CSS-only (no JS animation) so it inherits setContentProtection like
+         every other surface drawn into the BrowserWindow.
+         Brand colors come from inline style vars (--mp-accent etc.) set per
+         row from MODEL_REGISTRY; Max gets its own classed treatment because
+         its border is a CSS gradient (can't be expressed as a single color
+         token). */
+      .mp-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        font-size: 11px;
+        color: rgba(244, 244, 245, 0.92);
+        cursor: pointer;
+        border-radius: 6px;
+        transition: background-color 160ms var(--ease-ios);
+      }
+      .mp-row:hover { background: rgba(255, 255, 255, 0.06); }
+      .mp-row.is-selected { background: rgba(255, 255, 255, 0.04); }
+      .mp-row.is-locked { color: rgba(244, 244, 245, 0.55); }
+      .mp-row.is-locked:hover { background: rgba(255, 255, 255, 0.04); }
+      .mp-mono {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        border-radius: 5px;
+        border: 1px solid;
+        font-weight: 700;
+        font-size: 11px;
+        line-height: 1;
+        flex-shrink: 0;
+      }
+      /* Max monogram — amber→purple gradient chip, matching the in-app
+         Max dialect (chat-header chip uses the same amber-500/10 →
+         purple-500/10 tokens). Marketing-dialect cream/gold stays out of
+         this surface per the palette comment at the top of this file. */
+      .mp-mono-max {
+        background: linear-gradient(135deg, rgba(245, 158, 11, 0.22), rgba(168, 85, 247, 0.22));
+        border: 1px solid rgba(245, 158, 11, 0.55);
+        color: #fcd34d;
+      }
+      .mp-name { flex: 1; min-width: 0; }
+      .mp-check { opacity: 0.85; }
+      .mp-locked {
+        font-size: 8px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        padding: 1px 5px;
+        border-radius: 3px;
+        background: rgba(251, 191, 36, 0.10);
+        color: rgba(251, 191, 36, 0.85);
+        border: 1px solid rgba(251, 191, 36, 0.30);
+      }
+      .mp-locked-max {
+        background: linear-gradient(135deg, rgba(245, 158, 11, 0.16), rgba(168, 85, 247, 0.16));
+        color: #fcd34d;
+        border: 1px solid rgba(245, 158, 11, 0.50);
+      }
+
+      /* ── Model picker — rich cards (settings panel) ──
+         The "world's richest" treatment lives here. Restraint over flash:
+         deep ink surfaces, hairline brand-color rails for Pro/Basic models,
+         tonal-gold metallic border + slow cream sheen for Max — closer to
+         a fine watch case-back or an Amex Centurion card than a neon
+         gradient. Newsreader serif (already preconnected at the top of
+         this file) carries the Max flagship label.
+         All animation is CSS-only and respects prefers-reduced-motion via
+         the global media query at the bottom of this stylesheet. */
+      .mp-card {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        width: 100%;
+        padding: 14px 16px 14px 18px;
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.015), rgba(255, 255, 255, 0)),
+          rgba(15, 15, 18, 0.72);
+        text-align: left;
+        cursor: pointer;
+        transition:
+          border-color 220ms var(--ease-ios),
+          background-color 220ms var(--ease-ios),
+          box-shadow 240ms var(--ease-ios),
+          transform 220ms var(--ease-ios);
+        overflow: hidden;
+      }
+      .mp-card:hover {
+        border-color: color-mix(in oklab, var(--mp-accent, #71717a) 55%, transparent);
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0)),
+          rgba(20, 20, 24, 0.80);
+      }
+      /* Selected state for non-Max cards: 2px brand-color border + soft
+         brand-tinted glow (tonal, not neon). */
+      .mp-card.is-selected {
+        border-color: var(--mp-accent, #71717a);
+        box-shadow:
+          0 0 0 1px var(--mp-accent, transparent) inset,
+          0 8px 28px -12px color-mix(in oklab, var(--mp-accent, transparent) 55%, transparent);
+      }
+      .mp-card.is-locked {
+        opacity: 0.55;
+        cursor: pointer;
+      }
+      .mp-card.is-locked:hover { opacity: 0.78; }
+      .mp-card:active:not(.is-locked) { transform: scale(0.992); }
+
+      /* Brand-color rail — runs the full height of the card on the left,
+         3px wide. Gives Pro/Basic models a credit-card-stripe accent
+         without competing with the Max card's gold border. */
+      .mp-card::before {
+        content: '';
+        position: absolute;
+        left: 0; top: 12px; bottom: 12px;
+        width: 3px;
+        border-radius: 0 3px 3px 0;
+        background: var(--mp-accent, transparent);
+        opacity: 0.55;
+        transition: opacity 220ms var(--ease-ios);
+      }
+      .mp-card:hover::before { opacity: 0.85; }
+      .mp-card.is-selected::before { opacity: 1; }
+      .mp-card.is-locked::before { opacity: 0.20; }
+
+      /* ── Max card — flagship treatment in the in-app dialect ──
+         Same dark zinc surface as the other cards (no foreign cream/ink
+         palette — that one's reserved for marketing/auth surfaces, see
+         the comment block at the top of this file). Max distinction is
+         a hairline amber→purple gradient rim that mirrors the chat-header
+         and popout Max chips, plus a slightly stronger inner background
+         tint. No animation — keeps the settings panel quiet during long
+         interview sessions. */
+      .mp-card-max {
+        background:
+          radial-gradient(140% 100% at 0% 0%, rgba(245, 158, 11, 0.06), transparent 55%),
+          radial-gradient(120% 100% at 100% 100%, rgba(168, 85, 247, 0.05), transparent 55%),
+          rgba(15, 15, 18, 0.78);
+        border: 1px solid transparent;
+      }
+      /* Amber→purple rim painted via the standard mask-composite trick.
+         The .mp-card::before from above is repurposed as the perimeter
+         rim instead of a 3px left bar — same pseudo-element, redefined
+         for Max so the brand-rail rule is fully overridden, not stacked. */
+      .mp-card-max::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: auto;
+        padding: 1px;
+        border-radius: inherit;
+        background: linear-gradient(135deg,
+          rgba(245, 158, 11, 0.55) 0%,
+          rgba(251, 191, 36, 0.50) 35%,
+          rgba(168, 85, 247, 0.50) 70%,
+          rgba(139, 92, 246, 0.55) 100%);
+        -webkit-mask:
+          linear-gradient(#000 0 0) content-box,
+          linear-gradient(#000 0 0);
+        -webkit-mask-composite: xor;
+                mask-composite: exclude;
+        pointer-events: none;
+        opacity: 0.80;
+        transition: opacity 240ms var(--ease-ios);
+      }
+      .mp-card-max:hover::before { opacity: 1; }
+      .mp-card-max.is-selected::before {
+        opacity: 1;
+        padding: 2px;
+      }
+      .mp-card-max.is-locked::before { opacity: 0.45; }
+
+      /* Monogram chip — colored square housing the model letter. Pro/Basic
+         pull color from inline-style vars; Max has its own metallic chip. */
+      .mp-card-mono {
+        flex-shrink: 0;
+        width: 40px;
+        height: 40px;
+        border-radius: 10px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        font-size: 18px;
+        line-height: 1;
+        border: 1px solid var(--mp-accent, rgba(255, 255, 255, 0.08));
+        background: var(--mp-chip, rgba(255, 255, 255, 0.04));
+        color: var(--mp-fg, #e4e4e7);
+        transition: transform 220ms var(--ease-ios), box-shadow 220ms var(--ease-ios);
+      }
+      .mp-card:hover .mp-card-mono { transform: translateY(-1px); }
+      .mp-card.is-selected .mp-card-mono {
+        box-shadow: 0 0 0 1px var(--mp-accent) inset, 0 6px 18px -8px var(--mp-accent);
+      }
+      /* Max monogram — amber→purple gradient chip, same palette as the rim. */
+      .mp-card-mono-max {
+        background: linear-gradient(135deg, rgba(245, 158, 11, 0.22), rgba(168, 85, 247, 0.20));
+        border: 1px solid rgba(245, 158, 11, 0.55);
+        color: #fcd34d;
+      }
+      .mp-card-max:hover .mp-card-mono-max { transform: translateY(-1px); }
+      .mp-card-max.is-selected .mp-card-mono-max {
+        box-shadow:
+          0 0 0 1px rgba(245, 158, 11, 0.55) inset,
+          0 6px 22px -6px rgba(168, 85, 247, 0.35);
+      }
+
+      /* Body — name + tagline */
+      .mp-card-body {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        flex: 1;
+        min-width: 0;
+      }
+      .mp-card-title {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .mp-card-name {
+        font-size: 13.5px;
+        font-weight: 600;
+        color: rgba(244, 244, 245, 0.95);
+        letter-spacing: -0.01em;
+      }
+      .mp-card-tag {
+        font-size: 11px;
+        line-height: 1.4;
+        color: rgba(244, 244, 245, 0.55);
+      }
+
+      /* Right-side affordance — Active chip / lock badge */
+      .mp-card-right {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+      }
+      .mp-card-active {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 9.5px;
+        font-weight: 700;
+        letter-spacing: 0.10em;
+        text-transform: uppercase;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: color-mix(in oklab, var(--mp-accent, #10b981) 14%, transparent);
+        color: var(--mp-fg, #34d399);
+        border: 1px solid color-mix(in oklab, var(--mp-accent, #10b981) 40%, transparent);
+      }
+      .mp-card-active-max {
+        background: linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(168, 85, 247, 0.16));
+        color: #fcd34d;
+        border: 1px solid rgba(245, 158, 11, 0.50);
+      }
+      .mp-card-lock {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        font-size: 9.5px;
+        font-weight: 700;
+        letter-spacing: 0.10em;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(251, 191, 36, 0.10);
+        color: rgba(251, 191, 36, 0.90);
+        border: 1px solid rgba(251, 191, 36, 0.32);
+      }
+      .mp-card-lock-max {
+        background: linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(168, 85, 247, 0.16));
+        color: #fcd34d;
+        border: 1px solid rgba(245, 158, 11, 0.50);
+      }
+      /* Inline badges — "Recommended" (GPT) and "Flagship" (Claude) */
+      .mp-card-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        padding: 2px 7px;
+        border-radius: 999px;
+        white-space: nowrap;
+      }
+      .mp-card-badge-recommended {
+        background: rgba(16, 185, 129, 0.18);
+        color: #34d399;
+        border: 1px solid rgba(16, 185, 129, 0.40);
+      }
+      .mp-card-badge-flagship {
+        background: linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(168, 85, 247, 0.16));
+        color: #fcd34d;
+        border: 1px solid rgba(245, 158, 11, 0.50);
+      }
+
+      /* ── Compact full-card variant ──
+         Used for the four non-Max models in the settings panel's 2-col
+         grid. Same visual language (brand rail, monogram chip, name) but
+         shrunken so the four cards plus the full-width Claude showcase
+         all fit in the modal without scrolling. Tagline is dropped — the
+         model name + colored chip already telegraphs identity, and the
+         showcase Claude card carries the marketing weight. */
+      .mp-card.is-compact {
+        padding: 10px 14px 10px 16px;
+        gap: 11px;
+      }
+      .mp-card.is-compact .mp-card-mono {
+        width: 32px;
+        height: 32px;
+        border-radius: 8px;
+        font-size: 17px;
+      }
+      .mp-card.is-compact::before {
+        top: 8px;
+        bottom: 8px;
+      }
+      .mp-card.is-compact .mp-card-name {
+        font-size: 12.5px;
+      }
+      .mp-card.is-compact .mp-card-tag { display: none; }
+      .mp-card.is-compact .mp-card-active,
+      .mp-card.is-compact .mp-card-lock {
+        font-size: 8.5px;
+        padding: 3px 7px;
+        letter-spacing: 0.08em;
+      }
+      .mp-card.is-compact .mp-card-badge {
+        font-size: 8px;
+        padding: 2px 6px;
       }
 
       /* Respect reduced-motion preference — disables all iOS springs */

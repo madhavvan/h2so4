@@ -21,7 +21,7 @@ router.post('/validate', async (req, res) => {
         error: 'version_expired',
         message: 'This version is no longer supported. Please update.',
         min_version: minVersion,
-        download_url: 'https://github.com/madhavvan/h2so4/releases/latest',
+        download_url: 'https://get.minicaai.com',
       });
     }
 
@@ -95,6 +95,13 @@ router.post('/validate', async (req, res) => {
       sessions_limit: license.sessions_limit,
       sessions_exhausted: false,
       is_admin: isAdmin,
+      // Credits — server-tracked so renewal payments propagate across
+      // devices. Pro/Max return -1 sentinels (the client treats those as
+      // "unlimited" and ignores the bucket entirely).
+      credits_remaining_seconds: license.credits_remaining_seconds,
+      credits_expire_at: license.credits_expire_at,
+      trial_remaining_seconds: license.trial_remaining_seconds,
+      trial_granted_at: license.trial_granted_at,
     });
   } catch (err) {
     console.error('License validation error:', err);
@@ -188,7 +195,7 @@ router.get('/version', (req, res) => {
   res.json({
     min_version: db.getConfig('min_app_version', '2.0.0'),
     latest_version: db.getConfig('latest_app_version', '2.0.0'),
-    download_url: 'https://github.com/madhavvan/h2so4/releases/latest',
+    download_url: 'https://get.minicaai.com',
   });
 });
 
