@@ -24,9 +24,11 @@ import {
   X, Crown, Zap, Sparkles, Check, Loader2, ExternalLink, AlertTriangle,
   Cpu, ChevronRight, Info, ShieldCheck, UploadCloud,
 } from 'lucide-react';
+import { WizardHat } from './WizardHat';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
 import { backfillAllConversations, BackfillProgress } from './services/aiProxyService';
 import { RefundPolicy } from './RefundPolicy';
+import { useAnimatedModal } from './hooks/useAnimatedModal';
 
 const API_BASE = 'https://api.minicaai.com';
 
@@ -70,6 +72,16 @@ interface ManageSubscriptionProps {
   // provided, the Renew row is hidden and Basic users are pointed at the
   // credit-exhausted modal's renew button instead.
   onRenewRequested?: () => void;
+  // Externally-tracked upgrade-in-flight signal (Free → paid). Lets the
+  // upgrade buttons here render their own loading state while the parent
+  // (App.tsx) is mid-fetch on /create-checkout and waiting for the
+  // browser to open. Without this, the button click felt unresponsive
+  // — modal closed instantly with no feedback. Now button shows spinner
+  // until the parent decides to close us, smoothly.
+  upgradePending?: 'basic' | 'pro' | 'max' | null;
+  // Same pattern but for the +1h Basic top-up — separate flag so the
+  // renewal spinner doesn't accidentally light up the upgrade rows.
+  renewPending?: boolean;
 }
 
 const TIER_INFO: Record<string, {
@@ -101,16 +113,17 @@ const TIER_INFO: Record<string, {
     blurb: 'Unlimited time on Gemini, GPT-5.5, Grok, and Groq. Pop-out + Auto-Solve.',
   },
   max: {
-    // Sparkles (not Crown) is the only Max-vs-Pro visual differentiation —
-    // both stay in the existing amber-orange-purple gradient language so
-    // the in-app surface stays consistent with the chat-header Max chip
-    // and the popout Max chip. The cream/gold dialect from the marketing
-    // surface (SubscriptionGate) stays out of the in-app surfaces — see
-    // the comment block at the top of index.html for the rationale.
+    // WizardHat is the dedicated Max-tier identity icon (custom SVG at
+    // /WizardHat.tsx) — the "god-tier" mark that distinguishes Max from
+    // Pro's Crown. Both stay in the existing amber-orange-purple gradient
+    // language so the in-app surface stays consistent with the chat-header
+    // Max chip and the popout Max chip. The cream/gold dialect from the
+    // marketing surface (SubscriptionGate) stays out of the in-app surfaces
+    // — see the comment block at the top of index.html for the rationale.
     label: 'Max',
     color: 'text-amber-400',
     gradient: 'from-amber-600/40 via-orange-600/40 to-purple-700/40',
-    icon: Sparkles,
+    icon: WizardHat,
     blurb: 'Everything in Pro · plus Claude Sonnet 4.6, Auto-Type, and Train Model.',
   },
 };
@@ -189,7 +202,16 @@ export function ManageSubscription({
   onProfileUpdated,
   onLicenseUpdated,
   onRenewRequested,
+  upgradePending = null,
+  renewPending = false,
 }: ManageSubscriptionProps) {
+  // Smooth enter/exit — fades the backdrop and slides the content into
+  // place rather than instant-popping. 220ms matches the smoothShow
+  // duration in electron/main.cjs so window-level and modal-level
+  // animations stay perceptually in sync if both fire close together
+  // (e.g., a checkout flow that closes this modal AND surfaces the
+  // tray's first-time toast at the same moment).
+  const { isMounted, isVisible } = useAnimatedModal(isOpen, 220);
   const [sub, setSub] = useState<SubscriptionStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<string | null>(null); // tracks which button is in-flight
@@ -548,7 +570,7 @@ export function ManageSubscription({
     }
   }, [fetchSubscription, onLicenseUpdated, onProfileUpdated]);
 
-  if (!isOpen) return null;
+  if (!isMounted) return null;
 
   // Reconcile server snapshot (sub) with live license (userLicense) — the
   // license updates immediately on webhook events, while sub is the snapshot
@@ -580,13 +602,22 @@ export function ManageSubscription({
 
   return (
     <div
-      className="fixed inset-0 z-[99999] bg-black/85 overflow-y-auto custom-scrollbar"
-      style={{ WebkitAppRegion: 'no-drag' } as any}
+      // Backdrop: fade in/out the dim overlay. We avoid scaling the
+      // entire surface (it's full-screen scrollable; a 2% scale on a
+      // 1080p surface looks weirder than no scale at all) and instead
+      // get the "lifted" feel from the inner content's translate-y.
+      className={`fixed inset-0 z-[99999] overflow-y-auto custom-scrollbar transition-opacity duration-200 ease-out ${
+        isVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+      }`}
+      style={{ backgroundColor: 'rgba(0,0,0,0.85)', WebkitAppRegion: 'no-drag' } as any}
       role="dialog"
       aria-modal="true"
       aria-label="Manage subscription"
     >
-      {/* Top bar */}
+      {/* Top bar — sticks to the top of the scroll container. We do NOT
+          wrap the body in a transform-gpu element because position:sticky
+          attaches to the nearest scroll ancestor and a transformed
+          ancestor would create a new containing block that breaks it. */}
       <div className="sticky top-0 z-10 bg-[#0a0a0d]/95 border-b border-white/[0.06] px-6 py-3 flex items-center justify-between">
         <h2 className="text-lg font-bold text-white">Manage subscription</h2>
         <button
@@ -598,7 +629,14 @@ export function ManageSubscription({
         </button>
       </div>
 
-      <div className="max-w-3xl mx-auto p-6 space-y-6">
+      {/* Body — gets the subtle lift-up animation. translate + opacity is
+          fine here (no sticky inside) and gives the modal contents a
+          "rises into place" feel rather than just blinking on. */}
+      <div
+        className={`max-w-3xl mx-auto p-6 space-y-6 transition-all duration-200 ease-out ${
+          isVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-3'
+        }`}
+      >
         {/* Hero card */}
         <div className={`relative overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br ${tierMeta.gradient} p-6`}>
           <div className="flex items-start justify-between gap-6 flex-wrap">
@@ -710,42 +748,57 @@ export function ManageSubscription({
             <>
               <button
                 onClick={() => onUpgradeRequested('pro')}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors"
+                disabled={upgradePending != null}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <div className="flex items-center gap-3">
                   <Crown size={18} className="text-blue-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">Upgrade to Pro</div>
+                    <div className="font-semibold text-white text-sm">
+                      {upgradePending === 'pro' ? 'Preparing checkout…' : 'Upgrade to Pro'}
+                    </div>
                     <div className="text-xs text-white/60">Unlimited time · GPT-5.5, Grok, Llama · Pop-out · Auto-Solve</div>
                   </div>
                 </div>
-                <ChevronRight size={16} className="text-white/40" />
+                {upgradePending === 'pro'
+                  ? <Loader2 size={16} className="animate-spin text-blue-400" />
+                  : <ChevronRight size={16} className="text-white/40" />}
               </button>
               <button
                 onClick={() => onUpgradeRequested('max')}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors"
+                disabled={upgradePending != null}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <div className="flex items-center gap-3">
-                  <Sparkles size={18} className="text-amber-400" />
+                  <WizardHat size={18} className="text-amber-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">Upgrade to Max</div>
+                    <div className="font-semibold text-white text-sm">
+                      {upgradePending === 'max' ? 'Preparing checkout…' : 'Upgrade to Max'}
+                    </div>
                     <div className="text-xs text-white/60">Pro + Claude Sonnet 4.6 + Auto-Type + Train Model</div>
                   </div>
                 </div>
-                <ChevronRight size={16} className="text-white/40" />
+                {upgradePending === 'max'
+                  ? <Loader2 size={16} className="animate-spin text-amber-400" />
+                  : <ChevronRight size={16} className="text-white/40" />}
               </button>
               <button
                 onClick={() => onUpgradeRequested('basic')}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors"
+                disabled={upgradePending != null}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <div className="flex items-center gap-3">
                   <Zap size={18} className="text-emerald-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">Get Basic</div>
+                    <div className="font-semibold text-white text-sm">
+                      {upgradePending === 'basic' ? 'Preparing checkout…' : 'Get Basic'}
+                    </div>
                     <div className="text-xs text-white/60">3 hours · 14-day window · GPT, Grok, Llama (no Claude)</div>
                   </div>
                 </div>
-                <ChevronRight size={16} className="text-white/40" />
+                {upgradePending === 'basic'
+                  ? <Loader2 size={16} className="animate-spin text-emerald-400" />
+                  : <ChevronRight size={16} className="text-white/40" />}
               </button>
             </>
           )}
@@ -756,43 +809,58 @@ export function ManageSubscription({
               {onRenewRequested && (
                 <button
                   onClick={onRenewRequested}
-                  className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors"
+                  disabled={renewPending || upgradePending != null}
+                  className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <div className="flex items-center gap-3">
                     <Zap size={18} className="text-emerald-400" />
                     <div className="text-left">
-                      <div className="font-semibold text-white text-sm">Renew · +1 hour</div>
+                      <div className="font-semibold text-white text-sm">
+                        {renewPending ? 'Preparing checkout…' : 'Renew · +1 hour'}
+                      </div>
                       <div className="text-xs text-white/60">Adds another hour of session time to your Basic plan.</div>
                     </div>
                   </div>
-                  <ChevronRight size={16} className="text-white/40" />
+                  {renewPending
+                    ? <Loader2 size={16} className="animate-spin text-emerald-400" />
+                    : <ChevronRight size={16} className="text-white/40" />}
                 </button>
               )}
               <button
                 onClick={() => onUpgradeRequested('pro')}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors"
+                disabled={upgradePending != null}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <div className="flex items-center gap-3">
                   <Crown size={18} className="text-blue-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">Upgrade to Pro</div>
+                    <div className="font-semibold text-white text-sm">
+                      {upgradePending === 'pro' ? 'Preparing checkout…' : 'Upgrade to Pro'}
+                    </div>
                     <div className="text-xs text-white/60">Unlimited time, no expiry · keep your remaining Basic hours.</div>
                   </div>
                 </div>
-                <ChevronRight size={16} className="text-white/40" />
+                {upgradePending === 'pro'
+                  ? <Loader2 size={16} className="animate-spin text-blue-400" />
+                  : <ChevronRight size={16} className="text-white/40" />}
               </button>
               <button
                 onClick={() => onUpgradeRequested('max')}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors"
+                disabled={upgradePending != null}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <div className="flex items-center gap-3">
-                  <Sparkles size={18} className="text-amber-400" />
+                  <WizardHat size={18} className="text-amber-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">Upgrade to Max</div>
+                    <div className="font-semibold text-white text-sm">
+                      {upgradePending === 'max' ? 'Preparing checkout…' : 'Upgrade to Max'}
+                    </div>
                     <div className="text-xs text-white/60">Adds Claude + Auto-Type + Train Model.</div>
                   </div>
                 </div>
-                <ChevronRight size={16} className="text-white/40" />
+                {upgradePending === 'max'
+                  ? <Loader2 size={16} className="animate-spin text-amber-400" />
+                  : <ChevronRight size={16} className="text-white/40" />}
               </button>
             </>
           )}
@@ -807,7 +875,7 @@ export function ManageSubscription({
               className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors disabled:opacity-50"
             >
               <div className="flex items-center gap-3">
-                <Sparkles size={18} className="text-amber-400" />
+                <WizardHat size={18} className="text-amber-400" />
                 <div className="text-left">
                   <div className="font-semibold text-white text-sm">Upgrade to Max</div>
                   <div className="text-xs text-white/60">Adds Claude Sonnet 4.6 + Auto-Type + Train Model. Effective immediately, prorated diff next invoice.</div>

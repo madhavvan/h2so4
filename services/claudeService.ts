@@ -773,10 +773,34 @@ interface PromptContext {
   kbHint: string;
 }
 
+// Mirrors getCustomInstructionsBlock() in aiProxyService.ts. Inlined here
+// (not imported) so claudeService stays standalone — see file-header
+// comment for the deliberate non-import policy on cross-service helpers.
+// Both implementations must stay byte-identical: any future tweak to the
+// strict-follow framing has to land in BOTH places or Claude responses
+// drift from how Gemini/OpenAI/Groq/xAI handle the same instructions.
+function getClaudeCustomInstructionsBlock(): string {
+  if (typeof localStorage === 'undefined') return '';
+  const raw = (localStorage.getItem('CUSTOM_INSTRUCTIONS') || '').trim();
+  if (!raw) return '';
+  return `━━━━━━ USER INSTRUCTIONS — FOLLOW STRICTLY ━━━━━━
+The user has supplied the following directives. Treat them as the highest-priority rules for this response. They override conflicting style guidance from other parts of the system prompt unless that other guidance is about safety or factual accuracy.
+
+${raw}
+
+━━━━━━ END USER INSTRUCTIONS ━━━━━━
+
+`;
+}
+
 async function prepareClaudeStreamPrompts(
   contextFiles: ContextFile[],
   generalMode: boolean,
 ): Promise<PromptContext> {
+  // Custom instructions read once and prepended in every branch below.
+  // Empty string when none — cheap no-op concat.
+  const customBlock = getClaudeCustomInstructionsBlock();
+
   // General mode opts out of resume/JD grounding — skip extraction.
   if (generalMode) {
     const textContext = contextFiles
@@ -784,7 +808,7 @@ async function prepareClaudeStreamPrompts(
       .map(f => `[[SOURCE: ${f.type.toUpperCase()} - ${f.name}]]\n${f.content}\n[[END SOURCE]]`)
       .join('\n\n');
     return {
-      systemInstruction: buildClaudeSystemInstruction(textContext, true, contextFiles),
+      systemInstruction: customBlock + buildClaudeSystemInstruction(textContext, true, contextFiles),
       userRulesBlock: buildClaudeUserRulesBlock(false),
       kbHint: '',
     };
@@ -796,13 +820,13 @@ async function prepareClaudeStreamPrompts(
       .map(f => `[[SOURCE: ${f.type.toUpperCase()} - ${f.name}]]\n${f.content}\n[[END SOURCE]]`)
       .join('\n\n');
     return {
-      systemInstruction: buildClaudeSystemInstruction(textContext, false, contextFiles),
+      systemInstruction: customBlock + buildClaudeSystemInstruction(textContext, false, contextFiles),
       userRulesBlock: buildClaudeUserRulesBlock(false),
       kbHint: '\n\n[Remember: draw from the Knowledge Base where relevant.]',
     };
   }
   return {
-    systemInstruction: buildClaudeSystemInstructionNew(
+    systemInstruction: customBlock + buildClaudeSystemInstructionNew(
       cards.identity,
       cards.jdPriorities,
       cards.resume,

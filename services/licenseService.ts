@@ -165,10 +165,12 @@ class LicenseService {
   private readonly AUTH_KEY = 'minicaai_auth';
   private readonly TOKEN_KEY = 'minicaai_token';
 
-  // Server base URL. Both renderer (Vite/Electron at localhost) and the
-  // packaged Electron build hit the same Railway-hosted backend — there's
-  // no separate dev origin to switch to here, so the URL is fixed.
-  private API_BASE = 'https://api.minicaai.com';
+  // Server base URL. Default is the Railway-hosted backend; override
+  // via .env VITE_SERVER_URL=http://localhost:4000 to test the dev
+  // server through the Electron dev mode. The Vite build inlines this
+  // at compile time, so prod builds always get the prod URL unless the
+  // env var was explicitly set during the build.
+  private API_BASE = (import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com';
 
   // ── Device Fingerprint ──
   async getDeviceId(): Promise<string> {

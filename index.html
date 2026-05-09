@@ -3,6 +3,34 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         Content Security Policy
+         Defense-in-depth on top of Electron's contextIsolation +
+         nodeIntegration:false. Specifically blocks any markdown-injected
+         <script src=evil> and any javascript: URL that would otherwise
+         survive into the renderer. The directives are calibrated so:
+           • Vite dev HMR works (unsafe-eval, ws:)
+           • Packaged builds work (file:// + dist/ assets)
+           • Outbound API + Deepgram WebSocket work
+           • Inline <style> in this file works ('unsafe-inline' in style-src)
+           • Inline scripts are NOT allowed — strict-dynamic isn't here yet
+             but 'self' + no nonce blocks any injected script tag
+         If a third-party origin is ever loaded in any window (we don't
+         today), update this meta accordingly.
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+    <meta http-equiv="Content-Security-Policy" content="
+      default-src 'self';
+      script-src 'self' 'unsafe-eval';
+      style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+      font-src 'self' https://fonts.gstatic.com data:;
+      img-src 'self' data: blob: https:;
+      media-src 'self' blob: data:;
+      connect-src 'self' ws: wss: http://localhost:* https: data: blob:;
+      frame-src 'none';
+      object-src 'none';
+      base-uri 'self';
+      form-action 'self';
+    ">
     <title>Interview Copilot AI</title>
     <!-- Branded favicon set. Generated from build/icon.svg by
          scripts/build-icons.mjs and copied into the build root by Vite from
@@ -200,6 +228,74 @@
       }
       .animate-in {
         animation: ios-bubble-in var(--dur-ios) var(--ease-ios-out) both;
+      }
+
+      /* ── iOS-flavored chat composer ─────────────────────────────
+         The textarea + send/auto-solve buttons share one design language
+         here — same rounded shell, same iOS-spring transitions, gradient
+         circular buttons matching iMessage's look. The previous design
+         used flat Tailwind utility colors (bg-primary, bg-purple-600)
+         that visually disconnected from the rest of the iOS-aesthetic
+         app. */
+      .composer-shell {
+        /* Outer shell: subtle background + 1px hairline. Stays inert on
+           focus — user feedback (2026-05-08) was that the prior
+           focus-within blue glow felt like a highlighted/active state
+           and competed with the chat content for attention. The shell
+           is now purely structural: the rounded container exists to
+           group the textarea with the Send / Auto-Solve gradient
+           buttons as one visual unit, but typing into it doesn't
+           change the shell's appearance. */
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+      }
+      .dark .composer-shell {
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+      }
+
+      /* ── Composer buttons (Send / Auto-Solve) ──
+         Final iteration: monochrome white-alpha. Iteration history
+         that informed this — first attempt was iOS chromatic gradient
+         (cheap), second was liquid-glass with sheen and halo (cheaper),
+         third was solid blue/violet (classic but still chromatic). User
+         pulled all the way to "remove the color, make it classic" —
+         which is the right call. At 2M users, chromatic chat-send
+         buttons read as "consumer chat app", monochrome icon buttons
+         read as "professional tool". Slack, Discord, GitHub, macOS,
+         Linear, Notion all converged on this exact pattern in dark
+         surfaces: a translucent white-alpha bg at ~7% opacity (just
+         visible enough to ground the icon as a button), brightening to
+         ~14% on hover, fading to ~3% when disabled. Both buttons share
+         identical CSS — Send vs Auto-Solve is communicated entirely by
+         the icon glyph (paper-airplane vs scan-search), which is the
+         classic pattern for icon-button rows where every button has
+         the same shape and only the icon changes. */
+      .btn-ios-send,
+      .btn-ios-violet {
+        flex-shrink: 0;
+        background-color: rgba(255, 255, 255, 0.07);
+        transition:
+          background-color 150ms ease,
+          opacity 150ms ease;
+      }
+      .btn-ios-send:hover:not(:disabled),
+      .btn-ios-violet:hover:not(:disabled) {
+        background-color: rgba(255, 255, 255, 0.14);
+      }
+      .btn-ios-send:disabled,
+      .btn-ios-violet:disabled {
+        background-color: rgba(255, 255, 255, 0.03);
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      /* PiP textarea focus glow upgrade — was a 4px white box-shadow at 6%
+         opacity (too subtle to read). Bump to a slightly more visible focus
+         ring so users know the textarea is engaged in the popout. Keeps
+         the transparent-window aesthetic — no solid fill, just a halo. */
+      .pip-textarea:focus {
+        box-shadow:
+          0 0 0 4px rgba(255, 255, 255, 0.08),
+          0 0 14px rgba(255, 255, 255, 0.05);
       }
 
       /* ── iOS mobile-landing motion primitives ──

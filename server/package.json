@@ -6,12 +6,15 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "stripe:setup": "node --env-file=.env scripts/stripe-setup.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
     "@google/genai": "^1.48.0",
     "better-sqlite3": "^12.8.0",
+    "cheerio": "^1.1.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
@@ -29,7 +32,8 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0"
+    "nodemon": "^3.1.0",
+    "vitest": "^2.1.9"
   },
   "engines": {
     "node": ">=20.0.0"

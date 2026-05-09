@@ -18,6 +18,9 @@ const adminRoutes = require('./routes/admin');
 const aiRoutes = require('./routes/ai');
 const conversationRoutes = require('./routes/conversations');
 const downloadRoutes = require('./routes/downloads');
+// Semver compare — extracted to utils/version.js so unit tests can hit
+// it without booting Express. Used by /version + /license/validate.
+const { compareVersions } = require('./utils/version');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -110,9 +113,13 @@ const adminDestructiveLimiter = new RateLimiterMemory({ points: 30, duration: 30
 // AI endpoint limiter — keyed by user (when authenticated) or IP (fallback).
 // Each AI call is real money to us (Claude w/ web_search ≈ $0.05+, GPT/Gemini
 // cheaper but still non-trivial), so a leaked token must not be able to grind
-// thousands of dollars in inference. 60/min/user covers heavy interview use
-// (≈1 call/sec sustained) without exposing the cost ceiling.
-const aiLimiter = new RateLimiterMemory({ points: 60, duration: 60 });
+// thousands of dollars in inference. Bumped May 2026 from 60→90/min/user
+// after users reported hitting the cap during legitimate interview use:
+// model switching, parallel chat-and-fresh-context calls, and Auto-Type
+// firing its own AI planner all share this bucket. 90/min ≈ 1.5/sec
+// sustained, still tight enough that a leaked token can't grind unbounded
+// inference, but breathing room for normal interview pace.
+const aiLimiter = new RateLimiterMemory({ points: 90, duration: 60 });
 
 // Optional IP allowlist for admin endpoints. Comma-separated CIDR-free list
 // (single IPs and IPv4/IPv6 exact match). Empty string = no restriction
@@ -229,7 +236,10 @@ app.use(async (req, res, next) => {
       try {
         await aiLimiter.consume(aiKey);
       } catch {
-        return res.status(429).json({ error: 'AI rate limit reached. Slow down and try again in a minute.' });
+        return res.status(429).json({
+          error: 'You are sending requests too fast — pause for a few seconds and try again. (App-level cap: 90/min/user.)',
+          code: 'app_rate_limit',
+        });
       }
     }
 
@@ -287,6 +297,41 @@ app.use(downloadRoutes);
 // ── Health check ──
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', version: '1.0.0', service: 'minicaai-api' });
+});
+
+// ── Crash report intake ──
+// Receives Crashpad/Breakpad minidumps from the Electron crashReporter
+// running on user devices. The body is multipart/form-data with the
+// dump itself + extra metadata (app_version, platform, arch). We don't
+// parse the dump — Crashpad's minidump format requires breakpad's
+// minidump_stackwalk to symbolize, which is offline analyst work. Here
+// we just persist the metadata so the dashboard can show "N crashes
+// today, version X, platform Y" and surface affected users.
+//
+// No auth required: the reporter has no JWT. Rate-limited at the
+// Express layer to keep an attacker from filling the disk with junk.
+// Body size capped at 5MB (typical minidump is 100-500KB).
+const crashUpload = express.raw({ type: '*/*', limit: '5mb' });
+app.post('/api/v1/crash', crashUpload, (req, res) => {
+  try {
+    const meta = {
+      ip: req.ip,
+      ua: req.headers['user-agent'] || '',
+      app_version: req.query.app_version || '',
+      platform: req.query.platform || '',
+      arch: req.query.arch || '',
+      bytes: Buffer.isBuffer(req.body) ? req.body.length : 0,
+      received_at: Date.now(),
+    };
+    // Best-effort log only for now — the dashboard table can come later.
+    // Even just having the count visible in the logs is a step up from
+    // "we have no idea how often the app crashes."
+    console.log('[crash]', JSON.stringify(meta));
+    res.json({ ok: true });
+  } catch (err) {
+    console.warn('[crash] receipt failed:', err && err.message);
+    res.status(500).json({ error: 'crash receipt failed' });
+  }
 });
 
 // ── Stealth verification page ──
@@ -413,16 +458,7 @@ app.get('/api/v1/app-version', (req, res) => {
   });
 });
 
-// Simple semver comparison: returns -1 if a < b, 0 if equal, 1 if a > b
-function compareVersions(a, b) {
-  const pa = a.split('.').map(Number);
-  const pb = b.split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] || 0) < (pb[i] || 0)) return -1;
-    if ((pa[i] || 0) > (pb[i] || 0)) return 1;
-  }
-  return 0;
-}
+// (compareVersions imported at top of file from ./utils/version)
 
 // ── 404 ──
 app.use((req, res) => {
@@ -468,6 +504,18 @@ function runResetTokenCleanup() {
 }
 runResetTokenCleanup();
 setInterval(runResetTokenCleanup, RESET_TOKEN_CLEANUP_INTERVAL_MS).unref();
+
+// Daily SQLite VACUUM INTO snapshot. Single-file SQLite has no replication;
+// this is the one defense against volume corruption / accidental delete /
+// detach. Keeps 7 most recent. Skipped in test mode (':memory:' DB).
+if (process.env.NODE_ENV !== 'test' && process.env.DATABASE_PATH !== ':memory:') {
+  try {
+    const backup = require('./backup');
+    backup.startDailyBackups();
+  } catch (err) {
+    console.warn('[backup] failed to start daily backups:', err && err.message);
+  }
+}
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  LIVE SUPPORT CHAT (WebSocket)

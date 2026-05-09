@@ -66,8 +66,8 @@ export function useDatabase(userId: string | null) {
       setSessionId(session.id);
 
       const [msgs, files, list] = await Promise.all([
-        ipc.invoke('db:get-messages', session.id),
-        ipc.invoke('db:get-context-files', session.id),
+        ipc.invoke('db:get-messages', session.id, userId),
+        ipc.invoke('db:get-context-files', session.id, userId),
         ipc.invoke('db:list-sessions', userId),
       ]);
       if (cancelled) return;
@@ -91,14 +91,16 @@ export function useDatabase(userId: string | null) {
 
     const onMessagesUpdated = (sid: string) => {
       if (sid === sessionRef.current?.id) {
-        ipc.invoke('db:get-messages', sid).then(setMessages);
+        const uid = userIdRef.current;
+        if (uid) ipc.invoke('db:get-messages', sid, uid).then(setMessages);
       }
     };
 
     const onFilesUpdated = (sid?: string) => {
       const id = sid || sessionRef.current?.id;
       if (id) {
-        ipc.invoke('db:get-context-files', id).then(setContextFiles);
+        const uid = userIdRef.current;
+        if (uid) ipc.invoke('db:get-context-files', id, uid).then(setContextFiles);
       }
     };
 
@@ -126,8 +128,8 @@ export function useDatabase(userId: string | null) {
       sessionRef.current = session;
       setSessionId(session.id);
       const [msgs, files] = await Promise.all([
-        ipc.invoke('db:get-messages', session.id),
-        ipc.invoke('db:get-context-files', session.id),
+        ipc.invoke('db:get-messages', session.id, uid),
+        ipc.invoke('db:get-context-files', session.id, uid),
       ]);
       setMessages(msgs);
       setContextFiles(files);
@@ -145,10 +147,10 @@ export function useDatabase(userId: string | null) {
   }, []);
 
   const addMessage = useCallback(async (msg: Message) => {
-    if (!ipc || !sessionRef.current) return;
+    if (!ipc || !sessionRef.current || !userIdRef.current) return;
     const session = sessionRef.current;
     setMessages(prev => [...prev, msg]);
-    await ipc.invoke('db:add-message', session.id, msg);
+    await ipc.invoke('db:add-message', session.id, msg, userIdRef.current);
     // Best-effort cloud sync so admin can see the conversation in the
     // dashboard. Fire-and-forget — never blocks the UI, never surfaces
     // errors to the candidate. See services/aiProxyService.ts header
@@ -166,15 +168,15 @@ export function useDatabase(userId: string | null) {
   }, []);
 
   const addContextFile = useCallback(async (file: ContextFile) => {
-    if (!ipc || !sessionRef.current) return;
+    if (!ipc || !sessionRef.current || !userIdRef.current) return;
     setContextFiles(prev => [...prev, file]);
-    await ipc.invoke('db:add-context-file', sessionRef.current.id, file);
+    await ipc.invoke('db:add-context-file', sessionRef.current.id, file, userIdRef.current);
   }, []);
 
   const removeContextFile = useCallback(async (fileId: string) => {
-    if (!ipc) return;
+    if (!ipc || !userIdRef.current) return;
     setContextFiles(prev => prev.filter(f => f.id !== fileId));
-    await ipc.invoke('db:remove-context-file', fileId);
+    await ipc.invoke('db:remove-context-file', fileId, userIdRef.current);
   }, []);
 
   const newSession = useCallback(async (name?: string) => {
@@ -194,8 +196,8 @@ export function useDatabase(userId: string | null) {
     sessionRef.current = session;
     setSessionId(session.id);
     const [msgs, files] = await Promise.all([
-      ipc.invoke('db:get-messages', session.id),
-      ipc.invoke('db:get-context-files', session.id),
+      ipc.invoke('db:get-messages', session.id, userIdRef.current),
+      ipc.invoke('db:get-context-files', session.id, userIdRef.current),
     ]);
     setMessages(msgs);
     setContextFiles(files);
@@ -222,8 +224,8 @@ export function useDatabase(userId: string | null) {
       sessionRef.current = result.newActiveSession;
       setSessionId(result.newActiveSession.id);
       const [msgs, files] = await Promise.all([
-        ipc.invoke('db:get-messages', result.newActiveSession.id),
-        ipc.invoke('db:get-context-files', result.newActiveSession.id),
+        ipc.invoke('db:get-messages', result.newActiveSession.id, userIdRef.current),
+        ipc.invoke('db:get-context-files', result.newActiveSession.id, userIdRef.current),
       ]);
       setMessages(msgs);
       setContextFiles(files);
@@ -231,8 +233,8 @@ export function useDatabase(userId: string | null) {
   }, []);
 
   const clearSession = useCallback(async () => {
-    if (!ipc || !sessionRef.current) return;
-    await ipc.invoke('db:clear-session', sessionRef.current.id);
+    if (!ipc || !sessionRef.current || !userIdRef.current) return;
+    await ipc.invoke('db:clear-session', sessionRef.current.id, userIdRef.current);
     setMessages([]);
     setContextFiles([]);
   }, []);

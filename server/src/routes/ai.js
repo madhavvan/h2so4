@@ -6,27 +6,276 @@
 const express = require('express');
 const { authMiddleware } = require('../middleware/auth');
 const { requireTier } = require('../middleware/tier');
+const { requireActiveSubscriptionInRegion } = require('../middleware/regionGate');
+const db = require('../database');
 const router = express.Router();
 
-// All AI routes require authentication
+// All AI routes require authentication.
 router.use(authMiddleware);
+
+// India-region paid-required gate. Hard-blocks free/trial/expired/refunded
+// users in regions where free tier is not available (currently only IN).
+// Admin emails bypass. Past-due/canceling states pass through (grace
+// window — Razorpay auto-retry / through-cycle access). Without this,
+// an IN user could DevTools-bypass the client paywall and use Gemini
+// (and our other AI keys) without paying. (See middleware/regionGate.js
+// for the full policy + rationale.)
+router.use(requireActiveSubscriptionInRegion);
+
+// ─── Free-tier daily quota for Gemini ─────────────────────────────────
+// Free tier IS supposed to have Gemini access (documented), but until
+// now there was no per-user daily cap. With the JWT-signature-not-
+// verified pre-pass on the AI rate limiter, an attacker could forge a
+// JWT and burn Google quota on our dime. This middleware uses the LIVE
+// license tier (not the JWT's stale `req.user.tier`) and applies the
+// 50/day cap from incrementAndCheckGeminiQuota only to free users.
+function geminiQuotaGate(req, res, next) {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: 'Authentication required' });
+    const license = db.getLicenseByUserId(userId);
+    const liveTier = license?.tier || 'free';
+    const result = db.incrementAndCheckGeminiQuota(userId, liveTier);
+    if (!result.ok) {
+      return res.status(429).json({
+        error: 'gemini_quota_exceeded',
+        used: result.used,
+        limit: result.limit,
+        day: result.day,
+        message: `Free tier is limited to ${result.limit} Gemini calls/day. Upgrade to Basic or higher for unlimited access.`,
+      });
+    }
+    next();
+  } catch (err) {
+    console.warn('[gemini-quota] gate threw:', err && err.message);
+    next(); // fail-open on quota infra errors — don't break the user's session
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  FRESH_CONTEXT injection helpers
+//
+//  When a chat call comes in, we classify the user's latest message
+//  (the live transcript) — if it looks tool/UI/version-specific,
+//  freshContext.enrichTranscript() fetches authoritative snippets
+//  via Brave Search. The snippets get prepended to the system
+//  instruction as a <FRESH_CONTEXT> block so the model grounds its
+//  answer in current evidence instead of stale training memory.
+//
+//  Latency: ~5ms on cache hit, ~500ms on miss. Brave free tier
+//  covers ~100 interviews/month; paid is $3/1k beyond.
+//
+//  Fail-open: if Brave is unreachable or BRAVE_API_KEY missing,
+//  enrichTranscript returns null and the chat proceeds unmodified.
+//  The caller never sees a retrieval error.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const { enrichTranscript } = require('../services/freshContext');
+
+// Pull the most recent user-role message from a messages array.
+// Used by all "messages: [...]"-shaped routes (OpenAI/xAI/Groq/Claude).
+function lastUserMessage(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.role === 'user' && typeof m.content === 'string') return m.content;
+  }
+  return '';
+}
+
+// Wrapper that NEVER throws — callers inline-await without try/catch.
+// On any failure (classifier exception, SQLite locked, etc.), returns
+// null and we skip injection. Logs the outcome for observability.
+//
+// CRITICAL: chat-time enrichment is CACHE-ONLY. We never trigger a
+// live Brave call or page fetch from the chat path — that would block
+// the model call by 500-2000ms on cold paths, which the user feels as
+// a latency regression vs. the pre-retrieval baseline. Live work
+// happens ONLY in /prefetch-context (async, 202'd, populates caches
+// in the background while the user is still hearing the question).
+//
+// Net behavior:
+//   - Cache hit → ~5ms, FRESH_CONTEXT injected, model gets grounded
+//   - Cache miss → ~5ms, no enrichment, model uses training memory
+//   - Brave down / no API key / timeout / etc. → never reached
+//     because we don't fire live calls here
+//
+// User experience: ALWAYS the same speed. Web search is purely
+// additive — it makes hits exceptional, but misses still answer.
+async function tryEnrich(transcript, requestId) {
+  try {
+    const r = await enrichTranscript(transcript, { cacheOnly: true });
+    if (r && r.context) {
+      const tag = r.cached ? (r.stale ? 'stale-cache' : 'cache-hit') : 'fresh';
+      const preview = String(transcript || '').slice(0, 80).replace(/\s+/g, ' ');
+      console.log(`[fresh-context] ${tag} (${(r.sources || []).length} src) for "${preview}" req=${requestId || '-'}`);
+    }
+    return r;
+  } catch (err) {
+    console.warn('[fresh-context] enrich threw (fail-open):', err && err.message);
+    return null;
+  }
+}
+
+// Prepend FRESH_CONTEXT to the existing system instruction. Order
+// matters: grounding evidence first, voice rules after. The model is
+// instructed (in freshContext.formatContext) to internalize, not cite.
+function prependFreshToSystem(systemInstruction, freshContext) {
+  if (!freshContext) return systemInstruction;
+  const existing = String(systemInstruction || '');
+  return existing ? `${freshContext}\n\n${existing}` : freshContext;
+}
+
+// Same idea but for messages-array shape: find the system message and
+// prepend its content; if no system message exists, insert one at [0].
+function prependFreshToMessages(messages, freshContext) {
+  if (!freshContext) return messages;
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  const sysIdx = messages.findIndex(m => m && m.role === 'system');
+  if (sysIdx === -1) {
+    return [{ role: 'system', content: freshContext }, ...messages];
+  }
+  const copy = messages.slice();
+  const cur = copy[sysIdx] || {};
+  copy[sysIdx] = { ...cur, content: prependFreshToSystem(cur.content, freshContext) };
+  return copy;
+}
+
+// ── Upstream 429 detection ──
+// Each provider SDK surfaces rate-limit errors slightly differently.
+// We unify the detection here so every route can branch the catch
+// uniformly: "is this an upstream rate-limit?" → return 429 to client
+// with a provider-specific message, instead of swallowing it as a
+// generic 500. The user-facing experience matters because "rate
+// limited, try again" is actionable; "AI request failed" isn't.
+function is429(err) {
+  if (!err) return false;
+  if (err.status === 429 || err.statusCode === 429 || err.code === 429) return true;
+  if (err.code === 'rate_limit_exceeded') return true;
+  if (err?.error?.code === 'rate_limit_exceeded') return true;
+  if (err?.error?.error?.type === 'rate_limit_error') return true;  // Anthropic
+  const msg = String(err.message || '');
+  if (/\b429\b/.test(msg)) return true;
+  if (/rate.?limit/i.test(msg)) return true;
+  if (/RESOURCE_EXHAUSTED/.test(msg)) return true;  // Gemini / Vertex
+  if (/quota.*exceeded/i.test(msg)) return true;
+  return false;
+}
+
+// Build a uniform 429 response body for the client. The renderer's
+// existing error toast appends "(Rate limited - please wait)" when it
+// sees status 429 — this gives the user an actionable message instead
+// of "AI request failed" which is what they see today.
+function rateLimitedJson(provider) {
+  return {
+    error: `${provider} rate-limited — give it a few seconds and try again.`,
+    provider,
+    code: 'rate_limit',
+  };
+}
 
 // ── Tier gate aliases ──
 // Mirrors services/licenseService.ts FEATURE_GATES.models, in shorthand:
-//   - PAID  → basic + pro + max  (GPT-5.5, Grok, Llama-4-Scout)
+//   - PAID  → basic + pro + max  (GPT-5.5, Grok, Groq GPT-OSS-120B)
 //   - MAX   → max only           (Claude Sonnet 4.6, Auto-Type planner)
 // Free tier: only Gemini, ungated. Defined here so adding a new model
 // route only requires picking the right gate, not hand-listing tiers.
 const PAID = ['basic', 'pro', 'max'];
 const MAX_ONLY = ['max'];
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  /prefetch-context — speculative cache warming during transcription
+//
+//  Pattern: while the interviewer is still speaking and the renderer
+//  is transcribing word-by-word, the renderer fires this endpoint
+//  every ~500ms (debounced) with the current partial transcript. The
+//  endpoint returns 202 IMMEDIATELY and runs enrichTranscript() in the
+//  background, populating the Brave cache + page-content cache. By
+//  the time the user hits Send and the real /chat/* route fires, the
+//  caches are warm — the enrichment that would have cost ~1500ms cold
+//  now costs ~10ms (cache hit).
+//
+//  Net effect: same perceived speed as before, but with rich grounded
+//  fresh-context in every model call instead of stale training data.
+//
+//  Server-side dedup: same query within 30s = no-op. The renderer's
+//  500ms debounce already limits the rate, but as the transcript
+//  grows ("what tabs", "what tabs in AWS", "what tabs in AWS Glue"),
+//  multiple slightly-different queries fire. We dedup at the exact-
+//  query level — partial overlaps still fire because their fingerprints
+//  differ (and they probably reach different docs pages anyway, so the
+//  page cache picks them up).
+//
+//  Rate limiting: relies on the global aiLimiter middleware
+//  (90/min/user). No separate bucket — keeping it simple.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Dedup map: normalized-query → last-fired-at. 30s TTL.
+const PREFETCH_DEDUP_TTL_MS = 30_000;
+const _prefetchDedup = new Map();
+
+function _shouldDedupPrefetch(transcript) {
+  const key = String(transcript || '').trim().toLowerCase().slice(0, 500);
+  if (!key) return true;
+  const now = Date.now();
+  const last = _prefetchDedup.get(key);
+  if (last && now - last < PREFETCH_DEDUP_TTL_MS) return true;
+  _prefetchDedup.set(key, now);
+  // Periodic cleanup so the map doesn't grow unbounded across long sessions.
+  if (_prefetchDedup.size > 1000) {
+    const cutoff = now - PREFETCH_DEDUP_TTL_MS;
+    for (const [k, ts] of _prefetchDedup) {
+      if (ts < cutoff) _prefetchDedup.delete(k);
+    }
+  }
+  return false;
+}
+
+router.post('/prefetch-context', async (req, res) => {
+  const { transcript } = req.body || {};
+  if (!transcript || typeof transcript !== 'string' || transcript.length < 10) {
+    return res.status(400).json({ error: 'transcript required (min 10 chars)' });
+  }
+
+  // Dedup: don't refire the exact same query inside 30s.
+  if (_shouldDedupPrefetch(transcript)) {
+    return res.status(202).json({ ok: true, deduped: true });
+  }
+
+  // 202 IMMEDIATELY — caller never blocks on retrieval. The work
+  // continues in the event loop; cache writes happen as side effects.
+  res.status(202).json({ ok: true, queued: true });
+
+  // Fire-and-forget. We don't await this — the response is already
+  // sent, but the promise continues executing until enrichTranscript
+  // finishes (Brave search + page fetch + cache writes).
+  const requestId = req.headers['x-request-id'] || `pf-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  Promise.resolve().then(() => enrichTranscript(transcript))
+    .then(result => {
+      if (!result) return;
+      const dfLen = result.deepFetch?.contentLength || 0;
+      const tag = result.cached ? (result.stale ? 'stale-cache' : 'cache-hit') : 'fresh';
+      const preview = String(transcript || '').slice(0, 60).replace(/\s+/g, ' ');
+      console.log(`[prefetch] ${tag} deep=${dfLen}ch authority=${result.authority || '-'} "${preview}" req=${requestId} user=${req.user?.id || '-'}`);
+    })
+    .catch(err => {
+      console.warn(`[prefetch] enrich failed req=${requestId}:`, err && err.message);
+    });
+});
+
+// Test hook — exposes the dedup helper so test code can reset state
+// between cases. Only used by Vitest.
+function _resetPrefetchDedup() { _prefetchDedup.clear(); }
+
 // ── Gemini ──
-router.post('/chat/gemini', async (req, res) => {
+router.post('/chat/gemini', geminiQuotaGate, async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Gemini not configured' });
 
   try {
     const { prompt, systemInstruction, history, fileParts } = req.body;
+    const fresh = await tryEnrich(prompt, req.headers['x-request-id']);
+    const enrichedSystem = prependFreshToSystem(systemInstruction, fresh?.context);
 
     const { GoogleGenAI } = require('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
@@ -42,13 +291,17 @@ router.post('/chat/gemini', async (req, res) => {
       model: 'gemini-3-flash-preview',
       contents: [{ role: 'user', parts }],
       config: {
-        systemInstruction: systemInstruction || '',
+        systemInstruction: enrichedSystem || '',
         temperature: 0.7,
       }
     });
 
     res.json({ text: response.text || '' });
   } catch (err) {
+    if (is429(err)) {
+      console.warn('[gemini] upstream 429:', err.message);
+      return res.status(429).json(rateLimitedJson('Gemini'));
+    }
     console.error('Gemini proxy error:', err.message);
     res.status(500).json({ error: 'AI request failed', detail: err.message });
   }
@@ -74,35 +327,150 @@ router.post('/chat/gemini', async (req, res) => {
 
 // Allowed values for the chat.completions API on gpt-5.5. 'xhigh' is
 // supported by the model but intentionally not exposed to clients —
-// avoids surprise bills if a UI bug ever sent it.
-const ALLOWED_REASONING_EFFORTS = ['none', 'low', 'medium', 'high'];
+// avoids surprise bills if a UI bug ever sent it. 'auto' is a special
+// pseudo-value that triggers question-shape-based effort selection
+// (coding→low, system design→medium, etc.); it never reaches OpenAI.
+const ALLOWED_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'auto'];
+
+// Auto-effort mapping: question category → reasoning_effort value.
+// EVERYTHING DEFAULTS TO 'none'. Rationale: the Brave-backed fresh-context
+// retrieval already supplies the model with grounded, current evidence
+// for the question shapes that previously benefited from extra reasoning
+// (system design, ML, case/strategy — all the analytical categories).
+// Once the model has authoritative source content in its prompt, extra
+// reasoning_effort buys very little quality and costs material latency
+// (+5-15s on hard categories with 'medium'). Speed wins.
+//
+// The mapping stays as a Map (not a constant 'none') so a future
+// per-category bump is a one-line change if we ever decide a specific
+// shape benefits from reasoning that fresh-context can't provide.
+//
+// Users who explicitly want 'low' / 'medium' / 'high' can still pick
+// those manually from the reasoning-effort dial — we honor explicit
+// choice and only auto-pick when the client sends 'auto' or no value.
+const AUTO_EFFORT_BY_CATEGORY = {
+  coding:         'none',
+  system_design:  'none',  // Brave fresh-context covers the trade-off depth
+  ml_data:        'none',  // Brave fresh-context covers the model-choice depth
+  quantitative:   'none',
+  strategy_case:  'none',  // Brave fresh-context covers recent business signals
+  behavioral:     'none',
+  concept:        'none',
+  clarifier:      'none',
+  other:          'none',
+};
+
+const { classifyQuestion } = require('../services/questionClassifier');
 
 // Single source of truth for tier-gating + validation. Returns the
 // effort string to pass to OpenAI. Non-Max tiers always get 'none'
 // regardless of what the client sent — defense in depth, since the
 // client UI also locks the bar but a tampered client could bypass it.
 //
-// Default fallback is 'none' — matches the new product policy: every
-// non-Max tier is locked to 'none' anyway, and Max users on the new
-// client always send an explicit value. An old client that doesn't
-// send the field at all (3.4.6 and earlier) deliberately gets 'none' so
-// the new "instant first-response" baseline applies uniformly across
-// the user base — Max users on old clients briefly see this until they
-// update; they've never had reasoning-effort control before, so this
-// is a product decision, not a regression.
-function resolveReasoningEffort(req) {
-  const requested = (req.body && typeof req.body.reasoning_effort === 'string')
+// `transcript` (optional) — when client sends `reasoning_effort: 'auto'`
+// (or doesn't send the field), we classify the transcript and pick the
+// effort level that matches the question's analytical depth. This lets
+// Max-tier users keep the effort dial set to "auto" and trust the server
+// to pick "low" for a coding question vs "medium" for a system design.
+function resolveReasoningEffort(req, transcript) {
+  const raw = (req.body && typeof req.body.reasoning_effort === 'string')
     ? req.body.reasoning_effort
-    : 'none';
-  const validated = ALLOWED_REASONING_EFFORTS.includes(requested) ? requested : 'none';
-  // req.license.tier is set by requireTier middleware (mirrors the live
-  // license row, not the JWT — handles tier upgrades that landed after
-  // login without forcing re-auth).
+    : 'auto';  // pre-existing clients that don't send the field now opt INTO auto;
+               // explicit 'none' from clients still works (validated below)
+  const requested = ALLOWED_REASONING_EFFORTS.includes(raw) ? raw : 'auto';
+
+  // Auto mode: classify the transcript and map category → effort.
+  let validated;
+  if (requested === 'auto') {
+    const t = transcript || (Array.isArray(req.body?.messages)
+      ? lastUserMessage(req.body.messages) : '');
+    const { category } = classifyQuestion(t);
+    validated = AUTO_EFFORT_BY_CATEGORY[category] || 'low';
+  } else {
+    validated = requested;
+  }
+
+  // Tier gate: non-Max users always get 'none' (cost control — high
+  // reasoning_effort is ~5x the per-call cost). Auto-classification
+  // for non-Max users still runs but is silently downgraded here.
   const tier = req.license?.tier || 'free';
   if (tier !== 'max' && validated !== 'none') {
     return 'none';
   }
   return validated;
+}
+
+// ─────────────────────────────────────────────────────────────
+// DYNAMIC max_tokens SCALING for user custom instructions
+//
+// User direction (2026-05-08): "if they give the instructions as
+// STAR method, that will potentially require more tokens; in that
+// case tokens limit must be increased and burn them. customer
+// satisfaction not the tokens."
+//
+// Custom instructions arrive embedded inside the system prompt
+// (the client's getCustomInstructionsBlock prepends them to the
+// rest of the system text). We scan that text for keywords that
+// imply long-form responses and scale max_tokens accordingly,
+// capped at each provider's hard ceiling so we never request
+// beyond what the API will accept. The keyword set is conservative
+// — false positives just allocate extra TPM headroom (which is
+// cheap; the API only bills actual generated tokens), false
+// negatives truncate STAR-method answers mid-sentence (the bug
+// we're fixing).
+//
+// Provider hard caps as of 2026-05:
+//   OpenAI gpt-5.5            16,384 max_completion_tokens
+//   Anthropic Sonnet 4.6      64,000 max_tokens
+//   xAI grok-4-1-fast         8,000 max_tokens (model-specific)
+//   Groq openai/gpt-oss-120b  8,192 max_tokens
+//   Gemini 3-flash-preview    8,192 maxOutputTokens (SDK default)
+// ─────────────────────────────────────────────────────────────
+
+function extractSystemText(messages) {
+  if (!Array.isArray(messages)) return '';
+  const sys = messages.find(m => m && m.role === 'system');
+  if (!sys) return '';
+  if (typeof sys.content === 'string') return sys.content;
+  if (Array.isArray(sys.content)) {
+    return sys.content
+      .map(p => (typeof p === 'string' ? p : (p && typeof p.text === 'string' ? p.text : '')))
+      .join('\n');
+  }
+  return '';
+}
+
+function scaleTokensForInstructions(systemText, baseMax, hardCap) {
+  if (!systemText || typeof systemText !== 'string') return Math.min(baseMax, hardCap);
+  // Only the user-instructions block is worth scanning — but it lives
+  // inside the same systemText so a regex sweep is fine. We lowercase
+  // once so each .test() below doesn't re-lowercase the whole prompt.
+  const text = systemText.toLowerCase();
+  let multiplier = 1.0;
+  // Strong: STAR-method behavioral answers expand to 800-1500 tokens
+  // (situation + task + action + result, with detail in each).
+  if (/\bstar\s*method\b|situation[\s\S]{0,400}?action[\s\S]{0,400}?result/.test(text)) {
+    multiplier = Math.max(multiplier, 2.0);
+  }
+  // Moderate-strong: "detailed/comprehensive/thorough" responses tend
+  // to run 1.5-1.8x baseline length.
+  if (/\bdetailed\b|\bcomprehensive\b|\bin[\s-]depth\b|\bthorough\b/.test(text)) {
+    multiplier = Math.max(multiplier, 1.6);
+  }
+  // Moderate: step-by-step explanations.
+  if (/\bstep[\s-]by[\s-]step\b/.test(text)) {
+    multiplier = Math.max(multiplier, 1.6);
+  }
+  // Moderate: code-example requests (system design + code = long).
+  if (/\bcode\s+example|with\s+code|include\s+code|long\s+code|full\s+implementation/.test(text)) {
+    multiplier = Math.max(multiplier, 1.5);
+  }
+  // Counter-signal: explicit "tight" instructions cap us at baseline,
+  // so we don't over-allocate when the user explicitly wants brevity.
+  if (/\bunder\s+\d+\s+words\b|\bbrief\b|\bconcise\b|\bterse\b|\bshort\s+answer\b/.test(text)) {
+    multiplier = Math.min(multiplier, 1.0);
+  }
+  return Math.min(Math.round(baseMax * multiplier), hardCap);
 }
 
 router.post('/chat/openai', requireTier(...PAID), async (req, res) => {
@@ -111,19 +479,34 @@ router.post('/chat/openai', requireTier(...PAID), async (req, res) => {
 
   try {
     const { messages } = req.body;
+    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
+    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+
     const reasoningEffort = resolveReasoningEffort(req);
     const OpenAI = require('openai');
     const openai = new OpenAI({ apiKey });
 
+    // Match the stream route's scaling — non-streaming chat path needs
+    // the same custom-instruction-aware token budget so STAR / detailed
+    // responses don't truncate at the base limit when this endpoint is
+    // the one in use (e.g., generateConversationTitle, generateOpenAI
+    // helpers, prewarm flows).
+    const sysText = extractSystemText(enrichedMessages);
+    const maxTokens = scaleTokensForInstructions(sysText, 16000, 16384);
+
     const completion = await openai.chat.completions.create({
       model: 'gpt-5.5',
-      messages,
-      max_completion_tokens: 16000,
+      messages: enrichedMessages,
+      max_completion_tokens: maxTokens,
       reasoning_effort: reasoningEffort,
     });
 
     res.json({ text: completion.choices[0]?.message?.content || '' });
   } catch (err) {
+    if (is429(err)) {
+      console.warn('[openai] upstream 429:', err.message);
+      return res.status(429).json(rateLimitedJson('OpenAI'));
+    }
     console.error('OpenAI proxy error:', err.message);
     res.status(500).json({ error: 'AI request failed', detail: err.message });
   }
@@ -136,41 +519,80 @@ router.post('/chat/xai', requireTier(...PAID), async (req, res) => {
 
   try {
     const { messages } = req.body;
+    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
+    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+
     const OpenAI = require('openai');
     const client = new OpenAI({ apiKey, baseURL: 'https://api.x.ai/v1' });
 
+    // Match the stream-route bump: 1,600 was a leftover from the
+    // fast-response experiment and truncated long answers; 8,000
+    // baseline is the new floor with scaling on top.
+    const sysText = extractSystemText(enrichedMessages);
+    const maxTokens = scaleTokensForInstructions(sysText, 8000, 8000);
+
     const completion = await client.chat.completions.create({
       model: 'grok-4-1-fast-non-reasoning',
-      messages,
-      max_tokens: 1600,
+      messages: enrichedMessages,
+      max_tokens: maxTokens,
       temperature: 0.7,
     });
 
     res.json({ text: completion.choices[0]?.message?.content || '' });
   } catch (err) {
+    if (is429(err)) {
+      console.warn('[xai] upstream 429:', err.message);
+      return res.status(429).json(rateLimitedJson('Grok'));
+    }
     console.error('xAI proxy error:', err.message);
     res.status(500).json({ error: 'AI request failed', detail: err.message });
   }
 });
 
 // ── Groq ──
+// Upgraded May 2026 from Llama-4-Scout-17B to GPT-OSS-120B:
+//   - 7x parameter count (17B → 120B) closes the quality gap with the
+//     other chat models (Sonnet, GPT-5.5, Gemini 3 Flash). Scout-17B
+//     was structurally too small to follow the senior-instinct prompt
+//     reliably — it would give junior-shaped answers despite the
+//     prompt asking for non-obvious trade-offs and edge-case naming.
+//   - GPT-OSS-120B has reasoning capabilities AND is faster on Groq's
+//     hardware (500 t/sec vs Scout's slower throughput).
+//   - Verified via console.groq.com/docs/models on the day of upgrade.
+//     Production-grade, not preview.
+//   - max_tokens added explicitly: Groq's default for Scout was small
+//     and was likely truncating long answers. 8000 covers any realistic
+//     interview answer with margin.
 router.post('/chat/groq', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Groq not configured' });
 
   try {
     const { messages } = req.body;
+    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
+    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+
     const Groq = require('groq-sdk');
     const groq = new Groq({ apiKey });
 
+    // Mirror the stream-route scaling — keeps chat + stream parity for
+    // STAR / detailed custom-instruction users hitting this path.
+    const sysText = extractSystemText(enrichedMessages);
+    const maxTokens = scaleTokensForInstructions(sysText, 8000, 8192);
+
     const completion = await groq.chat.completions.create({
-      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-      messages,
+      model: 'openai/gpt-oss-120b',
+      messages: enrichedMessages,
+      max_tokens: maxTokens,
       temperature: 0.7,
     });
 
     res.json({ text: completion.choices[0]?.message?.content || '' });
   } catch (err) {
+    if (is429(err)) {
+      console.warn('[groq] upstream 429:', err.message);
+      return res.status(429).json(rateLimitedJson('Groq'));
+    }
     console.error('Groq proxy error:', err.message);
     res.status(500).json({ error: 'AI request failed', detail: err.message });
   }
@@ -203,6 +625,9 @@ router.post('/chat/claude', requireTier(...MAX_ONLY), async (req, res) => {
 
   try {
     const { messages, systemInstruction, enableWebSearch } = req.body;
+    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
+    const enrichedSystem = prependFreshToSystem(systemInstruction, fresh?.context);
+
     const client = new Anthropic({ apiKey });
 
     const tools = [];
@@ -210,13 +635,19 @@ router.post('/chat/claude', requireTier(...MAX_ONLY), async (req, res) => {
       tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 3 });
     }
 
-    const system = systemInstruction
-      ? [{ type: 'text', text: systemInstruction, cache_control: { type: 'ephemeral' } }]
+    const system = enrichedSystem
+      ? [{ type: 'text', text: enrichedSystem, cache_control: { type: 'ephemeral' } }]
       : undefined;
+
+    // Match the stream route — non-streaming chat path also needs
+    // custom-instruction-aware token scaling. Sonnet 4.6 supports
+    // up to 64,000 max_tokens, so STAR / detailed responses can scale
+    // up to 32,000 here without truncation.
+    const maxTokens = scaleTokensForInstructions(enrichedSystem || '', 16000, 64000);
 
     const completion = await client.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 16000,
+      max_tokens: maxTokens,
       system,
       messages,
       tools: tools.length ? tools : undefined,
@@ -234,6 +665,10 @@ router.post('/chat/claude', requireTier(...MAX_ONLY), async (req, res) => {
 
     res.json({ text });
   } catch (err) {
+    if (is429(err)) {
+      console.warn('[claude] upstream 429:', err.message);
+      return res.status(429).json(rateLimitedJson('Claude'));
+    }
     console.error('Claude proxy error:', err.message);
     res.status(500).json({ error: 'AI request failed', detail: err.message });
   }
@@ -286,13 +721,16 @@ function openSseStream(req, res) {
 }
 
 // ── Gemini (stream) ──
-router.post('/stream/gemini', async (req, res) => {
+router.post('/stream/gemini', geminiQuotaGate, async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Gemini not configured' });
 
   const sse = openSseStream(req, res);
   try {
     const { prompt, systemInstruction, fileParts } = req.body;
+    const fresh = await tryEnrich(prompt, req.headers['x-request-id']);
+    const enrichedSystem = prependFreshToSystem(systemInstruction, fresh?.context);
+
     const { GoogleGenAI } = require('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
 
@@ -306,7 +744,7 @@ router.post('/stream/gemini', async (req, res) => {
       model: 'gemini-3-flash-preview',
       contents: [{ role: 'user', parts }],
       config: {
-        systemInstruction: systemInstruction || '',
+        systemInstruction: enrichedSystem || '',
         temperature: 0.7,
         abortSignal: sse.signal,
       }
@@ -320,6 +758,12 @@ router.post('/stream/gemini', async (req, res) => {
     sse.done();
   } catch (err) {
     if (err?.name === 'AbortError' || sse.closed) { sse.done(); return; }
+    if (is429(err)) {
+      console.warn('[gemini] upstream 429 (stream):', err.message);
+      sse.error('Gemini rate-limited — give it a few seconds and try again.');
+      sse.done();
+      return;
+    }
     console.error('Gemini stream error:', err.message);
     sse.error(err.message || 'AI request failed');
     sse.done();
@@ -338,15 +782,27 @@ router.post('/stream/openai', requireTier(...PAID), async (req, res) => {
   const sse = openSseStream(req, res);
   try {
     const { messages } = req.body;
+    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
+    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+
     const reasoningEffort = resolveReasoningEffort(req);
     const OpenAI = require('openai');
     const openai = new OpenAI({ apiKey });
 
+    // Scale max_completion_tokens based on user custom instructions
+    // embedded in the system prompt (STAR method / detailed / etc.).
+    // Base 16,000 already near gpt-5.5's hard cap of 16,384, so the
+    // scaling is mostly a no-op here — but the helper is still applied
+    // for symmetry with the other 3 stream providers and so future
+    // base bumps automatically respect the cap.
+    const sysText = extractSystemText(enrichedMessages);
+    const maxTokens = scaleTokensForInstructions(sysText, 16000, 16384);
+
     const stream = await openai.chat.completions.create(
       {
         model: 'gpt-5.5',
-        messages,
-        max_completion_tokens: 16000,
+        messages: enrichedMessages,
+        max_completion_tokens: maxTokens,
         reasoning_effort: reasoningEffort,
         stream: true,
       },
@@ -361,6 +817,12 @@ router.post('/stream/openai', requireTier(...PAID), async (req, res) => {
     sse.done();
   } catch (err) {
     if (err?.name === 'AbortError' || sse.closed) { sse.done(); return; }
+    if (is429(err)) {
+      console.warn('[openai] upstream 429 (stream):', err.message);
+      sse.error('OpenAI rate-limited — give it a few seconds and try again.');
+      sse.done();
+      return;
+    }
     console.error('OpenAI stream error:', err.message);
     sse.error(err.message || 'AI request failed');
     sse.done();
@@ -375,14 +837,26 @@ router.post('/stream/xai', requireTier(...PAID), async (req, res) => {
   const sse = openSseStream(req, res);
   try {
     const { messages } = req.body;
+    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
+    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+
     const OpenAI = require('openai');
     const client = new OpenAI({ apiKey, baseURL: 'https://api.x.ai/v1' });
+
+    // xAI baseline bumped from 1,600 (a leftover from the original
+    // fast-response experiment) to 8,000 — the prior cap truncated
+    // every STAR-method or detailed response mid-sentence. STAR
+    // answers run 800-1500 tokens; comprehensive system-design 2-3k.
+    // Scaling on top of the new baseline lets long-form custom
+    // instructions push to the model's hard cap.
+    const sysText = extractSystemText(enrichedMessages);
+    const maxTokens = scaleTokensForInstructions(sysText, 8000, 8000);
 
     const stream = await client.chat.completions.create(
       {
         model: 'grok-4-1-fast-non-reasoning',
-        messages,
-        max_tokens: 1600,
+        messages: enrichedMessages,
+        max_tokens: maxTokens,
         temperature: 0.7,
         stream: true,
       },
@@ -397,6 +871,12 @@ router.post('/stream/xai', requireTier(...PAID), async (req, res) => {
     sse.done();
   } catch (err) {
     if (err?.name === 'AbortError' || sse.closed) { sse.done(); return; }
+    if (is429(err)) {
+      console.warn('[xai] upstream 429 (stream):', err.message);
+      sse.error('Grok rate-limited — give it a few seconds and try again.');
+      sse.done();
+      return;
+    }
     console.error('xAI stream error:', err.message);
     sse.error(err.message || 'AI request failed');
     sse.done();
@@ -404,6 +884,8 @@ router.post('/stream/xai', requireTier(...PAID), async (req, res) => {
 });
 
 // ── Groq (stream) ──
+// Same model upgrade as /chat/groq: Llama-4-Scout-17B → GPT-OSS-120B.
+// See chat handler comment for full rationale.
 router.post('/stream/groq', requireTier(...PAID), async (req, res) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Groq not configured' });
@@ -411,13 +893,23 @@ router.post('/stream/groq', requireTier(...PAID), async (req, res) => {
   const sse = openSseStream(req, res);
   try {
     const { messages } = req.body;
+    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
+    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+
     const Groq = require('groq-sdk');
     const groq = new Groq({ apiKey });
 
+    // Groq base 8,000 with hard cap 8,192 — scaling is mostly a no-op
+    // here (already near cap) but helper is applied for symmetry with
+    // the other providers; long-form custom instructions push to 8,192.
+    const sysText = extractSystemText(enrichedMessages);
+    const maxTokens = scaleTokensForInstructions(sysText, 8000, 8192);
+
     const stream = await groq.chat.completions.create(
       {
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages,
+        model: 'openai/gpt-oss-120b',
+        max_tokens: maxTokens,
+        messages: enrichedMessages,
         temperature: 0.7,
         stream: true,
       },
@@ -432,6 +924,12 @@ router.post('/stream/groq', requireTier(...PAID), async (req, res) => {
     sse.done();
   } catch (err) {
     if (err?.name === 'AbortError' || sse.closed) { sse.done(); return; }
+    if (is429(err)) {
+      console.warn('[groq] upstream 429 (stream):', err.message);
+      sse.error('Groq rate-limited — give it a few seconds and try again.');
+      sse.done();
+      return;
+    }
     console.error('Groq stream error:', err.message);
     sse.error(err.message || 'AI request failed');
     sse.done();
@@ -453,6 +951,9 @@ router.post('/stream/claude', requireTier(...MAX_ONLY), async (req, res) => {
   const sse = openSseStream(req, res);
   try {
     const { messages, systemInstruction, enableWebSearch } = req.body;
+    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
+    const enrichedSystem = prependFreshToSystem(systemInstruction, fresh?.context);
+
     const client = new Anthropic({ apiKey });
 
     const tools = [];
@@ -460,13 +961,21 @@ router.post('/stream/claude', requireTier(...MAX_ONLY), async (req, res) => {
       tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 3 });
     }
 
-    const system = systemInstruction
-      ? [{ type: 'text', text: systemInstruction, cache_control: { type: 'ephemeral' } }]
+    const system = enrichedSystem
+      ? [{ type: 'text', text: enrichedSystem, cache_control: { type: 'ephemeral' } }]
       : undefined;
+
+    // Claude Sonnet 4.6 supports up to 64,000 max_tokens. Base 16,000
+    // is fine for most answers; long-form custom instructions (STAR
+    // method, comprehensive deep-dives) scale up to 32,000+ here.
+    // The systemInstruction is the cached static block, so the user's
+    // custom instructions (prepended to it client-side) get cached
+    // along with it — repeat calls read at 10% input cost.
+    const maxTokens = scaleTokensForInstructions(enrichedSystem || '', 16000, 64000);
 
     const stream = client.messages.stream({
       model: 'claude-sonnet-4-6',
-      max_tokens: 16000,
+      max_tokens: maxTokens,
       system,
       messages,
       tools: tools.length ? tools : undefined,
@@ -485,6 +994,12 @@ router.post('/stream/claude', requireTier(...MAX_ONLY), async (req, res) => {
     sse.done();
   } catch (err) {
     if (err?.name === 'AbortError' || sse.closed) { sse.done(); return; }
+    if (is429(err)) {
+      console.warn('[claude] upstream 429 (stream):', err.message);
+      sse.error('Claude rate-limited — give it a few seconds and try again.');
+      sse.done();
+      return;
+    }
     console.error('Claude stream error:', err.message);
     sse.error(err.message || 'AI request failed');
     sse.done();
@@ -510,6 +1025,101 @@ router.post('/stream/claude', requireTier(...MAX_ONLY), async (req, res) => {
 // JSON plan that the deterministic logic couldn't have produced.
 // Cost: ~$0.005 per call. Latency target: ~500-800ms. Used only for
 // Auto-Type, only on Max-tier (Auto-Type is gated to Max anyway).
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  /autotype-agent — Sonnet 4.6 with tool-use (the "god-level" path)
+//  Replaces the v1 Haiku one-shot at /autotype-plan. Sonnet's chain-
+//  of-thought + tool_use guarantees richer plans for the hard cases
+//  (HackerRank templates, mid-file insertions, partial signatures).
+//  Caller uses this when deterministic UIA confidence < 0.85.
+//  Cost: ~$0.013/call. Max-tier only.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Two-tier planner: Sonnet 4.6 (primary) → Groq Llama-3.3-70B (fallback).
+// Both are AI agents with forced tool_choice, but they run on different
+// vendors so an Anthropic outage doesn't sink Tier 2 entirely. The caller
+// (electron/main.cjs) treats the response as opaque — `planner_used` in
+// the body identifies which vendor served the plan.
+router.post('/autotype-agent', requireTier(...MAX_ONLY), async (req, res) => {
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  const groqKey = process.env.GROQ_API_KEY;
+
+  // Both planners unconfigured — 503 so the caller falls all the way
+  // through to Tier 3 (Haiku) or Tier 4 (OCR). This is the only path
+  // that should hit prod; prod has at minimum ANTHROPIC_API_KEY set.
+  if (!anthropicKey && !groqKey) {
+    return res.status(503).json({ error: 'No planner configured (need ANTHROPIC_API_KEY or GROQ_API_KEY)' });
+  }
+
+  const { editorText, cursorOffset, code, language } = req.body || {};
+  if (typeof code !== 'string' || code.length === 0) {
+    return res.status(400).json({ error: 'code is required' });
+  }
+
+  const requestId = req.headers['x-request-id'] || `at-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  const sharedArgs = {
+    editorText: editorText || '',
+    cursorOffset: cursorOffset || 0,
+    code,
+    language: language || 'unknown',
+    requestId,
+  };
+
+  // ── Primary: Sonnet 4.6 ──
+  // Skipped entirely if ANTHROPIC_API_KEY isn't set (Groq-only deploy).
+  let sonnetErr = null;
+  if (anthropicKey) {
+    try {
+      const { runAutoTypeAgent } = require('../services/autoTypeAgent');
+      const t0 = Date.now();
+      const plan = await runAutoTypeAgent({ ...sharedArgs, apiKey: anthropicKey });
+      const took = Date.now() - t0;
+      console.log(`[autotype-agent] planner=sonnet user=${req.user?.id} took=${took}ms confidence=${plan.confidence} action=${plan.cursor_action} skip=L${plan.skip_leading}/T${plan.skip_trailing} wipe=${plan.wipe_chars}`);
+      return res.json({ ...plan, planner_used: 'sonnet' });
+    } catch (err) {
+      sonnetErr = err;
+      // EMPTY_CODE means the input is bad — Groq can't fix it. Short-
+      // circuit before wasting a Groq call.
+      if (err.code === 'EMPTY_CODE') {
+        return res.status(400).json({ error: 'code is empty' });
+      }
+      console.warn(`[autotype-agent] sonnet failed (code=${err.code || '?'}, msg=${err.message}) — trying Groq fallback`);
+    }
+  }
+
+  // ── Fallback: Groq Llama-3.3-70B ──
+  // Fires when Sonnet threw OR ANTHROPIC_API_KEY wasn't set. If we get
+  // here without GROQ_API_KEY, surface the Sonnet error (or 503 if no
+  // Sonnet attempt was made).
+  if (!groqKey) {
+    if (sonnetErr) {
+      console.error('[autotype-agent] sonnet failed and no Groq fallback configured:', sonnetErr.code || '', sonnetErr.message);
+      if (sonnetErr.code === 'NOT_CONFIGURED') return res.status(503).json({ error: 'Claude not configured' });
+      if (sonnetErr.code === 'NO_TOOL_CALL') return res.status(502).json({ error: 'Agent produced no plan' });
+      return res.status(500).json({ error: 'Agent call failed', detail: sonnetErr.message });
+    }
+    return res.status(503).json({ error: 'No planner configured' });
+  }
+
+  try {
+    const { runGroqAutoTypePlanner } = require('../services/groqAutoTypePlanner');
+    const t0 = Date.now();
+    const plan = await runGroqAutoTypePlanner({ ...sharedArgs, apiKey: groqKey });
+    const took = Date.now() - t0;
+    console.log(`[autotype-agent] planner=groq user=${req.user?.id} took=${took}ms confidence=${plan.confidence} action=${plan.cursor_action} skip=L${plan.skip_leading}/T${plan.skip_trailing} wipe=${plan.wipe_chars}${sonnetErr ? ` (after sonnet ${sonnetErr.code || 'error'})` : ''}`);
+    return res.json({
+      ...plan,
+      planner_used: 'groq',
+      // When we fail-over, surface why so logs (and eventually telemetry)
+      // can attribute Groq usage to the right cause.
+      sonnet_error: sonnetErr ? (sonnetErr.code || sonnetErr.message) : undefined,
+    });
+  } catch (groqErr) {
+    console.error('[autotype-agent] both planners failed:', { sonnet: sonnetErr?.code, groq: groqErr.code || groqErr.message });
+    if (groqErr.code === 'EMPTY_CODE') return res.status(400).json({ error: 'code is empty' });
+    if (groqErr.code === 'NO_TOOL_CALL') return res.status(502).json({ error: 'Both planners produced no plan' });
+    return res.status(502).json({ error: 'Agent call failed (both Sonnet and Groq)', detail: groqErr.message });
+  }
+});
+
 router.post('/autotype-plan', requireTier(...MAX_ONLY), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) {

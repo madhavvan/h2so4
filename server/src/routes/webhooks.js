@@ -92,6 +92,29 @@ function tierForRazorpayPlan(planId) {
   return null;
 }
 
+// ─── Out-of-order delivery gate helper ───────────────────────────────
+// Wraps gateAndRecordEventForUser with consistent logging. Stripe sends
+// event.created in seconds; Razorpay sends body.created_at in seconds.
+// The audit-traced bug: a subscription.updated arriving AFTER
+// subscription.deleted resurrected canceled users (status flipped back
+// to 'active'). Now any handler whose event is older than the latest
+// already-applied event for that user short-circuits silently.
+//
+// Returns true if the handler should proceed, false if it should skip.
+// The gate also UPDATES the per-user last_provider_event_at on accept,
+// so subsequent stale events for the same user are blocked.
+function gateOutOfOrder(userId, eventCreatedSec, eventLabel) {
+  const result = db.gateAndRecordEventForUser(userId, eventCreatedSec);
+  if (!result.accept) {
+    console.log(
+      `[WEBHOOK] Skipping out-of-order ${eventLabel} for user=${userId}: ` +
+      `event.created=${result.eventCreatedSec} < lastSeen=${result.lastSeen}`
+    );
+    return false;
+  }
+  return true;
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  STRIPE WEBHOOK
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -155,6 +178,11 @@ async function handleStripeEvent(event) {
         console.error('[WEBHOOK] Unknown user for checkout session:', email, session.id);
         return;
       }
+      // Out-of-order gate — symmetric with the Razorpay payment.captured
+      // handler. Without this, a stale checkout.session.completed retried
+      // by Stripe after a customer.subscription.deleted would resurrect a
+      // canceled customer's paid tier. (P0-S1 from the global audit.)
+      if (!gateOutOfOrder(user.id, event.created, 'stripe.checkout.session.completed')) return;
 
       // Every non-renewal checkout MUST carry a valid tier in metadata.
       // If neither flag is present, this is a config bug — record it as
@@ -278,6 +306,10 @@ async function handleStripeEvent(event) {
       const d = db.getDB();
       const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
       if (!user) return;
+      // Out-of-order guard: a stale subscription.updated arriving AFTER
+      // subscription.deleted (or after a more recent .updated) used to
+      // resurrect canceled users.
+      if (!gateOutOfOrder(user.id, event.created, 'customer.subscription.updated')) return;
 
       const currentLicense = db.getLicenseByUserId(user.id);
       // If the update event doesn't carry a tier (raw status flips
@@ -297,57 +329,82 @@ async function handleStripeEvent(event) {
 
       console.log('[WEBHOOK] Subscription updated:', customerId, 'tier:', tier, 'status:', subscription.status, 'cancel_at_period_end:', isCanceling);
 
+      // Wrap each multi-step mutation in a SQLite transaction so that a
+      // crash mid-handler (DB lock, disk full, constraint trip) leaves
+      // the user's tier/license rows in a consistent state. Without this,
+      // a partial failure could ship `users.tier='pro'` but `licenses.tier`
+      // unchanged, and the next event would operate on inconsistent state.
+      const sqlite = d;
       if (isActiveOrTrialing && isCanceling) {
         // Cancel-at-period-end: user clicked Cancel but cycle hasn't ended.
         // Status flips to 'canceling' so the client can render an explicit
         // "Cancellation scheduled — access until <date>" banner and offer a
         // Reactivate button. expires_at = current_period_end so the timer
         // is honest about when access actually ends.
-        db.updateUserTier(user.id, grant.tier);
-        db.updateLicenseOnPayment(user.id, {
-          tier: grant.tier,
-          status: 'canceling',
-          expires_at: periodEndMs > 0 ? periodEndMs : grant.expires_at,
-          sessions_limit: grant.sessions_limit,
-        });
+        sqlite.transaction(() => {
+          db.updateUserTier(user.id, grant.tier);
+          db.updateLicenseOnPayment(user.id, {
+            tier: grant.tier,
+            status: 'canceling',
+            expires_at: periodEndMs > 0 ? periodEndMs : grant.expires_at,
+            sessions_limit: grant.sessions_limit,
+          });
+        })();
       } else if (isActiveOrTrialing) {
         // Normal active sub — full grant. Also clears any prior 'canceling'
         // state (covers the case where the user cancels then reactivates
         // via the portal — Stripe flips cancel_at_period_end back to false
         // and we should reflect that locally).
-        db.updateUserTier(user.id, grant.tier);
-        db.updateLicenseOnPayment(user.id, {
-          tier: grant.tier,
-          status: 'active',
-          expires_at: grant.expires_at,
-          sessions_limit: grant.sessions_limit,
-        });
+        sqlite.transaction(() => {
+          db.updateUserTier(user.id, grant.tier);
+          db.updateLicenseOnPayment(user.id, {
+            tier: grant.tier,
+            status: 'active',
+            expires_at: grant.expires_at,
+            sessions_limit: grant.sessions_limit,
+          });
+        })();
       } else if (subscription.status === 'past_due') {
-        // Grace period — Stripe's dunning will retry. Do nothing to the
-        // license until `canceled` or `unpaid` arrives.
+        // Grace period — Stripe's dunning will retry. Surface the past_due
+        // status to the license so the in-app banner can render. The tier
+        // stays the same so the user keeps access during retries (Stripe
+        // dunning runs ~7 days). On retry success or canceled/unpaid we
+        // exit past_due via the corresponding branches above. (P0-S2.)
+        sqlite.transaction(() => {
+          db.updateUserTier(user.id, grant.tier);
+          db.updateLicenseOnPayment(user.id, {
+            tier: grant.tier,
+            status: 'past_due',
+            expires_at: grant.expires_at,
+            sessions_limit: grant.sessions_limit,
+          });
+        })();
         console.log('[WEBHOOK] Subscription past_due for:', user.email);
       } else if (subscription.status === 'paused') {
-        // Stripe collection paused (manual pause via portal/API). Treat as
-        // a soft revoke — user keeps no access while the sub is paused,
-        // but the customer/sub records stay in Stripe so a future resume
-        // restores the relationship without a fresh signup. customer.subscription.resumed
-        // (handled below) flips this back to 'active'.
-        db.updateUserTier(user.id, 'free');
-        db.updateLicenseOnPayment(user.id, {
-          tier: 'free',
-          status: 'paused',
-          expires_at: Date.now(),
-          sessions_limit: 5,
-        });
-        console.log('[WEBHOOK] Subscription paused for:', user.email);
+        // Stripe collection paused (manual pause via portal/API). Mirrors
+        // Razorpay paused: keep the tier on the license so resume can
+        // restore from the same row, but mark status='paused' so the
+        // region/access gates deny while paused. customer.subscription.resumed
+        // flips status back to 'active'. (P1-S6 — fixed asymmetry.)
+        sqlite.transaction(() => {
+          db.updateLicenseOnPayment(user.id, {
+            tier: grant.tier,
+            status: 'paused',
+            expires_at: Date.now(),
+            sessions_limit: grant.sessions_limit,
+          });
+        })();
+        console.log('[WEBHOOK] Subscription paused for:', user.email, '— tier preserved as', grant.tier);
       } else if (['canceled', 'unpaid'].includes(subscription.status)) {
-        db.updateUserTier(user.id, 'free');
-        db.updateLicenseOnPayment(user.id, {
-          tier: 'free',
-          status: 'expired',
-          expires_at: Date.now(),
-          sessions_limit: 5,
-        });
+        sqlite.transaction(() => {
+          db.updateUserTier(user.id, 'free');
+          db.updateLicenseOnPayment(user.id, {
+            tier: 'free',
+            status: 'expired',
+            expires_at: Date.now(),
+            sessions_limit: 5,
+          });
+        })();
       } else if (subscription.status === 'incomplete_expired') {
         // First payment never succeeded; subscription is dead. The user
         // never received a license for this sub, so this is purely a
@@ -366,19 +423,28 @@ async function handleStripeEvent(event) {
 
     case 'customer.subscription.paused': {
       // Dedicated event some Stripe configs send instead of (or alongside)
-      // subscription.updated with status='paused'. Same revoke behavior.
+      // subscription.updated with status='paused'. Mirror the .updated
+      // path: preserve the tier on the license so resume restores from
+      // the same row without losing tier metadata. (P1-S6.)
       const subscription = event.data.object;
+      const tier = resolveTier(subscription.metadata?.tier);
       const d = db.getDB();
       const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(subscription.customer);
       if (!user) return;
-      db.updateUserTier(user.id, 'free');
-      db.updateLicenseOnPayment(user.id, {
-        tier: 'free',
-        status: 'paused',
-        expires_at: Date.now(),
-        sessions_limit: 5,
-      });
-      console.log('[WEBHOOK] customer.subscription.paused for:', user.email);
+      if (!gateOutOfOrder(user.id, event.created, 'customer.subscription.paused')) return;
+      const license = db.getLicenseByUserId(user.id);
+      if (!license) return;
+      const preservedTier = tier || license.tier;
+      const grant = grantConfigForTier(preservedTier);
+      d.transaction(() => {
+        db.updateLicenseOnPayment(user.id, {
+          tier: preservedTier,
+          status: 'paused',
+          expires_at: Date.now(),
+          sessions_limit: grant.sessions_limit,
+        });
+      })();
+      console.log('[WEBHOOK] customer.subscription.paused for:', user.email, '— tier preserved as', preservedTier);
       return;
     }
 
@@ -390,14 +456,17 @@ async function handleStripeEvent(event) {
       const d = db.getDB();
       const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(subscription.customer);
       if (!user || !tier) return;
+      if (!gateOutOfOrder(user.id, event.created, 'customer.subscription.resumed')) return;
       const grant = grantConfigForTier(tier);
-      db.updateUserTier(user.id, grant.tier);
-      db.updateLicenseOnPayment(user.id, {
-        tier: grant.tier,
-        status: 'active',
-        expires_at: grant.expires_at,
-        sessions_limit: grant.sessions_limit,
-      });
+      d.transaction(() => {
+        db.updateUserTier(user.id, grant.tier);
+        db.updateLicenseOnPayment(user.id, {
+          tier: grant.tier,
+          status: 'active',
+          expires_at: grant.expires_at,
+          sessions_limit: grant.sessions_limit,
+        });
+      })();
       console.log('[WEBHOOK] customer.subscription.resumed for:', user.email, 'restored tier:', grant.tier);
       return;
     }
@@ -428,25 +497,28 @@ async function handleStripeEvent(event) {
       const d = db.getDB();
       const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
       if (!user) return;
-      db.updateUserTier(user.id, 'free');
-      db.updateLicenseOnPayment(user.id, {
-        tier: 'free',
-        status: 'expired',
-        expires_at: Date.now(),
-        sessions_limit: 5,
-      });
-      db.recordPayment({
-        user_id: user.id,
-        email: user.email,
-        provider: 'stripe',
-        provider_payment_id: null,
-        provider_subscription_id: subscription.id,
-        amount: 0,
-        currency: 'USD',
-        status: 'cancelled',
-        tier_granted: 'free',
-        metadata: { reason: 'subscription_deleted' },
-      });
+      if (!gateOutOfOrder(user.id, event.created, 'customer.subscription.deleted')) return;
+      d.transaction(() => {
+        db.updateUserTier(user.id, 'free');
+        db.updateLicenseOnPayment(user.id, {
+          tier: 'free',
+          status: 'expired',
+          expires_at: Date.now(),
+          sessions_limit: 5,
+        });
+        db.recordPayment({
+          user_id: user.id,
+          email: user.email,
+          provider: 'stripe',
+          provider_payment_id: null,
+          provider_subscription_id: subscription.id,
+          amount: 0,
+          currency: 'USD',
+          status: 'cancelled',
+          tier_granted: 'free',
+          metadata: { reason: 'subscription_deleted' },
+        });
+      })();
       console.log('[WEBHOOK] User downgraded to free:', user.email);
       return;
     }
@@ -459,6 +531,8 @@ async function handleStripeEvent(event) {
       const d = db.getDB();
       const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
       if (!user) return;
+      // Out-of-order gate, mirrors Razorpay payment.failed (P0-S1 / P0-S2).
+      if (!gateOutOfOrder(user.id, event.created, 'stripe.invoice.payment_failed')) return;
       db.recordPayment({
         user_id: user.id,
         email: user.email,
@@ -471,10 +545,24 @@ async function handleStripeEvent(event) {
         tier_granted: null,
         metadata: { invoice_id: invoice.id },
       });
+      // Flip license to past_due so the in-app dunning banner can fire.
+      // Stripe will auto-retry over the dunning window; a successful
+      // invoice.payment_succeeded or subscription.updated 'active' will
+      // move us back to 'active'. Mirrors the Razorpay payment.failed
+      // handler. (P0-S2 from the global audit.) Only flip if currently
+      // active — never resurrect a canceling/expired/refunded sub.
+      const license = db.getLicenseByUserId(user.id);
+      if (license && license.status === 'active') {
+        db.updateLicenseOnPayment(user.id, {
+          tier: license.tier,
+          status: 'past_due',
+          expires_at: license.expires_at,
+          sessions_limit: license.sessions_limit,
+        });
+      }
       // Best-effort notification — the user's card was declined and
       // Stripe will retry over the dunning window. Telling them now
       // gives them a chance to fix the card before the sub lapses.
-      const license = db.getLicenseByUserId(user.id);
       // Stripe doesn't always populate last_finalization_error on the
       // invoice. When it's absent we fall through to a generic message
       // — the email already explains the common causes.
@@ -518,13 +606,16 @@ async function handleStripeEvent(event) {
       });
 
       if (fullRefund) {
-        db.updateUserTier(user.id, 'free');
-        db.updateLicenseOnPayment(user.id, {
-          tier: 'free',
-          status: 'refunded',
-          expires_at: Date.now(),
-          sessions_limit: 5,
-        });
+        if (!gateOutOfOrder(user.id, event.created, 'charge.refunded.full')) return;
+        d.transaction(() => {
+          db.updateUserTier(user.id, 'free');
+          db.updateLicenseOnPayment(user.id, {
+            tier: 'free',
+            status: 'refunded',
+            expires_at: Date.now(),
+            sessions_limit: 5,
+          });
+        })();
         console.log('[WEBHOOK] Full refund — user downgraded to free:', user.email);
       } else {
         console.log('[WEBHOOK] Partial refund recorded for:', user.email, 'amount:', refundAmount);
@@ -558,29 +649,32 @@ async function handleStripeEvent(event) {
         console.log('[WEBHOOK] charge.dispute.created — could not map to user:', dispute.id);
         return;
       }
-      db.recordPayment({
-        user_id: user.id,
-        email: user.email,
-        provider: 'stripe',
-        provider_payment_id: dispute.charge,
-        provider_subscription_id: null,
-        amount: -(dispute.amount || 0),
-        currency: (dispute.currency || 'usd').toUpperCase(),
-        status: 'disputed',
-        tier_granted: null,
-        metadata: {
-          dispute_id: dispute.id,
-          reason: dispute.reason,
-          status: dispute.status,
-        },
-      });
-      db.updateUserTier(user.id, 'free');
-      db.updateLicenseOnPayment(user.id, {
-        tier: 'free',
-        status: 'disputed',
-        expires_at: Date.now(),
-        sessions_limit: 5,
-      });
+      if (!gateOutOfOrder(user.id, event.created, 'charge.dispute.created')) return;
+      d.transaction(() => {
+        db.recordPayment({
+          user_id: user.id,
+          email: user.email,
+          provider: 'stripe',
+          provider_payment_id: dispute.charge,
+          provider_subscription_id: null,
+          amount: -(dispute.amount || 0),
+          currency: (dispute.currency || 'usd').toUpperCase(),
+          status: 'disputed',
+          tier_granted: null,
+          metadata: {
+            dispute_id: dispute.id,
+            reason: dispute.reason,
+            status: dispute.status,
+          },
+        });
+        db.updateUserTier(user.id, 'free');
+        db.updateLicenseOnPayment(user.id, {
+          tier: 'free',
+          status: 'disputed',
+          expires_at: Date.now(),
+          sessions_limit: 5,
+        });
+      })();
       console.log('[WEBHOOK] Dispute — user downgraded to free:', user.email, 'reason:', dispute.reason);
       return;
     }
@@ -614,11 +708,11 @@ async function handleStripeEvent(event) {
         }
       }
       if (!user) return;
-      // Restore the tier from the user's most recent paid subscription.
-      // We can't read it from the dispute payload directly — query Stripe
-      // for any active subscription on this customer. If they have no
-      // active sub (e.g. it was canceled while disputed), we leave them on
-      // free; they can resubscribe.
+      if (!gateOutOfOrder(user.id, event.created, 'charge.dispute.closed')) return;
+      // Restore the tier from the user's most recent paid subscription
+      // OR Basic one-time purchase. Pre-2026-05 we only checked active
+      // subs — Basic dispute-won users got no restoration even though
+      // their one-time payment was legitimate. (P1-S3 from the audit.)
       let restoredTier = null;
       try {
         const subs = await stripe.subscriptions.list({ customer: dispute.customer || user.stripe_customer_id, status: 'active', limit: 1 });
@@ -628,19 +722,85 @@ async function handleStripeEvent(event) {
       } catch (err) {
         console.error('[WEBHOOK] dispute.closed: could not list subs:', err.message);
       }
+      // Fallback: if no active sub, check for a recent legitimate payment
+      // (Basic one-time, or a sub that's since canceled). The dispute
+      // window is short — typically the disputed charge is the most
+      // recent completed Stripe payment on this user. We guard against
+      // restoring from the disputed payment itself by skipping rows where
+      // status='disputed' (already recorded by .created).
       if (!restoredTier) {
-        console.log('[WEBHOOK] dispute.closed won but no active sub to restore for:', user.email);
+        const recentPay = d.prepare(`
+          SELECT tier_granted FROM payments
+          WHERE user_id = ? AND provider = 'stripe' AND status = 'completed'
+            AND tier_granted IS NOT NULL AND tier_granted != 'free'
+          ORDER BY created_at DESC LIMIT 1
+        `).get(user.id);
+        if (recentPay) restoredTier = resolveTier(recentPay.tier_granted);
+      }
+      if (!restoredTier) {
+        console.log('[WEBHOOK] dispute.closed won but no active sub or recent payment to restore for:', user.email);
         return;
       }
       const grant = grantConfigForTier(restoredTier);
-      db.updateUserTier(user.id, grant.tier);
-      db.updateLicenseOnPayment(user.id, {
-        tier: grant.tier,
-        status: 'active',
-        expires_at: grant.expires_at,
-        sessions_limit: grant.sessions_limit,
-      });
+      d.transaction(() => {
+        db.updateUserTier(user.id, grant.tier);
+        db.updateLicenseOnPayment(user.id, {
+          tier: grant.tier,
+          status: 'active',
+          expires_at: grant.expires_at,
+          sessions_limit: grant.sessions_limit,
+        });
+      })();
       console.log('[WEBHOOK] Dispute won — restored tier for:', user.email, 'tier:', restoredTier);
+      return;
+    }
+
+    case 'payment_intent.payment_failed':
+    case 'charge.failed': {
+      // Failure of a one-time charge — Basic purchase or renewal top-up.
+      // Distinct from invoice.payment_failed which fires for subscription
+      // invoices. Without this handler, failed one-time checkouts produce
+      // no DB row, no email, no admin signal. (P1-S5 from the audit.)
+      const obj = event.data.object;
+      const customerId = obj.customer;
+      // Anonymous / guest checkouts (no customer attached) — no user to
+      // notify. Just log and bail.
+      if (!customerId) {
+        console.log('[WEBHOOK]', event.type, 'with no customer:', obj.id);
+        return;
+      }
+      const d = db.getDB();
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
+      if (!user) {
+        console.log('[WEBHOOK]', event.type, 'for unknown customer:', customerId);
+        return;
+      }
+      if (!gateOutOfOrder(user.id, event.created, `stripe.${event.type}`)) return;
+      db.recordPayment({
+        user_id: user.id,
+        email: user.email,
+        provider: 'stripe',
+        provider_payment_id: obj.id,
+        provider_subscription_id: null,  // one-time, no sub
+        amount: obj.amount || 0,
+        currency: (obj.currency || 'usd').toUpperCase(),
+        status: 'failed',
+        tier_granted: null,
+        metadata: {
+          event: event.type,
+          error_code: obj.last_payment_error?.code || obj.failure_code,
+          error_message: obj.last_payment_error?.message || obj.failure_message,
+        },
+      });
+      // Notify the user — for renewals they need to know to retry, and
+      // for Basic checkouts the charge attempt failed.
+      const license = db.getLicenseByUserId(user.id);
+      await notifyPaymentFailed({
+        user,
+        tier: license?.tier,
+        reason: obj.last_payment_error?.message || obj.failure_message || null,
+      });
+      console.log('[WEBHOOK] One-time payment failed for:', user.email, 'event:', event.type);
       return;
     }
 
@@ -686,13 +846,33 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
   // Razorpay sends x-razorpay-event-id on modern accounts. When absent
   // (older merchant accounts), derive a stable synthetic id from the
   // payload so retries of the same event still collide in the dedup
-  // table. created_at is in the outer body on Razorpay's payload.
+  // table.
+  //
+  // BUG FIX (Task #26): the previous synthetic id included `body.created_at`,
+  // but Razorpay's docs say `created_at` changes per retry on older
+  // accounts — meaning the same business event produced a DIFFERENT
+  // synthetic id on each retry, completely defeating dedup. Drop
+  // created_at from the tuple. The remaining (event + entity_id) tuple is
+  // stable across retries: an `payment.captured` event for `pay_xxx` always
+  // has the same payment.id, and Razorpay never emits two distinct
+  // payment.captured events for the same payment.
   const headerEventId = req.headers['x-razorpay-event-id'];
   const payment = body.payload?.payment?.entity;
   const subscription = body.payload?.subscription?.entity;
   const refund = body.payload?.refund?.entity;
-  const syntheticId = `${body.event || 'unknown'}:${payment?.id || subscription?.id || refund?.id || 'no-id'}:${body.created_at || ''}`;
+  const syntheticId = `${body.event || 'unknown'}:${payment?.id || subscription?.id || refund?.id || 'no-id'}`;
   const eventId = headerEventId || syntheticId;
+
+  // Refuse the dead-id sentinel — if both body.event AND every entity id
+  // are missing, the synthetic id collapses to "unknown:no-id" and would
+  // collide across all such events, silently dropping any future malformed
+  // events as "duplicates" of the first one we ever saw. Without this
+  // guard a single bad payload would poison the dedup table forever.
+  // (P0-C from the audit.)
+  if (!headerEventId && eventId === 'unknown:no-id') {
+    console.error('[RZP WEBHOOK] Refusing event with no x-razorpay-event-id header AND no entity id in payload');
+    return res.status(400).json({ error: 'Missing event id and no entity to derive one from' });
+  }
 
   if (!db.recordWebhookEventOnce(eventId, 'razorpay', body.event)) {
     console.log('[RZP WEBHOOK] Duplicate event skipped:', eventId, body.event);
@@ -737,31 +917,64 @@ async function handleRazorpayEvent(body) {
       }
       const user = db.getUserByEmail(email);
       if (!user) return;
+      if (!gateOutOfOrder(user.id, body.created_at, 'rzp.subscription.charged')) return;
+
+      // First-charge race with /verify-razorpay: both this event AND the
+      // client's success callback can record the same payment.id. Without
+      // a dedup guard here, the second one throws on the UNIQUE
+      // (provider, provider_payment_id) index — handler returns 500 →
+      // Razorpay retries → loops. Mirrors the pattern in payment.captured.
+      // (P1-F from the audit.)
+      if (payment?.id && db.isPaymentAlreadyRecorded(user.id, payment.id)) {
+        console.log('[RZP WEBHOOK] subscription.charged: payment already recorded — skipping:', payment.id);
+        return;
+      }
 
       const grant = grantConfigForTier(tier);
-      db.updateUserTier(user.id, grant.tier);
-      db.updateLicenseOnPayment(user.id, {
-        tier: grant.tier,
-        status: 'active',
-        expires_at: grant.expires_at,
-        sessions_limit: grant.sessions_limit,
-      });
       const d = db.getDB();
-      d.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
-        .run(`rzp_${payment?.id || subscription?.id}`, Date.now(), user.id);
-      db.recordPayment({
-        user_id: user.id,
-        email: user.email,
-        provider: 'razorpay',
-        provider_payment_id: payment?.id,
-        provider_subscription_id: subscription?.id,
-        amount: payment?.amount || 0,
-        currency: payment?.currency?.toUpperCase() || 'INR',
-        status: 'completed',
-        tier_granted: grant.tier,
-        metadata: { event: 'subscription.charged', tier: grant.tier },
-      });
-      console.log('[RZP WEBHOOK] User upgraded to', grant.tier.toUpperCase(), ':', email);
+      let alreadyGranted = false;
+      d.transaction(() => {
+        // In-tx re-check — closes the small window between the pre-check
+        // above and the writes here. Same pattern as payment.captured.
+        if (payment?.id) {
+          const dup = d.prepare(
+            "SELECT id FROM payments WHERE user_id = ? AND provider = 'razorpay' AND provider_payment_id = ? AND status = 'completed' LIMIT 1"
+          ).get(user.id, payment.id);
+          if (dup) { alreadyGranted = true; return; }
+        }
+        db.updateUserTier(user.id, grant.tier);
+        db.updateLicenseOnPayment(user.id, {
+          tier: grant.tier,
+          status: 'active',
+          expires_at: grant.expires_at,
+          sessions_limit: grant.sessions_limit,
+        });
+        // Legacy: prefix-marker in stripe_customer_id for provider detection
+        // (still used by reads that haven't migrated to razorpay_subscription_id).
+        // Prefer subscription.id (stable across renewals) over payment.id
+        // (rolling per-payment) to reduce churn.
+        d.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
+          .run(`rzp_${subscription?.id || payment?.id}`, Date.now(), user.id);
+        // New column: dedicated Razorpay subscription pointer, set once.
+        if (subscription?.id) db.setRazorpaySubscriptionId(user.id, subscription.id);
+        db.recordPayment({
+          user_id: user.id,
+          email: user.email,
+          provider: 'razorpay',
+          provider_payment_id: payment?.id,
+          provider_subscription_id: subscription?.id,
+          amount: payment?.amount || 0,
+          currency: payment?.currency?.toUpperCase() || 'INR',
+          status: 'completed',
+          tier_granted: grant.tier,
+          metadata: { event: 'subscription.charged', tier: grant.tier },
+        });
+      })();
+      if (alreadyGranted) {
+        console.log('[RZP WEBHOOK] subscription.charged: payment already recorded inside tx — /verify-razorpay won the race:', payment?.id);
+      } else {
+        console.log('[RZP WEBHOOK] User upgraded to', grant.tier.toUpperCase(), ':', email);
+      }
       return;
     }
 
@@ -774,29 +987,33 @@ async function handleRazorpayEvent(body) {
       if (!email) return;
       const user = db.getUserByEmail(email);
       if (!user) return;
+      if (!gateOutOfOrder(user.id, body.created_at, `rzp.${event}`)) return;
       // Capture the prior tier BEFORE we wipe the license so the
       // notification email can name the plan that just lapsed.
       const priorLicense = db.getLicenseByUserId(user.id);
       const priorTier = priorLicense?.tier || subscription?.notes?.tier;
-      db.updateUserTier(user.id, 'free');
-      db.updateLicenseOnPayment(user.id, {
-        tier: 'free',
-        status: 'expired',
-        expires_at: Date.now(),
-        sessions_limit: 5,
-      });
-      db.recordPayment({
-        user_id: user.id,
-        email: user.email,
-        provider: 'razorpay',
-        provider_payment_id: null,
-        provider_subscription_id: subscription?.id,
-        amount: 0,
-        currency: 'INR',
-        status: 'cancelled',
-        tier_granted: 'free',
-        metadata: { event, reason: event },
-      });
+      const d = db.getDB();
+      d.transaction(() => {
+        db.updateUserTier(user.id, 'free');
+        db.updateLicenseOnPayment(user.id, {
+          tier: 'free',
+          status: 'expired',
+          expires_at: Date.now(),
+          sessions_limit: 5,
+        });
+        db.recordPayment({
+          user_id: user.id,
+          email: user.email,
+          provider: 'razorpay',
+          provider_payment_id: null,
+          provider_subscription_id: subscription?.id,
+          amount: 0,
+          currency: 'INR',
+          status: 'cancelled',
+          tier_granted: 'free',
+          metadata: { event, reason: event },
+        });
+      })();
       console.log('[RZP WEBHOOK] User downgraded to free:', email);
 
       // Razorpay halts a subscription only after several failed
@@ -833,6 +1050,12 @@ async function handleRazorpayEvent(body) {
       }
       const user = db.getUserByEmail(email);
       if (!user) return;
+      // Out-of-order gate — without this, a stale payment.captured (Razorpay
+      // retries up to 24h on 5xx) arriving AFTER subscription.cancelled
+      // would re-grant Pro/Max to a canceled customer. Every other Razorpay
+      // mutating handler runs this check; payment.captured was the
+      // exception. (P0-B from the audit.)
+      if (!gateOutOfOrder(user.id, body.created_at, 'rzp.payment.captured')) return;
 
       // Race with /verify-razorpay: both this webhook and the client's
       // success callback record a completed payment AND grant the same
@@ -912,6 +1135,11 @@ async function handleRazorpayEvent(body) {
       if (!email) return;
       const user = db.getUserByEmail(email);
       if (!user) return;
+      // Out-of-order gate matches the other mutating handlers (P0-B).
+      // payment.failed is bookkeeping + notification, but a stale failed
+      // event arriving after a successful retry would still send a
+      // misleading "your payment failed" email.
+      if (!gateOutOfOrder(user.id, body.created_at, 'rzp.payment.failed')) return;
       db.recordPayment({
         user_id: user.id,
         email: user.email,
@@ -924,10 +1152,22 @@ async function handleRazorpayEvent(body) {
         tier_granted: null,
         metadata: { event: 'payment.failed', error_code: payment?.error_code },
       });
+      // Flip license to past_due so the in-app banner fires before the
+      // user sees a halt. Razorpay will retry the charge automatically;
+      // a successful subscription.charged or payment.captured will move
+      // us back to 'active'. (P1-D from the audit.)
+      const license = db.getLicenseByUserId(user.id);
+      if (license && license.status === 'active') {
+        db.updateLicenseOnPayment(user.id, {
+          tier: license.tier,
+          status: 'past_due',
+          expires_at: license.expires_at,
+          sessions_limit: license.sessions_limit,
+        });
+      }
       // Razorpay's error_description is the user-friendly string
       // (e.g. "Your card was declined by the bank"). error_code is a
       // machine token like BAD_REQUEST_ERROR — not useful in an email.
-      const license = db.getLicenseByUserId(user.id);
       const reason = payment?.error_description || null;
       await notifyPaymentFailed({
         user,
@@ -961,37 +1201,180 @@ async function handleRazorpayEvent(body) {
       }
       const user = db.getUserById(priorPayment.user_id);
       if (!user) return;
+      if (!gateOutOfOrder(user.id, body.created_at, `rzp.${event}`)) return;
       const refundAmount = refund?.amount || 0;
       const fullRefund = refundAmount >= priorPayment.amount;
-      db.recordPayment({
-        user_id: user.id,
-        email: user.email,
-        provider: 'razorpay',
-        provider_payment_id: paymentId,
-        provider_subscription_id: priorPayment.provider_subscription_id,
-        amount: -refundAmount,
-        currency: (refund?.currency || priorPayment.currency || 'INR').toUpperCase(),
-        status: 'refunded',
-        tier_granted: null,
-        metadata: {
-          refund_id: refund?.id,
-          event,
-          full_refund: fullRefund,
-          original_payment_id: paymentId,
-        },
-      });
-      if (fullRefund) {
-        db.updateUserTier(user.id, 'free');
-        db.updateLicenseOnPayment(user.id, {
-          tier: 'free',
+      d.transaction(() => {
+        db.recordPayment({
+          user_id: user.id,
+          email: user.email,
+          provider: 'razorpay',
+          provider_payment_id: paymentId,
+          provider_subscription_id: priorPayment.provider_subscription_id,
+          amount: -refundAmount,
+          currency: (refund?.currency || priorPayment.currency || 'INR').toUpperCase(),
           status: 'refunded',
-          expires_at: Date.now(),
-          sessions_limit: 5,
+          tier_granted: null,
+          metadata: {
+            refund_id: refund?.id,
+            event,
+            full_refund: fullRefund,
+            original_payment_id: paymentId,
+          },
         });
+        if (fullRefund) {
+          db.updateUserTier(user.id, 'free');
+          db.updateLicenseOnPayment(user.id, {
+            tier: 'free',
+            status: 'refunded',
+            expires_at: Date.now(),
+            sessions_limit: 5,
+          });
+        }
+      })();
+      if (fullRefund) {
         console.log('[RZP WEBHOOK] Full refund — user downgraded to free:', user.email);
       } else {
         console.log('[RZP WEBHOOK] Partial refund recorded for:', user.email, 'amount:', refundAmount);
       }
+      return;
+    }
+
+    case 'subscription.completed': {
+      // Razorpay fires this when a subscription naturally completes its
+      // total_count of cycles (we set total_count: 12 at creation, so this
+      // fires after 12 successful charges — i.e. after a full year on
+      // monthly billing). The subscription enters status='completed' on
+      // Razorpay's side; our license must mirror that or the user keeps
+      // Pro/Max for free indefinitely. (P1-B from the audit.)
+      const subscription = payload.subscription?.entity;
+      const email = subscription?.notes?.user_email;
+      console.log('[RZP WEBHOOK] Subscription completed (12-cycle natural end):', email);
+
+      if (!email) return;
+      const user = db.getUserByEmail(email);
+      if (!user) return;
+      if (!gateOutOfOrder(user.id, body.created_at, 'rzp.subscription.completed')) return;
+      const d = db.getDB();
+      d.transaction(() => {
+        db.updateUserTier(user.id, 'free');
+        db.updateLicenseOnPayment(user.id, {
+          tier: 'free',
+          status: 'expired',
+          expires_at: Date.now(),
+          sessions_limit: 5,
+        });
+        db.recordPayment({
+          user_id: user.id,
+          email: user.email,
+          provider: 'razorpay',
+          provider_payment_id: null,
+          provider_subscription_id: subscription?.id,
+          amount: 0,
+          currency: 'INR',
+          status: 'completed_naturally',
+          tier_granted: 'free',
+          metadata: { event: 'subscription.completed', reason: 'natural_end_of_total_count' },
+        });
+      })();
+      console.log('[RZP WEBHOOK] User downgraded to free after natural end-of-subscription:', email);
+      return;
+    }
+
+    case 'subscription.updated': {
+      // Fires when the subscription's plan_id changes — e.g. after our
+      // /upgrade-tier route schedules a Max→Pro downgrade for cycle_end.
+      // Razorpay applies the change and emits subscription.updated.
+      // Without handling this, the local tier stays on the OLD value
+      // until the next subscription.charged tick, which can be days
+      // away — UI shows wrong tier in that window. (P1-C from the audit.)
+      const subscription = payload.subscription?.entity;
+      const email = subscription?.notes?.user_email;
+      const newPlanId = subscription?.plan_id;
+      const newTier = tierForRazorpayPlan(newPlanId);
+      console.log('[RZP WEBHOOK] Subscription updated:', email, 'new plan_id:', newPlanId, 'tier:', newTier);
+
+      if (!email || !newTier) return;  // unknown plan — let next charge resolve it
+      const user = db.getUserByEmail(email);
+      if (!user) return;
+      if (!gateOutOfOrder(user.id, body.created_at, 'rzp.subscription.updated')) return;
+      const license = db.getLicenseByUserId(user.id);
+      if (!license) return;
+      // Only update if the tier actually changed — Razorpay also fires
+      // subscription.updated for non-tier mutations (e.g. quantity).
+      if (license.tier === newTier) {
+        console.log('[RZP WEBHOOK] subscription.updated: tier unchanged, no-op');
+        return;
+      }
+      const grant = grantConfigForTier(newTier);
+      db.updateUserTier(user.id, grant.tier);
+      db.updateLicenseOnPayment(user.id, {
+        tier: grant.tier,
+        // Preserve current status/expires_at — this isn't a fresh charge,
+        // just a tier swap mid-cycle. Next subscription.charged will
+        // refresh expires_at on the new plan's billing tick.
+        status: license.status === 'past_due' ? 'past_due' : 'active',
+        expires_at: license.expires_at,
+        sessions_limit: grant.sessions_limit,
+      });
+      console.log('[RZP WEBHOOK] Subscription plan swap applied:', email, license.tier, '→', grant.tier);
+      return;
+    }
+
+    case 'subscription.paused': {
+      // Razorpay supports merchant- or user-initiated pauses. A paused
+      // sub doesn't bill but also shouldn't grant tier access. Mirror
+      // 'cancelled' semantics but with status='paused' so a future
+      // 'subscription.resumed' can restore.
+      const subscription = payload.subscription?.entity;
+      const email = subscription?.notes?.user_email;
+      console.log('[RZP WEBHOOK] Subscription paused:', email);
+      if (!email) return;
+      const user = db.getUserByEmail(email);
+      if (!user) return;
+      if (!gateOutOfOrder(user.id, body.created_at, 'rzp.subscription.paused')) return;
+      const license = db.getLicenseByUserId(user.id);
+      if (!license) return;
+      db.updateLicenseOnPayment(user.id, {
+        tier: license.tier,
+        status: 'paused',
+        expires_at: Date.now(),
+        sessions_limit: license.sessions_limit,
+      });
+      return;
+    }
+
+    case 'subscription.resumed': {
+      const subscription = payload.subscription?.entity;
+      const email = subscription?.notes?.user_email;
+      const planTier = tierForRazorpayPlan(subscription?.plan_id);
+      const tier = resolveTier(planTier || subscription?.notes?.tier);
+      console.log('[RZP WEBHOOK] Subscription resumed:', email, 'tier:', tier);
+      if (!email || !tier) return;
+      const user = db.getUserByEmail(email);
+      if (!user) return;
+      if (!gateOutOfOrder(user.id, body.created_at, 'rzp.subscription.resumed')) return;
+      const grant = grantConfigForTier(tier);
+      db.updateUserTier(user.id, grant.tier);
+      db.updateLicenseOnPayment(user.id, {
+        tier: grant.tier,
+        status: 'active',
+        expires_at: grant.expires_at,
+        sessions_limit: grant.sessions_limit,
+      });
+      return;
+    }
+
+    case 'subscription.activated':
+    case 'subscription.authenticated':
+    case 'subscription.pending': {
+      // Audit-trail-only events. The first tier grant lands via
+      // subscription.charged or payment.captured (whichever Razorpay
+      // emits first). Logging these gives operators visibility into
+      // the lifecycle without mutating local state.
+      const subscription = payload.subscription?.entity;
+      const email = subscription?.notes?.user_email;
+      console.log(`[RZP WEBHOOK] ${event}:`, email, 'sub:', subscription?.id);
       return;
     }
 
@@ -1001,3 +1384,14 @@ async function handleRazorpayEvent(body) {
 }
 
 module.exports = router;
+// Internals exposed for unit tests only — the production code path
+// always uses the route handlers above.
+module.exports._test = {
+  handleRazorpayEvent,
+  handleStripeEvent,
+  gateOutOfOrder,
+  tierForRazorpayPlan,
+  resolveTier,
+  grantConfigForTier,
+  VALID_TIERS,
+};

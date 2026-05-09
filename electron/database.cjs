@@ -164,18 +164,39 @@ function deleteSession(sessionId, userId) {
   return { ok: true, newActiveSession: fresh };
 }
 
+// ── Ownership helpers ──
+// Cheap session-ownership check used by every per-session operation that
+// accepts userId from the renderer. Until v3.4.10 the message + context-
+// file IPC handlers accepted only sessionId, which meant a renderer XSS
+// could read or write any session by guessing IDs (they're timestamp-
+// based, hence guessable). All affected paths now pass userId and we
+// verify ownership at the SQL layer before touching child rows. Returns
+// true if the session belongs to the user, false otherwise. A null
+// userId fails closed — better to surface a "not signed in" error than
+// to grant cross-user access by default.
+function _ownsSession(sessionId, userId) {
+  if (!sessionId || !userId) return false;
+  const row = getDB()
+    .prepare('SELECT id FROM sessions WHERE id = ? AND user_id = ?')
+    .get(sessionId, userId);
+  return !!row;
+}
+
 // ── Message operations ──
 
-function getMessages(sessionId) {
+function getMessages(sessionId, userId) {
+  if (!_ownsSession(sessionId, userId)) return [];
   return getDB()
     .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC')
     .all(sessionId);
 }
 
-function addMessage(sessionId, message) {
+function addMessage(sessionId, message, userId) {
+  if (!_ownsSession(sessionId, userId)) return false;
   const d = getDB();
   d.prepare('INSERT OR REPLACE INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)')
     .run(message.id, sessionId, message.role, message.content, message.timestamp);
+  return true;
 
   // Title generation moved to the renderer (generateConversationTitle in
   // aiProxyService.ts) which fires an LLM-backed summary after the first
@@ -187,13 +208,16 @@ function addMessage(sessionId, message) {
   // lands; the renderer overwrites it once it has the topic.
 }
 
-function clearMessages(sessionId) {
+function clearMessages(sessionId, userId) {
+  if (!_ownsSession(sessionId, userId)) return false;
   getDB().prepare('DELETE FROM messages WHERE session_id = ?').run(sessionId);
+  return true;
 }
 
 // ── Context file operations ──
 
-function getContextFiles(sessionId) {
+function getContextFiles(sessionId, userId) {
+  if (!_ownsSession(sessionId, userId)) return [];
   return getDB()
     .prepare('SELECT * FROM context_files WHERE session_id = ? ORDER BY rowid ASC')
     .all(sessionId)
@@ -207,18 +231,34 @@ function getContextFiles(sessionId) {
     }));
 }
 
-function addContextFile(sessionId, file) {
+function addContextFile(sessionId, file, userId) {
+  if (!_ownsSession(sessionId, userId)) return false;
   getDB()
     .prepare('INSERT OR REPLACE INTO context_files (id, session_id, name, content, type, mime_type, base64) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(file.id, sessionId, file.name, file.content, file.type, file.mimeType || null, file.base64 || null);
+  return true;
 }
 
-function removeContextFile(fileId) {
-  getDB().prepare('DELETE FROM context_files WHERE id = ?').run(fileId);
+function removeContextFile(fileId, userId) {
+  // Resolve the file's parent session and check ownership before delete.
+  // Without the join, a guessed fileId could delete any user's file.
+  if (!fileId || !userId) return false;
+  const d = getDB();
+  const row = d.prepare(`
+    SELECT cf.id
+      FROM context_files cf
+      JOIN sessions s ON s.id = cf.session_id
+     WHERE cf.id = ? AND s.user_id = ?
+  `).get(fileId, userId);
+  if (!row) return false;
+  d.prepare('DELETE FROM context_files WHERE id = ?').run(fileId);
+  return true;
 }
 
-function clearContextFiles(sessionId) {
+function clearContextFiles(sessionId, userId) {
+  if (!_ownsSession(sessionId, userId)) return false;
   getDB().prepare('DELETE FROM context_files WHERE session_id = ?').run(sessionId);
+  return true;
 }
 
 // ── Cleanup ──

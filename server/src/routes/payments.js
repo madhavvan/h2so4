@@ -152,7 +152,8 @@ async function assertRazorpayPlanMatches(razorpayClient, planId, tier) {
     entry = {
       amount: plan.item?.amount,
       currency: plan.item?.currency,
-      period: plan.period, // 'monthly', 'yearly', 'weekly', 'daily'
+      period: plan.period,     // 'monthly', 'yearly', 'weekly', 'daily'
+      interval: plan.interval, // count of `period` between charges (1 = every period)
       validated_at: now,
     };
     razorpayPlanCache.set(planId, entry);
@@ -167,6 +168,14 @@ async function assertRazorpayPlanMatches(razorpayClient, planId, tier) {
   }
   if (entry.period !== 'monthly') {
     mismatches.push(`period: expected monthly, got ${entry.period || '<missing>'}`);
+  }
+  // P1-H from the audit: a plan with period='monthly' and interval=3
+  // would bill every quarter at the same INR amount — same total
+  // revenue per year but customer charged 4× a year instead of 12×.
+  // Razorpay's UI lets you set both fields independently, so a
+  // dashboard misclick can ship that misconfiguration silently.
+  if (entry.interval !== 1) {
+    mismatches.push(`interval: expected 1 (every period), got ${entry.interval ?? '<missing>'}`);
   }
   if (mismatches.length) {
     const err = new Error(`Razorpay plan misconfigured for tier=${tier}: ${mismatches.join('; ')}`);
@@ -695,10 +704,25 @@ async function createStripeCheckout(req, res, tier) {
   // recurring subscriptions with provider-managed lifecycle.
   const mode = tier === 'basic' ? 'payment' : 'subscription';
 
+  // Reuse the existing Stripe customer when we have one. Stripe creates a
+  // brand-new cus_* if you pass `customer_email` instead of `customer`,
+  // and we'd then overwrite users.stripe_customer_id on every checkout
+  // — fragmenting the same human across N customer rows. With reuse, the
+  // user keeps a single stable customer_id across renewals, plan swaps,
+  // disputes, and reactivations. (P2-S3 from the audit.)
+  const existingUser = db.getUserById(req.user.id);
+  const reuseCustomerId = existingUser?.stripe_customer_id?.startsWith('cus_')
+    ? existingUser.stripe_customer_id
+    : null;
+
   const sessionParams = {
     mode,
-    payment_method_types: ['card'],
-    customer_email: req.user.email,
+    // Omitting payment_method_types lets the Stripe Dashboard control
+    // which methods are offered. With Dashboard config, EU users get
+    // SEPA + iDEAL + Bancontact, UK users get BACS + card, AU users get
+    // BPAY, AND Apple/Google Pay light up automatically on supported
+    // devices for all card-eligible regions. Explicit ['card'] disabled
+    // every one of those. (P2-S1 from the audit.)
     line_items: [{ ...lineItem, quantity: 1 }],
     // `tier` rides in the URL so the frontend can show a welcome banner
     // even if the webhook hasn't landed by the time the user returns.
@@ -711,7 +735,27 @@ async function createStripeCheckout(req, res, tier) {
       tier,
     },
     billing_address_collection: 'required',
+    // Stripe Tax — automatic VAT/GST/sales tax calculation per the
+    // customer's billing address. Required for EU/UK/AU compliance once
+    // we cross local registration thresholds. Tax is added on top of
+    // the listed price; the user sees the breakdown on the Checkout
+    // page. Requires Stripe Tax enabled in the Dashboard + the merchant
+    // having registered tax IDs in jurisdictions where they collect.
+    // (P2-S2 from the audit.) Safe-default if not configured: Stripe
+    // returns 0 tax and the flow proceeds, so this is non-breaking.
+    automatic_tax: { enabled: true },
+    // Allow Stripe to update the customer's stored address based on
+    // the address collected at checkout — needed for Tax to recompute
+    // jurisdiction on subsequent invoices.
+    customer_update: reuseCustomerId ? { address: 'auto' } : undefined,
   };
+
+  if (reuseCustomerId) {
+    sessionParams.customer = reuseCustomerId;
+  } else {
+    sessionParams.customer_email = req.user.email;
+  }
+
   // For subscriptions, also stamp tier onto the subscription itself so
   // customer.subscription.updated/.deleted webhooks know which tier to keep
   // or revoke.
@@ -1149,9 +1193,15 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
           });
         }
 
-        // Store payment reference
+        // Store payment reference. Legacy prefix-marker in stripe_customer_id
+        // for provider detection; new dedicated column razorpay_subscription_id
+        // for the actual stable subscription pointer (only set when this is
+        // a recurring sub, not a one-time order).
         sqlite.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
-          .run(`rzp_${razorpay_payment_id}`, Date.now(), user.id);
+          .run(`rzp_${razorpay_subscription_id || razorpay_payment_id}`, Date.now(), user.id);
+        if (razorpay_subscription_id) {
+          db.setRazorpaySubscriptionId(user.id, razorpay_subscription_id);
+        }
 
         // Record payment in history
         db.recordPayment({
@@ -1314,11 +1364,27 @@ router.post('/portal', authMiddleware, async (req, res) => {
   try {
     if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
 
-    const customers = await stripe.customers.list({ email: req.user.email, limit: 1 });
-    if (customers.data.length === 0) return res.status(404).json({ error: 'No Stripe subscription found' });
+    // Prefer the customer_id stored on the user row. customers.list({email})
+    // can return multiple cus_* if the user re-signed up — Stripe's order
+    // is undocumented for tie-breaks, so we'd nondeterministically land
+    // the user in the wrong portal session (showing someone else's
+    // billing history). Use the stored id as the source of truth, falling
+    // back to email lookup ONLY when no stored id exists (legacy users).
+    // (P0-S3 from the audit.)
+    const user = db.getUserById(req.user.id);
+    let customerId = (user?.stripe_customer_id?.startsWith('cus_'))
+      ? user.stripe_customer_id
+      : null;
+    if (!customerId) {
+      const customers = await stripe.customers.list({ email: req.user.email, limit: 1 });
+      if (customers.data.length === 0) {
+        return res.status(404).json({ error: 'No Stripe subscription found' });
+      }
+      customerId = customers.data[0].id;
+    }
 
     const session = await stripe.billingPortal.sessions.create({
-      customer: customers.data[0].id,
+      customer: customerId,
       return_url: process.env.FRONTEND_URL || 'http://localhost:3005',
     });
 
@@ -1373,18 +1439,29 @@ router.post('/cancel-razorpay', authMiddleware, async (req, res) => {
       // Fetch is best-effort — if it fails the webhook still reconciles.
       console.warn('[cancel-razorpay] subscription.fetch failed:', fetchErr.message);
     }
-    if (periodEndMs) {
-      const license = db.getLicenseByUserId(req.user.id);
-      if (license) {
-        db.updateLicenseOnPayment(req.user.id, {
-          tier: license.tier,            // unchanged — user keeps access through cycle
-          status: 'active',              // still active until cycle end
-          expires_at: periodEndMs,       // auto-expires at cycle end
-          sessions_limit: license.sessions_limit,
-        });
-        updatedLicense = db.getLicenseByUserId(req.user.id);
-      }
+    // Always flip status='canceling' once Razorpay has accepted the
+    // cancel call, even if the secondary fetch for current_end failed.
+    // Without this, a fetch blip (network, Razorpay 5xx) leaves the UI
+    // showing "Pro Active" with no Reactivate button — the user assumes
+    // they're still being charged and either clicks Cancel again or
+    // contacts support. (P0-A + P1-E from the audit.) When periodEndMs
+    // is unavailable we keep the existing expires_at — the webhook will
+    // correct it on its own tick.
+    const license = db.getLicenseByUserId(req.user.id);
+    if (license) {
+      db.updateLicenseOnPayment(req.user.id, {
+        tier: license.tier,                              // unchanged — user keeps access through cycle
+        status: 'canceling',                             // matches /cancel-subscription unified route
+        expires_at: periodEndMs || license.expires_at,   // preserve existing if fetch blipped
+        sessions_limit: license.sessions_limit,
+      });
+      updatedLicense = db.getLicenseByUserId(req.user.id);
     }
+    // Advance the out-of-order gate so any stray pre-cancel events
+    // (subscription.charged, payment.captured) that arrive AFTER the
+    // server-initiated cancel are rejected. Without this anchor a stale
+    // charge event could resurrect the subscription. (P1-G from the audit.)
+    db.gateAndRecordEventForUser(req.user.id, Math.floor(Date.now() / 1000));
 
     res.json({
       success: true,
@@ -1482,15 +1559,18 @@ router.post('/cancel-subscription', authMiddleware, async (req, res) => {
     // webhook will reconcile if anything diverges.
     let updatedLicense = null;
     const license = db.getLicenseByUserId(user.id);
-    if (license && periodEndMs) {
+    if (license) {
       db.updateLicenseOnPayment(user.id, {
         tier: license.tier,
         status: 'canceling',
-        expires_at: periodEndMs,
+        expires_at: periodEndMs || license.expires_at,
         sessions_limit: license.sessions_limit,
       });
       updatedLicense = db.getLicenseByUserId(user.id);
     }
+    // Anchor the out-of-order gate to the cancel moment — same reasoning
+    // as the legacy /cancel-razorpay route. (P1-G from the audit.)
+    db.gateAndRecordEventForUser(user.id, Math.floor(Date.now() / 1000));
 
     res.json({
       success: true,
@@ -1507,3 +1587,15 @@ router.post('/cancel-subscription', authMiddleware, async (req, res) => {
 });
 
 module.exports = router;
+// Internals exposed for unit tests only. Not consumed by other route files
+// — callers should always use the router. See test/payments.test.js.
+module.exports._test = {
+  STRIPE_PRICE_DATA,
+  resolveStripeLineItem,
+  EXPECTED_USD_CENTS,
+  // Razorpay test surfaces — used by razorpay-plan-validation.test.js
+  assertRazorpayPlanMatches,
+  EXPECTED_INR_PAISE,
+  razorpayPlanCache,
+  PRICE_VALIDATION_TTL_MS,
+};

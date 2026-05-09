@@ -788,7 +788,31 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
       return res.status(400).json({ error: 'Payment has no provider_payment_id — cannot refund' });
     }
 
-    const { amount, reason } = req.body || {};
+    const { amount, reason, override_reason } = req.body || {};
+
+    // ─── Server-enforced refund eligibility ──────────────────────────
+    // Until v3.4.10, eligibility was policy text only — admins were
+    // trusted to honor REFUND_POLICY.md by hand. That left an admin
+    // JWT compromise as a 100%-of-revenue refund vector. Now the
+    // server checks the rules and blocks ineligible refunds unless
+    // the admin explicitly supplies `override_reason`. The override
+    // is logged in the audit trail for compliance review.
+    const { computeRefundEligibility } = require('../services/refundEligibility');
+    const license = db.getLicenseByUserId(payment.user_id);
+    const eligibility = computeRefundEligibility(payment, license);
+    if (!eligibility.eligible && !override_reason) {
+      return res.status(400).json({
+        error: 'refund_ineligible',
+        code: eligibility.code,
+        reason: eligibility.reason,
+        hint: 'Pass `override_reason` (string, min 10 chars) to refund anyway with audit trail.',
+      });
+    }
+    if (!eligibility.eligible && override_reason) {
+      if (typeof override_reason !== 'string' || override_reason.trim().length < 10) {
+        return res.status(400).json({ error: 'override_reason must be at least 10 characters' });
+      }
+    }
     // Provider-side refund amount. If the admin didn't specify, refund the
     // full charge. Keep in the provider's smallest unit (cents/paise) — our
     // DB already stores it that way.
@@ -848,6 +872,13 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
       currency: payment.currency,
       provider_refund_id: providerRefundId,
       reason: reason || null,
+      // Eligibility outcome at decision time. If eligible=false AND we
+      // proceeded, override_reason is required (validated above) and shows
+      // up here so a future audit can see the policy was knowingly bypassed.
+      eligibility_eligible: eligibility.eligible,
+      eligibility_code: eligibility.eligible ? null : eligibility.code,
+      eligibility_reason: eligibility.eligible ? null : eligibility.reason,
+      override_reason: !eligibility.eligible ? override_reason : null,
     });
 
     res.json({

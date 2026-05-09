@@ -297,7 +297,15 @@
   box-shadow: 0 2px 14px rgba(255, 255, 255, 0.06);
 }
 .send-btn:active { transform: scale(0.94); }
-.send-btn svg { width: 18px; height: 18px; color: var(--text-main); stroke: var(--text-main); stroke-width: 1.5px; fill: none; filter: drop-shadow(0 1px 3px rgba(0,0,0,0.5)); }
+/* Popout send / auto-solve icon — drop the hardcoded `stroke` and
+   `fill: none` so this rule works for BOTH stroke-based icons (lucide
+   ScanSearch on Auto-Solve) AND fill-based icons (GitHub Octicon
+   PaperAirplane on Send). Each icon's own inline fill/stroke
+   attributes now drive its rendering, with `color` providing the
+   currentColor source for both. Without this fix, PaperAirplane would
+   render invisible in the popout because the previous `fill: none`
+   beat its inline `fill="currentColor"`. */
+.send-btn svg { width: 18px; height: 18px; color: var(--text-main); stroke-width: 1.5px; filter: drop-shadow(0 1px 3px rgba(0,0,0,0.5)); }
 
 /* Typing indicator */
 .typing-bubble { display: flex; gap: 4px; align-items: center; padding: 16px !important; }

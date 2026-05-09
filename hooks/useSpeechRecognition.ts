@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { getDeepgramKey } from '../services/aiProxyService';
 
 interface SpeechResult {
@@ -342,6 +342,27 @@ export const useSpeechRecognition = ({
       }
     }
   }, [onResult, onError, stopListening, connectDeepgram]);
+
+  // ── Unmount cleanup ────────────────────────────────────────────────
+  // The hook used to depend entirely on its consumer calling stopListening
+  // before unmount. If MainApp ever unmounted with a session live (hot
+  // reload during recording, future code path that tears down on tier
+  // change, or a user-triggered logout while listening), the MediaRecorder,
+  // WebSocket, audioStream, and reconnect timer all leaked. The browser
+  // would keep the screen-share / mic indicator on indefinitely. Adding
+  // this once-only effect with a stable cleanup means the hook
+  // self-cleans regardless of caller behavior.
+  useEffect(() => {
+    return () => {
+      try { stopListening(); } catch { /* never throw on unmount */ }
+    };
+    // Intentionally empty deps — we only want the cleanup to run on the
+    // FINAL unmount, not on every stopListening identity change. The
+    // reference to stopListening is captured fresh each cleanup tick
+    // because React closes over the most recent render's value at unmount
+    // time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return { isListening, error, startListening, stopListening, stream: currentStream };
 };

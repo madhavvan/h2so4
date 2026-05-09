@@ -14,13 +14,21 @@ function getDB() {
 
   const dbPath = process.env.DATABASE_PATH || path.join(__dirname, '..', 'data', 'minicaai.db');
 
+  // Production: refuse to boot if DATABASE_PATH is unset. Previously this
+  // was a console.warn that scrolled past in deploy logs — any deploy that
+  // forgot to attach a Railway Volume would silently write to the
+  // container's ephemeral filesystem, and every user/license/payment row
+  // would be lost on the next restart. Fail-closed at boot is the only
+  // way to make this misconfiguration impossible to ship by accident.
   if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_PATH) {
-    console.warn('━'.repeat(70));
-    console.warn('⚠  DATABASE_PATH is not set. SQLite will write to the container');
-    console.warn('   filesystem, which is EPHEMERAL on Railway. All users, licenses,');
-    console.warn('   and conversations will be LOST on every restart/redeploy.');
-    console.warn('   Fix: attach a Railway Volume and set DATABASE_PATH=/data/minicaai.db');
-    console.warn('━'.repeat(70));
+    console.error('━'.repeat(70));
+    console.error('✖  FATAL: DATABASE_PATH is not set in production.');
+    console.error('   SQLite would write to the ephemeral container filesystem,');
+    console.error('   losing all users/licenses/payments on the next restart.');
+    console.error('   Fix: attach a Railway Volume and set DATABASE_PATH=/data/minicaai.db');
+    console.error('   Refusing to start. See server/src/database.js for context.');
+    console.error('━'.repeat(70));
+    process.exit(1);
   }
   console.log(`[db] Using SQLite at: ${dbPath}`);
 
@@ -241,6 +249,20 @@ function getDB() {
     db.exec('ALTER TABLE users ADD COLUMN tokens_revoked_after INTEGER DEFAULT 0');
   }
 
+  // Dedicated Razorpay subscription pointer. Pre-2026-05 the Razorpay
+  // path was overloaded into `stripe_customer_id` with values like
+  // `rzp_<paymentId>` (`rzp_` prefix used as a "this user is on Razorpay"
+  // marker). That worked for provider-detection but was misleading
+  // (anything calling `stripe.customers.retrieve(rzp_xxx)` would throw)
+  // and the value churned with each payment. The new column stores
+  // the SUBSCRIPTION id (stable across the lifecycle) directly, no
+  // prefix. Backfill: strip `rzp_` from any existing stripe_customer_id
+  // that uses the legacy convention.
+  if (!userCols.find(c => c.name === 'razorpay_subscription_id')) {
+    db.exec('ALTER TABLE users ADD COLUMN razorpay_subscription_id TEXT');
+    db.exec("UPDATE users SET razorpay_subscription_id = SUBSTR(stripe_customer_id, 5) WHERE stripe_customer_id LIKE 'rzp_%'");
+  }
+
   // Coarse OS label per device — used by AdminDashboard to show whether a
   // user is on Mac/Windows/Linux without needing to parse the raw UA on the
   // client side. Captured by the client at signup/login/validate via
@@ -305,6 +327,40 @@ function getDB() {
   const loginCols = db.prepare("PRAGMA table_info(login_logs)").all();
   if (!loginCols.find(c => c.name === 'platform')) {
     db.exec('ALTER TABLE login_logs ADD COLUMN platform TEXT');
+  }
+
+  // ── Webhook event ordering (out-of-order resurrection guard) ──
+  // Stripe doesn't guarantee delivery order. The reproducible bug:
+  //   t=0  user clicks Cancel → customer.subscription.deleted emitted
+  //   t=0  user immediately reactivates → customer.subscription.updated emitted
+  //   t+1s .deleted arrives, sets status=canceled
+  //   t+5s .updated arrives, blindly overwrites → status=active, tier=pro
+  // Net: a user who genuinely canceled gets resurrected. Same hazard on
+  // any out-of-order pair where the older event is destructive and the
+  // newer one is constructive (or vice-versa, depending on direction of
+  // staleness).
+  // Fix: persist the highest event.created we've seen per license, and
+  // gate every mutating handler on `event.created >= last_provider_event_at`.
+  // Stale events fall through silently. Stripe sends event.created in
+  // SECONDS — store seconds to match. New rows default to 0 so the very
+  // first event is always accepted.
+  if (!licenseCols.find(c => c.name === 'last_provider_event_at')) {
+    db.exec('ALTER TABLE licenses ADD COLUMN last_provider_event_at INTEGER DEFAULT 0');
+  }
+
+  // Per-user daily counter for Gemini calls. Free tier is documented as
+  // unlimited Gemini, but in practice an authenticated free user with a
+  // forged JWT (the AI rate limiter's pre-pass doesn't verify JWT
+  // signatures) could hit /chat/gemini in a hot loop and grind through
+  // Google's API quota at our cost. 50 calls/day is generous for honest
+  // use and a hard cap on abuse. Reset window stored as YYYY-MM-DD UTC
+  // string so we don't have to compute a midnight rollover comparison
+  // every request.
+  if (!licenseCols.find(c => c.name === 'gemini_calls_today')) {
+    db.exec('ALTER TABLE licenses ADD COLUMN gemini_calls_today INTEGER DEFAULT 0');
+  }
+  if (!licenseCols.find(c => c.name === 'gemini_calls_day')) {
+    db.exec("ALTER TABLE licenses ADD COLUMN gemini_calls_day TEXT DEFAULT ''");
   }
 
   return db;
@@ -582,6 +638,14 @@ function updateLicenseStatus(licenseKey, status) {
 // path that just pins expires_at) can omit them and the existing values
 // stay in place via COALESCE on the UPDATE side.
 function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_limit, credits_remaining_seconds, credits_expire_at }) {
+  // Status validation — refuse to persist an unknown status. Without this
+  // a typo at a call site (e.g. 'cancling' or 'past-due') would silently
+  // succeed and only manifest later as the renderer's license validity
+  // check failing in mysterious ways. See services/subscriptionStates.js
+  // for the canonical state machine.
+  const { assertValidStatus } = require('./services/subscriptionStates');
+  assertValidStatus(status);
+
   const sets = ['tier = ?', 'status = ?', 'expires_at = ?', 'sessions_limit = ?'];
   const args = [tier, status, expires_at, sessions_limit];
   if (credits_remaining_seconds !== undefined) {
@@ -920,6 +984,83 @@ function clearWebhookEvent(eventId) {
   getDB().prepare('DELETE FROM webhook_events WHERE event_id = ?').run(eventId);
 }
 
+// ─── Per-user Gemini daily quota ─────────────────────────────────────
+// Atomically increment and check the daily call counter. Returns:
+//   { ok: true,  used, limit, day }  — call allowed, counter incremented
+//   { ok: false, used, limit, day, reason: 'over_quota' } — over the cap
+// `tier` lets us short-circuit for paid users (no cap). Day is UTC.
+function incrementAndCheckGeminiQuota(userId, tier) {
+  if (tier !== 'free') return { ok: true, unlimited: true };
+  if (!userId) return { ok: true };
+  const FREE_DAILY_LIMIT = 50;
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+  const d = getDB();
+  // Atomic CAS-style: compare day, reset to 1 if changed, else +1, then read.
+  // SQLite serializes writes so two concurrent calls don't race past the limit.
+  const tx = d.transaction(() => {
+    const row = d.prepare('SELECT gemini_calls_today, gemini_calls_day FROM licenses WHERE user_id = ?').get(userId);
+    if (!row) {
+      // No license row — let the call through; the tier gate would have
+      // caught a missing license before it reached this helper.
+      return { ok: true, used: 0, limit: FREE_DAILY_LIMIT, day: today };
+    }
+    const sameDay = row.gemini_calls_day === today;
+    const current = sameDay ? (row.gemini_calls_today || 0) : 0;
+    if (current >= FREE_DAILY_LIMIT) {
+      return { ok: false, used: current, limit: FREE_DAILY_LIMIT, day: today, reason: 'over_quota' };
+    }
+    const next = current + 1;
+    d.prepare('UPDATE licenses SET gemini_calls_today = ?, gemini_calls_day = ? WHERE user_id = ?')
+      .run(next, today, userId);
+    return { ok: true, used: next, limit: FREE_DAILY_LIMIT, day: today };
+  });
+  return tx();
+}
+
+// ─── Out-of-order delivery gate ────────────────────────────────────────
+// Returns:
+//   { accept: true }  — caller should run the handler. last_provider_event_at
+//                       is updated to max(current, eventCreatedSec).
+//   { accept: false, reason, lastSeen } — event is older than the last
+//                       processed one for this user. Caller MUST short-
+//                       circuit the handler. Webhook still returns 200
+//                       (we have already processed a newer state).
+//
+// `eventCreatedSec` is Stripe's `event.created` (UNIX seconds) or the
+// equivalent we synthesize from Razorpay's `created_at` field. If the
+// event has no timestamp (rare), we accept defensively (better to risk a
+// stale resurrection than to permanently drop an event we have no way to
+// order).
+function gateAndRecordEventForUser(userId, eventCreatedSec) {
+  if (!userId) return { accept: true };
+  if (!Number.isFinite(eventCreatedSec) || eventCreatedSec <= 0) {
+    return { accept: true };
+  }
+  const d = getDB();
+  // Atomic: read current, compare, conditionally update — under SQLite's
+  // single-writer lock + WAL this is consistent without an explicit
+  // transaction. Two concurrent webhooks for the same user serialize on
+  // the row write.
+  const row = d.prepare('SELECT last_provider_event_at FROM licenses WHERE user_id = ?').get(userId);
+  if (!row) {
+    // No license yet (e.g. checkout.session.completed for a brand-new user
+    // before the license row is created in the same transaction). Accept;
+    // the handler will create the row with the right timestamp.
+    return { accept: true };
+  }
+  const lastSeen = row.last_provider_event_at || 0;
+  if (eventCreatedSec < lastSeen) {
+    return { accept: false, reason: 'out_of_order', lastSeen, eventCreatedSec };
+  }
+  // Equal-or-newer: update and accept. Equal-only events are typically the
+  // same delivery seen twice (the dedup table caught the dup but the gate
+  // is wrapped around the dedup-first paths too — accept defensively).
+  if (eventCreatedSec > lastSeen) {
+    d.prepare('UPDATE licenses SET last_provider_event_at = ? WHERE user_id = ?').run(eventCreatedSec, userId);
+  }
+  return { accept: true };
+}
+
 // Have we already recorded a completed renewal top-up for this exact
 // provider_payment_id? Used to dedup across /verify-razorpay (client
 // success callback) and the webhook (server-side), which BOTH fire for
@@ -1101,12 +1242,34 @@ function grantBasicRenewal(userId) {
 // created_at desc and filters to payments that actually carry a sub id
 // (one-time Basic purchases won't match).
 function getLatestRazorpaySubscriptionId(userId) {
+  // Prefer the dedicated `users.razorpay_subscription_id` column (set
+  // once per subscription, stable across renewals). Fall back to the
+  // payments-table scan for legacy users whose column hasn't been
+  // populated yet (e.g. subscription created before the schema
+  // migration shipped).
+  const u = getDB().prepare('SELECT razorpay_subscription_id FROM users WHERE id = ?').get(userId);
+  if (u && u.razorpay_subscription_id) return u.razorpay_subscription_id;
+
   const row = getDB().prepare(`
     SELECT provider_subscription_id FROM payments
     WHERE user_id = ? AND provider = 'razorpay' AND provider_subscription_id IS NOT NULL
     ORDER BY created_at DESC LIMIT 1
   `).get(userId);
   return row ? row.provider_subscription_id : null;
+}
+
+// Stamp the user's Razorpay subscription id ONCE per subscription.
+// Caller is the webhook (subscription.charged for first/recurring) or
+// /verify-razorpay (client-side success handler). We only WRITE if the
+// existing column is empty or different — avoids unnecessary churn on
+// every renewal payment.
+function setRazorpaySubscriptionId(userId, subscriptionId) {
+  if (!subscriptionId) return;
+  getDB().prepare(`
+    UPDATE users
+    SET razorpay_subscription_id = ?, updated_at = ?
+    WHERE id = ? AND (razorpay_subscription_id IS NULL OR razorpay_subscription_id != ?)
+  `).run(subscriptionId, Date.now(), userId, subscriptionId);
 }
 
 // Undo a revocation. Removes the revoked_keys row and flips the license
@@ -1712,6 +1875,7 @@ module.exports = {
   incrementSessionCount, updateLicenseStatus, updateLicenseOnPayment,
   extendLicenseExpiry, grantCreditSessions, grantBasicRenewal,
   getLatestRazorpaySubscriptionId,
+  setRazorpaySubscriptionId,
   // Devices
   registerDevice, getUserDevices, deactivateDevice, isDeviceAuthorized, resetUserDevices,
   revokeSingleDevice,
@@ -1724,7 +1888,9 @@ module.exports = {
   getPaymentById, hasPaymentBeenRefunded, recordAdminRefund, recordCompPayment, queryPayments,
   // Webhook idempotency
   recordWebhookEventOnce, clearWebhookEvent, isRenewalPaymentProcessed,
-  isPaymentAlreadyRecorded,
+  isPaymentAlreadyRecorded, gateAndRecordEventForUser,
+  // AI quotas
+  incrementAndCheckGeminiQuota,
   // Login logs
   logLogin, getRecentLogins,
   // Revoked keys

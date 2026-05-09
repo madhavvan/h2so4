@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search, Copy, ChevronUp } from 'lucide-react';
+import { WizardHat } from './WizardHat';
 // Phosphor duotone — used on the public landing + auth surfaces for the
 // editorial, premium feel that lucide's flat strokes can't quite reach.
 // In-app utility icons stay on lucide so dense toolbars don't get heavy.
@@ -584,7 +585,7 @@ const TIER_THEME: Record<Tier, { bg: string; text: string; border: string; bar: 
   free:  { bg: 'bg-slate-500/10',   text: 'text-slate-300',   border: 'border-slate-500/25',   bar: 'bg-slate-400',    dot: 'bg-slate-400',    Icon: Zap },
   basic: { bg: 'bg-emerald-500/10', text: 'text-emerald-300', border: 'border-emerald-500/25', bar: 'bg-emerald-400',  dot: 'bg-emerald-400',  Icon: Sparkles },
   pro:   { bg: 'bg-indigo-500/10',  text: 'text-indigo-300',  border: 'border-indigo-500/25',  bar: 'bg-indigo-400',   dot: 'bg-indigo-400',   Icon: Crown },
-  max:   { bg: 'bg-amber-500/10',   text: 'text-amber-300',   border: 'border-amber-500/25',   bar: 'bg-amber-400',    dot: 'bg-amber-400',    Icon: Crown },
+  max:   { bg: 'bg-amber-500/10',   text: 'text-amber-300',   border: 'border-amber-500/25',   bar: 'bg-amber-400',    dot: 'bg-amber-400',    Icon: WizardHat },
 };
 const tierOf = (t?: string): (typeof TIER_THEME)[Tier] => (TIER_THEME as any)[t || ''] || TIER_THEME.free;
 
@@ -593,7 +594,7 @@ const TierBadge = ({ tier }: { tier?: string }) => {
   const label = (tier || 'free').toUpperCase();
   return (
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase border ${th.bg} ${th.text} ${th.border}`}>
-      {label === 'MAX' && <Crown size={9} />}
+      {label === 'MAX' && <WizardHat size={9} />}
       {label}
     </span>
   );
@@ -5083,7 +5084,7 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
                     color: isMax ? '#b45309' : '#1d4ed8',
                   }}
                 >
-                  {isMax ? <Crown size={14} /> : <Check size={14} />}
+                  {isMax ? <WizardHat size={14} /> : <Check size={14} />}
                   {isAdminUser ? 'Admin · Max Active' : (isMax ? 'Max Active' : 'Pro Active')}
                 </div>
                 {/* Inline Pro→Max upgrade — one-tap path to the highest tier
@@ -5101,7 +5102,7 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
                       color: '#b45309',
                     }}
                   >
-                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Crown size={14} />}
+                    {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <WizardHat size={14} />}
                     Upgrade to Max
                   </button>
                 )}
@@ -5750,7 +5751,7 @@ const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
               border: tierMeta.label === 'Free' ? '1px solid var(--cream-line)' : 'none',
             }}
           >
-            {tierMeta.label === 'Free' ? <Sparkles size={11} /> : <Crown size={11} />}
+            {tierMeta.label === 'Free' ? <Sparkles size={11} /> : tierMeta.label === 'Max' ? <WizardHat size={11} /> : <Crown size={11} />}
             {tierMeta.label} plan
             <ChevronRight size={11} style={{ opacity: 0.7 }} />
           </button>
@@ -5897,7 +5898,9 @@ const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
               className="shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center"
               style={{ background: tierMeta.bg }}
             >
-              {(currentLicense?.tier === 'max' || currentLicense?.tier === 'pro')
+              {currentLicense?.tier === 'max'
+                ? <WizardHat size={20} style={{ color: tierMeta.color }} />
+                : currentLicense?.tier === 'pro'
                 ? <Crown size={20} style={{ color: tierMeta.color }} />
                 : <Zap size={20} style={{ color: tierMeta.color }} />}
             </div>
@@ -6156,7 +6159,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
     });
     actions.push({
       key: 'upgrade-max',
-      Icon: Crown, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
+      Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
       title: 'Upgrade to Max',
       subtitle: 'Pro + Claude Sonnet 4.6 + Auto-Type + Train Model',
       price: maxPrice || undefined,
@@ -6194,7 +6197,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
     });
     actions.push({
       key: 'upgrade-max',
-      Icon: Crown, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
+      Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
       title: 'Upgrade to Max',
       subtitle: 'Adds Claude, Auto-Type, Train Model',
       price: findTierPrice('max') || undefined,
@@ -6205,7 +6208,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
   if (tier === 'pro' && !isAdminUser) {
     actions.push({
       key: 'upgrade-max',
-      Icon: Crown, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
+      Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
       title: 'Upgrade to Max',
       subtitle: 'Adds Claude + Auto-Type + Train Model',
       price: findTierPrice('max') || undefined,
@@ -6301,7 +6304,9 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
                 className="shrink-0 w-12 h-12 rounded-2xl flex items-center justify-center"
                 style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)' }}
               >
-                {tier === 'max' || tier === 'pro' ? (
+                {tier === 'max' ? (
+                  <WizardHat size={22} style={{ color: tierMeta.color }} />
+                ) : tier === 'pro' ? (
                   <Crown size={22} style={{ color: tierMeta.color }} />
                 ) : tier === 'basic' ? (
                   <Zap size={22} style={{ color: tierMeta.color }} />
@@ -8660,7 +8665,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   <>
                     {effectiveTier === 'max' ? (
                       <div className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-amber-500/10 to-purple-500/10 border border-amber-500/30 text-amber-400 text-sm font-semibold flex items-center gap-2">
-                        <Crown size={14} /> {isAdminUser ? 'Admin · Max Active' : 'Max Active'}
+                        <WizardHat size={14} /> {isAdminUser ? 'Admin · Max Active' : 'Max Active'}
                       </div>
                     ) : (
                       <div className="px-6 py-2.5 rounded-xl bg-green-500/10 border border-green-500/20 text-green-400 text-sm font-semibold flex items-center gap-2">

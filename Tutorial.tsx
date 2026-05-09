@@ -18,6 +18,7 @@ import {
     X, Crown, Cpu, Mic, Camera, Keyboard, Monitor, FileText,
     EyeOff, Sparkles, ChevronLeft, ChevronRight, Check,
 } from 'lucide-react';
+import { WizardHat } from './WizardHat';
 
 const TUTORIAL_VERSION = 'v1';
 
@@ -84,7 +85,7 @@ const STEPS: TutorialStep[] = [
         ),
     },
     {
-        icon: Crown,
+        icon: WizardHat,
         accent: 'from-orange-400 to-amber-500',
         title: 'Train Claude (Max only)',
         body: (

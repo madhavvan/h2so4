@@ -17,6 +17,7 @@
 
 import React, { useEffect } from 'react';
 import { X } from 'lucide-react';
+import { useAnimatedModal } from './hooks/useAnimatedModal';
 
 interface RefundPolicyProps {
   isOpen: boolean;
@@ -27,6 +28,12 @@ const EFFECTIVE_DATE = 'May 5, 2026';
 const LAST_UPDATED = 'May 5, 2026';
 
 export function RefundPolicy({ isOpen, onClose }: RefundPolicyProps) {
+  // Same smooth-modal pattern as ManageSubscription. Backdrop fades,
+  // content slides into place. 220ms duration matches the rest of the
+  // app's modal vocabulary so transitions between Manage → Refund Policy
+  // feel like a single continuous gesture rather than two separate pops.
+  const { isMounted, isVisible } = useAnimatedModal(isOpen, 220);
+
   // Esc closes — same a11y pattern as ManageSubscription.
   useEffect(() => {
     if (!isOpen) return;
@@ -37,14 +44,17 @@ export function RefundPolicy({ isOpen, onClose }: RefundPolicyProps) {
     return () => document.removeEventListener('keydown', onKey);
   }, [isOpen, onClose]);
 
-  if (!isOpen) return null;
+  if (!isMounted) return null;
 
   return (
     <div
       // z-index above ManageSubscription (which uses z-[99999]) so this
       // overlays the billing surface when opened from its footer.
-      className="fixed inset-0 z-[999999] bg-black/85 overflow-y-auto custom-scrollbar"
-      style={{ WebkitAppRegion: 'no-drag' } as any}
+      // Backdrop fades in/out; content body has its own subtle lift.
+      className={`fixed inset-0 z-[999999] overflow-y-auto custom-scrollbar transition-opacity duration-200 ease-out ${
+        isVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+      }`}
+      style={{ backgroundColor: 'rgba(0,0,0,0.85)', WebkitAppRegion: 'no-drag' } as any}
       role="dialog"
       aria-modal="true"
       aria-label="Refund policy"
@@ -63,7 +73,11 @@ export function RefundPolicy({ isOpen, onClose }: RefundPolicyProps) {
         </button>
       </div>
 
-      <article className="max-w-3xl mx-auto px-6 py-8 space-y-6 text-[14px] leading-relaxed text-white/80">
+      <article
+        className={`max-w-3xl mx-auto px-6 py-8 space-y-6 text-[14px] leading-relaxed text-white/80 transition-all duration-200 ease-out ${
+          isVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-3'
+        }`}
+      >
         {/* Effective date strip */}
         <div className="text-xs text-white/50 flex flex-wrap gap-x-4 gap-y-1">
           <span><span className="text-white/40">Effective:</span> {EFFECTIVE_DATE}</span>

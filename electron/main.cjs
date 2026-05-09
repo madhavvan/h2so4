@@ -1,7 +1,41 @@
-const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage, dialog, shell, globalShortcut, Notification, crashReporter } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const { spawn } = require('child_process');
 const database = require('./database.cjs');
+
+// ─── Crash reporter — must initialize BEFORE app emits 'ready' ───────
+// Without this, main-process crashes (V8 GC fault, native module SEGV,
+// GPU process abort, third-party module memory corruption) leave zero
+// telemetry — they're invisible until a user emails their electron-log
+// file. The reporter writes a Breakpad/Crashpad minidump locally and
+// uploads to the configured submitURL on next launch.
+//
+// We deliberately set `uploadToServer:false` until the server endpoint
+// is observed to be stable in production — a misbehaving submitURL
+// (404, slow, hung) blocks app startup. Operator can flip via env var
+// once /api/v1/crash is verified.
+try {
+  crashReporter.start({
+    productName: 'Interview Copilot',
+    companyName: 'minicaai',
+    submitURL: process.env.CRASH_SUBMIT_URL || 'https://api.minicaai.com/api/v1/crash',
+    uploadToServer: process.env.CRASH_UPLOAD_TO_SERVER === '1',
+    ignoreSystemCrashHandler: false,
+    rateLimit: true,
+    compress: true,
+    extra: {
+      app_version: app.getVersion(),
+      platform: process.platform,
+      arch: process.arch,
+    },
+  });
+} catch (err) {
+  // Reporter init can fail on unusual platforms (no temp dir writable,
+  // sandbox restrictions). Log and continue — better to ship without
+  // crash reporting than fail to start.
+  console.warn('[crashReporter] init failed:', err && err.message);
+}
 
 // Shared logger. Writes to <userData>/logs/main.log at info+ and to stdout.
 // Lifted to module scope so one-off failure paths (tray icon fallback, any
@@ -44,9 +78,7 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on('second-instance', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      if (!mainWindow.isVisible()) mainWindow.show();
-      mainWindow.focus();
+      smoothShow(mainWindow);
     } else {
       createMainWindow();
     }
@@ -57,6 +89,264 @@ let mainWindow = null;
 let popoutWindow = null;
 let tray = null;
 
+// ─── Smooth show / hide for windows ──────────────────────────────────────
+// Replaces raw .show() / .hide() calls in hot paths (hotkey, tray click,
+// close button, second-instance, notification click). Without these,
+// the window snaps in/out which feels primitive on a 2026 desktop. We
+// animate opacity 0↔1 over 220ms in / 160ms out with cubic easing for
+// a perceptually smooth landing rather than a uniform fade.
+//
+// Stealth bypass: if sessionActive=true (interview live) the animation
+// is skipped — opacity transitions are still visible to screen-share
+// frame grabbers in some Windows display drivers, and at that point
+// any visual noise during a session is unacceptable. Falls back to
+// instant show/hide which the existing setContentProtection already
+// covers cleanly.
+//
+// Per-window animation guard via WeakMap: a rapid hotkey toggle (user
+// presses Ctrl+Alt+Space twice in 100ms) shouldn't stack two competing
+// intervals — we cancel the previous before starting the next. WeakMap
+// because BrowserWindow is a JS object that may be garbage-collected
+// after destroy() and we don't want to leak entries.
+const _windowAnimating = new WeakMap();
+
+function _cancelWindowAnimation(win) {
+  const prev = _windowAnimating.get(win);
+  if (prev) {
+    clearInterval(prev.interval);
+    _windowAnimating.delete(win);
+  }
+}
+
+function smoothShow(win, opts) {
+  opts = opts || {};
+  if (!win || win.isDestroyed()) return;
+  // Stealth bypass — see comment above.
+  if (sessionActive) {
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+    return;
+  }
+  _cancelWindowAnimation(win);
+
+  const DURATION = opts.duration || 220;
+  const startTime = Date.now();
+  try { win.setOpacity(0); } catch (_) { /* opacity unsupported on some configs */ }
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+
+  const interval = setInterval(() => {
+    if (win.isDestroyed()) {
+      clearInterval(interval);
+      _windowAnimating.delete(win);
+      return;
+    }
+    const elapsed = Date.now() - startTime;
+    const t = Math.min(1, elapsed / DURATION);
+    // Ease-out cubic — fast initial rise, soft landing at full opacity
+    const eased = 1 - Math.pow(1 - t, 3);
+    try { win.setOpacity(eased); } catch (_) {}
+    if (t >= 1) {
+      clearInterval(interval);
+      try { win.setOpacity(1); } catch (_) {}
+      _windowAnimating.delete(win);
+    }
+  }, 16);
+  _windowAnimating.set(win, { interval, type: 'show' });
+}
+
+// ─── Navigation hardening ───────────────────────────────────────────────
+// Applied to each BrowserWindow's webContents to block two attack paths
+// that markdown links and window.open() expose:
+//
+//   1. New-window opens (anchor target=_blank, window.open()) — without
+//      a window-open handler, Electron creates a CHILD BrowserWindow with
+//      the parent's webPreferences, including preload + contextIsolation.
+//      A markdown-injected <a href="https://attacker"> that the user
+//      clicks would land in a window with access to our IPC bridge.
+//
+//   2. Top-frame navigation away from our app URL — a will-navigate
+//      handler that doesn't preventDefault lets the renderer be replaced
+//      entirely with attacker HTML, again with preload still attached.
+//
+// Both: external URLs go through shell.openExternal with a strict
+// protocol allowlist (http, https, mailto). javascript:, file:, data:,
+// chrome:, vbscript: etc. are rejected.
+function isSafeExternalUrl(url) {
+  if (typeof url !== 'string' || url.length > 4096) return false;
+  let parsed;
+  try { parsed = new URL(url); } catch { return false; }
+  return parsed.protocol === 'https:' || parsed.protocol === 'http:' || parsed.protocol === 'mailto:';
+}
+
+function attachNavigationGuards(webContents, isDev) {
+  if (!webContents) return;
+
+  // window.open / target=_blank — never spawn a child Electron window.
+  // Open in OS browser if URL is safe, otherwise drop silently.
+  webContents.setWindowOpenHandler(({ url }) => {
+    if (isSafeExternalUrl(url)) {
+      shell.openExternal(url).catch((err) => {
+        electronLog.warn('[nav-guard] openExternal failed:', err && err.message);
+      });
+    } else {
+      electronLog.warn('[nav-guard] blocked window.open with unsafe URL:', url);
+    }
+    return { action: 'deny' };
+  });
+
+  // Top-frame navigation — refuse to leave the app URL. The renderer
+  // can do client-side routing within #hash / ?query without triggering
+  // will-navigate, so this is purely a hostile-redirect guard.
+  webContents.on('will-navigate', (event, url) => {
+    let allowed = false;
+    if (isDev) {
+      // Dev: anything served from the Vite dev server.
+      allowed = url.startsWith('http://localhost:3005') || url.startsWith('http://127.0.0.1:3005');
+    } else {
+      // Packaged: anything inside the app's dist/index.html origin (file://).
+      allowed = url.startsWith('file://');
+    }
+    if (!allowed) {
+      electronLog.warn('[nav-guard] blocked will-navigate to:', url);
+      event.preventDefault();
+      // If it's a safe external URL, route through the OS browser as a
+      // courtesy — the renderer might have intended to "open this link"
+      // but used a top-frame anchor. setWindowOpenHandler usually catches
+      // these, but Electron's plumbing routes some clicks here instead.
+      if (isSafeExternalUrl(url)) {
+        shell.openExternal(url).catch(() => {});
+      }
+    }
+  });
+
+  // Belt-and-suspenders: refuse will-redirect too. Some redirect chains
+  // can survive will-navigate's preventDefault if a previous redirect was
+  // permitted, so re-validate every step.
+  webContents.on('will-redirect', (event, url) => {
+    const allowed = isDev
+      ? (url.startsWith('http://localhost:3005') || url.startsWith('http://127.0.0.1:3005'))
+      : url.startsWith('file://');
+    if (!allowed) {
+      electronLog.warn('[nav-guard] blocked will-redirect to:', url);
+      event.preventDefault();
+    }
+  });
+}
+
+function smoothHide(win, onDone, opts) {
+  opts = opts || {};
+  if (!win || win.isDestroyed()) {
+    if (onDone) onDone();
+    return;
+  }
+  if (!win.isVisible()) {
+    // Already hidden — just run the done callback so chained logic
+    // (notifyHiddenToTray, setManageSubOpen, etc.) still fires.
+    if (onDone) onDone();
+    return;
+  }
+  if (sessionActive) {
+    win.hide();
+    try { win.setOpacity(1); } catch (_) {}
+    if (onDone) onDone();
+    return;
+  }
+  _cancelWindowAnimation(win);
+
+  const DURATION = opts.duration || 160;
+  const startTime = Date.now();
+  let startOpacity = 1;
+  try { startOpacity = win.getOpacity(); } catch (_) {}
+
+  const interval = setInterval(() => {
+    if (win.isDestroyed()) {
+      clearInterval(interval);
+      _windowAnimating.delete(win);
+      if (onDone) onDone();
+      return;
+    }
+    const elapsed = Date.now() - startTime;
+    const t = Math.min(1, elapsed / DURATION);
+    // Ease-in cubic — slow start, fast finish. Window appears to
+    // "fall away" rather than fade uniformly.
+    const eased = 1 - Math.pow(t, 3);
+    try { win.setOpacity(startOpacity * eased); } catch (_) {}
+    if (t >= 1) {
+      clearInterval(interval);
+      try {
+        win.hide();
+        win.setOpacity(1); // reset for next show
+      } catch (_) {}
+      _windowAnimating.delete(win);
+      if (onDone) onDone();
+    }
+  }, 16);
+  _windowAnimating.set(win, { interval, type: 'hide' });
+}
+
+// ─── First-time "app is in the tray" notification ────────────────────────
+// Fires once per install when the user first hides the window. Without it
+// new users who just hit X often think the app crashed (it didn't — it's
+// just stealth-mode invisible in the tray) and uninstall before figuring
+// it out. Persisted as a tiny JSON file in userData so the choice survives
+// quits, resets on reinstall (a fresh install is a fine time to remind).
+let _trayTipFile = null;
+function getTrayTipFile() {
+  if (_trayTipFile) return _trayTipFile;
+  _trayTipFile = path.join(app.getPath('userData'), 'tray-tip-shown.json');
+  return _trayTipFile;
+}
+function hasTrayTipBeenShown() {
+  try { return fs.existsSync(getTrayTipFile()); } catch { return false; }
+}
+function markTrayTipShown() {
+  try {
+    fs.writeFileSync(getTrayTipFile(), JSON.stringify({ shownAt: new Date().toISOString() }));
+  } catch (err) {
+    electronLog.warn('[tray-tip] failed to persist:', err && err.message);
+  }
+}
+function notifyHiddenToTray() {
+  // Hard guard: never fire during an active interview session. Windows
+  // toast notifications render OUTSIDE Electron's setContentProtection
+  // and would appear on the candidate's screen-share, leaking both the
+  // app's existence and its product name. The session-active handler is
+  // the source of truth for "interview in progress."
+  if (sessionActive) {
+    electronLog.info('[tray-tip] suppressed — session-active=true (screen-share leak risk)');
+    return;
+  }
+  if (hasTrayTipBeenShown()) return;
+  // Mark BEFORE showing — even if the Notification API fails, we don't
+  // want to spam the user on every subsequent hide. One try, then quiet.
+  markTrayTipShown();
+  if (!Notification.isSupported()) {
+    electronLog.info('[tray-tip] Notification not supported on this OS, skipping');
+    return;
+  }
+  const accel = process.platform === 'darwin' ? 'Cmd+Alt+Space' : 'Ctrl+Alt+Space';
+  try {
+    const n = new Notification({
+      title: 'Interview Copilot is in your system tray',
+      body: `Press ${accel} anytime to bring it back, or click the icon in your taskbar tray.`,
+      silent: false,
+    });
+    n.on('click', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        smoothShow(mainWindow);
+      } else {
+        createMainWindow();
+      }
+    });
+    n.show();
+  } catch (err) {
+    electronLog.warn('[tray-tip] Notification show threw:', err && err.message);
+  }
+}
+
 // Updater state shared between the auto-update block (set when a download
 // finishes) and the close / before-quit handlers (which install the pending
 // update instead of leaving it stranded in the cache).
@@ -64,6 +354,12 @@ let pendingUpdate = null;          // { version, info } | null
 let installPendingUpdate = null;   // (() => void) | null
 
 const isDev = !app.isPackaged;
+
+// API base URL — production uses api.minicaai.com; dev can override via
+// MINICAAI_API_BASE to hit a local server (useful when testing changes
+// to autotype-agent or other server endpoints before they're deployed).
+// Set MINICAAI_API_BASE=http://localhost:4000 in your dev shell.
+const API_BASE = process.env.MINICAAI_API_BASE || 'https://api.minicaai.com';
 
 // Permissions and lifecycle are set up in the APP LIFECYCLE section below
 
@@ -134,10 +430,15 @@ function createMainWindow() {
     if (!pendingUpdate || !installPendingUpdate) {
       // Tell the renderer we're hiding to the tray so it can show a
       // first-time toast with the "right-click the slot to bring it back"
-      // tip. Sent BEFORE hide() so the renderer can paint the toast in
-      // the popout (which stays visible) before the main window vanishes.
+      // tip. Sent BEFORE the smoothHide() begins so the renderer can paint
+      // the toast in the popout (which stays visible) in sync with the
+      // main window's fade-out — they animate together rather than the
+      // toast popping in mid-fade.
       try { mainWindow.webContents.send('app-hidden-to-tray'); } catch {}
-      mainWindow.hide();
+      // smoothHide animates opacity 1→0 over 160ms then calls hide().
+      // OS notification fires AFTER the window is fully hidden so the
+      // toast doesn't compete visually with a still-fading window.
+      smoothHide(mainWindow, () => notifyHiddenToTray());
       return;
     }
     // Pending update — ask in-app instead of via native dialog.
@@ -154,13 +455,28 @@ function createMainWindow() {
     } catch {
       // If renderer is gone for any reason, fall back to plain hide rather
       // than open a native dialog (which would still leak).
-      mainWindow.hide();
+      smoothHide(mainWindow);
     }
   });
 
   mainWindow.once('ready-to-show', () => {
-    mainWindow.show();
+    // First appearance on cold launch — fade in smoothly rather than
+    // snapping to full opacity. Subsequent show/hide cycles use the
+    // same helper for visual consistency with hotkey/tray paths.
+    smoothShow(mainWindow);
   });
+
+  // ── Window-open + will-navigate hardening ─────────────────────
+  // Without these, a markdown link (or any DOM-injected <a target=_blank>
+  // or window.open call) can spawn a child BrowserWindow that INHERITS
+  // mainWindow's webPreferences (contextIsolation, preload bridge). Same
+  // hazard for navigation: a click on `<a href="https://attacker">` would
+  // navigate the renderer AWAY from dist/index.html, dropping the user
+  // into an attacker-controlled page that still has access to our preload
+  // bridge. Block both — open external URLs in the OS browser via
+  // shell.openExternal (with allowlisted protocols), refuse navigation
+  // away from the dev server / packaged dist URL.
+  attachNavigationGuards(mainWindow.webContents, isDev);
 
   // Load the full app
   if (isDev) {
@@ -349,6 +665,10 @@ function createPopoutWindow(options = {}) {
     popoutWindow.show();
     enforceAlwaysOnTop();
   });
+
+  // Same navigation hardening as the main window — markdown links inside
+  // the popout chat get the same external-only treatment.
+  attachNavigationGuards(popoutWindow.webContents, isDev);
 
   // Load the app in popout mode
   if (isDev) {
@@ -542,7 +862,7 @@ ipcMain.on('update-prompt-decision', (_event, payload) => {
     try { installPendingUpdate(); } catch {}
   } else if (mainWindow && !mainWindow.isDestroyed()) {
     try { mainWindow.webContents.send('app-hidden-to-tray'); } catch {}
-    mainWindow.hide();
+    smoothHide(mainWindow, () => notifyHiddenToTray());
   }
   // After this decision the user has acknowledged the pending update.
   // Don't keep the prompt sticky — it'll re-arm naturally when a NEW
@@ -707,9 +1027,7 @@ ipcMain.on('popout:set-focusable', (_event, focusable) => {
 // doesn't have to alt-tab back from the browser "close tab" page.
 ipcMain.on('focus-main-window', () => {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
+    smoothShow(mainWindow);
     mainWindow.moveTop();
     // Briefly flash always-on-top to beat the OS focus-stealing guard,
     // then release it so the window doesn't stay pinned.
@@ -1482,72 +1800,146 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     try {
       const snapText = uiaSnapshotBefore.text || '';
       const cursorOff = uiaSnapshotBefore.cursorOffset || 0;
-      const planRes = await fetch('https://api.minicaai.com/api/v1/ai/autotype-plan', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({
-          editorText: snapText,
-          cursorOffset: cursorOff,
-          code,
-          language,
-        }),
-      });
-      if (planRes.ok) {
-        const aiPlan = await planRes.json().catch(() => null);
-        if (aiPlan && aiPlan.ok === true
-            && Number.isFinite(aiPlan.confidence) && aiPlan.confidence >= 0.7) {
-          effectiveSkipLines = Number.isInteger(aiPlan.skip_leading) ? Math.max(0, aiPlan.skip_leading) : 0;
-          effectiveSkipTrailing = Number.isInteger(aiPlan.skip_trailing) ? Math.max(0, aiPlan.skip_trailing) : 0;
-          wipeFirstLine = !!aiPlan.wipe_first_line;
-          let proposedCursor = ['use_current', 'move_to_end', 'go_to_line'].includes(aiPlan.cursor_action)
-            ? aiPlan.cursor_action : 'use_current';
-          cursorTargetLine = Number.isInteger(aiPlan.target_line) ? aiPlan.target_line : 0;
-          cursorTargetColumn = Number.isInteger(aiPlan.target_column) ? aiPlan.target_column : 0;
-          // ── Cursor-respect override ──
-          // The user just dropped their cursor where they want code typed. If
-          // the planner says "move to end of file" but the editor has a
-          // template with driver code BELOW the cursor (effectiveSkipTrailing
-          // > 0 means the planner itself detected post-cursor content), then
-          // moving to end would land the code BELOW the driver code — wrong
-          // place, looks like "started from beginning of new section" to the
-          // user. Same for go_to_line(0|1) — that's "jump to top," which
-          // overrides the cursor placement the user just made.
-          const editorHasContentBelowCursor = effectiveSkipTrailing > 0;
-          if (proposedCursor === 'move_to_end' && editorHasContentBelowCursor) {
-            console.log('[auto-type] cursor: planner asked move_to_end but editor has content below cursor — honoring user cursor instead');
-            proposedCursor = 'use_current';
-          } else if (proposedCursor === 'go_to_line' && cursorTargetLine <= 1) {
-            console.log(`[auto-type] cursor: planner asked go_to_line(${cursorTargetLine}) — too close to top, honoring user cursor instead`);
-            proposedCursor = 'use_current';
-          }
-          cursorAction = proposedCursor;
-          wipeChars = Number.isInteger(aiPlan.wipe_chars) ? Math.max(0, Math.min(200, aiPlan.wipe_chars)) : 0;
-          typePrefix = typeof aiPlan.prefix === 'string' ? aiPlan.prefix.slice(0, 200) : '';
-          typeSuffix = typeof aiPlan.suffix === 'string' ? aiPlan.suffix.slice(0, 200) : '';
-          usedHaiku = true;
-          console.log(`[auto-type] Haiku plan ACCEPTED: cursor=${cursorAction}${cursorAction === 'go_to_line' ? `(L${cursorTargetLine}:C${cursorTargetColumn})` : ''} wipeChars=${wipeChars} skip=${effectiveSkipLines} trail=${effectiveSkipTrailing} wipeLine=${wipeFirstLine} prefix=${JSON.stringify(typePrefix.slice(0, 30))} suffix=${JSON.stringify(typeSuffix.slice(0, 30))} conf=${aiPlan.confidence.toFixed(2)} reason=${aiPlan.reasoning || ''}`);
-        } else if (aiPlan) {
-          console.log(`[auto-type] Haiku plan rejected (conf=${aiPlan.confidence ?? '?'}, threshold=0.7)`);
-        }
-      } else if (planRes.status === 404 || planRes.status === 503) {
-        // Endpoint not deployed (Railway lagging on a tag) or downstream
-        // unavailable. Surface a non-blocking warning to the renderer so
-        // the user knows the AI planner isn't doing its job — without it
-        // they'd silently get the deterministic fallback and might be
-        // confused why "the smart auto-type" isn't smart.
-        console.warn(`[auto-type] Haiku planner HTTP ${planRes.status} — using deterministic fallback only (server may need redeploy)`);
-        autoTypeBroadcast({
-          phase: 'planner-unavailable',
-          status: planRes.status,
+      // Broadcast 'thinking' phase so the renderer can show a "Reading
+      // editor — Sonnet is reasoning..." pill instead of a silent gap.
+      // Sonnet calls take 3-8s vs Haiku's 0.5-1s, so the user feedback
+      // matters more here.
+      autoTypeBroadcast({ phase: 'thinking', source: 'agent' });
+      // GOD-LEVEL PATH: try the AI agent first. The /autotype-agent
+      // endpoint is now two-tier internally — Sonnet 4.6 (Anthropic)
+      // primary with Groq Llama-3.3-70B fail-over on Anthropic outage.
+      // Both planners use chain-of-thought + forced tool_choice. The
+      // response includes a `planner_used` field ('sonnet' or 'groq')
+      // so we can surface which vendor served this run in logs/UI.
+      // Falls through to Haiku on any failure (503, parse error, low
+      // confidence) so we get graceful degradation.
+      let aiPlan = null;
+      let plannerSource = 'sonnet-agent';  // Default; updated from response below
+      try {
+        const agentRes = await fetch(`${API_BASE}/api/v1/ai/autotype-agent`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${authToken}`,
+          },
+          body: JSON.stringify({
+            editorText: snapText,
+            cursorOffset: cursorOff,
+            code,
+            language,
+          }),
         });
-      } else {
-        console.log(`[auto-type] Haiku planner HTTP ${planRes.status}`);
+        if (agentRes.ok) {
+          const agentPlan = await agentRes.json().catch(() => null);
+          if (agentPlan && agentPlan.ok === true) {
+            aiPlan = agentPlan;
+            // Identify which planner served this. The server's
+            // /autotype-agent route returns planner_used to disambiguate
+            // Sonnet (primary) from Groq (fallback) when Anthropic is
+            // degraded. Older server builds may omit the field — default
+            // to 'sonnet-agent' so logs stay coherent.
+            if (agentPlan.planner_used === 'groq') {
+              plannerSource = 'groq-fallback';
+              console.log(`[auto-type] agent served by Groq fallback (sonnet error: ${agentPlan.sonnet_error || 'unknown'})`);
+            } else if (agentPlan.planner_used === 'sonnet') {
+              plannerSource = 'sonnet-agent';
+            }
+          } else {
+            console.log('[auto-type] agent returned non-ok plan, falling through to Haiku');
+          }
+        } else {
+          console.log(`[auto-type] agent endpoint HTTP ${agentRes.status} — trying Haiku fallback`);
+        }
+      } catch (agentErr) {
+        console.warn('[auto-type] agent call threw, trying Haiku fallback:', agentErr && agentErr.message);
+      }
+
+      // Fallback: original Haiku one-shot. Kept as a cheaper / faster
+      // backup for when the Sonnet agent is unavailable (Anthropic
+      // outage, server cold start, network blip).
+      if (!aiPlan) {
+        plannerSource = 'haiku-fallback';
+        const planRes = await fetch(`${API_BASE}/api/v1/ai/autotype-plan`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${authToken}`,
+          },
+          body: JSON.stringify({
+            editorText: snapText,
+            cursorOffset: cursorOff,
+            code,
+            language,
+          }),
+        });
+        if (planRes.ok) {
+          aiPlan = await planRes.json().catch(() => null);
+        } else if (planRes.status === 404 || planRes.status === 503) {
+          console.warn(`[auto-type] Haiku planner HTTP ${planRes.status} — using deterministic fallback only (server may need redeploy)`);
+          autoTypeBroadcast({
+            phase: 'planner-unavailable',
+            status: planRes.status,
+          });
+        }
+      }
+
+      // Plan acceptance — same shape from agent or Haiku, treat
+      // identically. Confidence threshold 0.7 holds for both: lower
+      // confidence falls through to the deterministic plan.
+      if (aiPlan && aiPlan.ok === true
+          && Number.isFinite(aiPlan.confidence) && aiPlan.confidence >= 0.7) {
+        effectiveSkipLines = Number.isInteger(aiPlan.skip_leading) ? Math.max(0, aiPlan.skip_leading) : 0;
+        effectiveSkipTrailing = Number.isInteger(aiPlan.skip_trailing) ? Math.max(0, aiPlan.skip_trailing) : 0;
+        wipeFirstLine = !!aiPlan.wipe_first_line;
+        let proposedCursor = ['use_current', 'move_to_end', 'go_to_line'].includes(aiPlan.cursor_action)
+          ? aiPlan.cursor_action : 'use_current';
+        cursorTargetLine = Number.isInteger(aiPlan.target_line) ? aiPlan.target_line : 0;
+        cursorTargetColumn = Number.isInteger(aiPlan.target_column) ? aiPlan.target_column : 0;
+        // ── Cursor-respect override ──
+        // The user just dropped their cursor where they want code typed. If
+        // the planner says "move to end of file" but the editor has a
+        // template with driver code BELOW the cursor (effectiveSkipTrailing
+        // > 0 means the planner itself detected post-cursor content), then
+        // moving to end would land the code BELOW the driver code — wrong
+        // place, looks like "started from beginning of new section" to the
+        // user. Same for go_to_line(0|1) — that's "jump to top," which
+        // overrides the cursor placement the user just made.
+        const editorHasContentBelowCursor = effectiveSkipTrailing > 0;
+        if (proposedCursor === 'move_to_end' && editorHasContentBelowCursor) {
+          console.log('[auto-type] cursor: planner asked move_to_end but editor has content below cursor — honoring user cursor instead');
+          proposedCursor = 'use_current';
+        } else if (proposedCursor === 'go_to_line' && cursorTargetLine <= 1) {
+          console.log(`[auto-type] cursor: planner asked go_to_line(${cursorTargetLine}) — too close to top, honoring user cursor instead`);
+          proposedCursor = 'use_current';
+        }
+        cursorAction = proposedCursor;
+        wipeChars = Number.isInteger(aiPlan.wipe_chars) ? Math.max(0, Math.min(200, aiPlan.wipe_chars)) : 0;
+        typePrefix = typeof aiPlan.prefix === 'string' ? aiPlan.prefix.slice(0, 200) : '';
+        typeSuffix = typeof aiPlan.suffix === 'string' ? aiPlan.suffix.slice(0, 200) : '';
+        usedHaiku = true;  // Reused name; tracks "AI planner accepted"
+        const reasoning = (aiPlan.reasoning || '').replace(/\s+/g, ' ').slice(0, 200);
+        console.log(`[auto-type] ${plannerSource} plan ACCEPTED: cursor=${cursorAction}${cursorAction === 'go_to_line' ? `(L${cursorTargetLine}:C${cursorTargetColumn})` : ''} wipeChars=${wipeChars} skip=${effectiveSkipLines} trail=${effectiveSkipTrailing} wipeLine=${wipeFirstLine} prefix=${JSON.stringify(typePrefix.slice(0, 30))} suffix=${JSON.stringify(typeSuffix.slice(0, 30))} conf=${aiPlan.confidence.toFixed(2)} reason=${reasoning}`);
+        // Surface the agent's reasoning to the renderer so the user (and
+        // future debugging) can see WHY the model chose this plan. This
+        // is a key part of the "Claude-like" UX — the model's thinking
+        // is auditable, not hidden in a JSON blob.
+        // Both Sonnet and Groq paths produce reasoning text — surface
+        // it identically, but tag the source so the renderer can show
+        // a small "served by Groq (Anthropic degraded)" hint when the
+        // fallback fired.
+        if ((plannerSource === 'sonnet-agent' || plannerSource === 'groq-fallback') && reasoning) {
+          autoTypeBroadcast({
+            phase: 'plan-ready',
+            source: plannerSource === 'groq-fallback' ? 'groq' : 'agent',
+            reasoning,
+            confidence: aiPlan.confidence,
+          });
+        }
+      } else if (aiPlan) {
+        console.log(`[auto-type] ${plannerSource} plan rejected (conf=${aiPlan.confidence ?? '?'}, threshold=0.7)`);
       }
     } catch (planErr) {
-      console.warn('[auto-type] Haiku plan call failed:', planErr && planErr.message);
+      console.warn('[auto-type] AI plan call failed:', planErr && planErr.message);
     }
   }
 
@@ -2602,12 +2994,18 @@ ipcMain.handle('db:delete-session', (_event, sessionId, userId) => {
   return result;
 });
 
-ipcMain.handle('db:get-messages', (_event, sessionId) => {
-  return database.getMessages(sessionId);
+// Per-session ops now require userId — verify ownership before any
+// read/write so a renderer that guesses a sessionId (Date.now()-based)
+// can't reach another user's data on a shared device. Renderer always
+// passes userId from licenseService; callers without one (legacy) get
+// an empty result rather than cross-user access.
+ipcMain.handle('db:get-messages', (_event, sessionId, userId) => {
+  return database.getMessages(sessionId, userId);
 });
 
-ipcMain.handle('db:add-message', (_event, sessionId, message) => {
-  database.addMessage(sessionId, message);
+ipcMain.handle('db:add-message', (_event, sessionId, message, userId) => {
+  const ok = database.addMessage(sessionId, message, userId);
+  if (!ok) return { ok: false, reason: 'forbidden' };
   // Notify the OTHER window so it updates in real time
   BrowserWindow.getAllWindows().forEach(win => {
     if (win.webContents.id !== _event.sender.id && !win.isDestroyed()) {
@@ -2618,63 +3016,115 @@ ipcMain.handle('db:add-message', (_event, sessionId, message) => {
   // so always broadcast a sessions-updated so the sidebar re-fetches
   // (cheap — the full list is tiny).
   broadcastToAllWindows('db:sessions-updated');
+  return { ok: true };
 });
 
-ipcMain.handle('db:get-context-files', (_event, sessionId) => {
-  return database.getContextFiles(sessionId);
+ipcMain.handle('db:get-context-files', (_event, sessionId, userId) => {
+  return database.getContextFiles(sessionId, userId);
 });
 
-ipcMain.handle('db:add-context-file', (_event, sessionId, file) => {
-  database.addContextFile(sessionId, file);
+ipcMain.handle('db:add-context-file', (_event, sessionId, file, userId) => {
+  const ok = database.addContextFile(sessionId, file, userId);
+  if (!ok) return { ok: false, reason: 'forbidden' };
   BrowserWindow.getAllWindows().forEach(win => {
     if (win.webContents.id !== _event.sender.id && !win.isDestroyed()) {
       win.webContents.send('db:files-updated', sessionId);
     }
   });
+  return { ok: true };
 });
 
-ipcMain.handle('db:remove-context-file', (_event, fileId) => {
-  database.removeContextFile(fileId);
+ipcMain.handle('db:remove-context-file', (_event, fileId, userId) => {
+  const ok = database.removeContextFile(fileId, userId);
+  if (!ok) return { ok: false, reason: 'forbidden' };
   BrowserWindow.getAllWindows().forEach(win => {
     if (win.webContents.id !== _event.sender.id && !win.isDestroyed()) {
       win.webContents.send('db:files-updated');
     }
   });
+  return { ok: true };
 });
 
-ipcMain.handle('db:clear-session', (_event, sessionId) => {
-  database.clearMessages(sessionId);
-  database.clearContextFiles(sessionId);
+ipcMain.handle('db:clear-session', (_event, sessionId, userId) => {
+  const okMsgs = database.clearMessages(sessionId, userId);
+  const okFiles = database.clearContextFiles(sessionId, userId);
+  if (!okMsgs && !okFiles) return { ok: false, reason: 'forbidden' };
   broadcastToAllWindows('db:session-cleared', sessionId);
   broadcastToAllWindows('db:sessions-updated');
+  return { ok: true };
 });
 
 // ───────────────────────────────────────────────
 //  SYSTEM TRAY
 // ───────────────────────────────────────────────
-function createTray() {
-  // Tray icon — INTENTIONALLY TRANSPARENT for screen-share invisibility.
-  // The OS still reserves a slot in the system tray (right-clickable + the
-  // hover surface is preserved) but no graphic draws there, so a viewer
-  // watching the candidate's screen can't visually identify the app from
-  // the taskbar tray strip. The first-launch tutorial walks the user through
-  // (a) where the slot is and (b) dragging it into the Windows overflow
-  // popup so it leaves the always-visible strip entirely.
-  //
-  // 1×1 fully-transparent PNG. Electron resizes to the OS-default tray size.
-  const transparentPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
-  let trayIcon = nativeImage.createFromBuffer(Buffer.from(transparentPng, 'base64'));
-  trayIcon = trayIcon.resize({ width: 16, height: 16 });
+// 1×1 fully-transparent PNG. Used only during active interview sessions
+// where stealth must override discoverability — see the session-active
+// handler. Outside of sessions we now use the real brand icon so users
+// can actually find and click the tray slot (this was the #1 source of
+// "I can't reopen the app" support reports).
+const TRANSPARENT_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
 
-  tray = new Tray(trayIcon);
-  // Native tray tooltip is rendered by the OS shell — NOT covered by
-  // setContentProtection and shows on screen-share when the cursor crosses
-  // the system tray. We need a non-empty tooltip so Windows doesn't
-  // collapse / garbage-collect the tray slot (which would lock the user
-  // out of right-click access), but the string must NOT identify the app.
-  // A single space character: takes up no visible width, satisfies "non-empty",
-  // doesn't leak any branding on screen-share.
-  tray.setToolTip(' ');
+function loadTrayIcon(stealth) {
+  if (stealth) {
+    const img = nativeImage.createFromBuffer(Buffer.from(TRANSPARENT_PNG_B64, 'base64'));
+    return img.resize({ width: 16, height: 16 });
+  }
+  // Real brand icon. electron/tray-icon.png (32×32) ships inside app.asar
+  // alongside main.cjs (electron/**/* is in package.json files glob).
+  // Electron auto-scales for HiDPI displays.
+  const iconPath = path.join(__dirname, 'tray-icon.png');
+  try {
+    const img = nativeImage.createFromPath(iconPath);
+    if (img.isEmpty()) throw new Error('nativeImage.createFromPath returned empty');
+    return img;
+  } catch (err) {
+    electronLog.warn('[tray] failed to load brand icon, falling back to transparent:', err.message);
+    const img = nativeImage.createFromBuffer(Buffer.from(TRANSPARENT_PNG_B64, 'base64'));
+    return img.resize({ width: 16, height: 16 });
+  }
+}
+
+function createTray(stealth = false) {
+  // Two visual modes:
+  //   stealth=false (default, idle state): real brand icon + "Interview Copilot"
+  //     tooltip. Users can see and click the tray slot like a normal app.
+  //   stealth=true (active interview session): 1×1 transparent icon + blank
+  //     tooltip. Slot still exists for right-click access but no graphic or
+  //     branding draws on the screen-share. We additionally destroy the tray
+  //     entirely on session-active=true (see ipcMain handler) — stealth=true
+  //     here is a defense-in-depth fallback for any path that re-creates
+  //     during a session.
+  const trayIcon = loadTrayIcon(stealth);
+
+  // Tray() can throw on Windows if the shell tray isn't ready (Explorer.exe
+  // mid-restart) or if the icon handle is rejected. Retry once after a brief
+  // delay rather than leaving the user with no way back into the app.
+  try {
+    tray = new Tray(trayIcon);
+  } catch (err) {
+    electronLog.warn('[tray] new Tray() threw, retrying in 500ms:', err.message);
+    tray = null;
+    setTimeout(() => {
+      try {
+        tray = new Tray(loadTrayIcon(stealth));
+        wireTrayHandlers(stealth);
+        electronLog.info('[tray] retry succeeded');
+      } catch (err2) {
+        electronLog.error('[tray] retry also failed, giving up this cycle:', err2.message);
+      }
+    }, 500);
+    return;
+  }
+
+  wireTrayHandlers(stealth);
+}
+
+function wireTrayHandlers(stealth) {
+  if (!tray || tray.isDestroyed()) return;
+  // Tooltip: branded when visible (helps users identify the slot they're
+  // hovering); single-space when stealth (non-empty so Windows doesn't
+  // garbage-collect the slot, but no branding to leak on screen-share).
+  tray.setToolTip(stealth ? ' ' : 'Interview Copilot');
 
   function updateTrayMenu() {
     // Defense-in-depth — the session-active handler clears trayMenuInterval
@@ -2683,6 +3133,11 @@ function createTray() {
     if (!tray || tray.isDestroyed()) return;
     const isMainVisible = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible();
     const isPopoutOpen = popoutWindow && !popoutWindow.isDestroyed();
+    // Display-only accelerator hint — the actual hotkey is registered
+    // via globalShortcut.register() in app.whenReady. We inline it in
+    // the label (rather than using Menu's `accelerator` property) to
+    // avoid a second binding that could double-fire with the global one.
+    const accelHint = process.platform === 'darwin' ? 'Cmd+Alt+Space' : 'Ctrl+Alt+Space';
 
     const contextMenu = Menu.buildFromTemplate([
       {
@@ -2691,15 +3146,14 @@ function createTray() {
       },
       { type: 'separator' },
       {
-        label: isMainVisible ? 'Hide Main Window' : 'Show Main Window',
+        label: isMainVisible ? `Hide Main Window  (${accelHint})` : `Show Main Window  (${accelHint})`,
         click: () => {
           if (!mainWindow || mainWindow.isDestroyed()) {
             createMainWindow();
           } else if (mainWindow.isVisible()) {
-            mainWindow.hide();
+            smoothHide(mainWindow);
           } else {
-            mainWindow.show();
-            mainWindow.focus();
+            smoothShow(mainWindow);
           }
           updateTrayMenu();
         }
@@ -2719,8 +3173,15 @@ function createTray() {
       {
         label: 'Quit',
         click: () => {
-          // Don't pre-set isQuitting — let before-quit decide whether to
-          // install a pending update first or proceed with cleanup.
+          // Tray-Quit race fix: if there's NO pending update, mark
+          // isQuitting=true now so mainWindow.on('close') (which fires as
+          // part of app.quit()'s window-close cascade) takes its
+          // early-return branch instead of showing the in-app update
+          // prompt or hiding to tray. When a pending update DOES exist,
+          // leave isQuitting=false so the close handler hits the update-
+          // prompt branch and offers the install — matches the X-button
+          // behavior, which the user expects.
+          if (!pendingUpdate) app.isQuitting = true;
           app.quit();
         }
       }
@@ -2729,15 +3190,14 @@ function createTray() {
     tray.setContextMenu(contextMenu);
   }
 
-  // Left-click on tray: toggle main window
+  // Left-click on tray: toggle main window with smooth animation
   tray.on('click', () => {
     if (!mainWindow || mainWindow.isDestroyed()) {
       createMainWindow();
     } else if (mainWindow.isVisible()) {
-      mainWindow.hide();
+      smoothHide(mainWindow);
     } else {
-      mainWindow.show();
-      mainWindow.focus();
+      smoothShow(mainWindow);
     }
     updateTrayMenu();
   });
@@ -2765,11 +3225,63 @@ app.whenReady().then(() => {
   // updater check, all of which then fight the primary instance.
   if (!app.hasSingleInstanceLock()) return;
 
-  // Grant all media permissions (screen capture, audio, etc.)
+  // AppUserModelId — without this, Windows toast notifications either
+  // show under "electron.app.Interview Copilot" or fail to display at
+  // all. Must match the appId in package.json's electron-builder config
+  // so notifications are routed to the same registered shortcut the
+  // installer created.
+  if (process.platform === 'win32') {
+    try { app.setAppUserModelId('com.interviewcopilot.app'); } catch (_) {}
+  }
+
+  // ── Permission handlers — allowlist by (permission, origin) ──────
+  // The previous blanket-grant handlers were defense-in-depth gaps:
+  // setPermissionRequestHandler((wc, perm, cb) => cb(true)) said "yes
+  // to anything for any origin." Today the renderer only loads our own
+  // file:// or localhost:3005 URL, so there's no exploit surface — but
+  // any future code that loads a third-party origin (Google sign-in
+  // popup, embedded webview) would silently inherit carte-blanche.
+  // Scope down now while it's a one-line change.
+  //
+  // Allowed permissions cover what the app actually uses:
+  //   media        — microphone (Deepgram transcription)
+  //   display-capture / screen-wake-lock — screen capture for Auto-Solve
+  //   notifications — first-time-tray-hide toast
+  //   clipboard-read / clipboard-sanitized-write — Copy buttons
+  // Anything else (geolocation, midi, sensors, persistent-storage,
+  // payment-handler, fullscreen, etc.) is denied.
+  const ALLOWED_PERMISSIONS = new Set([
+    'media',
+    'display-capture',
+    'screen-wake-lock',
+    'notifications',
+    'clipboard-read',
+    'clipboard-sanitized-write',
+  ]);
+  function isAppOrigin(webContents) {
+    if (!webContents || webContents.isDestroyed()) return false;
+    const url = webContents.getURL();
+    if (!url) return false;
+    if (isDev) {
+      return url.startsWith('http://localhost:3005') || url.startsWith('http://127.0.0.1:3005');
+    }
+    return url.startsWith('file://');
+  }
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    if (!ALLOWED_PERMISSIONS.has(permission)) {
+      electronLog.warn(`[permissions] denied ${permission} from ${webContents?.getURL?.()}`);
+      return callback(false);
+    }
+    if (!isAppOrigin(webContents)) {
+      electronLog.warn(`[permissions] denied ${permission} — non-app origin: ${webContents?.getURL?.()}`);
+      return callback(false);
+    }
     callback(true);
   });
-  session.defaultSession.setPermissionCheckHandler(() => true);
+  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
+    if (!ALLOWED_PERMISSIONS.has(permission)) return false;
+    return isAppOrigin(webContents);
+  });
 
   // Pre-warm the Windows UIA bridge so the first Auto-Type doesn't pay the
   // 300ms–2s PowerShell + `Add-Type System.Windows.Automation` cold start.
@@ -2786,6 +3298,77 @@ app.whenReady().then(() => {
 
   createMainWindow();
   createTray();
+
+  // ── Tray reliability watchdog ───────────────────────────────────────
+  // The tray icon dies in a few real-world scenarios that we shouldn't
+  // make the user troubleshoot:
+  //   • Explorer.exe restart (Task Manager → Restart Windows Explorer,
+  //     or a shell crash). Electron's auto-recovery isn't reliable on
+  //     all Windows builds — verify and recreate ourselves.
+  //   • Display config changes (plug/unplug monitor, resolution change,
+  //     DPI change). The system tray shell is recreated; our handle to
+  //     the old tray slot can go stale.
+  //   • Random "tray = null" left by a failed createTray() retry.
+  //
+  // Strategy: recreate ONLY when not in an active interview session
+  // (sessionActive guards screen-share invisibility). Every 60s and on
+  // every display-config event.
+  function reviveTrayIfDead(reason) {
+    if (sessionActive) return; // session-active intentionally has no tray
+    if (tray && !tray.isDestroyed()) return;
+    electronLog.info(`[tray] watchdog reviving — reason: ${reason}`);
+    try { createTray(); } catch (err) {
+      electronLog.warn('[tray] watchdog createTray threw:', err && err.message);
+    }
+  }
+  try {
+    screen.on('display-added', () => reviveTrayIfDead('display-added'));
+    screen.on('display-removed', () => reviveTrayIfDead('display-removed'));
+    screen.on('display-metrics-changed', () => reviveTrayIfDead('display-metrics-changed'));
+  } catch (err) {
+    electronLog.warn('[tray] screen event subscription failed:', err && err.message);
+  }
+  setInterval(() => reviveTrayIfDead('periodic-health-check'), 60_000);
+
+  // ── Global hotkey: bring the app back when it's hidden ──────────────
+  // The app window has skipTaskbar=true and the tray icon is sometimes
+  // genuinely lost (Explorer.exe restart, Windows 11 overflow flyout
+  // disabled, display-config change). Without this hotkey, a user with
+  // the window hidden and a missing tray slot has no way back into the
+  // app short of relaunching from the Start menu. Ctrl+Alt+Space is
+  // chosen because it is rarely bound (vs Ctrl+Shift+Space which IDEs
+  // use for parameter hints / smart completion) and is a 3-key chord
+  // that's hard to trigger by accident during typing.
+  //
+  // Registration can fail if another app already grabbed the chord —
+  // electronLog so we surface it in the support log without crashing.
+  const TOGGLE_ACCELERATOR = process.platform === 'darwin' ? 'Cmd+Alt+Space' : 'Ctrl+Alt+Space';
+  try {
+    const ok = globalShortcut.register(TOGGLE_ACCELERATOR, () => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        createMainWindow();
+        return;
+      }
+      if (mainWindow.isVisible() && mainWindow.isFocused()) {
+        // Visible AND focused — user is actively using it; this press
+        // is a request to hide. Same semantics as the close button.
+        try { mainWindow.webContents.send('app-hidden-to-tray'); } catch {}
+        smoothHide(mainWindow);
+      } else {
+        // Hidden, minimized, or visible-but-not-focused — bring forward
+        // with the fade-in that smoothShow does (handles restore from
+        // minimized internally).
+        smoothShow(mainWindow);
+      }
+    });
+    if (!ok) {
+      electronLog.warn(`[hotkey] register("${TOGGLE_ACCELERATOR}") returned false — likely already bound by another app`);
+    } else {
+      electronLog.info(`[hotkey] registered ${TOGGLE_ACCELERATOR}`);
+    }
+  } catch (err) {
+    electronLog.warn('[hotkey] registration threw:', err && err.message);
+  }
 
   // ── Auto-Update System ──
   // Strategy: at launch, race against a 6s window — if a previously
@@ -2988,7 +3571,7 @@ app.whenReady().then(() => {
     if (!mainWindow || mainWindow.isDestroyed()) {
       createMainWindow();
     } else {
-      mainWindow.show();
+      smoothShow(mainWindow);
     }
   });
 });
@@ -3011,6 +3594,7 @@ app.on('before-quit', (e) => {
     return;
   }
   app.isQuitting = true;
+  try { globalShortcut.unregisterAll(); } catch (_) {}
   try { killUIABridge(); } catch (_) {}
   database.closeDB();
 });

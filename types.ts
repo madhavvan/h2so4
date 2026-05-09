@@ -41,6 +41,18 @@ export interface AppSettings {
   // Defaults to 'none' for all tiers — fastest baseline, and non-Max are
   // stuck there anyway. Max users opt up per-session as needed.
   reasoningEffort: 'none' | 'low' | 'medium' | 'high';
+  // Free-form user-supplied directives that prepend to the system prompt
+  // for every model call. Examples: "Use the STAR method on behavioral
+  // questions", "Cite tool versions in code answers", "Keep responses
+  // under 200 words". The server wraps these in a
+  // ━━━ USER INSTRUCTIONS — FOLLOW STRICTLY ━━━ block ahead of the
+  // existing system prompt so the model treats them as high-priority
+  // directives. Stored in localStorage (key: CUSTOM_INSTRUCTIONS) to
+  // match the persistence pattern of generalMode/theme/fontSize.
+  // No hard char limit — but the modal warns above 3000 chars that
+  // long instructions slow first-token-out on every call. Empty string
+  // when unused (the server skips the wrapper block in that case).
+  customInstructions: string;
 }
 
 export interface ContextFile {

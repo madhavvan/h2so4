@@ -1,6 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, Send, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Wand2, Download, Monitor, Laptop, Terminal, LogOut, Crown, Sparkles, Loader2 } from 'lucide-react';
+import { Settings, Mic, MicOff, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Download, Monitor, Laptop, Terminal, LogOut, Crown, Sparkles, Loader2, EyeOff, ShieldCheck, ScanSearch } from 'lucide-react';
+import { WizardHat } from './WizardHat';
+import { PaperAirplane } from './GitHubIcons';
+import { GeminiIcon, OpenAIIcon, ClaudeIcon, GrokIcon, GroqIcon } from './ProviderIcons';
+import { ErrorBoundary } from './ErrorBoundary';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -8,6 +12,7 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT, prewarmIdentity, generateConversationTitle } from './services/aiProxyService';
 import { generateClaude, streamClaude, prewarmClaudeIdentity, trainClaudeModel, trainClaudeModelBeast, hasCachedTechState, type TrainingProgress } from './services/claudeService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
+import { usePrefetchContext } from './hooks/usePrefetchContext';
 import { extractTextFromPdf } from './services/pdfService';
 import { extractTextFromDocx } from './services/docxService';
 import { useDatabase, SessionSummary } from './hooks/useDatabase';
@@ -221,7 +226,7 @@ async function computeAutoTypeSkipLines(
 // 'done' = brief success flash, 'verify-mismatch' = typed but UIA read-back
 // disagreed with what we typed (editor may have stripped/reformatted or we
 // dropped input) — surfaced so the user can eyeball the result.
-type AutoTypePhase = 'idle' | 'preparing' | 'countdown' | 'typing' | 'done' | 'verify-mismatch';
+type AutoTypePhase = 'idle' | 'preparing' | 'thinking' | 'countdown' | 'typing' | 'done' | 'verify-mismatch';
 
 const CodeBlock: React.FC<{
     code: string;
@@ -262,6 +267,11 @@ const CodeBlock: React.FC<{
     // read when 'done' fires (verify signals always arrive before 'done').
     // Cleared at the start of each cycle so stale verdicts don't bleed across.
     const verifyMismatchRef = useRef(false);
+    // Captured reasoning from the Sonnet agent's plan. Populated by the
+    // 'plan-ready' phase event so the user can see WHY the agent chose
+    // its plan. Surfaced as a tooltip on the auto-type button while the
+    // cycle is running. Cleared at the start of each click.
+    const agentReasoningRef = useRef<string>('');
     // Diagnostics from the most recent verify-mismatch — what we expected to
     // find in the editor vs. what was actually there. Surfaced in the error
     // toast so the user can tell focus-loss from autocomplete-collision from
@@ -325,7 +335,21 @@ const CodeBlock: React.FC<{
         if (atPhase === 'idle') return;
         const handler = (data: any) => {
             if (!data || typeof data !== 'object') return;
-            if (data.phase === 'countdown') {
+            if (data.phase === 'thinking') {
+                // Sonnet agent is running — chain-of-thought reasoning
+                // takes 3-8s; show explicit feedback so the gap doesn't
+                // feel like a hang. Stays in this phase until 'plan-ready'
+                // (agent decided) or 'countdown' (planner skipped/failed).
+                setAtPhase('thinking');
+            } else if (data.phase === 'plan-ready') {
+                // Agent finished. Stash the reasoning preview if provided
+                // — it's surfaced in the button label so the user sees
+                // what the model decided. We don't change phase here;
+                // 'countdown' or 'typing' will land next.
+                if (typeof data.reasoning === 'string' && data.reasoning.trim()) {
+                    agentReasoningRef.current = data.reasoning.trim();
+                }
+            } else if (data.phase === 'countdown') {
                 setAtPhase('countdown');
                 setAtCountdown(data.n);
             } else if (data.phase === 'typing') {
@@ -427,8 +451,11 @@ const CodeBlock: React.FC<{
             setAtPhase('idle');
             return;
         }
-        if (atPhase === 'countdown' || atPhase === 'typing') {
-            // Second click during countdown / typing = abort via main.
+        if (atPhase === 'countdown' || atPhase === 'typing' || atPhase === 'thinking') {
+            // Second click during countdown / typing / agent-thinking = abort via main.
+            // (Aborting during 'thinking' just stops main's auto-type:send loop;
+            // the in-flight Sonnet call resolves into the void without affecting
+            // the typing engine.)
             electronIPC.send('auto-type:abort');
             return;
         }
@@ -519,6 +546,10 @@ const CodeBlock: React.FC<{
 
     const autoTypeLabel =
         atPhase === 'preparing'       ? 'Scanning editor…' :
+        // 'thinking' is the new agentic phase — Sonnet 4.6 is reasoning
+        // about the editor state via tool_use. Takes 3-8s on hard cases
+        // (HackerRank templates with __main__ blocks, mid-file inserts).
+        atPhase === 'thinking'        ? 'Thinking…  (click to cancel)' :
         atPhase === 'countdown'       ? `Typing in ${atCountdown}…  (click to cancel)` :
         atPhase === 'typing'          ? 'Typing…  (click to cancel)' :
         atPhase === 'done'            ? 'Done' :
@@ -527,6 +558,9 @@ const CodeBlock: React.FC<{
     const autoTypeClass =
         atPhase === 'done'            ? 'text-green-400'
       : atPhase === 'verify-mismatch' ? 'text-amber-400'
+      // 'thinking' uses blue to telegraph "AI is working" vs the amber
+      // "system is acting on your behalf" used for countdown/typing.
+      : atPhase === 'thinking'        ? 'text-blue-400'
       : atPhase !== 'idle'            ? 'text-amber-400'
       :                                 'text-gray-400 hover:text-white';
 
@@ -546,9 +580,15 @@ const CodeBlock: React.FC<{
                                 ? <Check size={12} />
                                 : atPhase === 'verify-mismatch'
                                 ? <AlertTriangle size={12} />
+                                : atPhase === 'thinking'
+                                // Loader2 (spinner) telegraphs "AI is reasoning"
+                                // — distinct from Zap (system action) so the
+                                // user can tell the difference between "the
+                                // agent is thinking" and "keystrokes incoming".
+                                ? <Loader2 size={12} className="animate-spin" />
                                 : <Zap size={12} className={atPhase !== 'idle' ? 'animate-pulse' : ''} />}
                             <span>{autoTypeLabel}</span>
-                            {!canAutoType && atPhase === 'idle' && <Crown size={10} className="text-amber-400" />}
+                            {!canAutoType && atPhase === 'idle' && <WizardHat size={10} className="text-amber-400" />}
                         </button>
                     )}
                     <button
@@ -655,51 +695,58 @@ const MessageRenderer = React.memo(({ content, fontSize, canAutoType, isStreamin
         fontSize === 'large' ? 'prose-lg' :
         'prose-base';
 
+    // Memoize the components map so its identity is stable across renders
+    // — without this hoist, ReactMarkdown sees a new `components` object
+    // every render and treats it as "props changed" for reconciliation.
+    // canAutoType + isStreaming are the only render-relevant props the
+    // child handlers close over, so the dep array reflects exactly what
+    // would actually require a fresh closure.
+    const markdownComponents = useMemo(() => ({
+        code({ node, inline, className, children, ...props }: any) {
+            const match = /language-(\w+)/.exec(className || '');
+            return !inline && match ? (
+                <CodeBlock code={String(children).replace(/\n$/, '')} language={match[1]} canAutoType={canAutoType} isStreaming={isStreaming} />
+            ) : (
+                <code className="bg-gray-200 dark:bg-gray-800 rounded px-1 py-0.5 font-mono text-sm" {...props}>
+                    {children}
+                </code>
+            );
+        },
+        a({ href, children, ...props }: any) {
+            // Intercept the in-app `[Label](upgrade)` link the AI emits
+            // when a feature is gated behind a paid tier (see the Auto-
+            // Solve gate message). Without this it would render as plain
+            // <a href="upgrade"> and a click would navigate the renderer
+            // to a broken relative URL — "http://localhost:3005/upgrade"
+            // in dev or "file:///.../upgrade" packaged — stranding the
+            // user on a 404 inside the desktop window. We dispatch a
+            // window event the App wrapper picks up to open
+            // ManageSubscription; using an event keeps this memoized
+            // component free of new props that would bust its React.memo
+            // on every render.
+            if (href === 'upgrade') {
+                return (
+                    <a
+                        href="#upgrade"
+                        onClick={(e) => {
+                            e.preventDefault();
+                            window.dispatchEvent(new CustomEvent('app:open-manage-subscription'));
+                        }}
+                        className="text-blue-400 hover:text-blue-300 font-bold underline cursor-pointer"
+                    >
+                        {children}
+                    </a>
+                );
+            }
+            return <a href={href} {...props}>{children}</a>;
+        }
+    }), [canAutoType, isStreaming]);
+
     return (
         <div className={`markdown-body prose dark:prose-invert max-w-none ${sizeClass} prose-pre:bg-transparent prose-pre:p-0 prose-pre:m-0`}>
             <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
-                components={{
-                    code({ node, inline, className, children, ...props }: any) {
-                        const match = /language-(\w+)/.exec(className || '');
-                        return !inline && match ? (
-                            <CodeBlock code={String(children).replace(/\n$/, '')} language={match[1]} canAutoType={canAutoType} isStreaming={isStreaming} />
-                        ) : (
-                            <code className="bg-gray-200 dark:bg-gray-800 rounded px-1 py-0.5 font-mono text-sm" {...props}>
-                                {children}
-                            </code>
-                        );
-                    },
-                    a({ href, children, ...props }: any) {
-                        // Intercept the in-app `[Label](upgrade)` link the AI
-                        // emits when a feature is gated behind a paid tier
-                        // (see the Auto-Solve gate message). Without this it
-                        // would render as plain <a href="upgrade"> and a click
-                        // navigates the renderer to a broken relative URL —
-                        // "http://localhost:3005/upgrade" in dev or
-                        // "file:///.../upgrade" packaged — stranding the user
-                        // on a 404 inside the desktop window. We dispatch a
-                        // window event the App wrapper picks up to open
-                        // ManageSubscription; using an event keeps this
-                        // memoized component free of new props that would
-                        // bust its React.memo on every render.
-                        if (href === 'upgrade') {
-                            return (
-                                <a
-                                    href="#upgrade"
-                                    onClick={(e) => {
-                                        e.preventDefault();
-                                        window.dispatchEvent(new CustomEvent('app:open-manage-subscription'));
-                                    }}
-                                    className="text-blue-400 hover:text-blue-300 font-bold underline cursor-pointer"
-                                >
-                                    {children}
-                                </a>
-                            );
-                        }
-                        return <a href={href} {...props}>{children}</a>;
-                    }
-                }}
+                components={markdownComponents}
             >
                 {content}
             </ReactMarkdown>
@@ -998,7 +1045,7 @@ const ChatInterface = ({
                             (340px) doesn't wrap the controls onto two rows. */}
                         {sizeIndex >= 1 && effectiveTier === 'max' && (
                           <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400">
-                            <Sparkles size={9} /> MAX
+                            <WizardHat size={9} /> MAX
                           </div>
                         )}
                         {sizeIndex >= 1 && effectiveTier === 'pro' && (
@@ -1276,17 +1323,17 @@ const ChatInterface = ({
                         />
                     </div>
                     
-                    <button 
-                        className="send-btn" 
-                        id="sendBtn" 
+                    <button
+                        className="send-btn"
+                        id="sendBtn"
                         aria-label="Send message"
                         onClick={handleManualSend}
                         disabled={!inputText.trim() || isProcessing}
                         style={{ opacity: (!inputText.trim() || isProcessing) ? 0.5 : 1 }}
                     >
-                        <Send size={18} strokeWidth={1.5} />
+                        <PaperAirplane size={18} />
                     </button>
-                    
+
                     <button
                         className="send-btn ml-2"
                         aria-label={gate.canAutoSolve ? "Auto-Solve" : "Auto-Solve — Pro only"}
@@ -1294,7 +1341,7 @@ const ChatInterface = ({
                         disabled={isProcessing || !gate.canAutoSolve}
                         style={{ opacity: (isProcessing || !gate.canAutoSolve) ? 0.4 : 1, position: 'relative' }}
                     >
-                        <Wand2 size={18} strokeWidth={1.5} />
+                        <ScanSearch size={18} strokeWidth={1.5} />
                         {!gate.canAutoSolve && (
                             <span
                                 className="absolute -top-1 -right-1 text-[7px] font-bold tracking-wider bg-amber-400/15 text-amber-300 px-1 py-px rounded border border-amber-400/40"
@@ -1314,6 +1361,53 @@ const ChatInterface = ({
             <header className={`h-14 md:h-16 border-b border-white/15 bg-transparent flex items-center justify-between px-4 shrink-0 z-20 sticky top-0`}>
                 <div className="flex items-center gap-2 md:gap-3">
                 <h1 className="font-bold text-base md:text-lg tracking-tight hidden xs:block">minica<span className="text-blue-500">ai</span></h1>
+                {/* Hide button — replaces the previous always-visible kbd chip.
+                    Three improvements over the old approach:
+                      1. CLEAR PURPOSE: labeled "Hide" with EyeOff icon, framed
+                         in the hover tooltip as a screen-share safety feature
+                         (not the ambiguous "hide/show" the user saw before).
+                      2. CLICKABLE: clicking it routes through the same
+                         close-window IPC the X button uses, which triggers
+                         the smoothHide() flow in main.cjs. So users now have
+                         THREE consistent paths: this button, Ctrl+Alt+Space,
+                         the X button.
+                      3. RESILIENT TO LAYOUT: the kbd chord is hidden below
+                         lg breakpoint when the conversations panel narrows
+                         the header — only "Hide" + icon stays visible. The
+                         hover tooltip still shows the shortcut in full, so
+                         the user can always learn it.
+                    Lives inside the main window (setContentProtection=true),
+                    so it's automatically invisible during screen-share. */}
+                <div className="relative group hidden md:block md:ml-12">
+                    <button
+                        onClick={() => electronIPC.send('close-window')}
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/[0.04] hover:bg-blue-500/15 border border-white/10 hover:border-blue-500/40 transition-all text-[11px] font-medium text-gray-400 hover:text-blue-300"
+                        aria-label="Hide app for screen-share safety. Also available via Ctrl+Alt+Space."
+                    >
+                        <EyeOff size={12} />
+                        <span>Hide</span>
+                        <kbd className="hidden lg:inline-flex px-1 py-0.5 rounded bg-white/[0.06] border border-white/10 font-mono text-[9px] text-white/50">
+                            {/(Mac|iPhone|iPad)/i.test(typeof navigator !== 'undefined' ? navigator.platform : '') ? '⌘' : 'Ctrl'}+Alt+Space
+                        </kbd>
+                    </button>
+                    {/* Tooltip — appears on hover, explains the safety
+                        framing the user asked for. pointer-events-none so
+                        the tooltip itself doesn't intercept the mouse. z-60
+                        sits above the sticky header (z-20) but below modals
+                        (z-99999). */}
+                    <div className="absolute top-full left-0 mt-2 w-80 p-3.5 rounded-xl bg-zinc-900/95 backdrop-blur-md border border-white/10 shadow-2xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 z-[60] pointer-events-none">
+                        <div className="flex items-center gap-2 mb-2">
+                            <ShieldCheck size={14} className="text-emerald-400" />
+                            <div className="text-xs font-bold text-white">Quick hide for screen-share safety</div>
+                        </div>
+                        <p className="text-[12px] text-white/70 leading-relaxed">
+                            Click here (or press <kbd className="inline-block px-1 py-0.5 rounded bg-white/10 font-mono text-[10px] text-white align-baseline">{/(Mac|iPhone|iPad)/i.test(typeof navigator !== 'undefined' ? navigator.platform : '') ? '⌘' : 'Ctrl'}+Alt+Space</kbd>) to instantly hide Interview Copilot from your interviewer's view during screen share.
+                        </p>
+                        <p className="text-[12px] text-white/70 leading-relaxed mt-2">
+                            Press the same shortcut to bring it back any time.
+                        </p>
+                    </div>
+                </div>
                 </div>
 
                 <div className="flex items-center gap-2 md:gap-3">
@@ -1322,20 +1416,29 @@ const ChatInterface = ({
                         than Pro. Matches the existing in-app Max gradient
                         (amber-500/10 → purple-500/10) the rest of the app
                         uses everywhere else for Max. */}
+                    {/* Tier badge — single subscription entry-point in the
+                        header. Doubles as status indicator (shows current
+                        plan: MAX / PRO / BASIC / Upgrade) AND action (click
+                        opens ManageSubscription). The previous header had a
+                        SECOND identical entry-point (a standalone Crown icon
+                        next to Settings) which was redundant and confusing —
+                        now removed. The badge itself is always visible
+                        regardless of breakpoint so users on narrow widths
+                        still see and can click it. */}
                     {userLicense && userLicense.tier === 'max' ? (
-                      <button onClick={onOpenManageSub} title="Manage subscription" className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400 hover:from-amber-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
-                        <Sparkles size={10} /> MAX
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400 hover:from-amber-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
+                        <WizardHat size={10} /> MAX
                       </button>
                     ) : userLicense && userLicense.tier === 'pro' ? (
-                      <button onClick={onOpenManageSub} title="Manage subscription" className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-blue-500/10 border-blue-500/30 text-blue-400 hover:bg-blue-500/20 transition-all cursor-pointer">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-blue-500/10 border-blue-500/30 text-blue-400 hover:bg-blue-500/20 transition-all cursor-pointer">
                         <Crown size={10} /> PRO
                       </button>
                     ) : userLicense && userLicense.tier === 'basic' ? (
-                      <button onClick={onOpenManageSub} title="Manage subscription" className="hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20 transition-all cursor-pointer">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20 transition-all cursor-pointer">
                         <Zap size={10} /> BASIC
                       </button>
                     ) : userLicense ? (
-                      <button onClick={onOpenManageSub} className="hidden md:flex px-3 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/30 text-blue-400 hover:from-blue-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-3 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/30 text-blue-400 hover:from-blue-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
                         <Crown size={10} /> Upgrade
                       </button>
                     ) : null}
@@ -1380,16 +1483,6 @@ const ChatInterface = ({
                     )}
                     <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Audio Help"><HelpCircle size={20} /></button>
                     <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Files (Knowledge Base)"><FileText size={20} /></button>
-                    {/* Subscription / billing — always-visible header entry to
-                        ManageSubscription. Until now the only path was the
-                        text-[10px] tier badge above, which is `hidden md:flex`
-                        and looks like a status pill (not an action). Putting
-                        it in the icon row alongside Settings/Help means
-                        users can find upgrade/downgrade/cancel from any
-                        window size, regardless of license state. The Crown
-                        icon matches the universal "premium" affordance the
-                        app uses elsewhere. */}
-                    <button onClick={onOpenManageSub} className="p-2 text-gray-400 hover:text-amber-400 hover:bg-amber-500/10 border border-transparent hover:border-amber-500/20 rounded-lg transition-all" aria-label="Manage subscription" title="Manage subscription"><Crown size={20} /></button>
                     <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border text-gray-400 hover:text-text hover:bg-surface`} aria-label="Settings"><Settings size={20} /></button>
                     <button onClick={onLogout} className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 rounded-lg transition-all" aria-label="Logout"><LogOut size={20} /></button>
                 </div>
@@ -1596,7 +1689,11 @@ const ChatInterface = ({
                                 )}
                             </div>
 
-                            <div className="relative p-2 flex items-end gap-2">
+                            {/* iOS-flavored composer — see index.html `.composer-shell` /
+                                `.btn-ios-send` / `.btn-ios-violet` rules for the visual
+                                language. focus-within lifts the whole row when the user
+                                engages the textarea (parent container glows, not the box). */}
+                            <div className="composer-shell relative flex items-end gap-2.5 mx-2 mb-2 px-2 py-2 rounded-2xl border border-border/60 bg-white/[0.02] dark:bg-white/[0.025] transition-all">
                                 <div className="relative flex-1 min-w-0">
                                     {interimText && (
                                         <div className="absolute top-2.5 left-3 text-gray-400 pointer-events-none text-sm md:text-base whitespace-pre-wrap truncate w-full opacity-60 italic z-0">
@@ -1623,40 +1720,40 @@ const ChatInterface = ({
                                     />
                                 </div>
 
-                                <div className="flex flex-col gap-1 pb-1">
+                                <div className="flex items-end gap-1.5 pb-0.5">
                                     {inputText && (
-                                        <button onClick={handleClear} className="p-2 text-gray-400 hover:text-red-400 rounded-lg hover:bg-gray-500/10 transition-colors">
-                                            <X size={18} />
+                                        <button
+                                            onClick={handleClear}
+                                            aria-label="Clear input"
+                                            className="w-8 h-8 rounded-full bg-white/[0.04] hover:bg-white/[0.08] flex items-center justify-center text-gray-400 hover:text-red-400 transition-colors"
+                                        >
+                                            <X size={14} strokeWidth={2.25} />
                                         </button>
                                     )}
-                                    <div className="flex gap-1">
-                                        <button
-                                            onClick={handleAutoSolve}
-                                            disabled={isProcessing || !gate.canAutoSolve}
-                                            aria-label={gate.canAutoSolve ? "Auto-Solve Screen" : "Auto-Solve — Pro only"}
-                                            className={`p-2 rounded-xl transition-all shadow-lg relative ${
-                                                !gate.canAutoSolve
-                                                ? 'bg-gray-600/30 text-gray-500 cursor-not-allowed border border-gray-500/20'
-                                                : !isProcessing
-                                                ? 'bg-purple-600 text-white hover:bg-purple-700'
-                                                : 'bg-surface text-gray-500 cursor-not-allowed border border-border'
-                                            }`}
-                                        >
-                                            <Wand2 size={18} />
-                                            {!gate.canAutoSolve && <Crown size={8} className="absolute top-1 right-1 text-amber-400" />}
-                                        </button>
-                                        <button 
-                                            onClick={handleManualSend}
-                                            disabled={!inputText.trim() || isProcessing}
-                                            className={`p-2 rounded-xl transition-all shadow-lg ${
-                                                inputText.trim() && !isProcessing
-                                                ? 'bg-primary text-white hover:bg-blue-600' 
-                                                : 'bg-surface text-gray-500 cursor-not-allowed border border-border'
-                                            }`}
-                                        >
-                                            <Send size={18} />
-                                        </button>
-                                    </div>
+                                    <button
+                                        onClick={handleAutoSolve}
+                                        disabled={isProcessing || !gate.canAutoSolve}
+                                        aria-label={gate.canAutoSolve ? "Auto-Solve Screen" : "Auto-Solve — Pro only"}
+                                        className="btn-ios-violet relative w-10 h-10 rounded-full flex items-center justify-center text-white"
+                                    >
+                                        <ScanSearch size={18} strokeWidth={2} />
+                                        {!gate.canAutoSolve && (
+                                            <span
+                                                className="absolute -top-1 -right-1 text-[8px] font-bold tracking-wider bg-amber-400 text-amber-950 px-1 py-px rounded shadow-sm"
+                                                style={{ letterSpacing: '0.04em', lineHeight: 1 }}
+                                            >
+                                                PRO
+                                            </span>
+                                        )}
+                                    </button>
+                                    <button
+                                        onClick={handleManualSend}
+                                        disabled={!inputText.trim() || isProcessing}
+                                        aria-label="Send message"
+                                        className="btn-ios-send w-10 h-10 rounded-full flex items-center justify-center text-white"
+                                    >
+                                        <PaperAirplane size={18} />
+                                    </button>
                                 </div>
                             </div>
                         </div>
@@ -1836,7 +1933,14 @@ type ModelKey = 'gemini' | 'groq' | 'openai' | 'xai' | 'claude';
 interface ModelMeta {
   short: string;          // Compact label for popout header (≤7 chars)
   label: string;          // Full label for settings cards
-  monogram: string;       // 1-char glyph for the colored chip
+  monogram: string;       // 1-char glyph — kept as accessibility/fallback text
+                          // for the icon's aria-label / screen-reader audiences,
+                          // and as a last-resort visual if the SVG ever fails
+                          // to load. Not rendered visually anymore.
+  Icon: React.ComponentType<{ size?: number | string }>;
+                          // Provider brand mark — replaces the prior
+                          // monogram-letter render. See ProviderIcons.tsx
+                          // for the SVG components and design notes.
   tier: 'free' | 'basic' | 'pro' | 'max';
   brand: { fg: string; chip: string; accent: string };
   tagline: string;        // One-line description on the rich card
@@ -1848,6 +1952,7 @@ const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
     short: 'Gemini',
     label: 'Gemini 3.1 Flash',
     monogram: 'G',
+    Icon: GeminiIcon,
     tier: 'free',
     brand: { fg: '#60a5fa', chip: 'rgba(59, 130, 246, 0.18)', accent: '#3b82f6' },
     tagline: 'Fast and free — included on every plan.',
@@ -1856,6 +1961,7 @@ const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
     short: 'Groq',
     label: 'Groq Llama 3',
     monogram: 'Q',
+    Icon: GroqIcon,
     tier: 'basic',
     brand: { fg: '#fb923c', chip: 'rgba(249, 115, 22, 0.18)', accent: '#f97316' },
     tagline: 'Llama 3 on Groq — sub-second answers.',
@@ -1864,6 +1970,7 @@ const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
     short: 'GPT',
     label: 'GPT-5.5',
     monogram: '5',
+    Icon: OpenAIIcon,
     tier: 'basic',
     brand: { fg: '#34d399', chip: 'rgba(16, 185, 129, 0.18)', accent: '#10b981' },
     tagline: 'OpenAI flagship — best for code and system design.',
@@ -1873,6 +1980,7 @@ const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
     short: 'Grok',
     label: 'Grok (xAI)',
     monogram: 'X',
+    Icon: GrokIcon,
     tier: 'basic',
     brand: { fg: '#e4e4e7', chip: 'rgba(228, 228, 231, 0.16)', accent: '#a1a1aa' },
     tagline: 'Real-time knowledge from xAI — Grok.',
@@ -1881,6 +1989,7 @@ const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
     short: 'Claude',
     label: 'Claude Sonnet 4.6',
     monogram: 'C',
+    Icon: ClaudeIcon,
     tier: 'max',
     // Max card uses CSS-driven gold/cream tokens (see .mp-card-max in
     // index.html); these brand fields are kept for any non-card surface
@@ -1957,9 +2066,10 @@ function ModelPickerCard({
             color: meta.brand.fg,
             borderColor: meta.brand.accent,
           } : undefined}
-          aria-hidden="true"
+          aria-label={meta.short}
+          role="img"
         >
-          {meta.monogram}
+          <meta.Icon size={12} />
         </span>
         <span className="mp-name">{meta.short}</span>
         {selected && <Check size={9} className="mp-check" aria-hidden="true" />}
@@ -1984,8 +2094,8 @@ function ModelPickerCard({
       } : undefined}
       aria-pressed={selected}
     >
-      <span className={`mp-card-mono${isMax ? ' mp-card-mono-max' : ''}`} aria-hidden="true">
-        {meta.monogram}
+      <span className={`mp-card-mono${isMax ? ' mp-card-mono-max' : ''}`} aria-label={meta.short} role="img">
+        <meta.Icon size={compact ? 18 : 22} />
       </span>
       <span className="mp-card-body">
         <span className="mp-card-title">
@@ -2644,6 +2754,11 @@ const ConversationSidebar = ({
   const saveEdit = async () => {
     if (editingId && editName.trim()) {
       await db.renameSession(editingId, editName.trim());
+      // Clear the auto-titled flag so the App-side re-titler doesn't
+      // overwrite this deliberate user choice on the next 10-message
+      // milestone. Wrapping in try/catch because some sandboxes restrict
+      // localStorage and we never want a rename to throw.
+      try { localStorage.removeItem(`auto_titled_${editingId}`); } catch {}
     }
     setEditingId(null);
     setEditName('');
@@ -2656,7 +2771,13 @@ const ConversationSidebar = ({
 
   const confirmDelete = async () => {
     if (deleteConfirmId) {
-      await db.deleteSession(deleteConfirmId);
+      const idToClean = deleteConfirmId;
+      await db.deleteSession(idToClean);
+      // Clean up the auto-titled flag — otherwise localStorage slowly
+      // accumulates orphan entries for every deleted session, and a
+      // brand-new session that happens to reuse a Date.now()-collision
+      // id would inherit the old flag.
+      try { localStorage.removeItem(`auto_titled_${idToClean}`); } catch {}
     }
     setDeleteConfirmId(null);
   };
@@ -2955,6 +3076,143 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       messagesRef.current = messages;
   }, [messages]);
 
+  // ── Auto-title state ──────────────────────────────────────────────
+  // Track per-session auto-titler activity so we can:
+  //   1. Prevent two streams ending close together from firing two
+  //      titler calls for the same session (would cost double API spend
+  //      and risk a race where the older call wins after the newer).
+  //   2. Cap retries at 3 per session — the v1 code's <=4 turn gate
+  //      was too restrictive (gave up after 4 messages even if the
+  //      first 4 attempts all failed) but unbounded retry would also
+  //      hammer the API for sessions where the model just won't title
+  //      cleanly. 3 attempts at fresh-placeholder titling, then we
+  //      stop trying for a while.
+  //   3. Track when we last re-titled so we re-evaluate at message-
+  //      count milestones (handles topic shift mid-conversation).
+  const titleAttemptsRef = useRef<Map<string, number>>(new Map());
+  const titlingInFlightRef = useRef<Set<string>>(new Set());
+  const lastRetitleAtRef = useRef<Map<string, number>>(new Map());
+
+  // ── Retroactive title pass ─────────────────────────────────────────
+  // One-shot scan on app startup: find every session with a placeholder
+  // name ("Interview <date>") that has at least one user+model exchange,
+  // and auto-title it from its existing transcript. This catches all the
+  // historical sessions stuck on placeholder titles — either because they
+  // pre-date the auto-titler, or because they fell into v1's broken
+  // <=4-turn gate after the first attempts failed.
+  //
+  // Per-session bookkeeping in localStorage:
+  //   auto_titled_<sid>    set on success (live OR retro path)
+  //   retro_skipped_<sid>  set when the retro pass tried and gave up
+  //                        (either no usable transcript or LLM kept
+  //                        rejecting the output). Without this we'd
+  //                        re-attempt on every app launch forever.
+  //
+  // Polite to the API: 1.2s gap between sessions, single in-flight call,
+  // and uses the same titlingInFlightRef as the live path so a session
+  // currently being titled by an active chat doesn't double-fire here.
+  const retroactivePassStartedRef = useRef(false);
+  useEffect(() => {
+    if (retroactivePassStartedRef.current) return;
+    if (!db.isElectron || !db.ready) return;
+    if (!userProfile?.id) return;
+    if (!Array.isArray(db.sessions) || db.sessions.length === 0) return;
+
+    // Catches BOTH stuck placeholder titles ("Interview 5/4/2026") AND
+    // the generic outputs of the v1 prompt ("Coding Help", "Discussion",
+    // "Interview Conversation"). The v1 prompt had "interview conversation"
+    // baked in plus Interviewer:/Candidate: framing, so it routinely
+    // produced low-info titles even on rich, specific conversations —
+    // those titles deserve re-titling too. Risk of overwriting a real
+    // user-chosen title that happens to match these patterns is low:
+    // anyone deliberately naming a session "Coding Help" is unlikely.
+    const GENERIC_PATTERN = /^(coding|programming|interview|conversation|chat|discussion|question|help|topic|untitled)(\s(help|chat|session|discussion|question|conversation))?$/i;
+    const isPlaceholderName = (name: string): boolean => {
+      if (!name) return true;
+      if (/^Interview\s/.test(name)) return true;
+      if (GENERIC_PATTERN.test(name.trim())) return true;
+      return false;
+    };
+
+    const placeholderSessions = (db.sessions as any[]).filter((s) => {
+      if (!isPlaceholderName(s.name)) return false;
+      try {
+        if (localStorage.getItem(`auto_titled_${s.id}`) === '1') return false;
+        if (localStorage.getItem(`retro_skipped_${s.id}`) === '1') return false;
+      } catch {}
+      // Skip sessions with no real conversation. The sidebar's
+      // listSessionsForUser projection includes message_count, but it's
+      // approximate here — we re-check below by fetching messages.
+      if ((s.message_count || 0) < 2) return false;
+      return true;
+    });
+
+    if (placeholderSessions.length === 0) {
+      retroactivePassStartedRef.current = true;
+      return;
+    }
+    retroactivePassStartedRef.current = true;
+    console.log(`[auto-title] retroactive pass: ${placeholderSessions.length} placeholder session(s) queued`);
+
+    let cancelled = false;
+    (async () => {
+      let succeeded = 0;
+      let skipped = 0;
+      for (const session of placeholderSessions) {
+        if (cancelled) return;
+        const sid: string = session.id;
+        // If the live titler grabbed this session in the meantime
+        // (active chat fired the placeholder-retry path), skip — let
+        // them finish their work, retry on next app launch if needed.
+        if (titlingInFlightRef.current.has(sid)) { skipped++; continue; }
+        titlingInFlightRef.current.add(sid);
+        try {
+          const messages = await electronIPC.invoke('db:get-messages', sid);
+          if (!Array.isArray(messages) || messages.length < 2) {
+            try { localStorage.setItem(`retro_skipped_${sid}`, '1'); } catch {}
+            skipped++;
+            continue;
+          }
+          const hasUser = messages.some((m: any) => m.role === 'user');
+          const hasModel = messages.some((m: any) => m.role === 'model');
+          if (!hasUser || !hasModel) {
+            try { localStorage.setItem(`retro_skipped_${sid}`, '1'); } catch {}
+            skipped++;
+            continue;
+          }
+          const title = await generateConversationTitle(
+            messages.map((m: any) => ({ role: m.role, content: m.content }))
+          );
+          if (title) {
+            await db.renameSession(sid, title);
+            try { localStorage.setItem(`auto_titled_${sid}`, '1'); } catch {}
+            succeeded++;
+          } else {
+            // Title generation returned null — either the model produced
+            // a rejected generic title, or the API call failed. Mark as
+            // retro-skipped so we don't re-hit on every launch; the live
+            // titler will still try if the user opens the session.
+            try { localStorage.setItem(`retro_skipped_${sid}`, '1'); } catch {}
+            skipped++;
+          }
+        } catch (err: any) {
+          console.warn('[auto-title] retro failed for', sid, err?.message || err);
+          try { localStorage.setItem(`retro_skipped_${sid}`, '1'); } catch {}
+          skipped++;
+        } finally {
+          titlingInFlightRef.current.delete(sid);
+        }
+        // 1.2s pause between sessions — keeps the API friendly even
+        // when a user has 50+ stuck placeholder sessions. Total cap on
+        // a 50-session backfill: ~60s in background, no UI block.
+        if (!cancelled) await new Promise(r => setTimeout(r, 1200));
+      }
+      console.log(`[auto-title] retroactive pass complete: ${succeeded} titled, ${skipped} skipped`);
+    })();
+
+    return () => { cancelled = true; };
+  }, [db.isElectron, db.ready, db.sessions, userProfile?.id]);
+
   // Keep contextFilesRef in sync with db.contextFiles. Also fire the
   // identity-extraction preflight here so the first interview question
   // doesn't pay the ~2-5s round-trip — by the time the user starts, the
@@ -3067,7 +3325,16 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     const t = window.setTimeout(() => setCheckoutToast(null), remaining);
     return () => window.clearTimeout(t);
   }, [checkoutToast]);
-  const handleSubscriptionUpgrade = useCallback((targetTier: 'basic' | 'pro' | 'max') => {
+  // Pending-upgrade state — drives the inline spinner on ManageSubscription's
+  // upgrade buttons AND keeps the modal open until the external browser
+  // has actually opened (or sync-grant has landed). Without this, the
+  // modal closed instantly on click and the user was thrown into a
+  // dim app waiting for a toast that hadn't surfaced yet — the exact
+  // "thrown to chat interface" symptom.
+  const [upgradePending, setUpgradePending] = useState<'basic' | 'pro' | 'max' | null>(null);
+  const [renewPending, setRenewPending] = useState(false);
+
+  const handleSubscriptionUpgrade = useCallback(async (targetTier: 'basic' | 'pro' | 'max') => {
       // Reuse the checkout flow in openProUpgrade. The checkout happens in
       // the browser via openExternal for /create-checkout, or completes
       // server-side and updates local state for /upgrade-tier. The
@@ -3075,12 +3342,36 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       // stripe-upgrade, razorpay-upgrade) — without it the chat-header tier
       // badge would stay on the old tier until the next 30-min revalidation
       // tick because openProUpgrade only updates localStorage.
-      setManageSubOpen(false);
-      openProUpgrade(targetTier, () => {
-          const saved = licenseService.loadAuth();
-          if (saved.user) setUserProfile(saved.user);
-          if (saved.license) setUserLicense(saved.license);
-      });
+      //
+      // New choreography (replaces the instant-close that felt like a
+      // "throw"): keep the modal mounted until openProUpgrade resolves.
+      // openProUpgrade is async — returns once /create-checkout responds AND
+      // tryOpenCheckoutUrl has either succeeded or surfaced a fallback toast.
+      // Then we wait an additional 600ms so the CheckoutToast at the top
+      // ("Stripe checkout opened in your browser") has time to land in
+      // the user's eyeline BEFORE the modal animates away. The result is
+      // a continuous gesture: click → button spins → toast appears → modal
+      // smoothly fades, revealing the toast.
+      setUpgradePending(targetTier);
+      try {
+          await openProUpgrade(targetTier, () => {
+              const saved = licenseService.loadAuth();
+              if (saved.user) setUserProfile(saved.user);
+              if (saved.license) setUserLicense(saved.license);
+          });
+          // Grace period: let the user register the toast appearing on
+          // top of the modal (z-100000 vs z-99999) before the modal
+          // dissolves. 600ms is short enough not to feel laggy, long
+          // enough for the eye to track the new visual.
+          await new Promise(r => setTimeout(r, 600));
+          setManageSubOpen(false);
+      } finally {
+          // Reset pending state regardless of success/failure so the
+          // buttons re-enable. On error the toast already surfaced the
+          // failure; user can retry from the same modal (we don't close
+          // on error).
+          setUpgradePending(null);
+      }
   }, [setUserProfile, setUserLicense]);
 
   // ── In-app update-on-close prompt ──
@@ -3228,6 +3519,11 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   
   // Local state for Quick Paste in Context Modal
   const [pasteContent, setPasteContent] = useState("");
+  // Drop-zone drag-active flag — toggles the visual treatment when a file
+  // is being dragged over the Knowledge drop zone in the Files modal.
+  // Reset to false on dragLeave + drop + modal close so the highlight
+  // doesn't get stuck if the user drags out of the modal.
+  const [dragActive, setDragActive] = useState(false);
 
   // ── Auto-Update State (Electron only) ──
   const [updateStatus, setUpdateStatus] = useState<{
@@ -3412,6 +3708,12 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       const v = localStorage.getItem("REASONING_EFFORT");
       return v === 'low' || v === 'medium' || v === 'high' ? v : 'none';
     })(),
+    // User-supplied custom instructions that prepend to every model's
+    // system prompt. Empty string by default (no wrapper block sent
+    // server-side). Persisted to localStorage on blur (debounced)
+    // matching the rest of this useState's localStorage-only pattern;
+    // no IPC / SQLite involvement until we add multi-device sync.
+    customInstructions: localStorage.getItem("CUSTOM_INSTRUCTIONS") || '',
   });
 
   // Settings Modal Local State
@@ -3466,6 +3768,15 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           localStorage.setItem("REASONING_EFFORT", v);
       }
   }, [settings.reasoningEffort]);
+
+  // Apply Custom Instructions persistence — same pattern as the rest of
+  // this useState block. The save is unconditional (no validation) so
+  // empty strings clear the key, and there's no debouncing here because
+  // the textarea uses an onBlur handler (not onChange) to update the
+  // setting, so this effect already only fires on blur transitions.
+  useEffect(() => {
+      localStorage.setItem("CUSTOM_INSTRUCTIONS", settings.customInstructions || '');
+  }, [settings.customInstructions]);
 
   // Sync temp state when settings open
   useEffect(() => {
@@ -4035,24 +4346,78 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             } else {
               setMessages(prev => [...prev, aiMsg]);
             }
-            // Auto-title the session once the first model response lands
-            // (ChatGPT-style topic summary). Fire-and-forget; if the LLM
-            // call fails the placeholder "Interview <date>" stays put.
+            // Auto-title the session — ChatGPT/Grok-style content-aware
+            // topic summary. Fire-and-forget; if the LLM call fails the
+            // placeholder "Interview <date>" stays put.
+            //
+            // Three trigger paths (handled by the helper, gated below):
+            //   A. PLACEHOLDER PATH: title still matches "Interview <date>".
+            //      Try titling on every model response, max 3 attempts.
+            //      Replaces v1's broken `<=4 turns` gate which gave up
+            //      forever after 4 messages even if all 4 attempts failed.
+            //   B. RE-TITLE PATH: title was AI-generated and the
+            //      conversation has grown by 10+ model responses since
+            //      the last titling. Topic may have shifted; regenerate
+            //      and update if the new title is meaningfully different.
+            //      Skipped if user has manually renamed (we track that
+            //      in localStorage via the saveEdit handler).
+            //   C. SKIP PATH: user has set a name (not placeholder, not
+            //      AI-generated), or the session is mid-titling already,
+            //      or attempts have been exhausted.
+            //
             // Skip in non-Electron / popout — only main owns the rename.
             if (db.isElectron && !inPopout && db.sessionId) {
-              const currentSession = (db.sessions || []).find((s: any) => s.id === db.sessionId);
+              const sid = db.sessionId;
+              const currentSession = (db.sessions || []).find((s: any) => s.id === sid);
               const currentName: string = currentSession?.name || '';
               const isPlaceholder = !currentName || /^Interview\s/.test(currentName);
-              const turnsSoFar = (messagesRef.current?.length || 0) + 1; // user + this AI msg
-              if (isPlaceholder && turnsSoFar >= 2 && turnsSoFar <= 4) {
-                const transcript = [...(messagesRef.current || []), aiMsg].map(m => ({ role: m.role, content: m.content }));
+              // localStorage flag — set when our auto-titler succeeds,
+              // cleared when user manually renames. Lets us re-title
+              // on topic shift without overwriting a deliberate rename.
+              let isAutoTitled = false;
+              try { isAutoTitled = localStorage.getItem(`auto_titled_${sid}`) === '1'; } catch {}
+              const totalMessages = (messagesRef.current?.length || 0) + 1; // includes this aiMsg
+              const lastRetitleAt = lastRetitleAtRef.current.get(sid) || 0;
+              const messagesSinceRetitle = totalMessages - lastRetitleAt;
+              const attemptsSoFar = titleAttemptsRef.current.get(sid) || 0;
+              const inFlight = titlingInFlightRef.current.has(sid);
+
+              const shouldTitlePlaceholder =
+                isPlaceholder && totalMessages >= 2 && attemptsSoFar < 3 && !inFlight;
+              const shouldRetitle =
+                !isPlaceholder && isAutoTitled && messagesSinceRetitle >= 10 && !inFlight;
+
+              if (shouldTitlePlaceholder || shouldRetitle) {
+                titlingInFlightRef.current.add(sid);
+                if (shouldTitlePlaceholder) {
+                  titleAttemptsRef.current.set(sid, attemptsSoFar + 1);
+                }
+                const transcript = [...(messagesRef.current || []), aiMsg]
+                  .map(m => ({ role: m.role, content: m.content }));
                 generateConversationTitle(transcript)
                   .then(title => {
-                    if (title && db.sessionId) {
-                      try { db.renameSession(db.sessionId, title); } catch {}
+                    if (!title || !db.sessionId) return;
+                    // For re-titling: skip the rename if the new title is
+                    // basically the same as the existing one (case/whitespace
+                    // normalization). Avoids spurious "renamed to same thing"
+                    // updates that flicker the sidebar and hit the server.
+                    if (shouldRetitle) {
+                      const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+                      if (norm(title) === norm(currentName)) return;
                     }
+                    try {
+                      db.renameSession(sid, title);
+                      // Mark as auto-titled so re-title path can find it.
+                      try { localStorage.setItem(`auto_titled_${sid}`, '1'); } catch {}
+                      lastRetitleAtRef.current.set(sid, totalMessages);
+                    } catch {}
                   })
-                  .catch(() => {});
+                  .catch((err) => {
+                    console.warn('[auto-title] caller-side error:', err?.message || err);
+                  })
+                  .finally(() => {
+                    titlingInFlightRef.current.delete(sid);
+                  });
               }
             }
         }
@@ -4138,6 +4503,26 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     onError: (err) => console.error("Speech Error:", err),
   });
 
+  // ── Speculative cache warming during transcription ──
+  // As inputText / interimText updates (from speech OR typing), fire
+  // /prefetch-context with a 500ms debounce. The server classifies
+  // (tool+specificity OR update-signal) and runs enrichTranscript() in
+  // the background, populating the Brave + page-content caches. By the
+  // time the user clicks Send, the chat call's enrichTranscript hits
+  // warm caches (~10ms) instead of paying the cold ~1500ms cost.
+  //
+  // Enabled in BOTH main AND popout windows. Server-side dedup (30s TTL,
+  // keyed by lowercased query) catches the duplicate when both windows
+  // have synced state for the same transcript. The cost is one extra
+  // ~5ms server-side dedup check, which is negligible.
+  //
+  // Disabled while processing — the model is already generating; another
+  // prefetch in-flight would be a waste of Brave quota.
+  usePrefetchContext({
+    transcript: `${inputText} ${interimText}`,
+    enabled: !isProcessing,
+  });
+
   // Pop-out: shadow state received from main window via IPC
   const [remoteIsListening, setRemoteIsListening] = useState(false);
   const [remoteIsProcessing, setRemoteIsProcessing] = useState(false);
@@ -4212,10 +4597,23 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const pendingPopoutModelRef = useRef<string | null>(null);
 
   // ── Cross-window state sync (Electron only) ──
-  // Main window → pop-out: relay state whenever it changes
+  // Main window → pop-out: relay state whenever it changes.
+  //
+  // PERFORMANCE FIX: previously this fired on EVERY change of any input
+  // — every keystroke (inputText) AND every Deepgram interim transcript
+  // tick (interimText, ~5Hz). With contextBridge serialization that's
+  // dozens of IPC calls per second on the hottest cross-window channel.
+  // Throttle to ~50ms via rAF coalescing: while a sync is "pending,"
+  // drop newer calls and let the rAF fire with the latest values.
+  // Visible state still feels live (50ms < a frame at 60fps), API
+  // pressure drops by ~10x.
+  const stateSyncRafRef = useRef<number | null>(null);
+  const stateSyncLatestRef = useRef<any>(null);
   useEffect(() => {
     if (!isElectron || isPopoutMode) return;
-    electronIPC.send('relay-to-popout', {
+    // Capture the freshest values; if a frame is already pending it
+    // will emit these, not the stale ones from the previous schedule.
+    stateSyncLatestRef.current = {
       type: 'state-sync',
       isListening: _rawIsListening,
       isProcessing,
@@ -4224,8 +4622,22 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       autoSend: settings.autoSend,
       speechError: _rawSpeechError,
       selectedModel: settings.selectedModel,
+    };
+    if (stateSyncRafRef.current !== null) return; // already pending
+    stateSyncRafRef.current = window.requestAnimationFrame(() => {
+      stateSyncRafRef.current = null;
+      const payload = stateSyncLatestRef.current;
+      if (payload) electronIPC.send('relay-to-popout', payload);
     });
   }, [_rawIsListening, isProcessing, interimText, inputText, settings.autoSend, _rawSpeechError, settings.selectedModel]);
+  // Cancel any pending rAF on unmount so a stale closure can't fire after
+  // teardown (mostly defensive — MainApp only unmounts on logout).
+  useEffect(() => () => {
+    if (stateSyncRafRef.current !== null) {
+      window.cancelAnimationFrame(stateSyncRafRef.current);
+      stateSyncRafRef.current = null;
+    }
+  }, []);
 
   // Pop-out: receive state from main window
   useEffect(() => {
@@ -4872,6 +5284,96 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       setPasteContent("");
   };
 
+  // ── Knowledge drop-zone helpers ──
+  // Three input modes — drag-drop a file, click to open the picker, or
+  // Cmd/Ctrl+V paste anywhere in the modal. The paste handler delegates
+  // to either the file pipeline (if clipboard has files / images) or the
+  // text snippet helper (if clipboard has plain text). Single mental
+  // model for the user — "drop, click, or paste" — replacing the prior
+  // "Add File button + Quick Paste textarea" split that confused users.
+
+  const addTextSnippet = (text: string, label?: string) => {
+      if (!text.trim()) return;
+      if (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) return;
+      const newFile: ContextFile = {
+          id: Date.now().toString(),
+          name: label || `Pasted Snippet ${db.contextFiles.length + 1}`,
+          content: text,
+          type: 'custom'
+      };
+      db.addContextFile(newFile);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+  };
+  const handleDragEnter = (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragActive(true);
+  };
+  const handleDragLeave = (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragActive(false);
+  };
+  const handleFilesDrop = (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragActive(false);
+      // Same mic-listening guard as the click-to-browse path: native file
+      // pickers / drop-handlers aren't covered by setContentProtection,
+      // so dragged filenames could leak on screen-share. Silent return
+      // matches the click-disabled UX above.
+      if (_rawIsListening) return;
+      const files = e.dataTransfer.files;
+      if (!files?.length) return;
+      // Reuse handleFileUpload's full processing pipeline (PDF/DOCX
+      // extraction, text decoding, base64 for images, gate enforcement)
+      // by synthesizing the change-event shape it expects.
+      const fakeEvent = { target: { files, value: '' } } as unknown as React.ChangeEvent<HTMLInputElement>;
+      handleFileUpload(fakeEvent);
+  };
+
+  const handleModalPaste = (e: React.ClipboardEvent) => {
+      // Native paste should keep working inside textareas / inputs —
+      // typing the resume into the paste-fallback textarea or pasting
+      // into Custom Instructions both need this. Only intercept paste
+      // when the focus is on a non-editable element (the modal frame
+      // or the drop-zone itself), so the snippet auto-add fires there.
+      const target = e.target as HTMLElement;
+      const isEditable = target.tagName === 'TEXTAREA' || target.tagName === 'INPUT' || target.isContentEditable;
+      if (isEditable) return;
+      // Files in clipboard (Cmd+V'd a file from Finder, or copied an
+      // image from a browser screenshot tool) → upload pipeline.
+      if (e.clipboardData.files.length > 0) {
+          e.preventDefault();
+          const fakeEvent = { target: { files: e.clipboardData.files, value: '' } } as unknown as React.ChangeEvent<HTMLInputElement>;
+          handleFileUpload(fakeEvent);
+          return;
+      }
+      // Plain text → unified files list as a "Pasted Snippet" entry.
+      // 500K-char ceiling defends against accidental dumps (e.g. user
+      // copies a whole book / a 50MB log file). Above that, React state
+      // updates start to choke and the modal hangs visibly. We
+      // deliberately don't truncate — better to refuse loudly than to
+      // silently drop content the user thinks they added.
+      const text = e.clipboardData.getData('text');
+      if (text.trim()) {
+          e.preventDefault();
+          if (text.length > 500_000) {
+              alert(
+                  `That's a large paste (${text.length.toLocaleString()} chars). ` +
+                  `For reliability, please paste under ~500,000 characters or ` +
+                  `upload as a file instead.`
+              );
+              return;
+          }
+          addTextSnippet(text);
+      }
+  };
+
   const removeFile = (id: string) => {
     db.removeContextFile(id);
   };
@@ -5160,7 +5662,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                         the only model going from Pro→Max unlocks is Claude. */}
                     {gate.isMax ? (
                       <span className="text-[10px] font-semibold tracking-[0.10em] uppercase text-[#f4dba0] bg-[rgba(201,165,92,0.10)] px-2.5 py-0.5 rounded-full border border-[rgba(201,165,92,0.45)] flex items-center gap-1">
-                        <Sparkles size={9} /> Full access
+                        <WizardHat size={9} /> Full access
                       </span>
                     ) : gate.isPro ? (
                       <span className="text-[10px] text-amber-300 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/25 flex items-center gap-1">
@@ -5311,7 +5813,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                         <span className="text-sm font-medium text-text">GPT Reasoning Speed</span>
                         {!gate.canChooseReasoningEffort && (
                             <span className="text-[9px] font-bold tracking-wider bg-amber-400/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/30 flex items-center gap-1">
-                                <Crown size={9} /> MAX
+                                <WizardHat size={9} /> MAX
                             </span>
                         )}
                     </div>
@@ -5343,7 +5845,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                                 >
                                     {level.charAt(0).toUpperCase() + level.slice(1)}
                                     {isLockedForTier && (
-                                        <Crown size={8} className="absolute top-0.5 right-0.5 text-amber-400/70" />
+                                        <WizardHat size={8} className="absolute top-0.5 right-0.5 text-amber-400/70" />
                                     )}
                                 </button>
                             );
@@ -5482,7 +5984,21 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           onUpgradeRequested={handleSubscriptionUpgrade}
           onProfileUpdated={(updated) => setUserProfile(updated)}
           onLicenseUpdated={(updated) => setUserLicense(updated)}
-          onRenewRequested={() => { setManageSubOpen(false); openProRenewal(refreshAuthFromStorage); }}
+          onRenewRequested={async () => {
+              // Mirror handleSubscriptionUpgrade's choreography for the
+              // +1h Basic renewal. Without this, the modal closed instantly
+              // on click and the renewal happened "somewhere offstage".
+              setRenewPending(true);
+              try {
+                  await openProRenewal(refreshAuthFromStorage);
+                  await new Promise(r => setTimeout(r, 600));
+                  setManageSubOpen(false);
+              } finally {
+                  setRenewPending(false);
+              }
+          }}
+          upgradePending={upgradePending}
+          renewPending={renewPending}
       />
 
       {/* --- Checkout-status toast — visible feedback for the upgrade flow ---
@@ -5664,18 +6180,53 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       </Modal>
 
       {/* --- Context Files Modal --- */}
-      <Modal isOpen={showContext} onClose={() => setShowContext(false)} title="Knowledge Base">
-        <div className="space-y-6">
-           {/* Info Banner */}
-           <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-3">
-               <div className="flex items-start gap-3">
-                   <Info size={18} className="text-blue-500 mt-0.5" />
-                   <div className="text-xs text-blue-200/80 leading-relaxed">
-                       <strong className="text-blue-400 block mb-1">How Context Works</strong>
-                       Files uploaded here are sent to the AI with every message.
-                       Use "Context Mode" to force the AI to rely on these files.
-                   </div>
+      <Modal isOpen={showContext} onClose={() => setShowContext(false)} title="Knowledge & Instructions">
+        <div className="space-y-6" onPaste={handleModalPaste}>
+           {/* ── Custom Instructions ──
+               User-supplied directives that prepend to every model call's
+               system prompt as a high-priority, "follow-strictly" block.
+               Bound directly to settings.customInstructions (no temp state)
+               so localStorage persistence runs on every keystroke — cheap,
+               simple, no debounce risk. No hard char limit. Once content
+               crosses 3,000 chars an orange advisory appears warning that
+               long instructions slow first-token-out; we still pass them
+               through verbatim because customer satisfaction beats token
+               cost (per 2026-05-08 user direction). */}
+           <div className="space-y-2">
+               <div className="flex items-center justify-between">
+                   <h3 className="text-sm font-bold text-text">Custom Instructions</h3>
+                   {settings.customInstructions.trim() && (
+                       <span className="text-[10px] font-semibold tracking-wider bg-emerald-500/15 text-emerald-400 px-2 py-0.5 rounded-full border border-emerald-500/30 flex items-center gap-1.5">
+                           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" /> Active in chat
+                       </span>
+                   )}
                </div>
+               <p className="text-[10px] text-gray-500 leading-relaxed">
+                   Tell the AI how to respond. These run before every model call as strict-follow directives. <span className="text-gray-600">Saved on this device only — set them again on each device you use.</span>
+               </p>
+               <textarea
+                   value={settings.customInstructions}
+                   onChange={(e) => setSettings(s => ({ ...s, customInstructions: e.target.value }))}
+                   placeholder='e.g. "Use the STAR method for behavioral questions. Cite tool versions in code answers. Keep responses under 200 words unless I ask for more detail."'
+                   className="w-full h-28 bg-background border border-border rounded-xl p-3 text-xs focus:ring-1 focus:ring-primary outline-none resize-y custom-scrollbar leading-relaxed"
+               />
+               <div className="flex items-center justify-between text-[10px]">
+                   <span className={settings.customInstructions.length > 3000 ? 'text-orange-400 font-medium' : 'text-gray-500'}>
+                       {settings.customInstructions.length.toLocaleString()} chars
+                   </span>
+                   <span className="text-gray-600">
+                       recommended 2,000–3,000 for fastest responses
+                   </span>
+               </div>
+               {settings.customInstructions.length > 3000 && (
+                   <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-orange-500/10 border border-orange-500/30 text-[10.5px] text-orange-300/90 leading-snug">
+                       <AlertTriangle size={12} className="text-orange-400 mt-0.5 shrink-0" />
+                       <span>
+                           <strong className="text-orange-400">Long instructions detected.</strong>
+                           {' '}Models will follow them, but responses may take a few extra seconds to start. Consider tightening to under 3,000 characters for the fastest experience.
+                       </span>
+                   </div>
+               )}
            </div>
 
            {/* ── Train Model — Max-tier only ──
@@ -5691,7 +6242,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                    <div className="flex items-start justify-between gap-4 mb-3">
                        <div className="flex-1 min-w-0">
                            <div className="flex items-center gap-2 mb-1">
-                               <Crown size={14} className="text-orange-400" />
+                               <WizardHat size={14} className="text-orange-400" />
                                <h3 className="text-sm font-bold text-orange-100">
                                    {isAdmin ? 'Train Claude (Beast)' : 'Train Claude'}
                                </h3>
@@ -5774,85 +6325,148 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                </div>
            )}
 
-           {/* File List */}
-           <div className="space-y-3">
+           {/* ── Knowledge — files + pasted snippets, unified list ──
+               One drop zone replaces the prior "Add File button + Quick
+               Paste textarea" split that confused users (where do I put
+               my resume?). The zone accepts: (1) drag-drop a file, (2)
+               click to open native picker, (3) Cmd/Ctrl+V paste — adds
+               files via upload pipeline OR plain text as a snippet via
+               addTextSnippet. Pasted snippets land in the same files
+               list as uploads with a CUSTOM type-badge so users see all
+               their context as one mental unit. The textarea still
+               exists as a collapsed paste-fallback for users who'd
+               rather type than paste. */}
+           <div className="space-y-3 pt-4 border-t border-border">
                <div className="flex items-center justify-between">
-                   <h3 className="text-sm font-bold text-text">
-                     Attached Files ({db.contextFiles.length}{gate.maxContextFiles !== -1 ? `/${gate.maxContextFiles}` : ''})
-                   </h3>
-                   {(() => {
-                     const limitHit = gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles;
-                     // Disable while listening: the OS file picker isn't
-                     // covered by setContentProtection and would leak on
-                     // screen-share. Stop the mic, upload, then resume.
-                     const blockedForSession = _rawIsListening;
-                     const disabled = limitHit || blockedForSession;
-                     const label = blockedForSession ? 'Paused (live)' : limitHit ? 'Limit reached' : 'Add File';
-                     const title = blockedForSession ? 'File picker is paused during a live interview to keep filenames off your screen-share. Stop the mic to add files.' : undefined;
-                     return (
-                       <button onClick={triggerFileUpload} disabled={disabled} title={title} className={`text-xs flex items-center gap-1 ${disabled ? 'text-gray-500 cursor-not-allowed' : 'text-primary hover:underline'}`}>
-                         <Plus size={12} /> {label}
-                       </button>
-                     );
-                   })()}
-                   {/* HIDDEN INPUT */}
-                   <input
-                       type="file"
-                       ref={fileInputRef}
-                       className="hidden"
-                       onChange={handleFileUpload}
-                       accept=".pdf,.docx,.txt,.md,.json,.js,.ts,.py,.html,.css,.csv,.png,.jpg,.jpeg"
-                       multiple={gate.maxContextFiles === -1}
-                   />
+                   <h3 className="text-sm font-bold text-text">Knowledge</h3>
+                   <span className="text-[10px] text-gray-500">
+                       {db.contextFiles.length}{gate.maxContextFiles !== -1 ? ` / ${gate.maxContextFiles}` : ' files'}
+                   </span>
                </div>
-               
-               <div className="space-y-2 max-h-[200px] overflow-y-auto custom-scrollbar pr-1">
-                   {db.contextFiles.length === 0 && (
-                       <div className="text-center py-6 border border-dashed border-border rounded-xl text-gray-500">
-                           <FilePlus size={24} className="mx-auto mb-2 opacity-50" />
-                           <p className="text-xs">No files added.</p>
+
+               {/* Drop zone — three input modes (drag, click, paste).
+                   The mic-listening guard mirrors the prior "Add File"
+                   disabled state: native file pickers / drag-drop UI
+                   aren't covered by setContentProtection, so a dragged
+                   filename would leak on screen-share otherwise. */}
+               {(() => {
+                 const limitHit = gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles;
+                 const blockedForSession = _rawIsListening;
+                 const disabled = limitHit || blockedForSession;
+                 return (
+                   <div
+                     onClick={() => !disabled && triggerFileUpload()}
+                     onDragEnter={!disabled ? handleDragEnter : undefined}
+                     onDragOver={!disabled ? handleDragOver : undefined}
+                     onDragLeave={!disabled ? handleDragLeave : undefined}
+                     onDrop={!disabled ? handleFilesDrop : undefined}
+                     className={`relative flex flex-col items-center justify-center gap-2 px-6 py-7 rounded-xl border-2 border-dashed transition-all ${
+                       disabled
+                         ? 'border-border/50 bg-surface/20 cursor-not-allowed'
+                         : dragActive
+                           ? 'border-primary/60 bg-primary/5 cursor-copy'
+                           : 'border-border hover:border-primary/40 hover:bg-surface/40 cursor-pointer'
+                     }`}
+                     title={blockedForSession ? 'File picker is paused during a live interview to keep filenames off your screen-share. Stop the mic to add files.' : undefined}
+                   >
+                     <Upload size={26} className={dragActive ? 'text-primary' : disabled ? 'text-gray-600' : 'text-gray-500'} />
+                     <div className="text-center">
+                       <p className="text-sm font-medium text-text">
+                         {blockedForSession ? 'Paused — stop the mic to add files' :
+                          limitHit ? 'File limit reached' :
+                          dragActive ? 'Release to upload' :
+                          'Drop files or click to browse'}
+                       </p>
+                       <p className="text-[10px] text-gray-500 mt-1">
+                         PDF · DOCX · TXT · MD · Code · Images
+                       </p>
+                     </div>
+                   </div>
+                 );
+               })()}
+
+               {/* Hidden file input — click target for the drop zone */}
+               <input
+                   type="file"
+                   ref={fileInputRef}
+                   className="hidden"
+                   onChange={handleFileUpload}
+                   accept=".pdf,.docx,.txt,.md,.json,.js,.ts,.py,.html,.css,.csv,.png,.jpg,.jpeg"
+                   multiple={gate.maxContextFiles === -1}
+               />
+
+               {/* ── Paste text directly — parallel input method ──
+                   Always-visible section (replaces the prior collapsed
+                   <details> that was too easy to miss; user feedback
+                   2026-05-09). Equal visual weight to the drop zone
+                   above so users see two real ways to add knowledge,
+                   not "drop zone + hidden fallback". The amber chip +
+                   helper line surface a non-obvious truth: text-only
+                   models like Groq do best with directly-pasted text,
+                   since PDF→text extraction can drop formatting cues
+                   that a live interviewer might quote back. */}
+               <div className="space-y-2 pt-1">
+                   <div className="flex items-center justify-between flex-wrap gap-2">
+                       <div className="flex items-center gap-1.5">
+                           <FileText size={12} className="text-gray-400" />
+                           <h4 className="text-[12px] font-semibold text-text">Paste text directly</h4>
                        </div>
-                   )}
-                   {db.contextFiles.map(file => (
-                       <div key={file.id} className="flex items-center justify-between p-2.5 bg-background border border-border rounded-lg group hover:border-primary/30 transition-colors">
-                           <div className="flex items-center gap-3 overflow-hidden">
-                               <div className="w-8 h-8 rounded bg-gray-500/10 flex items-center justify-center shrink-0">
-                                   <FileText size={14} className="text-gray-400" />
-                               </div>
-                               <div className="min-w-0">
-                                   <p className="text-xs font-medium text-text truncate max-w-[180px]">{file.name}</p>
-                                   <p className="text-[10px] text-gray-500 uppercase">{file.type}</p>
-                               </div>
-                           </div>
-                           <button onClick={() => removeFile(file.id)} className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors opacity-0 group-hover:opacity-100">
-                               <Trash2 size={14} />
+                       <span
+                           className="inline-flex items-center gap-1 text-[9.5px] font-semibold tracking-wider uppercase bg-amber-500/10 text-amber-300 px-2 py-0.5 rounded-full border border-amber-500/30"
+                           title="Groq is a text-only model with no PDF / image vision — pasting text directly bypasses any extraction loss."
+                       >
+                           <Info size={9} className="opacity-90" /> Best for Groq
+                       </span>
+                   </div>
+                   <p className="text-[10.5px] text-gray-500 leading-relaxed">
+                       Groq is text-only — pasting your resume / JD here is more reliable than uploading a PDF. We extract text from PDFs / DOCX automatically, but formatting cues can drop during extraction.
+                   </p>
+                   <div className="relative">
+                       <textarea
+                           value={pasteContent}
+                           onChange={(e) => setPasteContent(e.target.value)}
+                           placeholder="Paste resume, job description, or interview notes here…"
+                           className="w-full h-28 bg-background border border-border rounded-xl p-3 pr-12 text-xs focus:ring-1 focus:ring-primary focus:border-primary/40 outline-none resize-none custom-scrollbar leading-relaxed"
+                       />
+                       <div className="absolute bottom-2 right-2">
+                           <button
+                               onClick={handleAddPasteText}
+                               disabled={!pasteContent.trim() || (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles)}
+                               className={`p-2 rounded-lg transition-all ${pasteContent.trim() && !(gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) ? 'bg-primary text-white shadow-lg hover:bg-blue-600' : 'bg-surface text-gray-500 cursor-not-allowed border border-border'}`}
+                               aria-label="Add pasted text as context"
+                               title="Add as context"
+                           >
+                               <Plus size={16} />
                            </button>
                        </div>
-                   ))}
-               </div>
-           </div>
-
-           {/* Paste Text Section */}
-           <div className="space-y-3 pt-4 border-t border-border">
-               <h3 className="text-sm font-bold text-text">Quick Paste</h3>
-               <div className="relative">
-                   <textarea
-                        value={pasteContent}
-                        onChange={(e) => setPasteContent(e.target.value)}
-                        placeholder="Paste Resume text, Job Description, or Notes here..."
-                        className="w-full h-32 bg-background border border-border rounded-xl p-3 text-xs focus:ring-1 focus:ring-primary outline-none resize-none custom-scrollbar"
-                   />
-                   <div className="absolute bottom-2 right-2">
-                       <button
-                            onClick={handleAddPasteText}
-                            disabled={!pasteContent.trim() || (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles)}
-                            className={`p-2 rounded-lg transition-all ${pasteContent.trim() && !(gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) ? 'bg-primary text-white shadow-lg hover:bg-blue-600' : 'bg-surface text-gray-500 cursor-not-allowed border border-border'}`}
-                            aria-label="Add as Context"
-                       >
-                           <Plus size={16} />
-                       </button>
                    </div>
                </div>
+
+               {/* Unified files list — uploads + pasted snippets together.
+                   Placed AFTER both input methods so it reads as the
+                   "result" of either drop or paste. Hidden when empty
+                   since the drop-zone + paste-section above already
+                   serve as the empty-state CTAs. */}
+               {db.contextFiles.length > 0 && (
+                   <div className="space-y-2 max-h-[180px] overflow-y-auto custom-scrollbar pr-1 pt-1">
+                       {db.contextFiles.map(file => (
+                           <div key={file.id} className="flex items-center justify-between p-2.5 bg-background border border-border rounded-lg group hover:border-primary/30 transition-colors">
+                               <div className="flex items-center gap-3 overflow-hidden">
+                                   <div className="w-8 h-8 rounded bg-gray-500/10 flex items-center justify-center shrink-0">
+                                       <FileText size={14} className="text-gray-400" />
+                                   </div>
+                                   <div className="min-w-0">
+                                       <p className="text-xs font-medium text-text truncate max-w-[220px]">{file.name}</p>
+                                       <p className="text-[10px] text-gray-500 uppercase tracking-wider">{file.type}</p>
+                                   </div>
+                               </div>
+                               <button onClick={() => removeFile(file.id)} className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors opacity-0 group-hover:opacity-100">
+                                   <Trash2 size={14} />
+                               </button>
+                           </div>
+                       ))}
+                   </div>
+               )}
            </div>
 
            {/* General Mode Toggle within Context */}
@@ -6094,15 +6708,21 @@ export default function App() {
   // inside SubscriptionGate, not MainApp. The app itself is Electron-only.
   if (!isElectron && !isPopoutMode) {
     return (
-      <SubscriptionGate
-        onAuthenticated={(u, l) => {
-          setUser(u);
-          setLicense(l);
-          setAuthenticated(true);
-        }}
-      />
+      <ErrorBoundary>
+        <SubscriptionGate
+          onAuthenticated={(u, l) => {
+            setUser(u);
+            setLicense(l);
+            setAuthenticated(true);
+          }}
+        />
+      </ErrorBoundary>
     );
   }
 
-  return <MainApp userProfile={user} userLicense={license} onLogout={handleLogout} setUserProfile={setUser} setUserLicense={setLicense} />;
+  return (
+    <ErrorBoundary>
+      <MainApp userProfile={user} userLicense={license} onLogout={handleLogout} setUserProfile={setUser} setUserLicense={setLicense} />
+    </ErrorBoundary>
+  );
 }
