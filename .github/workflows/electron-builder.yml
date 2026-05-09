@@ -47,14 +47,23 @@ jobs:
     steps:
       - name: Decide if this matrix entry should build
         id: gate
-        # Build if: this is a real release event, OR matrix is flagged
-        # buildOnDispatch=true. Skip otherwise (i.e., Windows on manual).
+        # Build only when matrix.buildOnDispatch=true. The prior gate also
+        # ran on `release: *` events, which made the Windows job try to
+        # build in CI on every release — but CI doesn't carry the Azure
+        # Trusted Signing secrets (AZURE_CLIENT_SECRET / TENANT / CLIENT
+        # IDs), so the signing step always failed and produced a red X
+        # alongside the (already-uploaded, locally-signed) Windows .exe
+        # in the release. Windows builds locally via `npm run electron:
+        # publish` and is uploaded to the release before CI ever fires;
+        # Mac and Linux are the platforms CI handles. If we ever wire
+        # the Azure secrets into GitHub repo secrets, flip Windows'
+        # buildOnDispatch to true to re-enable CI rebuilds for it.
         run: |
-          if [ "${{ github.event_name }}" = "release" ] || [ "${{ matrix.buildOnDispatch }}" = "true" ]; then
+          if [ "${{ matrix.buildOnDispatch }}" = "true" ]; then
             echo "go=1" >> $GITHUB_OUTPUT
           else
             echo "go=0" >> $GITHUB_OUTPUT
-            echo "::notice::Skipping ${{ matrix.os }} on this trigger — locally-signed builds aren't rebuilt by CI."
+            echo "::notice::Skipping ${{ matrix.os }} — locally-signed builds aren't rebuilt by CI."
           fi
         shell: bash
 

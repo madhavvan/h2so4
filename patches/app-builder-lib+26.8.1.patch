@@ -1,0 +1,15 @@
+diff --git a/node_modules/app-builder-lib/out/node-module-collector/nodeModulesCollector.js b/node_modules/app-builder-lib/out/node-module-collector/nodeModulesCollector.js
+index 0956d26..7089146 100644
+--- a/node_modules/app-builder-lib/out/node-module-collector/nodeModulesCollector.js
++++ b/node_modules/app-builder-lib/out/node-module-collector/nodeModulesCollector.js
+@@ -295,7 +295,9 @@ class NodeModulesCollector {
+      */
+     async streamCollectorCommandToFile(command, args, cwd, tempOutputFile) {
+         const execName = path.basename(command, path.extname(command));
+-        const isWindowsScriptFile = process.platform === "win32" && path.extname(command).toLowerCase() === ".cmd";
++        // ─── PATCH: bypass .bat wrapper — shell:true alone handles .cmd
++        // on modern Node + the wrapper was producing empty output.
++        const isWindowsScriptFile = false;
+         if (isWindowsScriptFile) {
+             // If the command is a Windows script file (.cmd), we need to wrap it in a .bat file to ensure it runs correctly with cmd.exe
+             // This is necessary because .cmd files are not directly executable in the same way as .bat files.
