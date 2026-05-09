@@ -2,6 +2,7 @@ import path from 'path';
 import { readFileSync } from 'node:fs';
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
+import svgr from 'vite-plugin-svgr';
 
 // Read version from package.json at config-load time so the renderer and
 // the server-side version-check always agree. Injected as a global so
@@ -19,7 +20,15 @@ export default defineConfig(({ mode }) => {
         port: 3005,
         host: '0.0.0.0',
       },
-      plugins: [react()],
+      plugins: [
+        react(),
+        // SVG-as-React-component support via the `?react` query suffix.
+        // Used by ProviderIcons.tsx to import the AI provider brand
+        // marks shipped in @lobehub/icons-static-svg as React
+        // components so they can be styled with currentColor + sized
+        // via the size prop (vs. a flat <img> which loses both).
+        svgr({ include: '**/*.svg?react' }),
+      ],
       define: {
         'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
         'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
