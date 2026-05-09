@@ -165,12 +165,26 @@ class LicenseService {
   private readonly AUTH_KEY = 'minicaai_auth';
   private readonly TOKEN_KEY = 'minicaai_token';
 
-  // Server base URL. Default is the Railway-hosted backend; override
-  // via .env VITE_SERVER_URL=http://localhost:4000 to test the dev
-  // server through the Electron dev mode. The Vite build inlines this
-  // at compile time, so prod builds always get the prod URL unless the
-  // env var was explicitly set during the build.
-  private API_BASE = (import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com';
+  // Server base URL.
+  //
+  // Prod build: HARDCODED to api.minicaai.com regardless of any
+  // VITE_SERVER_URL env var. v4.0.0–v4.0.2 shipped with localhost:4000
+  // baked in because the build ran with .env.local active, and every
+  // user got 401s on every auth call (their stored JWTs were signed
+  // by prod's JWT_SECRET but the app was sending them to a dead local
+  // server). The PROD guard here makes that impossible — even if the
+  // dev forgets to clean their .env.local, a prod build always points
+  // at prod.
+  //
+  // Dev build (`npm run dev`): honors VITE_SERVER_URL if set, lets
+  // you point the renderer at a local server for testing.
+  //
+  // Vite inlines `import.meta.env.PROD` (= true for `vite build`,
+  // false for `vite dev`) at compile time, so the resulting bundle
+  // has a single static URL — no runtime branching, no surprises.
+  private API_BASE = (import.meta as any).env?.PROD
+    ? 'https://api.minicaai.com'
+    : ((import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com');
 
   // ── Device Fingerprint ──
   async getDeviceId(): Promise<string> {
