@@ -4599,21 +4599,18 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   // ── Cross-window state sync (Electron only) ──
   // Main window → pop-out: relay state whenever it changes.
   //
-  // PERFORMANCE FIX: previously this fired on EVERY change of any input
-  // — every keystroke (inputText) AND every Deepgram interim transcript
-  // tick (interimText, ~5Hz). With contextBridge serialization that's
-  // dozens of IPC calls per second on the hottest cross-window channel.
-  // Throttle to ~50ms via rAF coalescing: while a sync is "pending,"
-  // drop newer calls and let the rAF fire with the latest values.
-  // Visible state still feels live (50ms < a frame at 60fps), API
-  // pressure drops by ~10x.
-  const stateSyncRafRef = useRef<number | null>(null);
-  const stateSyncLatestRef = useRef<any>(null);
+  // Send directly on every state change. An earlier version coalesced via
+  // requestAnimationFrame to reduce IPC pressure during transcription,
+  // but Chromium pauses rAF callbacks entirely when a window is hidden
+  // or occluded — and main is exactly that during an interview (popout
+  // is always-on-top, main is skipTaskbar + behind the interview app).
+  // The pending rAF never fired, so the LIVE/AUTO chips and input
+  // textbox in the popout stayed frozen at their last-known state.
+  // Direct send works regardless of main's visibility; IPC pressure at
+  // ~5Hz interim ticks + keystrokes is well within Electron's headroom.
   useEffect(() => {
     if (!isElectron || isPopoutMode) return;
-    // Capture the freshest values; if a frame is already pending it
-    // will emit these, not the stale ones from the previous schedule.
-    stateSyncLatestRef.current = {
+    electronIPC.send('relay-to-popout', {
       type: 'state-sync',
       isListening: _rawIsListening,
       isProcessing,
@@ -4622,22 +4619,8 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       autoSend: settings.autoSend,
       speechError: _rawSpeechError,
       selectedModel: settings.selectedModel,
-    };
-    if (stateSyncRafRef.current !== null) return; // already pending
-    stateSyncRafRef.current = window.requestAnimationFrame(() => {
-      stateSyncRafRef.current = null;
-      const payload = stateSyncLatestRef.current;
-      if (payload) electronIPC.send('relay-to-popout', payload);
     });
   }, [_rawIsListening, isProcessing, interimText, inputText, settings.autoSend, _rawSpeechError, settings.selectedModel]);
-  // Cancel any pending rAF on unmount so a stale closure can't fire after
-  // teardown (mostly defensive — MainApp only unmounts on logout).
-  useEffect(() => () => {
-    if (stateSyncRafRef.current !== null) {
-      window.cancelAnimationFrame(stateSyncRafRef.current);
-      stateSyncRafRef.current = null;
-    }
-  }, []);
 
   // Pop-out: receive state from main window
   useEffect(() => {
