@@ -1,0 +1,80 @@
+name: Diagnose macOS signing hang
+
+# Dispatch-only, temporary. Does NOT build or publish anything — it only
+# probes WHY the macOS release build hangs at code-signing. Every probe is
+# timeout-bounded, so this job itself cannot hang. Safe to delete once the
+# question is answered.
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Runner environment
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== macOS ==="
+          sw_vers
+          echo "=== codesign / Xcode ==="
+          which codesign
+          xcodebuild -version
+
+      - name: Probe Apple timestamp + notary endpoints
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== DNS: timestamp.apple.com ==="
+          dscacheutil -q host -a name timestamp.apple.com
+          echo
+          echo "=== timestamp.apple.com  IPv4  (http/80 — the path codesign uses) ==="
+          curl -4 -sS -o /dev/null -w "  http=%{http_code}  dns=%{time_namelookup}s  connect=%{time_connect}s  total=%{time_total}s\n" --max-time 30 "http://timestamp.apple.com/ts01" || echo "  -> IPv4 FAILED / TIMED OUT"
+          echo
+          echo "=== timestamp.apple.com  IPv6 ==="
+          curl -6 -sS -o /dev/null -w "  http=%{http_code}  connect=%{time_connect}s  total=%{time_total}s\n" --max-time 30 "http://timestamp.apple.com/ts01" || echo "  -> IPv6 FAILED / TIMED OUT"
+          echo
+          echo "=== notary API  appstoreconnect.apple.com ==="
+          curl -sS -o /dev/null -w "  http=%{http_code}  connect=%{time_connect}s  total=%{time_total}s\n" --max-time 30 "https://appstoreconnect.apple.com/notary/v2/submissions" || echo "  -> notary endpoint FAILED / TIMED OUT"
+
+      - name: notarytool submission history
+        continue-on-error: true
+        run: |
+          set +e
+          echo "${{ secrets.APPLE_API_KEY_P8 }}" | openssl base64 -d -A > "$RUNNER_TEMP/AuthKey.p8"
+          echo "=== xcrun notarytool history (status of every past submission) ==="
+          timeout 150 xcrun notarytool history \
+            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "${{ secrets.APPLE_API_KEY_ID }}" \
+            --issuer "${{ secrets.APPLE_API_ISSUER }}"
+          echo "  -> notarytool history exit=$?  (124 = timed out = notary API unreachable)"
+
+      - name: Isolated codesign test - the decisive experiment
+        continue-on-error: true
+        run: |
+          set +e
+          echo "${{ secrets.CSC_LINK }}" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          KC="$RUNNER_TEMP/diag.keychain-db"
+          KCPASS="diag-temp-pw-7731"
+          security create-keychain -p "$KCPASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPASS" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "${{ secrets.CSC_KEY_PASSWORD }}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null 2>&1
+          security list-keychains -d user -s "$KC"
+          echo "=== signing identities in the diagnostic keychain ==="
+          security find-identity -v -p codesigning "$KC"
+          HASH=$(security find-identity -v -p codesigning "$KC" | awk '/^[[:space:]]*[0-9]+\)/{print $2; exit}')
+          echo "using identity: $HASH"
+          echo 'int main(void){return 0;}' > "$RUNNER_TEMP/t.c"
+          clang "$RUNNER_TEMP/t.c" -o "$RUNNER_TEMP/tA"
+          cp "$RUNNER_TEMP/tA" "$RUNNER_TEMP/tB"
+          echo
+          echo "######### TEST A: codesign --timestamp=none  (no network - keychain path only) #########"
+          time timeout 90 codesign --force --options runtime --keychain "$KC" --timestamp=none -s "$HASH" --verbose=4 "$RUNNER_TEMP/tA"
+          echo "######### TEST A exit=$?   (124 = HUNG  =>  the KEYCHAIN is the cause) #########"
+          echo
+          echo "######### TEST B: codesign --timestamp  (contacts Apple's timestamp server) #########"
+          time timeout 150 codesign --force --options runtime --keychain "$KC" --timestamp -s "$HASH" --verbose=4 "$RUNNER_TEMP/tB"
+          echo "######### TEST B exit=$?   (124 = HUNG  =>  Apple's TIMESTAMP SERVER is the cause) #########"
