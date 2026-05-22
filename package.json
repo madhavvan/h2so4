@@ -43,19 +43,17 @@
         {
           "target": "dmg",
           "arch": [
-            "x64",
-            "arm64"
+            "universal"
           ]
         },
         {
           "target": "zip",
           "arch": [
-            "x64",
-            "arm64"
+            "universal"
           ]
         }
       ],
-      "artifactName": "InterviewCopilot-Mac-${arch}.${ext}",
+      "artifactName": "InterviewCopilot-Mac.${ext}",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
@@ -63,7 +61,8 @@
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Interview Copilot needs microphone access to capture interview audio.",
         "NSScreenCaptureUsageDescription": "Interview Copilot needs screen capture to provide real-time interview assistance."
-      }
+      },
+      "notarize": true
     },
     "win": {
       "target": "nsis",
