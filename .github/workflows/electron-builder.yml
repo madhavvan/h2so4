@@ -22,6 +22,10 @@ permissions:
 
 jobs:
   release:
+    # Hard cap so a slow Apple notarization can't hang the build for hours.
+    # A healthy notarized 2-arch build runs ~40-55 min; past this the job
+    # fails cleanly instead of waiting on Apple's notary service forever.
+    timeout-minutes: 70
     strategy:
       fail-fast: false
       matrix:
