@@ -1,9 +1,7 @@
 name: Diagnose macOS signing hang
 
-# Dispatch-only, temporary. Does NOT build or publish anything — it only
-# probes WHY the macOS release build hangs at code-signing. Every probe is
-# timeout-bounded, so this job itself cannot hang. Safe to delete once the
-# question is answered.
+# Dispatch-only, temporary. Probes WHY the macOS release build hangs at
+# code-signing. Self-bounded (perl alarm); safe to delete once diagnosed.
 on:
   workflow_dispatch:
 
@@ -16,11 +14,8 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          echo "=== macOS ==="
-          sw_vers
-          echo "=== codesign / Xcode ==="
-          which codesign
-          xcodebuild -version
+          echo "=== macOS ==="; sw_vers
+          echo "=== codesign / Xcode ==="; which codesign; xcodebuild -version
 
       - name: Probe Apple timestamp + notary endpoints
         continue-on-error: true
@@ -29,14 +24,12 @@ jobs:
           echo "=== DNS: timestamp.apple.com ==="
           dscacheutil -q host -a name timestamp.apple.com
           echo
-          echo "=== timestamp.apple.com  IPv4  (http/80 — the path codesign uses) ==="
-          curl -4 -sS -o /dev/null -w "  http=%{http_code}  dns=%{time_namelookup}s  connect=%{time_connect}s  total=%{time_total}s\n" --max-time 30 "http://timestamp.apple.com/ts01" || echo "  -> IPv4 FAILED / TIMED OUT"
-          echo
-          echo "=== timestamp.apple.com  IPv6 ==="
-          curl -6 -sS -o /dev/null -w "  http=%{http_code}  connect=%{time_connect}s  total=%{time_total}s\n" --max-time 30 "http://timestamp.apple.com/ts01" || echo "  -> IPv6 FAILED / TIMED OUT"
-          echo
-          echo "=== notary API  appstoreconnect.apple.com ==="
-          curl -sS -o /dev/null -w "  http=%{http_code}  connect=%{time_connect}s  total=%{time_total}s\n" --max-time 30 "https://appstoreconnect.apple.com/notary/v2/submissions" || echo "  -> notary endpoint FAILED / TIMED OUT"
+          echo "=== timestamp.apple.com IPv4 (http/80 — the path codesign uses) ==="
+          curl -4 -sS -o /dev/null -w "  http=%{http_code} connect=%{time_connect}s total=%{time_total}s\n" --max-time 30 "http://timestamp.apple.com/ts01" || echo "  -> IPv4 FAILED/TIMED OUT"
+          echo "=== timestamp.apple.com IPv6 ==="
+          curl -6 -sS -o /dev/null -w "  http=%{http_code} connect=%{time_connect}s total=%{time_total}s\n" --max-time 30 "http://timestamp.apple.com/ts01" || echo "  -> IPv6 FAILED/TIMED OUT"
+          echo "=== notary API appstoreconnect.apple.com ==="
+          curl -sS -o /dev/null -w "  http=%{http_code} connect=%{time_connect}s total=%{time_total}s\n" --max-time 30 "https://appstoreconnect.apple.com/notary/v2/submissions" || echo "  -> notary FAILED/TIMED OUT"
 
       - name: notarytool submission history
         continue-on-error: true
@@ -44,11 +37,11 @@ jobs:
           set +e
           echo "${{ secrets.APPLE_API_KEY_P8 }}" | openssl base64 -d -A > "$RUNNER_TEMP/AuthKey.p8"
           echo "=== xcrun notarytool history (status of every past submission) ==="
-          timeout 150 xcrun notarytool history \
+          perl -e 'alarm shift; exec @ARGV' 120 xcrun notarytool history \
             --key "$RUNNER_TEMP/AuthKey.p8" \
             --key-id "${{ secrets.APPLE_API_KEY_ID }}" \
             --issuer "${{ secrets.APPLE_API_ISSUER }}"
-          echo "  -> notarytool history exit=$?  (124 = timed out = notary API unreachable)"
+          echo "  -> notarytool history exit=$?  (142 = timed out)"
 
       - name: Isolated codesign test - the decisive experiment
         continue-on-error: true
@@ -71,10 +64,14 @@ jobs:
           clang "$RUNNER_TEMP/t.c" -o "$RUNNER_TEMP/tA"
           cp "$RUNNER_TEMP/tA" "$RUNNER_TEMP/tB"
           echo
-          echo "######### TEST A: codesign --timestamp=none  (no network - keychain path only) #########"
-          time timeout 90 codesign --force --options runtime --keychain "$KC" --timestamp=none -s "$HASH" --verbose=4 "$RUNNER_TEMP/tA"
-          echo "######### TEST A exit=$?   (124 = HUNG  =>  the KEYCHAIN is the cause) #########"
+          echo "######### TEST A: codesign --timestamp=none  (no network — keychain path only) #########"
+          A0=$(date +%s)
+          perl -e 'alarm shift; exec @ARGV' 100 codesign --force --options runtime --keychain "$KC" --timestamp=none -s "$HASH" --verbose=4 "$RUNNER_TEMP/tA"
+          ARC=$?
+          echo "######### TEST A: exit=$ARC  elapsed=$(($(date +%s)-A0))s   (142 = HUNG => the KEYCHAIN is the cause) #########"
           echo
           echo "######### TEST B: codesign --timestamp  (contacts Apple's timestamp server) #########"
-          time timeout 150 codesign --force --options runtime --keychain "$KC" --timestamp -s "$HASH" --verbose=4 "$RUNNER_TEMP/tB"
-          echo "######### TEST B exit=$?   (124 = HUNG  =>  Apple's TIMESTAMP SERVER is the cause) #########"
+          B0=$(date +%s)
+          perl -e 'alarm shift; exec @ARGV' 160 codesign --force --options runtime --keychain "$KC" --timestamp -s "$HASH" --verbose=4 "$RUNNER_TEMP/tB"
+          BRC=$?
+          echo "######### TEST B: exit=$BRC  elapsed=$(($(date +%s)-B0))s   (142 = HUNG => Apple's TIMESTAMP SERVER is the cause) #########"
