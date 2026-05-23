@@ -1,4 +1,4 @@
-name: Notary status (per-submission)
+name: Notary status
 
 on:
   workflow_dispatch:
@@ -17,17 +17,14 @@ jobs:
           ISS="${{ secrets.APPLE_API_ISSUER }}"
 
           echo "########## CURRENT NOTARY HISTORY ##########"
-          xcrun notarytool history --key "$KEY" --key-id "$KID" --issuer "$ISS" --output-format json | tee /tmp/hist.json
+          xcrun notarytool history --key "$KEY" --key-id "$KID" --issuer "$ISS" | tee /tmp/hist.txt
+
+          # Extract submission UUIDs from the readable "id: <uuid>" lines
+          awk '/^[[:space:]]+id:/{print $2}' /tmp/hist.txt > /tmp/ids.txt
+          echo "extracted submission IDs: $(wc -l < /tmp/ids.txt)"
+
           echo
-
-          python3 -c "
-import json
-d=json.load(open('/tmp/hist.json'))
-for s in d.get('history',[]):
-    print(s.get('id'))
-" > /tmp/ids.txt
-
-          echo "########## PER-SUBMISSION INFO + LOG ##########"
+          echo "########## PER-SUBMISSION INFO + DEVELOPER LOG ##########"
           while read id; do
             [ -z "$id" ] && continue
             echo
