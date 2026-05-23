@@ -26,6 +26,7 @@
     "directories": {
       "output": "dist-electron"
     },
+    "afterPack": "./scripts/notary-cleanup.cjs",
     "files": [
       "dist/**/*",
       "electron/**/*"
