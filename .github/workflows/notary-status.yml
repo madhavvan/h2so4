@@ -1,0 +1,39 @@
+name: Notary status (per-submission)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: notary history + per-submission info + developer log
+        run: |
+          set +e
+          echo "${{ secrets.APPLE_API_KEY_P8 }}" | openssl base64 -d -A > "$RUNNER_TEMP/AuthKey.p8"
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          KID="${{ secrets.APPLE_API_KEY_ID }}"
+          ISS="${{ secrets.APPLE_API_ISSUER }}"
+
+          echo "########## CURRENT NOTARY HISTORY ##########"
+          xcrun notarytool history --key "$KEY" --key-id "$KID" --issuer "$ISS" --output-format json | tee /tmp/hist.json
+          echo
+
+          python3 -c "
+import json
+d=json.load(open('/tmp/hist.json'))
+for s in d.get('history',[]):
+    print(s.get('id'))
+" > /tmp/ids.txt
+
+          echo "########## PER-SUBMISSION INFO + LOG ##########"
+          while read id; do
+            [ -z "$id" ] && continue
+            echo
+            echo "================ $id ================"
+            echo "--- info ---"
+            xcrun notarytool info "$id" --key "$KEY" --key-id "$KID" --issuer "$ISS"
+            echo "--- developer log ---"
+            xcrun notarytool log "$id" --key "$KEY" --key-id "$KID" --issuer "$ISS"
+          done < /tmp/ids.txt
