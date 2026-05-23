@@ -64,7 +64,11 @@
         "NSMicrophoneUsageDescription": "Interview Copilot needs microphone access to capture interview audio.",
         "NSScreenCaptureUsageDescription": "Interview Copilot needs screen capture to provide real-time interview assistance."
       },
-      "notarize": true
+      "notarize": true,
+      "files": [
+        "!**/node_modules/@nut-tree-fork/libnut-linux/**/*",
+        "!**/node_modules/@nut-tree-fork/libnut-win32/**/*"
+      ]
     },
     "win": {
       "target": "nsis",
@@ -76,7 +80,11 @@
         "codeSigningAccountName": "minica-signing-4729",
         "certificateProfileName": "minicaai-prod",
         "publisherName": "Venu Madhav Pentala"
-      }
+      },
+      "files": [
+        "!**/node_modules/@nut-tree-fork/libnut-darwin/**/*",
+        "!**/node_modules/@nut-tree-fork/libnut-linux/**/*"
+      ]
     },
     "nsis": {
       "oneClick": true,
@@ -92,7 +100,11 @@
       ],
       "icon": "build/icon.png",
       "artifactName": "InterviewCopilot-Linux.${ext}",
-      "category": "Utility"
+      "category": "Utility",
+      "files": [
+        "!**/node_modules/@nut-tree-fork/libnut-darwin/**/*",
+        "!**/node_modules/@nut-tree-fork/libnut-win32/**/*"
+      ]
     }
   },
   "dependencies": {
