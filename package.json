@@ -65,7 +65,7 @@
         "NSMicrophoneUsageDescription": "Interview Copilot needs microphone access to capture interview audio.",
         "NSScreenCaptureUsageDescription": "Interview Copilot needs screen capture to provide real-time interview assistance."
       },
-      "notarize": true,
+      "notarize": false,
       "files": [
         "!**/node_modules/@nut-tree-fork/libnut-linux/**/*",
         "!**/node_modules/@nut-tree-fork/libnut-win32/**/*"
