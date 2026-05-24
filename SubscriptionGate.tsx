@@ -6652,7 +6652,7 @@ const SupportMobile: React.FC<SupportMobileProps> = ({
       text: `Hi ${currentUser.name || 'there'}! I'm Hari, your support agent. How can I help you today?`,
       time,
     }]);
-    const serverUrl = import.meta.env.VITE_SERVER_URL || 'https://api.minicaai.com';
+    const serverUrl = import.meta.env.PROD ? 'https://api.minicaai.com' : (import.meta.env.VITE_SERVER_URL || 'https://api.minicaai.com');
     const wsUrl = serverUrl.replace(/^http/, 'ws') + '/ws/support';
     try {
       const ws = new WebSocket(wsUrl);
@@ -9762,7 +9762,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       }]);
 
       // Connect WebSocket for live chat
-      const serverUrl = import.meta.env.VITE_SERVER_URL || 'https://api.minicaai.com';
+      const serverUrl = import.meta.env.PROD ? 'https://api.minicaai.com' : (import.meta.env.VITE_SERVER_URL || 'https://api.minicaai.com');
       const wsUrl = serverUrl.replace(/^http/, 'ws') + '/ws/support';
       try {
         const ws = new WebSocket(wsUrl);
