@@ -6,9 +6,24 @@
 import { licenseService } from './licenseService';
 import { Message, ContextFile } from '../types';
 
-// Default to production. Override via .env: VITE_SERVER_URL=http://localhost:4000
-// for local-server testing through the Electron dev mode.
-const API_BASE = (import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com';
+// Prod build (`vite build` / `npm run electron:publish`): always points at
+// api.minicaai.com regardless of .env.local. Mirrors licenseService.ts:185.
+// A forgotten VITE_SERVER_URL=http://localhost:4000 in .env.local shipped
+// v4.0.5 with every AI call (deepgram-key, chat, autotype-plan) pointing
+// at localhost, which 401'd for every user because their JWTs were signed
+// by prod's JWT_SECRET. The PROD guard here makes that impossible — even
+// if the dev forgets to clean their .env.local, a prod build always
+// points at prod.
+//
+// Dev build (`npm run dev`): honors VITE_SERVER_URL if set, lets you
+// point the renderer at a local server for testing.
+//
+// Vite inlines `import.meta.env.PROD` (= true for `vite build`, false
+// for `vite dev`) at compile time, so the resulting bundle has a single
+// static URL — no runtime branching, no surprises.
+const API_BASE = (import.meta as any).env?.PROD
+  ? 'https://api.minicaai.com'
+  : ((import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com');
 
 // ── Retry configuration for resilient AI requests ──
 const MAX_RETRIES = 3;
