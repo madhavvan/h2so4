@@ -1,7 +1,7 @@
 {
   "name": "interview-copilot-ai",
   "private": true,
-  "version": "4.0.7",
+  "version": "4.0.8",
   "description": "AI-powered real-time interview assistant",
   "author": {
     "name": "Interview Copilot",
@@ -65,7 +65,7 @@
         "NSMicrophoneUsageDescription": "Interview Copilot needs microphone access to capture interview audio.",
         "NSScreenCaptureUsageDescription": "Interview Copilot needs screen capture to provide real-time interview assistance."
       },
-      "notarize": false,
+      "notarize": true,
       "files": [
         "!**/node_modules/@nut-tree-fork/libnut-linux/**/*",
         "!**/node_modules/@nut-tree-fork/libnut-win32/**/*"
