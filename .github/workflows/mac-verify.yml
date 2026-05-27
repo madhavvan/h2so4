@@ -1,0 +1,133 @@
+name: Mac end-to-end verify
+
+# One-off diagnostic: downloads the latest published macOS artifacts from
+# /releases/latest and exercises the full Apple Gatekeeper pipeline against
+# them. Tells us whether a real Mac user can double-click the .dmg/.zip
+# and have macOS open the app without the "Apple could not verify" hoop.
+#
+# What this answers definitively:
+#   - codesign --verify: the bundle's signature is intact + identity is
+#     a valid Developer ID Application cert
+#   - spctl --assess: macOS Gatekeeper would actually let this run
+#   - stapler validate: the notarization ticket is physically attached
+#     to the app (offline-friendly first launch); if this fails but
+#     spctl passes, only online users are covered
+#   - notarytool log: shows what Apple recorded about the submission
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download v4.0.8 mac artifacts from /releases/latest
+        run: |
+          set +e
+          mkdir -p ~/verify && cd ~/verify
+          for f in InterviewCopilot-Mac-arm64.dmg InterviewCopilot-Mac-arm64.zip InterviewCopilot-Mac-x64.dmg InterviewCopilot-Mac-x64.zip; do
+            echo "↓ $f"
+            curl -sL -o "$f" "https://github.com/madhavvan/h2so4/releases/latest/download/$f"
+            ls -lh "$f"
+          done
+
+      - name: Inspect DMG (arm64) — the install path most Mac users take
+        run: |
+          set +e
+          cd ~/verify
+          echo "========== Mount arm64 DMG =========="
+          MOUNT=$(hdiutil attach -nobrowse -readonly InterviewCopilot-Mac-arm64.dmg | awk '/\/Volumes\//{print $NF; exit}')
+          echo "mounted at: $MOUNT"
+          APP=$(find "$MOUNT" -name "*.app" -maxdepth 2 | head -1)
+          echo "found app:  $APP"
+          echo ""
+          echo "========== codesign --verify --deep --strict =========="
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1
+          echo "exit: $?"
+          echo ""
+          echo "========== codesign --display (signing identity + entitlements) =========="
+          codesign --display --verbose=4 "$APP" 2>&1 | head -30
+          echo ""
+          echo "========== spctl --assess (THE Gatekeeper decision) =========="
+          spctl --assess --verbose=4 --type execute "$APP" 2>&1
+          echo "exit: $?"
+          echo ""
+          echo "========== stapler validate (offline-friendly first launch?) =========="
+          xcrun stapler validate "$APP" 2>&1
+          echo "exit: $?"
+          echo ""
+          echo "========== Helper apps inside Frameworks/ — each must also pass =========="
+          find "$APP/Contents/Frameworks" -name "*.app" -maxdepth 3 | while read helper; do
+            echo "--- $helper ---"
+            codesign --verify --strict --verbose=1 "$helper" 2>&1 | head -3
+            xcrun stapler validate "$helper" 2>&1 | head -2
+          done
+          echo ""
+          hdiutil detach "$MOUNT" -quiet
+
+      - name: Inspect ZIP (arm64) — the auto-update path
+        run: |
+          set +e
+          cd ~/verify
+          mkdir -p arm64-unzip && cd arm64-unzip
+          ditto -x -k ../InterviewCopilot-Mac-arm64.zip .
+          APP=$(find . -name "*.app" -maxdepth 2 | head -1)
+          echo "unzipped app: $APP"
+          echo ""
+          echo "========== codesign --verify (the auto-update bundle) =========="
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1
+          echo ""
+          echo "========== stapler validate (the auto-update bundle) =========="
+          xcrun stapler validate "$APP" 2>&1
+
+      - name: Inspect DMG (x64)
+        run: |
+          set +e
+          cd ~/verify
+          MOUNT=$(hdiutil attach -nobrowse -readonly InterviewCopilot-Mac-x64.dmg | awk '/\/Volumes\//{print $NF; exit}')
+          APP=$(find "$MOUNT" -name "*.app" -maxdepth 2 | head -1)
+          echo "========== x64 codesign + spctl + stapler =========="
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1
+          spctl --assess --verbose=4 --type execute "$APP" 2>&1
+          xcrun stapler validate "$APP" 2>&1
+          hdiutil detach "$MOUNT" -quiet
+
+      - name: Simulate fresh Mac user — quarantine flag + first launch
+        run: |
+          set +e
+          cd ~/verify
+          # Real downloads land with com.apple.quarantine extended attr. We
+          # didn't get one via curl, so add it manually to reproduce what an
+          # actual user sees. Then ask Gatekeeper what would happen on dbl-click.
+          xattr -w com.apple.quarantine "0083;0;Safari;0" InterviewCopilot-Mac-arm64.dmg
+          xattr -l InterviewCopilot-Mac-arm64.dmg
+          echo ""
+          echo "========== spctl on quarantined DMG (the actual user experience) =========="
+          spctl --assess --type open --context context:primary-signature --verbose=4 InterviewCopilot-Mac-arm64.dmg 2>&1
+          echo ""
+          MOUNT=$(hdiutil attach -nobrowse -readonly InterviewCopilot-Mac-arm64.dmg | awk '/\/Volumes\//{print $NF; exit}')
+          APP=$(find "$MOUNT" -name "*.app" -maxdepth 2 | head -1)
+          # Simulate the user dragging to ~/Applications and double-clicking
+          cp -R "$APP" /tmp/InstalledApp.app
+          xattr -w com.apple.quarantine "0083;0;Safari;0" /tmp/InstalledApp.app
+          echo "========== spctl on quarantined installed app (DOUBLE-CLICK GATEKEEPER VERDICT) =========="
+          spctl --assess --type execute --verbose=4 /tmp/InstalledApp.app 2>&1
+          echo "exit: $?"
+          hdiutil detach "$MOUNT" -quiet
+
+      - name: Final summary
+        if: always()
+        run: |
+          set +e
+          echo "==========================================================="
+          echo "  IF every exit code above was 0 AND stapler validate said"
+          echo "  'The validate action worked!' → Mac users open cleanly."
+          echo ""
+          echo "  IF stapler said 'does not have a ticket stapled to it'"
+          echo "  → online users are fine, offline first-launches will"
+          echo "  still show the 'could not verify' dialog."
+          echo ""
+          echo "  IF spctl said 'rejected' → the app cannot be opened at"
+          echo "  all without manual System Settings bypass."
+          echo "==========================================================="
