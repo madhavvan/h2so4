@@ -679,7 +679,16 @@ function invalidatePendingResetTokensForUser(userId) {
 function applyPasswordReset(userId, newPassword) {
   const d = getDB();
   const passwordHash = hashPassword(newPassword);
-  const now = Date.now();
+  // Truncate the revocation cutoff to the current SECOND. authMiddleware
+  // compares JWT iat (seconds) against tokens_revoked_after as
+  // `iat*1000 < revoked_after`. A caller that re-issues a token for the same
+  // session immediately after this (PUT /auth/password, to keep the user
+  // logged in) would otherwise have its brand-new token read as revoked —
+  // a raw-ms Date.now() sits a few hundred ms past the new token's
+  // second-floored iat*1000. Aligning the cutoff to the second boundary
+  // lets the replacement token survive while every token issued in a prior
+  // second is killed. Harmless for the reset flow, which re-logs in anyway.
+  const now = Math.floor(Date.now() / 1000) * 1000;
   let invalidatedSiblings = 0;
   const tx = d.transaction(() => {
     d.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')

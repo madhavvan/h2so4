@@ -903,12 +903,19 @@ router.put('/password', authMiddleware, (req, res) => {
       return res.status(401).json({ error: 'Current password is incorrect' });
     }
 
-    const d = db.getDB();
-    const newHash = db.hashPassword(new_password);
-    d.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')
-      .run(newHash, Date.now(), user.id);
+    // Atomic: hash + revoke ALL existing sessions (tokens_revoked_after) +
+    // invalidate any outstanding reset links — the same transaction the
+    // reset flow uses. Changing a password must kill other live sessions
+    // (the whole point when a device is compromised); previously this route
+    // updated only the hash, leaving every long-lived JWT valid. We then
+    // re-issue a token for THIS session so the user who just changed their
+    // password isn't bounced to the login screen. The client saves the
+    // returned token; an older client that ignores it simply re-logs in,
+    // which is safe.
+    db.applyPasswordReset(user.id, new_password);
+    const token = generateToken({ id: user.id, email: user.email, tier: user.tier });
 
-    res.json({ success: true, message: 'Password updated' });
+    res.json({ success: true, message: 'Password updated', token });
   } catch (err) {
     console.error('Password change error:', err);
     res.status(500).json({ error: 'Failed to change password' });
