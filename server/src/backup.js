@@ -99,6 +99,20 @@ function runBackup() {
     try { sizeMb = fs.statSync(target).size / (1024 * 1024); } catch (_) {}
     console.log(`[backup] snapshot ok: ${target} (${sizeMb.toFixed(1)}MB in ${took}ms)`);
     rotateOld(backupDir);
+
+    // Off-site copy (S3 / R2 / B2) — gated on BACKUP_S3_* env, no-op + zero
+    // overhead when unconfigured. Fire-and-forget: a failed upload must never
+    // break the local snapshot or the daily interval. See backupOffsite.js.
+    try {
+      const offsite = require('./backupOffsite');
+      if (offsite.isConfigured()) {
+        offsite.uploadBackup(target)
+          .then(r => { if (r && !r.skipped) console.log(`[backup] off-site upload ok: ${r.key} (${(r.bytes / 1048576).toFixed(1)}MB)`); })
+          .catch(err => console.error('[backup] off-site upload FAILED:', err.message));
+      }
+    } catch (offErr) {
+      console.warn('[backup] off-site module load failed:', offErr.message);
+    }
   } catch (err) {
     console.error('[backup] snapshot FAILED:', err.message);
   }
@@ -114,6 +128,21 @@ function startDailyBackups() {
   // for in-flight HTTP requests but shouldn't be held open by an idle
   // interval.
   if (_intervalHandle.unref) _intervalHandle.unref();
+
+  // Off-site self-test at boot — verifies credentials + bucket reachability
+  // with a tiny probe upload+readback, so a misconfiguration is loud in logs
+  // now rather than discovered during a real disaster. No-op when off-site
+  // backups are not configured.
+  try {
+    const offsite = require('./backupOffsite');
+    if (offsite.isConfigured()) {
+      offsite.selfTest()
+        .then(r => { if (r && !r.skipped) console.log('[backup] off-site self-test PASSED — credentials + bucket reachable'); })
+        .catch(err => console.error('[backup] off-site self-test FAILED — backups are NOT going off-site:', err.message));
+    }
+  } catch (e) {
+    console.warn('[backup] off-site self-test load failed:', e.message);
+  }
 }
 
 function stopDailyBackups() {
