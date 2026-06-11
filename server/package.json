@@ -8,7 +8,10 @@
     "dev": "nodemon src/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "stripe:setup": "node --env-file=.env scripts/stripe-setup.mjs"
+    "stripe:setup": "node --env-file=.env scripts/stripe-setup.mjs",
+    "docs:encrypt": "node scripts/encrypt-docs.mjs",
+    "docs:check": "node scripts/encrypt-docs.mjs --check",
+    "docs:keygen": "node scripts/encrypt-docs.mjs --keygen"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",

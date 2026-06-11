@@ -1120,6 +1120,58 @@ router.post('/autotype-agent', requireTier(...MAX_ONLY), async (req, res) => {
   }
 });
 
+// ── /autotype-vision ──
+// Vision-grounded planner. Used when Windows UIA is blind to the target
+// editor (browser-hosted Monaco/CodeMirror — HackerRank, CoderPad,
+// CodeSignal). The caller sends a SCREENSHOT of the editor instead of a
+// text dump; Sonnet 4.6 reads the pixels, locates the caret, and returns
+// the same plan shape the typing engine already consumes (plus the
+// `move_relative` / `lines_delta` fields for invisible counted-arrow
+// cursor repositioning). Falls through (caller's responsibility) to the
+// text agent / Haiku / deterministic chain on any non-2xx.
+router.post('/autotype-vision', requireTier(...MAX_ONLY), async (req, res) => {
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (!anthropicKey) {
+    return res.status(503).json({ error: 'Claude not configured (need ANTHROPIC_API_KEY)' });
+  }
+
+  const { screenshotBase64, screenshotMediaType, code, language, editorText } = req.body || {};
+  if (typeof code !== 'string' || code.length === 0) {
+    return res.status(400).json({ error: 'code is required' });
+  }
+  if (typeof screenshotBase64 !== 'string' || screenshotBase64.length < 100) {
+    return res.status(400).json({ error: 'screenshotBase64 is required' });
+  }
+
+  const requestId = req.headers['x-request-id'] || `atv-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  try {
+    const { runAutoTypeVisionAgent } = require('../services/autoTypeVisionAgent');
+    const t0 = Date.now();
+    const plan = await runAutoTypeVisionAgent({
+      screenshotBase64,
+      screenshotMediaType: screenshotMediaType || 'image/png',
+      code,
+      language: language || 'unknown',
+      editorText: typeof editorText === 'string' ? editorText : '',
+      apiKey: anthropicKey,
+      requestId,
+    });
+    const took = Date.now() - t0;
+    const opsSummary = (plan.operations || [])
+      .map(o => `${o.op}[${o.start_line}${o.op === 'insert' ? '' : '-' + o.end_line}]`)
+      .join(',');
+    console.log(`[autotype-vision] user=${req.user?.id} took=${took}ms confidence=${plan.confidence} ops=${plan.operations ? plan.operations.length : 0} [${opsSummary}]`);
+    return res.json({ ...plan, planner_used: 'vision' });
+  } catch (err) {
+    if (err.code === 'EMPTY_CODE') return res.status(400).json({ error: 'code is empty' });
+    if (err.code === 'BAD_IMAGE') return res.status(400).json({ error: 'screenshot missing or unreadable' });
+    if (err.code === 'NOT_CONFIGURED') return res.status(503).json({ error: 'Claude not configured' });
+    if (err.code === 'NO_TOOL_CALL') return res.status(502).json({ error: 'Vision agent produced no plan' });
+    console.error('[autotype-vision] failed:', err.code || '', err.message);
+    return res.status(500).json({ error: 'Vision agent call failed', detail: err.message });
+  }
+});
+
 router.post('/autotype-plan', requireTier(...MAX_ONLY), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) {

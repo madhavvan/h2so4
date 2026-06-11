@@ -54,11 +54,22 @@
     <link rel="stylesheet" href="/index.css">
     <style>
       :root {
-        /* Light Mode Defaults */
-        --bg-color: #f8fafc; /* Slate 50 */
-        --surface-color: #ffffff; /* White */
-        --border-color: #e2e8f0; /* Slate 200 */
-        --text-color: #0f172a; /* Slate 900 */
+        /* Light Mode Defaults — now warm cream tokens, NOT pure white.
+           User feedback 2026-05-13: "pure white look[s] pure white,
+           make it look rich". Cream palette gives the in-app light
+           theme an Anthropic-inspired warm feel instead of generic
+           SaaS pure-white. */
+        --bg-color: #faf6ec;            /* warm page bg */
+        --surface-color: #faf7f0;       /* --cream — panel/modal surface */
+        --border-color: #e8e2d1;        /* --cream-line — warm border */
+        --text-color: #141413;          /* --ink — warm near-black */
+
+        /* Theme-aware popover surfaces (model picker, dropdowns, tooltips).
+           Default = light cream translucent. .dark overrides below set
+           the dark navy used by the original popout-design popover. */
+        --model-menu-bg:      rgba(250, 247, 240, 0.94);
+        --model-menu-border:  rgba(20, 20, 19, 0.18);
+        --model-menu-shadow:  0 10px 32px rgba(20, 20, 19, 0.18);
 
         /* ── Anthropic-inspired warm palette (landing + auth views) ──
            Used on the public marketing surface and the login/signup
@@ -129,6 +140,12 @@
         --surface-color: #18181b; /* Zinc 900 */
         --border-color: #27272a; /* Zinc 800 */
         --text-color: #e4e4e7; /* Zinc 200 */
+
+        /* Dark-mode popover surfaces — match the original popout
+           design (deep navy, 94% opacity, strong drop shadow). */
+        --model-menu-bg:     rgba(10, 10, 30, 0.94);
+        --model-menu-border: rgba(255, 255, 255, 0.18);
+        --model-menu-shadow: 0 10px 32px rgba(0, 0, 0, 0.60);
       }
 
       /* ── Typography: SF-family, -webkit-font-smoothing for iOS feel ── */

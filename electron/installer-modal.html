@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline' 'self'; img-src 'self' data:;">
+<title>Interview Copilot</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    width: 100%;
+    background: #f3f4f6;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    color: #0f172a;
+    -webkit-user-select: none;
+    user-select: none;
+    overflow: hidden;
+    cursor: default;
+  }
+  .wrap {
+    padding: 18px 22px;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .head img {
+    width: 22px;
+    height: 22px;
+    border-radius: 5px;
+  }
+  .head .title {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.1px;
+    color: #0f172a;
+  }
+  .status {
+    font-size: 12px;
+    color: #475569;
+  }
+  .bar {
+    position: relative;
+    width: 100%;
+    height: 14px;
+    background: #e5e7eb;
+    border: 1px solid #d1d5db;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .bar::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -40%;
+    width: 40%;
+    height: 100%;
+    background: linear-gradient(90deg, #15803d 0%, #22c55e 50%, #15803d 100%);
+    animation: slide 1.2s ease-in-out infinite;
+  }
+  @keyframes slide {
+    0%   { left: -40%; }
+    100% { left: 100%;  }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <img src="./tray-icon.png" alt="">
+      <div class="title">Interview Copilot</div>
+    </div>
+    <div class="status">Installing update…</div>
+    <div class="bar"></div>
+  </div>
+</body>
+</html>

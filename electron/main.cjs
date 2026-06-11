@@ -3,6 +3,12 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const database = require('./database.cjs');
+// P11-4/5: bracket balance tracker for post-typing surgical repair.
+const bracketTracker = require('./bracketTracker.cjs');
+const autoTypePlanLog = require('./autoTypePlanLog.cjs');
+// P5d Part 1: target-coverage check — catches under-planned/under-typed
+// solutions that per-op verify is blind to (pure module, unit-tested).
+const { computeCoverageGaps, shouldTriggerRepair } = require('./autoTypeCoverage.cjs');
 
 // ─── Crash reporter — must initialize BEFORE app emits 'ready' ───────
 // Without this, main-process crashes (V8 GC fault, native module SEGV,
@@ -73,21 +79,79 @@ process.on('unhandledRejection', (reason) => {
 // never gets a chance to install, and the user sees the same "ready to
 // install" prompt every launch. With it, a second launch focuses the
 // existing window instead, and pending updates install at the next quit.
+//
+// We also use the second-instance hook as our custom-protocol handler:
+// after Google OAuth completes, the success page redirects the browser
+// to `interview-copilot://signin-complete`, which Windows treats as a
+// fresh launch with that URL in argv. The browser tab then closes/goes
+// blank automatically (browsers always close the protocol-launch tab
+// when the OS handler claims it) and Electron focuses its main window.
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  // Register the custom protocol so Windows/macOS/Linux route
+  // `interview-copilot://...` URLs to this app. Packaged builds use the
+  // installed exe; dev launches register the running electron binary.
+  try {
+    const protocolName = 'interview-copilot';
+    if (process.defaultApp) {
+      // Dev mode: tell the OS to launch this script via the running
+      // electron CLI with the second argument (path of the app dir).
+      if (process.argv.length >= 2) {
+        app.setAsDefaultProtocolClient(protocolName, process.execPath, [require('path').resolve(process.argv[1])]);
+      }
+    } else {
+      app.setAsDefaultProtocolClient(protocolName);
+    }
+  } catch (e) {
+    // OS denied registration (admin-required, sandboxed, etc.). Sign-in
+    // still works via polling; we just don't get the auto-close.
+    try { electronLog.warn('[protocol] setAsDefaultProtocolClient failed:', e && e.message); } catch {}
+  }
+
+  app.on('second-instance', (_evt, argv) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       smoothShow(mainWindow);
     } else {
       createMainWindow();
     }
+    // If the second-instance trigger was a protocol URL, log it. The
+    // renderer's existing /google/poll path is what actually consumes
+    // the signed-in session — we just needed to bring the window
+    // forward and let the browser tab close on its own.
+    try {
+      const protoArg = (argv || []).find(a => typeof a === 'string' && a.startsWith('interview-copilot://'));
+      if (protoArg) electronLog.info('[protocol] handoff:', protoArg);
+    } catch { /* logging is best-effort */ }
+  });
+
+  // macOS routes protocol URLs through `open-url` rather than
+  // second-instance. Same outcome: focus the main window.
+  app.on('open-url', (evt, url) => {
+    evt.preventDefault();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      smoothShow(mainWindow);
+    }
+    try { electronLog.info('[protocol] open-url:', url); } catch {}
   });
 }
 
 let mainWindow = null;
 let popoutWindow = null;
 let tray = null;
+let installerModalWindow = null;
+
+// Cached userId for main-process operations that need it without a renderer
+// roundtrip — specifically the close/quit "fresh session on next launch"
+// path. Populated opportunistically: every db:* IPC handler that already
+// receives userId from the renderer calls _maybeCacheUserId(userId), so by
+// the time the user touches the X button we have it. Cleared on sign-out
+// is not needed — sign-out itself goes through db:get-active-session with
+// the new (or null) userId, overwriting this value naturally.
+let _cachedUserId = null;
+function _maybeCacheUserId(userId) {
+  if (userId && typeof userId === 'string') _cachedUserId = userId;
+}
 
 // ─── Smooth show / hide for windows ──────────────────────────────────────
 // Replaces raw .show() / .hide() calls in hot paths (hotkey, tray click,
@@ -287,6 +351,157 @@ function smoothHide(win, onDone, opts) {
   _windowAnimating.set(win, { interval, type: 'hide' });
 }
 
+// ─── macOS Installer Modal ────────────────────────────────────────────────
+// Mac's update path (electron-updater MacUpdater → ditto-swap of the .app
+// bundle) has no equivalent of the NSIS oneClick progress dialog Windows
+// users see — the swap is completely silent at the OS level. Without UI,
+// the user clicks "Restart & Update" and just watches the window vanish
+// with no signal that anything is happening; the new app then appears
+// 1–2s later with the dock bounce, but in the gap it looks like a crash.
+//
+// This helper paints a small frameless window styled to mirror the NSIS
+// dialog: light-gray background, app icon + product name, "Installing
+// update…" status, animated green progress bar. Shown for ~1.5s before
+// quitAndInstall fires; once the main process tears down it closes with
+// the rest of the renderers. setContentProtection(true) so a screen-share
+// in progress at update time doesn't leak "Interview Copilot is updating".
+function showMacInstallerModal({ version } = {}) {
+  if (process.platform !== 'darwin') return Promise.resolve();
+  if (installerModalWindow && !installerModalWindow.isDestroyed()) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let resolved = false;
+    const done = () => { if (!resolved) { resolved = true; resolve(); } };
+    try {
+      const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
+      const modalW = 500;
+      const modalH = 140;
+      installerModalWindow = new BrowserWindow({
+        width: modalW,
+        height: modalH,
+        x: Math.round((screenW - modalW) / 2),
+        y: Math.round((screenH - modalH) / 2),
+        frame: false,
+        resizable: false,
+        movable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        transparent: false,
+        backgroundColor: '#f3f4f6',
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        // Non-focusable: never steal focus from a running screen-share
+        // window picker or whatever the user had selected at update time.
+        focusable: false,
+        show: false,
+        title: 'Interview Copilot',
+        webPreferences: {
+          nodeIntegration: false,
+          contextIsolation: true,
+          sandbox: true,
+          devTools: false,
+        },
+      });
+      try { installerModalWindow.setContentProtection(true); } catch (_) {}
+      installerModalWindow.once('ready-to-show', () => {
+        try { installerModalWindow.show(); } catch (_) {}
+        done();
+      });
+      installerModalWindow.loadFile(
+        path.join(__dirname, 'installer-modal.html'),
+        version ? { query: { v: String(version) } } : undefined
+      ).catch((err) => {
+        electronLog.warn('[updater] installer-modal loadFile failed:', err && err.message);
+        done();
+      });
+      // Belt-and-suspenders: never let a failed paint stall performInstall.
+      setTimeout(done, 800);
+    } catch (err) {
+      electronLog.warn('[updater] showMacInstallerModal threw:', err && err.message);
+      done();
+    }
+  });
+}
+
+// ─── Clean-close handler ──────────────────────────────────────────────────
+// Fires when the user signals "I'm done with this session" via:
+//   1. X on main window when the popout is NOT in use (popout-in-use means
+//      the user is still interviewing — X is just hiding the management UI)
+//   2. Tray menu "Quit" (always — Quit is a deliberate "really done" signal,
+//      so it cleans up even if the popout was open)
+//
+// Three things happen, in this order:
+//   1. database.endActiveSession(userId) — synchronous SQL. Empty sessions
+//      get DELETEd (so the sidebar doesn't fill with placeholder "Interview
+//      <date>" rows for users who opened-and-closed without asking anything).
+//      Non-empty sessions get is_active=0 so they stay in history but next
+//      launch's getOrCreateActiveSession sees no active row → mints a fresh
+//      one. This is the "every fresh app open = fresh conversation" piece.
+//   2. database.getOrCreateActiveSession(userId) — mint the fresh session
+//      RIGHT NOW so the renderer has something to switch to. On the Quit
+//      path this is technically wasted work (process dies in a few hundred
+//      ms anyway), but on the X-hide path it's load-bearing: the renderer
+//      is still alive and needs the new session id to update its in-memory
+//      messages/files state via the existing db:active-session-changed
+//      broadcast wiring.
+//   3. webContents.send('cmd-end-session') to main renderer — renderer
+//      reacts by stopping the mic (if listening) and turning off Auto mode
+//      (if on). The popout, if open, mirrors via the existing state-sync
+//      effect — no separate IPC needed.
+//
+// Why we cache userId in main instead of asking the renderer: this path
+// must work even when the renderer is mid-quit and can't respond to IPC.
+// Caching means the DB call is sync and bulletproof — at worst, the
+// renderer doesn't get the cmd-end-session in time and mic/auto state
+// is irrelevant because the process is dying anyway.
+//
+// No-op when userId is unknown (user never signed in this session).
+function endSessionCleanly() {
+  if (!_cachedUserId) {
+    electronLog.info('[end-session] skip — no cached userId yet');
+    return;
+  }
+  let result;
+  try {
+    result = database.endActiveSession(_cachedUserId);
+    electronLog.info(`[end-session] ${result.action} ${result.sessionId || '-'}`);
+  } catch (err) {
+    electronLog.warn('[end-session] endActiveSession failed:', err && err.message);
+    return;
+  }
+  // Only mint a fresh session if we actually touched something. If action
+  // was 'noop' (no active session existed), there's nothing for the renderer
+  // to switch to and the next db:get-active-session call will mint lazily.
+  if (result.action !== 'noop') {
+    try {
+      const fresh = database.getOrCreateActiveSession(_cachedUserId);
+      // Reuse the existing broadcast wiring — useDatabase.ts subscribes to
+      // db:active-session-changed and reloads in place. Both main and
+      // popout receive it, so popout (if open during a Quit) also switches.
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) {
+          try { win.webContents.send('db:active-session-changed', fresh.id); } catch {}
+          try { win.webContents.send('db:sessions-updated'); } catch {}
+        }
+      });
+    } catch (err) {
+      electronLog.warn('[end-session] mint fresh failed:', err && err.message);
+    }
+  }
+  // Tell the main renderer to stop mic + Auto. Fire-and-forget — even if
+  // the renderer is mid-tear-down it's not load-bearing (mic dies with the
+  // process anyway; autoSend is in-memory and doesn't survive a quit).
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('cmd-end-session');
+    }
+  } catch (err) {
+    electronLog.warn('[end-session] cmd-end-session send failed:', err && err.message);
+  }
+}
+
 // ─── First-time "app is in the tray" notification ────────────────────────
 // Fires once per install when the user first hides the window. Without it
 // new users who just hit X often think the app crashed (it didn't — it's
@@ -355,11 +570,56 @@ let installPendingUpdate = null;   // (() => void) | null
 
 const isDev = !app.isPackaged;
 
-// API base URL — production uses api.minicaai.com; dev can override via
-// MINICAAI_API_BASE to hit a local server (useful when testing changes
-// to autotype-agent or other server endpoints before they're deployed).
-// Set MINICAAI_API_BASE=http://localhost:4000 in your dev shell.
-const API_BASE = process.env.MINICAAI_API_BASE || 'https://api.minicaai.com';
+// API base URL — production uses api.minicaai.com.
+//
+// `let` (not `const`) because in DEV we auto-redirect to a local server
+// when one is reachable — see resolveDevApiBase() in app.whenReady().
+// Rationale: a dev iterating on server routes (e.g. the auto-type vision
+// planner) needs main.cjs to hit THEIR local server, not production —
+// otherwise a brand-new route 404s and the feature silently falls back
+// to its old behavior, making it look like the code change "did
+// nothing". An explicit MINICAAI_API_BASE env var always wins; the
+// auto-detect only fills the gap when it's unset.
+//
+// Production builds (`!isDev`) never auto-detect — always api.minicaai.com.
+let API_BASE = process.env.MINICAAI_API_BASE || 'https://api.minicaai.com';
+
+// Probe a candidate local API base; resolves true if it answers a cheap
+// GET within the timeout. Used only in dev, only when MINICAAI_API_BASE
+// is unset.
+async function probeLocalApiBase(base, timeoutMs = 1200) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const res = await fetch(`${base}/api/v1/geo`, { signal: ctrl.signal });
+    clearTimeout(t);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Dev-only: if MINICAAI_API_BASE wasn't explicitly set and a local
+// server is up on :4000, redirect API_BASE there. Logged loudly either
+// way so "which server is main.cjs calling?" is never a mystery again.
+async function resolveDevApiBase() {
+  if (!isDev) {
+    console.log(`[main] API_BASE = ${API_BASE} (packaged build)`);
+    return;
+  }
+  if (process.env.MINICAAI_API_BASE) {
+    console.log(`[main] API_BASE = ${API_BASE} (from MINICAAI_API_BASE env)`);
+    return;
+  }
+  const localBase = 'http://localhost:4000';
+  const localUp = await probeLocalApiBase(localBase);
+  if (localUp) {
+    API_BASE = localBase;
+    console.log(`[main] API_BASE = ${API_BASE} (dev auto-detect: local server is up — server-side changes will be picked up here)`);
+  } else {
+    console.log(`[main] API_BASE = ${API_BASE} (dev, but no local server on :4000 — using production; new local-only routes will 404)`);
+  }
+}
 
 // Permissions and lifecycle are set up in the APP LIFECYCLE section below
 
@@ -428,6 +688,21 @@ function createMainWindow() {
     if (app.isQuitting) return;
     e.preventDefault();
     if (!pendingUpdate || !installPendingUpdate) {
+      // ── Clean-close gate ────────────────────────────────────────────
+      // When the popout is in use, the user is actively interviewing —
+      // X on main is just "hide the management UI", NOT "I'm done". So
+      // we preserve mic / Auto / conversation in that case.
+      //
+      // When the popout is NOT in use, X is the user's "I'm done with
+      // this session" signal. Stop the mic, turn off Auto, and demote
+      // (or delete-if-empty) the active conversation so the next launch
+      // opens to a fresh empty session. This is the token-saving design
+      // — each interview becomes its own session, history doesn't grow
+      // unbounded across days.
+      const popoutInUse = popoutWindow && !popoutWindow.isDestroyed();
+      if (!popoutInUse) {
+        endSessionCleanly();
+      }
       // Tell the renderer we're hiding to the tray so it can show a
       // first-time toast with the "right-click the slot to bring it back"
       // tip. Sent BEFORE the smoothHide() begins so the renderer can paint
@@ -513,6 +788,29 @@ function enforceAlwaysOnTop() {
     // (focus toggles, alwaysOnTop changes, content-protection, parent-
     // window relations) gets corrected within the next event tick.
     popoutWindow.setSkipTaskbar(true);
+    // ── macOS: re-assert Spaces behavior AFTER setAlwaysOnTop ──
+    // Floating above ANOTHER app's fullscreen on macOS needs TWO things:
+    // a high window LEVEL ('screen-saver', set above) AND a collection
+    // BEHAVIOR that lets the window join the fullscreen Space
+    // (canJoinAllSpaces + fullScreenAuxiliary, set via
+    // setVisibleOnAllWorkspaces). The catch: setAlwaysOnTop() RESETS the
+    // collection behavior, so a one-shot call at popout-creation gets
+    // clobbered the instant this re-assert first runs — and again on every
+    // 2s tick / blur / focus / move / resize. Re-applying it HERE, right
+    // after the level, keeps the two in lock-step so the popout reliably
+    // floats over fullscreen apps (Zoom/Meet/Teams, a fullscreen browser
+    // assessment) and follows the user across Spaces. Order matters:
+    // workspaces MUST come after the level. Gated to darwin for explicit
+    // intent (the API is a no-op on Windows; Spaces is a Mac construct).
+    // Wrapped so a transient Cocoa error can never crash the always-on-top
+    // safety net that the rest of the app's stealth depends on.
+    if (process.platform === 'darwin') {
+      try {
+        popoutWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      } catch (e) {
+        electronLog.warn('[popout] setVisibleOnAllWorkspaces failed:', e && e.message);
+      }
+    }
   }
 }
 
@@ -621,7 +919,21 @@ function createPopoutWindow(options = {}) {
   // INVISIBLE TO SCREEN SHARE
   popoutWindow.setContentProtection(true);
 
-  // Set highest always-on-top level immediately
+  // ── macOS: follow Spaces and float above fullscreen ──
+  // The popout must (a) follow the user across Spaces — a Mission Control /
+  // 4-finger swipe during an interview must not strand it on the Space it
+  // was opened in — and (b) sit above a fullscreen Zoom/Meet/Teams call or
+  // a fullscreen browser-based assessment. Both come from
+  // setVisibleOnAllWorkspaces(true,{visibleOnFullScreen:true}). It is NOT
+  // called here as a one-shot anymore: setAlwaysOnTop() resets that
+  // collection behavior, so it has to be re-applied AFTER every
+  // setAlwaysOnTop. That now lives inside enforceAlwaysOnTop() (called
+  // immediately below, and on the 2s interval + window events), which
+  // applies the window level and the Spaces/fullscreen behavior together
+  // in the correct order. No-op on Windows/Linux.
+
+  // Set highest always-on-top level immediately (also applies the macOS
+  // Spaces + visibleOnFullScreen behavior described above).
   enforceAlwaysOnTop();
 
   // ── ROBUST ALWAYS-ON-TOP ──
@@ -1017,6 +1329,16 @@ ipcMain.on('popout:set-focusable', (_event, focusable) => {
       // foreground (the browser).
       popoutWindow.focus();
     }
+    // macOS: setFocusable() can also reset the window's Spaces collection
+    // behavior. The focusable=true path re-asserts it via the 'focus'
+    // event (focus() above → enforceAlwaysOnTop), but the focusable=false
+    // path fires no focus event — so re-assert explicitly here too.
+    // enforceAlwaysOnTop re-applies BOTH the always-on-top level and the
+    // visibleOnFullScreen behavior, so the popout keeps floating over a
+    // fullscreen host app while the user toggles text-input focus. On
+    // Windows this is just a harmless re-assert of the level + toolwindow
+    // flag (already set above).
+    enforceAlwaysOnTop();
   } catch (err) {
     electronLog.warn('[popout:set-focusable] setFocusable threw:', err && err.message);
   }
@@ -1089,6 +1411,21 @@ ipcMain.on('session-active', (_event, payload) => {
       try { tray.destroy(); } catch {}
     }
     tray = null;
+
+    // ── macOS: hide the Dock icon while the session is live ──
+    // setSkipTaskbar(true) does nothing on Mac (it's a Win32 API), so
+    // without this the app's icon + name remain visible in the Dock
+    // throughout the interview. Cmd+Tab and Mission Control both expose
+    // it. setContentProtection blacks out the window's contents on
+    // screen-share, but it does nothing for the Dock — that's a
+    // separate OS-level surface. Hiding the Dock icon closes the only
+    // remaining "Interview Copilot is running" leak on Mac. The Dock
+    // icon comes back when the session ends (below).
+    if (process.platform === 'darwin' && app.dock) {
+      try { app.dock.hide(); } catch (e) {
+        electronLog.warn('[dock] hide failed:', e && e.message);
+      }
+    }
   } else {
     // Re-create only if app is still running and tray is gone.
     if (!tray && typeof createTray === 'function') {
@@ -1096,7 +1433,184 @@ ipcMain.on('session-active', (_event, payload) => {
         electronLog.warn('[tray] re-create after session-end failed:', err.message);
       }
     }
+    // ── macOS: restore the Dock icon at session end ──
+    // Symmetric to the hide above. Belt-and-suspenders: app.dock.show()
+    // is also called when the user explicitly quits or when the tray
+    // is rebuilt below — but doing it here keeps the dock state tied
+    // to the same lifecycle event the tray uses, so rebooting Dock +
+    // tray together stays consistent.
+    if (process.platform === 'darwin' && app.dock) {
+      try { app.dock.show(); } catch (e) {
+        electronLog.warn('[dock] show failed:', e && e.message);
+      }
+    }
   }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SUPPORT INBOX ALERT BRIDGE
+//  ─────────────────────────────────────────────────────────────
+//  Receives renderer-side ipcRenderer.send('support:alert', {...})
+//  whenever an agent's background WebSocket sees a new customer
+//  join or message (see App.tsx). We surface that through three
+//  channels in the desktop OS:
+//
+//   1. Native OS notification — Windows Action Center, macOS
+//      Notification Center, Linux libnotify — survives renderer
+//      hidden/minimized state because main owns the API.
+//   2. Tray icon tooltip + menu — even when alerts are suppressed
+//      for screen-share safety, the tray menu shows the unread
+//      count so the admin can see "3 waiting" without breaking
+//      the interview.
+//   3. macOS Dock badge / Windows taskbar overlay icon — the
+//      OS-native unread indicator pattern. App.setBadgeCount(n)
+//      and BrowserWindow.setOverlayIcon are the cross-platform
+//      moving parts.
+//
+//  Screen-share safety: if sessionActive=true we DO NOT fire the
+//  desktop notification or the taskbar/dock badge (those render
+//  outside setContentProtection and would leak both the app and
+//  the customer's name into the screen-share). We still tick the
+//  counter so when the session ends the admin sees the queue.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+let supportUnreadCount = 0;
+// Track the last alert per thread so back-to-back messages on the
+// same thread coalesce into one Notification rather than three. Main
+// side also debounces — renderer already deduplicates by 90s window,
+// but this is belt-and-suspenders for ipc retry storms.
+const supportLastAlertAt = new Map();
+const SUPPORT_ALERT_DEBOUNCE_MS = 4 * 1000;
+
+function updateSupportBadge() {
+  const n = supportUnreadCount;
+  // macOS dock badge — app.setBadgeCount(0) clears. Linux Unity also
+  // honors this (no-op on other Linux desktops, which is fine).
+  try { app.setBadgeCount(n); } catch (e) {
+    electronLog.warn('[support-alert] setBadgeCount failed:', e && e.message);
+  }
+  // Windows taskbar overlay icon. We don't ship a number-glyph for
+  // 'n', so we use a simple red dot. The tooltip carries the count.
+  // Skipped during sessionActive — the overlay icon renders in the
+  // OS taskbar which IS visible on a screen-share window picker.
+  if (process.platform === 'win32' && mainWindow && !mainWindow.isDestroyed()) {
+    try {
+      if (n > 0 && !sessionActive) {
+        const overlayPath = path.join(__dirname, '../build/icon-overlay.png');
+        if (fs.existsSync(overlayPath)) {
+          mainWindow.setOverlayIcon(nativeImage.createFromPath(overlayPath), `${n} waiting`);
+        } else {
+          // No asset — degrade to taskbar flash for attention.
+          try { mainWindow.flashFrame(true); } catch {}
+        }
+      } else {
+        mainWindow.setOverlayIcon(null, '');
+        try { mainWindow.flashFrame(false); } catch {}
+      }
+    } catch (e) {
+      electronLog.warn('[support-alert] setOverlayIcon failed:', e && e.message);
+    }
+  }
+  // Refresh tray tooltip + menu so the count is visible there too.
+  if (tray && !tray.isDestroyed()) {
+    try {
+      tray.setToolTip(n > 0 ? `Interview Copilot · ${n} support waiting` : 'Interview Copilot');
+    } catch {}
+  }
+}
+
+ipcMain.on('support:alert', (_event, payload) => {
+  const threadId = String(payload?.threadId || '');
+  const title = String(payload?.title || 'New chat').slice(0, 80);
+  const body = String(payload?.body || '').slice(0, 240);
+  const kind = String(payload?.kind || 'message');
+  const customerEmail = String(payload?.customerEmail || '');
+
+  if (!threadId) return;
+
+  // Per-thread debounce. Renderer also debounces by 90s, but a flood
+  // of messages from the same thread shouldn't fire 10 notifications.
+  const last = supportLastAlertAt.get(threadId) || 0;
+  if (Date.now() - last < SUPPORT_ALERT_DEBOUNCE_MS) {
+    // Still bump the unread counter — we missed the toast but the
+    // tray badge should reflect the activity.
+    if (kind === 'customer_joined') supportUnreadCount += 1;
+    updateSupportBadge();
+    return;
+  }
+  supportLastAlertAt.set(threadId, Date.now());
+
+  // Only customer_joined increments unread — message events for an
+  // EXISTING thread are already represented in the count.
+  if (kind === 'customer_joined') supportUnreadCount += 1;
+  updateSupportBadge();
+
+  // Screen-share guard: during a live interview, suppress visible
+  // notifications. The counter still ticks (above) so the admin
+  // sees the queue when the session ends.
+  if (sessionActive) {
+    electronLog.info(`[support-alert] suppressed during active session: ${title}`);
+    return;
+  }
+
+  if (!Notification.isSupported()) {
+    electronLog.info('[support-alert] Notification API unsupported on this OS');
+    return;
+  }
+
+  try {
+    const notif = new Notification({
+      title,
+      body,
+      silent: false,
+      tag: `support-${threadId}`,  // collapses same-thread re-fires on macOS/Linux
+    });
+    notif.on('click', () => {
+      // Bring the main window forward and tell the renderer to open
+      // the support inbox. Renderer handler in App.tsx flips the
+      // bot panel + inbox tab open.
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        try {
+          if (!mainWindow.isVisible()) smoothShow(mainWindow);
+          else mainWindow.focus();
+        } catch {}
+        try {
+          mainWindow.webContents.send('support:open-inbox', { threadId, customerEmail });
+        } catch {}
+      } else {
+        // Window was destroyed (rare). Recreate then signal.
+        try {
+          createMainWindow();
+          // Give the renderer a beat to mount before sending the deeplink.
+          setTimeout(() => {
+            try { mainWindow?.webContents?.send('support:open-inbox', { threadId, customerEmail }); }
+            catch {}
+          }, 1500);
+        } catch {}
+      }
+    });
+    notif.show();
+  } catch (err) {
+    electronLog.warn('[support-alert] Notification show threw:', err && err.message);
+  }
+});
+
+// Renderer signals "admin opened the inbox" — clear the unread state
+// so the next genuine wait starts from zero.
+ipcMain.on('support:clear-unread', () => {
+  if (supportUnreadCount !== 0) {
+    supportUnreadCount = 0;
+    supportLastAlertAt.clear();
+    updateSupportBadge();
+  }
+});
+
+// Renderer signals "admin opened a SPECIFIC thread" — just clear the
+// per-thread debounce so the next alert from that thread fires
+// immediately rather than waiting out the 4s window.
+ipcMain.on('support:thread-viewed', (_event, payload) => {
+  const threadId = String(payload?.threadId || '');
+  if (threadId) supportLastAlertAt.delete(threadId);
 });
 
 // ───────────────────────────────────────────────
@@ -1133,8 +1647,37 @@ function loadNut() {
   }
 }
 
+// P8.5: interruptible sleep. The naive `setTimeout` version was blind to
+// `autoTypeAbort` — if the user clicked cancel mid-P-burst (up to 4-10s)
+// or during a tool-switch pause (up to 30s), the typing loop's next
+// `if (autoTypeAbort) break;` check would not fire until the sleep
+// completed. Now any sleep races against the abort signal: when the IPC
+// `auto-type:abort` handler fires, all in-flight sleeps resolve immediately.
+let _atAbortPromise = null;
+let _atAbortResolve = null;
+
+function autoTypeArmAbortSignal() {
+  // Reset before each cycle so a prior cycle's resolved promise doesn't
+  // make new sleeps return instantly.
+  _atAbortPromise = new Promise(resolve => { _atAbortResolve = resolve; });
+}
+
+function autoTypeFireAbortSignal() {
+  if (_atAbortResolve) {
+    _atAbortResolve();
+    _atAbortResolve = null;
+  }
+}
+
 function autoTypeSleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  if (!_atAbortPromise || ms <= 5) {
+    // No active cycle or trivially short — skip the race overhead.
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+  return Promise.race([
+    new Promise(resolve => setTimeout(resolve, ms)),
+    _atAbortPromise,
+  ]);
 }
 
 // Jittered short-nav sleep. Same intent as autoTypeSleep but the timing
@@ -1150,12 +1693,68 @@ function autoTypeNavSleep(min, max) {
   return autoTypeSleep(min + Math.random() * (max - min));
 }
 
-// Gaussian random via Box-Muller.
+// Human-paced delay between REPEATED deliberate navigation / selection
+// keystrokes — the counted arrow-key runs in navigateToDocLine and the
+// Shift+arrow range selection in selectLineRangeContent.
+//
+// autoTypeNavSleep's 8-20ms cadence is fine for the 2-3 micro-keystrokes
+// of a per-line indent wipe, but a *run* of 10+ identical arrow events at
+// that speed is the loudest possible keystroke-timing fingerprint — no
+// human taps an arrow key a dozen times in ~150ms. Keystroke-biometric
+// proctoring (Ropes-class, HackerRank's analyzer) locks onto exactly that
+// kind of machine-regular burst. This centers each press on a realistic
+// deliberate-tap cadence (~130ms, gaussian) and ~9% of the time inserts a
+// longer pause — the user's eyes catching up to where the caret moved.
+function autoTypeHumanNavSleep() {
+  // Was autoTypeGauss(130, 42). Log-normal with σ=0.30 produces the right-
+  // skewed shape real humans show on counted arrow runs (some keys fly past
+  // fast, occasional longer pause when eyes catch up). Centered identically.
+  let d = autoTypeLogNormal(130, 0.30);
+  d = Math.max(58, Math.min(310, d));
+  if (Math.random() < 0.09) d += 180 + Math.random() * 320;
+  return autoTypeSleep(Math.round(d));
+}
+
+// Gaussian random via Box-Muller. Used as the primitive for autoTypeLogNormal
+// (the actual distribution we want for keystroke timings).
 function autoTypeGauss(mean, stdDev) {
   const u1 = Math.max(1e-9, Math.random());
   const u2 = Math.random();
   const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
   return mean + z * stdDev;
+}
+
+// Log-normal random — sampled as exp(N(μ, σ)) where μ is chosen so that the
+// expectation equals `meanMs`. This is the distribution real humans produce
+// for keystroke timing (inter-keystroke interval AND dwell time). Gaussian
+// IS WRONG for typing biometrics — the canonical Sciuto et al. paper (2021)
+// rejects gaussian and finds 3-parameter log-logistic / log-normal best fit.
+// Right-skewed with a fat tail; skewness ≈ 2, kurtosis ≈ 7 in real data.
+//
+// `sigmaLog` is the std of the underlying normal (in log-ms space). Larger σ
+// = wider tail. Recommended: 0.25 (tight burst) to 0.45 (wide hesitation).
+// Coefficient of variation (σ/μ in output space) ≈ sqrt(exp(σ²) - 1).
+//   σ=0.25 → CV ≈ 0.25  (similar to current gaussian, just right-skewed)
+//   σ=0.35 → CV ≈ 0.36
+//   σ=0.45 → CV ≈ 0.47  (matches Dhakal 136M IKI distribution)
+function autoTypeLogNormal(meanMs, sigmaLog) {
+  // E[exp(N(μ, σ²))] = exp(μ + σ²/2). Solve for μ so the expectation = meanMs.
+  const mu = Math.log(meanMs) - (sigmaLog * sigmaLog) / 2;
+  return Math.exp(autoTypeGauss(mu, sigmaLog));
+}
+
+// Pareto random (power-law) — used for P-burst "cognitive" pauses humans take
+// at clause / statement / function boundaries. Real human pause distributions
+// have a Pareto tail above ~2s (the "P-burst boundary" in keystroke-logging
+// literature) — heavy tails decaying by power law, not exponentially.
+// A gaussian-tailed pause distribution underestimates how often a human pauses
+// for 5+ seconds. Pareto(α=1.5, xm=1500) gives a realistic mix: median ~2.4s,
+// mean ~4.5s, occasional 10+s pauses.
+//
+// `alpha` controls the tail (lower = fatter). `xm` is the minimum / scale.
+function autoTypePareto(alpha, xm) {
+  const u = Math.max(1e-9, Math.random());
+  return xm / Math.pow(u, 1 / alpha);
 }
 
 // Cadence mode machine — a real typist drifts between bursts of fluent
@@ -1165,9 +1764,37 @@ function autoTypeGauss(mean, stdDev) {
 let _atMode = 'flow';
 let _atModeCharsLeft = 0;
 
+// AR(1) autocorrelation state — typing momentum. Real human IKI sequences
+// have lag-1 autocorrelation of 0.3-0.6 (when you slow down you stay slow
+// for a few keys; when in a burst you stay fast). i.i.d. random delays show
+// ACF ≈ 0 — published as a top-3 detection feature in the hybrid-CAPTCHA
+// keystroke-dynamics paper (arXiv 2510.02374, 2025). Mode persistence gives
+// some correlation but it's discrete; a continuous AR(1) blend on top is
+// what produces the smooth typing-momentum signal humans show.
+let _atLastIki = null;
+const AT_AR1_ALPHA = 0.45;  // blend weight on previous IKI
+
+// P4: Session-level fatigue tracking. Real humans degrade over time —
+// PLOS ONE typewriting-fatigue study: backspace rate rises 4.2% → 5.4%
+// over a 2-hour session, IKI variance widens, error rate climbs ~30%.
+// We track session-start time and apply a slow drift to per-char delays
+// in autoTypeHumanDelay. Without this, every auto-type run starts "fresh"
+// regardless of how long the user's been in the interview — a real human
+// who's been on for 45 min types differently from one in their first 5.
+let _atSessionStartMs = null;
+
 function autoTypeResetCadence() {
   _atMode = 'flow';
   _atModeCharsLeft = 10 + Math.floor(Math.random() * 25);
+  _atLastIki = null;  // fresh momentum per run
+  _atAutocompleteAttempts = 0;  // per-run autocomplete counter
+  // Session-start: set ONCE per app boot; subsequent auto-type invocations
+  // inherit the accumulated session-time (real humans don't reset their
+  // fatigue at each Auto-Type click). Reset only on explicit cadence reset
+  // from a true fresh-app state.
+  if (_atSessionStartMs === null) {
+    _atSessionStartMs = Date.now();
+  }
 }
 
 // Mouse-twitch state. A long stretch of pure-keyboard activity with zero
@@ -1261,16 +1888,24 @@ function autoTypeHumanDelay(ch, prevCh) {
 
   let d;
   if (_atMode === 'burst') {
-    // Was 85±20 (clamped 40-180). Now 120±25 (clamped 65-220).
-    d = autoTypeGauss(120, 25);
+    // Was gauss(120, 25). σ_log=0.25 → CV ≈ 0.25, similar variance but
+    // right-skewed (real humans produce log-normal, not gaussian). Clamp
+    // bounds kept identical to preserve burst feel.
+    d = autoTypeLogNormal(120, 0.25);
     d = Math.max(65, Math.min(220, d));
   } else if (_atMode === 'hesitation') {
-    // Was 300±80 (clamped 160-500). Now 430±110 (clamped 230-720).
-    d = autoTypeGauss(430, 110);
+    // Was gauss(430, 110). σ_log=0.40 — slightly wider tail because
+    // hesitation pauses ARE the long-tail regime. Without P-burst overlay
+    // (added separately below) this single mode wouldn't capture deep
+    // thinking pauses; here we just give it an honest log-normal shape.
+    d = autoTypeLogNormal(430, 0.40);
     d = Math.max(230, Math.min(720, d));
   } else {
-    // Was 150±50 (clamped 55-380). Now 210±65 (clamped 90-460).
-    d = autoTypeGauss(210, 65);
+    // Was gauss(210, 65). σ_log=0.35 → CV ≈ 0.36 within the clamp.
+    // Canonical Dhakal 136M dataset has CV ≈ 0.47; the clamp constrains
+    // us, but the distribution SHAPE is now correct (right-skewed, fat-
+    // tailed) — which is what statistical detectors check, not just CV.
+    d = autoTypeLogNormal(210, 0.35);
     d = Math.max(90, Math.min(460, d));
   }
 
@@ -1285,16 +1920,122 @@ function autoTypeHumanDelay(ch, prevCh) {
   if (isPunct) d += 100 + Math.random() * 200;
   if (ch === ' ') d += 15 + Math.random() * 70;
 
+  // ── P2b: Bigram-conditional multiplier ──
+  // Hand-alternation bigrams (e.g., "th", "ne", "or") are 50-80ms faster
+  // than same-finger bigrams (e.g., "ed", "rt") in real human typing.
+  // Without this, `qz` types identically to `th` — an ANOVA across bigram
+  // classes would show p≈1, an obvious bot signal. See Ostry 1983 +
+  // Aalto 136M study. Multiplier applies BEFORE the repeated-letter
+  // speedup which has its own stronger effect.
+  d *= autoTypeBigramMultiplier(prevCh, ch);
+
   if (prevCh && prevCh === ch && /[a-zA-Z]/.test(ch)) d *= 0.55;
 
-  // v3.4.7: stuck-pause rate bumped from 1.2% → 2.0%, max duration 6s → 7s.
-  // These long unscheduled pauses are what break up patterns that
-  // statistical keystroke analysis would otherwise lock onto — the
-  // *unpredictability* of when they land is more important than the
-  // average rhythm.
-  if (Math.random() < 0.020) d += 2000 + Math.random() * 5000;
+  // ── P3b: AR(1) autocorrelation — typing momentum ──
+  // Real human IKI sequences show lag-1 autocorrelation 0.3-0.6 — when you
+  // slow down you stay slow for a few keys; when in a burst you stay fast.
+  // i.i.d. random delays show ACF ≈ 0 — published as a top-3 detection
+  // feature in arXiv 2510.02374. Mode persistence already gives some
+  // correlation but it's discrete; this continuous blend on top produces
+  // the smooth typing-momentum signal humans show.
+  if (_atLastIki !== null) {
+    d = AT_AR1_ALPHA * _atLastIki + (1 - AT_AR1_ALPHA) * d;
+  }
+  _atLastIki = d;
+
+  // ── P4: Fatigue drift over session time ──
+  // PLOS ONE typewriting-fatigue study: backspace rate rises 4.2% → 5.4%
+  // over 2 hours, IKI variance widens, error rate climbs ~30%. We scale d
+  // upward gently — +0.5% per minute, capped at +25% total. A 45-min
+  // session adds ~22% to per-char delays. Without this, every run looks
+  // identical regardless of how long the user's been at it.
+  if (_atSessionStartMs !== null) {
+    const sessionMins = (Date.now() - _atSessionStartMs) / 60000;
+    const fatigueMult = 1 + Math.min(0.25, sessionMins * 0.005);
+    d *= fatigueMult;
+  }
+
+  // ── P2c: P-burst structured pauses ──
+  // Replaces the v3.4.7 uniform 2.0% stuck-pause. Real human pauses are
+  // NOT uniformly distributed — they cluster at syntactic boundaries
+  // (end of statement, end of block, after function signature) where the
+  // typist is planning the next thing. The P-burst literature (>2s pause
+  // = "P-burst boundary") describes exactly this. Pareto-tailed because
+  // human pause distributions have power-law tails, not exponential.
+  // The ~0.5% residual catches truly unscheduled pauses anywhere else.
+  // P-burst pauses RESET typing momentum (cleared _atLastIki) so the
+  // next keystroke after a 4s think doesn't anchor to the pre-pause IKI.
+  const burstPause = autoTypeMaybeBurstPause(ch, prevCh);
+  if (burstPause > 0) {
+    d += burstPause;
+    _atLastIki = null;
+  }
 
   return Math.round(d);
+}
+
+// Hand-alternation classifier for QWERTY US layout. Returns one of
+// 'alternation' (faster), 'same-finger' (slower), 'repetition' (already
+// handled with stronger speedup elsewhere), or 'normal'.
+const _AT_LEFT_HAND = 'qwertasdfgzxcvb';
+const _AT_RIGHT_HAND = 'yuiophjklnm';
+const _AT_FINGER_MAP = {
+  q: 1, a: 1, z: 1,
+  w: 2, s: 2, x: 2,
+  e: 3, d: 3, c: 3,
+  r: 4, f: 4, v: 4, t: 4, g: 4, b: 4,
+  y: 5, h: 5, n: 5, u: 5, j: 5, m: 5,
+  i: 6, k: 6,
+  o: 7, l: 7,
+  p: 8,
+};
+function autoTypeBigramClass(prevCh, ch) {
+  if (!prevCh || !ch) return 'normal';
+  if (!/[a-zA-Z]/.test(prevCh) || !/[a-zA-Z]/.test(ch)) return 'normal';
+  const p = prevCh.toLowerCase();
+  const c = ch.toLowerCase();
+  if (p === c) return 'repetition';
+  const pLeft = _AT_LEFT_HAND.includes(p);
+  const cLeft = _AT_LEFT_HAND.includes(c);
+  const pRight = _AT_RIGHT_HAND.includes(p);
+  const cRight = _AT_RIGHT_HAND.includes(c);
+  if (!(pLeft || pRight) || !(cLeft || cRight)) return 'normal';
+  if (pLeft !== cLeft) return 'alternation';
+  return _AT_FINGER_MAP[p] === _AT_FINGER_MAP[c] ? 'same-finger' : 'normal';
+}
+function autoTypeBigramMultiplier(prevCh, ch) {
+  const cls = autoTypeBigramClass(prevCh, ch);
+  if (cls === 'alternation') return 0.80;
+  if (cls === 'same-finger') return 1.20;
+  return 1.0;
+}
+
+// P-burst pause sampler — fires probabilistically AT syntactic boundaries
+// based on the just-typed char (prevCh, since we're computing the delay
+// BEFORE typing `ch`). All probabilities tuned so total time-spent-paused
+// per 1000 chars is comparable to the previous uniform 2% × ~4500ms model
+// (~80-90 seconds) but distributed at meaningful boundaries.
+function autoTypeMaybeBurstPause(ch, prevCh) {
+  if (!prevCh) return 0;
+  // Capped Pareto sample. Original caps (8-12s) were realistic for human
+  // "stuck thinking" pauses, but users perceived 10s+ pauses as the app
+  // freezing/hanging. Capped at 5s for confidence-building UX — still
+  // produces the heavy-tailed, syntax-clustered pause distribution that
+  // matters for biometric detection, just bounded.
+  const sample = (alpha, xm, cap) => Math.min(autoTypePareto(alpha, xm), cap);
+  // End of statement (`;`)
+  if (prevCh === ';' && Math.random() < 0.08) return sample(1.5, 1200, 5000);
+  // End of block (`}`)
+  if (prevCh === '}' && Math.random() < 0.08) return sample(1.5, 1200, 5000);
+  // Colon (Python def/if, function-signature end, JS object)
+  if (prevCh === ':' && Math.random() < 0.12) return sample(1.5, 1000, 4500);
+  // Opening brace
+  if (prevCh === '{' && Math.random() < 0.06) return sample(1.7, 800, 4000);
+  // Comma in argument list / literal
+  if (prevCh === ',' && Math.random() < 0.03) return sample(2.0, 500, 3500);
+  // Residual unscheduled
+  if (Math.random() < 0.005) return sample(2.0, 1200, 5000);
+  return 0;
 }
 
 // QWERTY neighbors for plausible typos. Letters only — typing a typo on
@@ -1315,7 +2056,132 @@ function autoTypePickTypoChar(correct) {
   return correct === correct.toUpperCase() ? pick.toUpperCase() : pick;
 }
 
+// ── P1a: Per-keystroke dwell time ──
+// THE SINGLE LARGEST FINGERPRINT FIX. Real human key dwell (press-to-release
+// duration) is 60-150ms (Aalto 136M-keystroke study). Bots that use
+// keyboard.type(ch) — which press-then-immediately-release with sub-ms gap —
+// have effectively 0ms dwell. Every published biometric classifier uses
+// dwell as feature #1 (CMU "tie5Roanl" benchmark, FCaptcha v1.3, BeCAPTCHA-Type).
+//
+// To inject real dwell, we replace `keyboard.type(ch)` (which is press+release
+// internally with no gap) with manual `pressKey(K)` → sleep(dwell) → `releaseKey(K)`.
+// Requires a char→Key mapping. For US QWERTY chars we cover the common set
+// below; unmapped chars (unicode, accented, etc.) fall back to keyboard.type
+// — which loses dwell but preserves correctness.
+//
+// Dwell sampled per-character based on key biomechanics: common keys (e, t, a,
+// space) are shorter; pinky/uncommon keys (q, z, j, special chars) longer.
+// Clamped [30, 180] ms to stay below OS key-repeat thresholds (typically
+// 250-500ms — held longer would trigger spurious key-repeat events).
+
+// US QWERTY char → {Key enum name, needs-shift}. Covers a-z, A-Z, 0-9,
+// space, common punctuation, and shifted versions thereof.
+const _AT_CHAR_KEY_MAP = (() => {
+  const m = {};
+  // a-z / A-Z (same Key.A enum, shift toggles case)
+  for (let i = 0; i < 26; i++) {
+    const lower = String.fromCharCode(97 + i);   // 'a'
+    const upper = String.fromCharCode(65 + i);   // 'A'
+    const name = upper;                          // nut-js Key.A ... Key.Z
+    m[lower] = { name, shift: false };
+    m[upper] = { name, shift: true };
+  }
+  // 0-9 and shifted symbols
+  const digitShift = { '0': ')', '1': '!', '2': '@', '3': '#', '4': '$',
+                       '5': '%', '6': '^', '7': '&', '8': '*', '9': '(' };
+  for (let d = 0; d <= 9; d++) {
+    const digit = String(d);
+    const name = `Num${d}`;
+    m[digit] = { name, shift: false };
+    m[digitShift[digit]] = { name, shift: true };
+  }
+  // Punctuation / symbols (US layout, dedicated keys)
+  m[' ']  = { name: 'Space',        shift: false };
+  m['\t'] = { name: 'Tab',          shift: false };
+  m['.']  = { name: 'Period',       shift: false };  m['>'] = { name: 'Period',       shift: true };
+  m[',']  = { name: 'Comma',        shift: false };  m['<'] = { name: 'Comma',        shift: true };
+  m[';']  = { name: 'Semicolon',    shift: false };  m[':'] = { name: 'Semicolon',    shift: true };
+  m["'"]  = { name: 'Quote',        shift: false };  m['"'] = { name: 'Quote',        shift: true };
+  m['[']  = { name: 'LeftBracket',  shift: false };  m['{'] = { name: 'LeftBracket',  shift: true };
+  m[']']  = { name: 'RightBracket', shift: false };  m['}'] = { name: 'RightBracket', shift: true };
+  m['\\'] = { name: 'Backslash',    shift: false };  m['|'] = { name: 'Backslash',    shift: true };
+  m['/']  = { name: 'Slash',        shift: false };  m['?'] = { name: 'Slash',        shift: true };
+  m['`']  = { name: 'Grave',        shift: false };  m['~'] = { name: 'Grave',        shift: true };
+  m['-']  = { name: 'Minus',        shift: false };  m['_'] = { name: 'Minus',        shift: true };
+  m['=']  = { name: 'Equal',        shift: false };  m['+'] = { name: 'Equal',        shift: true };
+  return m;
+})();
+
+// Sample a dwell time (ms) for a given character. Common keys are shorter,
+// pinky / uncommon longer. Log-normal-distributed (right-skewed, like real
+// human dwell). Clamped [30, 180] to avoid OS key-repeat trigger.
+function autoTypeSampleDwell(ch) {
+  let baseMean;
+  const lower = (ch || '').toLowerCase();
+  if (' eta'.includes(lower))                  baseMean = 65;   // most common
+  else if ('inosrh'.includes(lower))           baseMean = 75;   // next-tier common
+  else if ('lcdumpgwfybkv'.includes(lower))    baseMean = 90;   // mid
+  else if ('jxqz'.includes(lower))             baseMean = 115;  // pinky / rare
+  else                                          baseMean = 95;   // symbols / digits
+  const d = autoTypeLogNormal(baseMean, 0.30);
+  return Math.max(30, Math.min(180, Math.round(d)));
+}
+
+// Press a single keystroke with sampled dwell. Used for one-off keys like
+// Backspace, Enter, Tab, arrows, etc — anywhere we'd previously do
+// `pressKey(K); releaseKey(K);` back-to-back (0ms dwell — the bot fingerprint).
+async function autoTypePressWithDwell(keyboard, key) {
+  const d = autoTypeLogNormal(85, 0.30);
+  const dwell = Math.max(30, Math.min(180, Math.round(d)));
+  await keyboard.pressKey(key);
+  await autoTypeSleep(dwell);
+  await keyboard.releaseKey(key);
+}
+
+// Type a single CHARACTER (letter/digit/punctuation) with real dwell time.
+// Looks up the key in _AT_CHAR_KEY_MAP; for shifted chars (capitals, !@#,
+// etc), holds LeftShift across the press/release pair. Falls back to
+// keyboard.type() for chars not in the map (unicode, accented letters, etc) —
+// those lose dwell but the typing still works.
+async function typeCharHumanly(keyboard, Key, ch) {
+  const mapping = _AT_CHAR_KEY_MAP[ch];
+  if (!mapping || !Key[mapping.name]) {
+    // Unmapped char — fallback to keyboard.type (loses dwell but works).
+    try { await keyboard.type(ch); }
+    catch (e) { console.warn('[auto-type] typeCharHumanly fallback failed for', JSON.stringify(ch), ':', e && e.message); }
+    return;
+  }
+  const keyObj = Key[mapping.name];
+  const dwell = autoTypeSampleDwell(ch);
+  try {
+    if (mapping.shift) {
+      // Press Shift, brief settle (real Shift hold overlaps key press),
+      // then press the key with dwell, release key, release Shift.
+      await keyboard.pressKey(Key.LeftShift);
+      await autoTypeSleep(12 + Math.random() * 18);
+      await keyboard.pressKey(keyObj);
+      await autoTypeSleep(dwell);
+      await keyboard.releaseKey(keyObj);
+      await autoTypeSleep(6 + Math.random() * 14);
+      await keyboard.releaseKey(Key.LeftShift);
+    } else {
+      await keyboard.pressKey(keyObj);
+      await autoTypeSleep(dwell);
+      await keyboard.releaseKey(keyObj);
+    }
+  } catch (e) {
+    console.warn('[auto-type] typeCharHumanly manual press failed for', JSON.stringify(ch), ':', e && e.message);
+    // Last-resort: try keyboard.type so we don't drop the character entirely.
+    try { await keyboard.type(ch); } catch (_) {}
+  }
+}
+
 let _atLastWasTypo = false;
+// Per-run autocomplete attempt counter. Capped so a single Auto-Type run
+// can't add 6+ autocomplete-look pauses (~600ms each = 3.6s wasted) even
+// if UIA is flaky and most attempts skip Tab. Reset in autoTypeResetCadence.
+let _atAutocompleteAttempts = 0;
+const AT_AUTOCOMPLETE_MAX_PER_RUN = 3;
 
 // Type a single char, sometimes mis-typing + backspacing first.
 // ~0.8% per eligible char. Skipped if the previous char was also a typo
@@ -1325,33 +2191,80 @@ let _atLastWasTypo = false;
 async function autoTypeCharWithTypo(keyboard, Key, ch, prevCh) {
   if (process.env.DISABLE_AUTO_TYPE_MISTAKES === '1') {
     _atLastWasTypo = false;
-    await keyboard.type(ch);
+    await typeCharHumanly(keyboard, Key, ch);
     return;
   }
   const isLetter = /^[a-zA-Z]$/.test(ch);
   const prevIsAutoClose = prevCh && /[([{<"'`]/.test(prevCh);
-  if (isLetter && !_atLastWasTypo && !prevIsAutoClose && Math.random() < 0.008) {
+  const eligible = isLetter && !_atLastWasTypo && !prevIsAutoClose;
+  let didTypo = false;
+
+  // ── P3a: Raised error rate (was ~0.8% single-char, now ~3.2% combined) ──
+  // Real human correction rate is 5.9-6.5% per keystroke (Dhakal 136M).
+  // Three injection sites: extra-space (0.4%) + double-typo (0.3%) + bumped
+  // single-typo (2.5%). Plus word-backtrack (~0.4%) and indent-mistake
+  // (~1.2% per indent) → combined ~5%, close to human baseline.
+  // ── P1a integration: all typing here uses typeCharHumanly (real dwell)
+  // and backspaces use autoTypePressWithDwell (no zero-dwell key events).
+
+  // ── Extra-space typo (~0.4%) ──
+  if (eligible && Math.random() < 0.004) {
+    try {
+      await typeCharHumanly(keyboard, Key, ' ');
+      await autoTypeSleep(150 + Math.random() * 200);
+      await autoTypePressWithDwell(keyboard, Key.Backspace);
+      await autoTypeSleep(80 + Math.random() * 120);
+      didTypo = true;
+    } catch (e) {
+      console.warn('[auto-type] extra-space typo failed:', e && e.message);
+    }
+  }
+
+  // ── Double-typo (~0.3%) ──
+  if (!didTypo && eligible && Math.random() < 0.003) {
+    const wrong1 = autoTypePickTypoChar(ch);
+    if (wrong1) {
+      try {
+        await typeCharHumanly(keyboard, Key, wrong1);
+        await autoTypeSleep(80 + Math.random() * 120);
+        const wrong2 = autoTypePickTypoChar(ch);
+        if (wrong2) {
+          await typeCharHumanly(keyboard, Key, wrong2);
+          await autoTypeSleep(350 + Math.random() * 600);
+          await autoTypePressWithDwell(keyboard, Key.Backspace);
+          await autoTypeSleep(60 + Math.random() * 80);
+        } else {
+          await autoTypeSleep(250 + Math.random() * 500);
+        }
+        await autoTypePressWithDwell(keyboard, Key.Backspace);
+        await autoTypeSleep(100 + Math.random() * 130);
+        didTypo = true;
+      } catch (e) {
+        console.warn('[auto-type] double-typo failed:', e && e.message);
+      }
+    }
+  }
+
+  // ── Single-char typo (bumped from 0.008 → 0.025) ──
+  if (!didTypo && eligible && Math.random() < 0.025) {
     const wrong = autoTypePickTypoChar(ch);
     if (wrong) {
       let wrongTyped = false;
-      try { await keyboard.type(wrong); wrongTyped = true; }
+      try { await typeCharHumanly(keyboard, Key, wrong); wrongTyped = true; }
       catch (e) { console.warn('[auto-type] typo wrong-char failed:', e.message); }
       if (wrongTyped) {
         await autoTypeSleep(250 + Math.random() * 500);
-        // Backspace runs even if abort fires mid-sleep, so the wrong char
-        // never stays behind. Outer loop's abort check will exit after.
         try {
-          await keyboard.pressKey(Key.Backspace);
-          await keyboard.releaseKey(Key.Backspace);
+          await autoTypePressWithDwell(keyboard, Key.Backspace);
         } catch (e) { console.warn('[auto-type] typo backspace failed:', e.message); }
         await autoTypeSleep(100 + Math.random() * 120);
+        didTypo = true;
       }
-      _atLastWasTypo = true;
     }
-  } else {
-    _atLastWasTypo = false;
   }
-  await keyboard.type(ch);
+
+  _atLastWasTypo = didTypo;
+  await typeCharHumanly(keyboard, Key, ch);
 }
 
 // ───────────────────────────────────────────────
@@ -1411,14 +2324,11 @@ async function autoTypeMaybeBacktrackWord(keyboard, Key, word) {
   const wrong = word.slice(0, mid - 1) + word[mid] + word[mid - 1] + word.slice(mid + 1);
   if (wrong === word) return false;
 
-  // Best-effort cleanup: backspace `n` chars. If backspace itself fails,
-  // log and stop — nothing further we can do, caller's char-by-char path
-  // will also fail and be logged by the outer catch.
+  // Best-effort cleanup: backspace `n` chars with real dwell on each.
   const reverse = async (n) => {
     for (let k = 0; k < n; k++) {
       try {
-        await keyboard.pressKey(Key.Backspace);
-        await keyboard.releaseKey(Key.Backspace);
+        await autoTypePressWithDwell(keyboard, Key.Backspace);
       } catch (e) {
         console.warn('[auto-type] backtrack reverse failed:', e.message);
         return;
@@ -1432,7 +2342,7 @@ async function autoTypeMaybeBacktrackWord(keyboard, Key, word) {
   let wrongTyped = 0;
   for (const ch of wrong) {
     if (autoTypeAbort) { await reverse(wrongTyped); return false; }
-    try { await keyboard.type(ch); wrongTyped++; }
+    try { await typeCharHumanly(keyboard, Key, ch); wrongTyped++; }
     catch (e) {
       console.warn('[auto-type] backtrack wrong-char failed:', e.message);
       await reverse(wrongTyped);
@@ -1445,15 +2355,12 @@ async function autoTypeMaybeBacktrackWord(keyboard, Key, word) {
   // "Realize" — noticeable pause before the correction.
   await autoTypeSleep(320 + Math.random() * 420);
 
-  // Phase 2: backspace wrong word. On abort/error, clean up whatever remains
-  // and return false. Caller's char-by-char path will retype the correct word
-  // on top of any residue (visual mess, but not a silent skip).
+  // Phase 2: backspace wrong word with real dwell on each Backspace.
   let backspaced = 0;
   for (let i = 0; i < wrong.length; i++) {
     if (autoTypeAbort) { await reverse(wrongTyped - backspaced); return false; }
     try {
-      await keyboard.pressKey(Key.Backspace);
-      await keyboard.releaseKey(Key.Backspace);
+      await autoTypePressWithDwell(keyboard, Key.Backspace);
       backspaced++;
     } catch (e) {
       console.warn('[auto-type] backtrack backspace failed:', e.message);
@@ -1463,14 +2370,14 @@ async function autoTypeMaybeBacktrackWord(keyboard, Key, word) {
     await autoTypeSleep(32 + Math.random() * 38);
   }
 
-  // Phase 3: type correct word. On abort/error, back out partial correct
-  // so caller retypes from scratch.
+  // Phase 3: type correct word with dwell. On abort/error, back out
+  // partial correct so caller retypes from scratch.
   await autoTypeSleep(110 + Math.random() * 180);
   let cp = null;
   let correctTyped = 0;
   for (const ch of word) {
     if (autoTypeAbort) { await reverse(correctTyped); return false; }
-    try { await keyboard.type(ch); correctTyped++; }
+    try { await typeCharHumanly(keyboard, Key, ch); correctTyped++; }
     catch (e) {
       console.warn('[auto-type] backtrack correct-char failed:', e.message);
       await reverse(correctTyped);
@@ -1483,6 +2390,168 @@ async function autoTypeMaybeBacktrackWord(keyboard, Key, word) {
   // Suppress single-char typos for the next couple chars — stacked mistakes
   // look contrived.
   _atLastWasTypo = true;
+  return true;
+}
+
+// ── P5b: Autocomplete acceptance via Tab (with Tab+Escape recovery) ──
+//
+// Real coders press Tab to accept IDE autocomplete on ~30% of identifiers
+// (Copilot studies: 29.8% Python / 27.5% JS / 26.9% TS). We do the same:
+// type partial → pause → Tab → verify → recover safely.
+//
+// CRITICAL DESIGN POINT — recovery strategy (revised after a regression
+// where the naive "backspace 1 + retype" produced duplicate chars like
+// "Scannerner" when Tab actually triggered autocomplete):
+//
+//   1. **Pre-flight UIA check** — if UIA is unreliable BEFORE pressing
+//      Tab, abort the autocomplete attempt entirely (skip Tab, type rest
+//      manually). Pressing Tab without a reliable post-verify is the
+//      root of the corruption.
+//
+//   2. **Tab + Escape pair** — press Tab, brief sleep, then press Escape.
+//      Escape DISMISSES any open autocomplete dropdown WITHOUT undoing
+//      already-committed text. This stabilizes the editor's accessibility
+//      tree so the post-Tab UIA read is reliable.
+//
+//   3. **Verified recovery** — after the long settle, UIA-read again.
+//      Compute exact `insertDelta` (cursorAfter - cursorBefore). Three
+//      possible outcomes, each with a SAFE recovery:
+//        • insertDelta === remaining.length AND inserted text matches our
+//          intended `remaining` → autocomplete worked, done.
+//        • insertDelta === 1 → Tab inserted a literal tab char → backspace
+//          1, type rest manually.
+//        • Other → backspace `insertDelta` chars, type rest manually.
+//      All three paths produce CORRECT editor state — no duplicate-char bug.
+//
+//   4. **Final fallback (still-flaky UIA)** — if UIA fails even after the
+//      Tab+Escape settle, do nothing risky: type the rest manually WITHOUT
+//      backspacing. May produce a stray tab char if Tab inserted literal
+//      tab, but the post-typing verify+correct (P5c) sees the wrong tail
+//      length and can append/adjust. Better a fixable trailing artifact
+//      than a duplicate-char corruption mid-identifier.
+//
+// Kill-switch: DISABLE_AUTO_TYPE_MISTAKES=1 disables.
+async function autoTypeMaybeAutocomplete(keyboard, Key, word, prevCh) {
+  if (process.env.DISABLE_AUTO_TYPE_MISTAKES === '1') return false;
+  if (!word || word.length < 6) return false;
+  if (!/^[a-zA-Z_][a-zA-Z_0-9]*$/.test(word)) return false;
+  // Cap per-run attempts. Each attempt adds 600-1000ms of pause regardless
+  // of whether Tab succeeds. Without this cap, a code block with many long
+  // identifiers stacks up multiple seconds of pure pause and starts feeling
+  // like the auto-typer is hung.
+  if (_atAutocompleteAttempts >= AT_AUTOCOMPLETE_MAX_PER_RUN) return false;
+  if (Math.random() > 0.22) return false;
+  _atAutocompleteAttempts++;
+
+  // Type first N chars (3-5)
+  const N = Math.min(word.length - 1, 3 + Math.floor(Math.random() * 3));
+  let curPrev = prevCh;
+  for (let k = 0; k < N; k++) {
+    if (autoTypeAbort) return false;
+    const cN = word[k];
+    try { await autoTypeCharWithTypo(keyboard, Key, cN, curPrev); }
+    catch (_) { return false; }
+    await autoTypeSleep(autoTypeHumanDelay(cN, curPrev));
+    curPrev = cN;
+  }
+
+  const remaining = word.slice(N);
+
+  // "Looking at dropdown" pause — biometric signal, also gives UIA time
+  // to settle after the burst of N chars we just typed.
+  await autoTypeSleep(280 + Math.random() * 380);
+
+  // STEP 1: Pre-flight UIA check. If UIA is broken right now (mid-typing
+  // accessibility-tree churn), skip Tab entirely — type rest as plain
+  // chars. The biometric signature (mid-identifier pause) is preserved.
+  const beforeTab = await readFocusedViaUIA(600);
+  if (!beforeTab || !beforeTab.ok || typeof beforeTab.cursorOffset !== 'number') {
+    for (let k = 0; k < remaining.length; k++) {
+      if (autoTypeAbort) return false;
+      const cN = remaining[k];
+      try { await autoTypeCharWithTypo(keyboard, Key, cN, curPrev); }
+      catch (_) { return false; }
+      await autoTypeSleep(autoTypeHumanDelay(cN, curPrev));
+      curPrev = cN;
+    }
+    console.log(`[auto-type] autocomplete "${word}": pre-Tab UIA unreliable — skipped Tab, typed rest manually (pattern preserved)`);
+    return true;
+  }
+  const cursorBefore = beforeTab.cursorOffset;
+
+  // STEP 2: Tab + Escape. Tab attempts autocomplete; Escape dismisses any
+  // resulting dropdown without affecting committed text. This stabilizes
+  // the editor accessibility tree for the post-Tab UIA read.
+  try {
+    await autoTypePressWithDwell(keyboard, Key.Tab);
+    await autoTypeSleep(60 + Math.random() * 100);
+    await autoTypePressWithDwell(keyboard, Key.Escape);
+  } catch (_) { return false; }
+  await autoTypeSleep(240 + Math.random() * 260);  // long settle post-Escape
+
+  // STEP 3: Verified recovery.
+  const after = await readFocusedViaUIA(1200);
+
+  // STEP 4 (fallback): Still-flaky UIA. Don't backspace — type rest as is.
+  // Better to leave a fixable trailing stray than a mid-identifier dup-char.
+  if (!after || !after.ok || typeof after.text !== 'string') {
+    for (let k = 0; k < remaining.length; k++) {
+      if (autoTypeAbort) return false;
+      const cN = remaining[k];
+      try { await autoTypeCharWithTypo(keyboard, Key, cN, curPrev); }
+      catch (_) { return false; }
+      await autoTypeSleep(autoTypeHumanDelay(cN, curPrev));
+      curPrev = cN;
+    }
+    console.log(`[auto-type] autocomplete "${word}": post-Tab+Esc UIA still failing — typed rest (no backspace to avoid dup-char corruption)`);
+    return true;
+  }
+
+  const cursorAfter = after.cursorOffset || 0;
+  const insertDelta = cursorAfter - cursorBefore;
+
+  // STEP 3a: Tab triggered autocomplete and inserted exactly what we wanted.
+  if (insertDelta === remaining.length) {
+    const inserted = after.text.slice(cursorBefore, cursorAfter);
+    if (inserted === remaining) {
+      console.log(`[auto-type] autocomplete ACCEPTED "${word}" via Tab (saved ${remaining.length} keystrokes)`);
+      return true;
+    }
+  }
+
+  // STEP 3b: Tab inserted a literal tab char (delta = 1, autocomplete didn't fire).
+  if (insertDelta === 1) {
+    try { await autoTypePressWithDwell(keyboard, Key.Backspace); } catch (_) {}
+    await autoTypeSleep(40 + Math.random() * 50);
+    for (let k = 0; k < remaining.length; k++) {
+      if (autoTypeAbort) return false;
+      const cN = remaining[k];
+      try { await autoTypeCharWithTypo(keyboard, Key, cN, curPrev); }
+      catch (_) { return false; }
+      await autoTypeSleep(autoTypeHumanDelay(cN, curPrev));
+      curPrev = cN;
+    }
+    console.log(`[auto-type] autocomplete "${word}": Tab inserted literal tab (no dropdown was open) — backspaced + typed rest`);
+    return true;
+  }
+
+  // STEP 3c: Tab did something unexpected. Backspace exactly the chars it
+  // inserted (we KNOW insertDelta now), then retype manually.
+  const toBackspace = Math.max(0, Math.min(insertDelta, 60));
+  for (let k = 0; k < toBackspace; k++) {
+    if (autoTypeAbort) return false;
+    try { await autoTypePressWithDwell(keyboard, Key.Backspace); } catch (_) {}
+    await autoTypeSleep(28 + Math.random() * 38);
+  }
+  for (let k = 0; k < remaining.length; k++) {
+    if (autoTypeAbort) return false;
+    const cN = remaining[k];
+    try { await autoTypeCharWithTypo(keyboard, Key, cN, curPrev); }
+    catch (_) { return false; }
+    await autoTypeSleep(autoTypeHumanDelay(cN, curPrev));
+    curPrev = cN;
+  }
+  console.log(`[auto-type] autocomplete "${word}": Tab inserted ${insertDelta} unexpected chars — backspaced + retyped`);
   return true;
 }
 
@@ -1504,8 +2573,7 @@ async function autoTypeMaybeIndentMistake(keyboard, Key, intendedIndentSpaces, p
   const reverse = async (n) => {
     for (let k = 0; k < n; k++) {
       try {
-        await keyboard.pressKey(Key.Backspace);
-        await keyboard.releaseKey(Key.Backspace);
+        await autoTypePressWithDwell(keyboard, Key.Backspace);
       } catch (e) {
         console.warn('[auto-type] indent reverse failed:', e.message);
         return;
@@ -1514,11 +2582,11 @@ async function autoTypeMaybeIndentMistake(keyboard, Key, intendedIndentSpaces, p
     }
   };
 
-  // Phase 1: type short indent. Abort/error = reverse + return false.
+  // Phase 1: type short indent (spaces with dwell). Abort/error = reverse + return false.
   let typed = 0;
   for (let i = 0; i < wrongCount; i++) {
     if (autoTypeAbort) { await reverse(typed); return false; }
-    try { await keyboard.type(' '); typed++; }
+    try { await typeCharHumanly(keyboard, Key, ' '); typed++; }
     catch (e) {
       console.warn('[auto-type] indent short-space failed:', e.message);
       await reverse(typed);
@@ -1534,8 +2602,7 @@ async function autoTypeMaybeIndentMistake(keyboard, Key, intendedIndentSpaces, p
   for (let i = 0; i < wrongCount; i++) {
     if (autoTypeAbort) { await reverse(typed - erased); return false; }
     try {
-      await keyboard.pressKey(Key.Backspace);
-      await keyboard.releaseKey(Key.Backspace);
+      await autoTypePressWithDwell(keyboard, Key.Backspace);
       erased++;
     } catch (e) {
       console.warn('[auto-type] indent backspace failed:', e.message);
@@ -1551,6 +2618,12 @@ async function autoTypeMaybeIndentMistake(keyboard, Key, intendedIndentSpaces, p
 
 let autoTypeAbort = false;
 let autoTypeInFlight = false;
+// P8-1: ID of the CodeBlock that triggered the current Auto-Type cycle.
+// Tagged into every auto-type:status broadcast so other CodeBlocks (popout,
+// prior messages) can ignore events they don't own. Without this, broadcasts
+// hit every mounted CodeBlock and they ALL visibly transition through
+// countdown / typing / done — the "Auto Type shows on the 1st chunk" bug.
+let _atCurrentBlockId = null;
 // Reason for the most recent abort. Tracked alongside autoTypeAbort so the
 // finally-block 'done' broadcast can tell the renderer WHY we stopped — the
 // renderer used to silently reset to idle on aborted=true with no toast,
@@ -1563,9 +2636,13 @@ let autoTypeAbortReason = null;
 let autoTypeAbortDiagnostic = null;
 
 // Broadcast progress so the clicked CodeBlock can update its button label.
+// P8-1: tag every broadcast with the owning blockId so non-owners ignore it.
 function autoTypeBroadcast(data) {
+  const tagged = (data && typeof data === 'object' && _atCurrentBlockId)
+    ? { ...data, blockId: _atCurrentBlockId }
+    : data;
   BrowserWindow.getAllWindows().forEach(win => {
-    if (!win.isDestroyed()) win.webContents.send('auto-type:status', data);
+    if (!win.isDestroyed()) win.webContents.send('auto-type:status', tagged);
   });
 }
 
@@ -1590,10 +2667,14 @@ ipcMain.on('auto-type:abort', () => {
   if (autoTypeInFlight) {
     autoTypeAbort = true;
     autoTypeAbortReason = 'user_abort';
+    // P8.5: wake any in-flight sleeps so the typing loop's abort checks
+    // fire immediately instead of waiting out a P-burst / tool-switch pause.
+    autoTypeFireAbortSignal();
   }
 });
 
 ipcMain.handle('auto-type:send', async (_event, payload) => {
+  console.log(`[auto-type] IPC received: payload.code=${payload && payload.code ? payload.code.length : 0} bytes, lang=${payload && payload.language || '?'}, skipLines=${payload && payload.skipLines || 0}`);
   const code = payload && typeof payload.code === 'string' ? payload.code : '';
   // skipLines lets the renderer (which ran OCR on the target editor) tell us
   // how many leading lines of `code` are already present on screen, so we
@@ -1612,13 +2693,32 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   // an anomaly. Defaults to false (cloud planner allowed) for backwards
   // compat — old renderers that don't send the field get the prior behavior.
   const localOnly = !!(payload && payload.localOnly === true);
-  if (autoTypeInFlight) return { error: 'Auto-Type already in progress.' };
-  if (!code.length) return { error: 'Nothing to type.' };
+  // Persistent run log: every auto-type call gets a unique runId and is
+  // captured to .autotype-plans.jsonl with intended code, planner ops,
+  // before/after snapshots, and verify result. Survives Electron restarts.
+  // "show me what the planner thought" is now a one-line tail of that file.
+  const _atRunId = autoTypePlanLog.newRunId();
+  autoTypePlanLog.begin(_atRunId);
+  autoTypePlanLog.record(_atRunId, { language, intendedCode: code, skipLines, localOnly });
+  // P8-1: pin the owning CodeBlock's ID so broadcasts can be addressed.
+  const blockId = payload && typeof payload.blockId === 'string' ? payload.blockId : null;
+  if (autoTypeInFlight) {
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'already_in_progress' });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    return { error: 'Auto-Type already in progress.' };
+  }
+  if (!code.length) {
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'empty_code' });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    return { error: 'Nothing to type.' };
+  }
 
   autoTypeInFlight = true;
   autoTypeAbort = false;
   autoTypeAbortReason = null;
   autoTypeAbortDiagnostic = null;
+  _atCurrentBlockId = blockId;
+  autoTypeArmAbortSignal();  // P8.5: prime the cancel-signal for this cycle
   autoTypeResetCadence();
   autoTypeResetMouseTwitch();
   _atLastWasTypo = false;
@@ -1663,7 +2763,15 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   // just means the user can watch typing happen.
   const restore = [];
   if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
-    restore.push(() => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show(); });
+    // showInactive (not show) on restore: bring the window back where it
+    // was, but DO NOT steal focus from the editor. show() activates the
+    // window and yanks it to the front — right after typing finishes,
+    // that means focus snaps off the editor (where the user wants to
+    // immediately run/review the typed code) onto our app. The hide-
+    // during-typing intent ("let the user see the editor") was correct;
+    // the post-typing "give the user their app back" is fine, but doing
+    // it without hijacking focus respects what the user is about to do.
+    restore.push(() => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.showInactive(); });
     mainWindow.hide();
   }
   // If the popout itself is focused (user just clicked Auto-Type inside it),
@@ -1737,12 +2845,30 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       return { aborted: true, reason: 'no_target_editor' };
     }
 
+    // ── Guard A: accessibility-placeholder = UIA-blind ──
+    // If UIA returned the "editor is not accessible" stub (VS Code etc.)
+    // instead of real content, blank it so every downstream consumer
+    // (planAutoTypeFromUIA, the vision planner's editorText, the multi-op
+    // structural filter, the flat-UIA Ctrl+A path) treats this as
+    // blindness and the screenshot vision planner runs as primary —
+    // rather than trusting a 99-char stub as the editor's code.
+    if (uia && uia.ok && isUiaPlaceholderText(uia.text)) {
+      console.warn(`[auto-type] UIA returned an accessibility placeholder ("${(uia.text || '').trim().slice(0, 56)}…") — treating editor as UIA-blind; vision will read the screenshot instead.`);
+      autoTypePlanLog.record(_atRunId, { uiaPlaceholderDetected: true, uiaPlaceholderText: (uia.text || '').trim().slice(0, 120) });
+      uia.text = '';
+      uia.uiaPlaceholder = true;
+    }
+
     if (uia && uia.ok) {
       uiaSnapshotBefore = uia;
+      if (typeof uia.text === 'string') {
+        autoTypePlanLog.record(_atRunId, { beforeText: uia.text, beforeCursorOffset: uia.cursorOffset });
+      }
       const plan = planAutoTypeFromUIA({
         code,
         editorText: uia.text || '',
         cursorOffset: uia.cursorOffset || 0,
+        processName: uia.processName || '',
       });
 
       // Verbose diagnostic dump so we can see — after the fact — what UIA
@@ -1762,10 +2888,37 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       // results fall back to whatever the renderer computed (could be 0,
       // could be an OCR guess).
       if (plan.confidence >= 0.85) {
+        // Store the deterministic plan's values REGARDLESS — they are the
+        // fallback floor. If vision / agent / haiku all fail to produce a
+        // plan, the single-region typing path below uses these.
         effectiveSkipLines = plan.skipLines;
         effectiveSkipTrailing = plan.skipTrailingLines || 0;
         wipeFirstLine = !!plan.wipeFirstLine;
-        usedUIA = true;
+        // ── PRIORITY: vision is PRIMARY, the deterministic planner is the
+        // fallback — NOT the other way around. ──
+        // The deterministic planner is SINGLE-REGION: one skip + one
+        // cursor position. It physically cannot express the multi-chunk /
+        // broken-code / junk-line / missing-import reality the vision
+        // planner exists to handle. So it may only SHORT-CIRCUIT vision
+        // (set usedUIA=true → skip the whole vision block) for ONE reason:
+        //   `fully_present` — the code is already entirely in the editor,
+        //   there is genuinely nothing for vision to do.
+        // Every other "confident" verdict — `cursor_mid_line`,
+        // `prefix_match`, `snippet_insert_at_cursor` — is a single-region
+        // GUESS. `cursor_mid_line` in particular is the exact scenario the
+        // user keeps hitting: drop the caret mid-line and the old code
+        // said "I'm 90% sure — type the whole file from here", which is
+        // the "it writes the code from the beginning" bug. For those, we
+        // keep the deterministic values as the fallback floor but let the
+        // vision planner run as PRIMARY. usedUIA stays false → the vision
+        // block runs → if vision produces a usable plan it wins; if every
+        // cloud planner fails, we still fall through to the single-region
+        // path with these deterministic values intact (no regression).
+        if (plan.reason === 'fully_present') {
+          usedUIA = true;
+        } else {
+          console.log(`[auto-type] UIA plan '${plan.reason}' (conf ${plan.confidence.toFixed(2)}) kept as FALLBACK floor only — vision planner runs as primary (skip=${plan.skipLines} held in reserve)`);
+        }
       } else {
         console.log(`[auto-type] UIA plan rejected (conf < 0.85) — using skipLines=${skipLines} from caller`);
       }
@@ -1785,21 +2938,71 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   let cursorAction = 'use_current';
   let cursorTargetLine = 0;
   let cursorTargetColumn = 0;
+  // Signed line count for cursor_action='move_relative' (vision planner):
+  // how many lines to move the caret FROM ITS CURRENT POSITION before
+  // typing. Negative = up, positive = down. Applied via counted arrow
+  // keys — invisible, no go-to-line widget, no scroll-to-top flash.
+  let cursorLinesDelta = 0;
+  // Vision planner v2 produces an ordered list of edit operations
+  // (replace/insert/delete anchored to document line numbers) instead of
+  // the single-region skip/cursor plan. When set, the multi-op executor
+  // runs and the single-region slice-and-type path is skipped entirely.
+  let multiOpPlan = null;
   let wipeChars = 0;
   let typePrefix = '';
   let typeSuffix = '';
-  let usedHaiku = false;
-  if (!usedUIA && uiaSnapshotBefore && authToken && localOnly) {
+  // True once any cloud planner (vision / text-agent / haiku) returned a
+  // plan we accepted (confidence >= 0.7). Drives the post-type verify
+  // gate so we only re-read UIA when there's a real plan to verify
+  // against. (Was named `usedHaiku` historically — kept being reused as
+  // new planners landed; renamed for clarity.)
+  let aiPlanAccepted = false;
+  // ── Observability ──
+  // These two are hoisted to the handler scope (not block-scoped) so the
+  // 'planner-decision' broadcast below — which the renderer surfaces to
+  // the USER — can report which planner actually drove the run and, on a
+  // miss, exactly WHY (route 404, local-only mode, no token, capture
+  // failed, low confidence). This is what ends the "diagnose → still
+  // broken → diagnose" loop: the app self-reports instead of us guessing.
+  let plannerLabel = 'deterministic-uia';     // overwritten as we go
+  let plannerDetail = '';                     // human-readable "why"
+  if (usedUIA) {
+    plannerLabel = 'deterministic-uia';
+    plannerDetail = `UIA read the editor directly (skip ${effectiveSkipLines}/${effectiveSkipTrailing})`;
+  }
+  // ── Diagnostic: make the fallback-planner decision EXPLICIT in the
+  // log. "Why didn't vision run?" must be answerable from the
+  // main-process output alone. This prints on every low-confidence run.
+  if (!usedUIA) {
+    plannerLabel = 'deterministic-fallback';  // until a cloud planner wins
+    if (!authToken) plannerDetail = 'not signed in — cloud planners need an auth token';
+    else if (localOnly) plannerDetail = 'Local-Only Auto-Type is ON — cloud planners (incl. vision) are disabled in settings';
+    const willEnter = !!authToken && !localOnly;
+    console.log(`[auto-type] fallback-planner gate: usedUIA=false hasSnapshot=${!!uiaSnapshotBefore} hasAuthToken=${!!authToken} localOnly=${localOnly} → ${willEnter ? 'ENTERING vision→agent→haiku fallback' : 'SKIPPED (' + (!authToken ? 'no auth token' : 'local-only mode') + ')'}`);
+  }
+  if (!usedUIA && authToken && localOnly) {
     // User is in local-only mode (corporate network / monitored interview).
     // Surface the skip in the log so the diagnostic trail explains why the
-    // deterministic-low-confidence path didn't get the AI fallback —
+    // deterministic-low-confidence path didn't get the cloud fallback —
     // otherwise it looks like a silent capability regression.
-    console.log('[auto-type] Haiku planner skipped: localOnlyAutoType=true (cloud fallback disabled by user)');
+    console.log('[auto-type] cloud planners skipped: localOnlyAutoType=true (vision + agent fallback disabled by user)');
   }
-  if (!usedUIA && uiaSnapshotBefore && authToken && !localOnly) {
+  // CRITICAL: this gate does NOT require uiaSnapshotBefore. UIA returns
+  // ok:false (no TextPattern) for contentEditable-based editors —
+  // CodeMirror on CoderPad is the canonical case — which leaves
+  // uiaSnapshotBefore null. That is EXACTLY when the vision planner is
+  // most needed (UIA is blind), so gating on the snapshot here was the
+  // bug that made vision never fire on CoderPad. We only need authToken
+  // (to call the server) and !localOnly (cloud allowed).
+  if (!usedUIA && authToken && !localOnly) {
     try {
-      const snapText = uiaSnapshotBefore.text || '';
-      const cursorOff = uiaSnapshotBefore.cursorOffset || 0;
+      // uiaSnapshotBefore may be null (UIA ok:false). The vision planner
+      // doesn't need it — it reads a screenshot. The text-agent fallback
+      // below DOES use snapText; it degrades to '' which makes the text
+      // agent blind, but that's fine — vision is tried first and is the
+      // real path for these editors.
+      const snapText = uiaSnapshotBefore ? (uiaSnapshotBefore.text || '') : '';
+      const cursorOff = uiaSnapshotBefore ? (uiaSnapshotBefore.cursorOffset || 0) : 0;
       // Broadcast 'thinking' phase so the renderer can show a "Reading
       // editor — Sonnet is reasoning..." pill instead of a silent gap.
       // Sonnet calls take 3-8s vs Haiku's 0.5-1s, so the user feedback
@@ -1815,7 +3018,85 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       // confidence) so we get graceful degradation.
       let aiPlan = null;
       let plannerSource = 'sonnet-agent';  // Default; updated from response below
+
+      // ── TIER 1: Vision planner ──
+      // UIA came back blind (low confidence) — almost always a browser-
+      // hosted editor (Monaco on HackerRank/CodeSignal, CodeMirror on
+      // CoderPad). A passive screenshot is the ONLY thing that can
+      // actually see the editor's content + caret from outside the
+      // browser. Capture a frame in-process (no flash, no scroll, no
+      // clipboard) and let Sonnet vision read it. Any failure falls
+      // straight through to the text agent below.
       try {
+        console.log('[auto-type] TIER 1: vision planner — capturing screen…');
+        const shot = await captureScreenForVision();
+        if (shot && shot.base64) {
+          console.log(`[auto-type] vision: screenshot captured (${shot.base64.length} b64 chars, ${shot.mediaType}) — calling /autotype-vision`);
+          // Persist screenshot to disk so the JSONL entry has a sibling
+          // PNG showing exactly what the planner saw. Best-effort — if
+          // it fails the run still proceeds and commits.
+          try {
+            const shotPath = autoTypePlanLog.saveScreenshot(_atRunId, shot.base64, shot.mediaType, app);
+            if (shotPath) {
+              autoTypePlanLog.record(_atRunId, { screenshotPath: shotPath, screenshotMediaType: shot.mediaType });
+              console.log(`[auto-type] vision: screenshot saved → ${shotPath}`);
+            }
+          } catch (_) { /* non-fatal */ }
+          autoTypeBroadcast({ phase: 'thinking', source: 'vision' });
+          const visRes = await fetch(`${API_BASE}/api/v1/ai/autotype-vision`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${authToken}`,
+            },
+            body: JSON.stringify({
+              screenshotBase64: shot.base64,
+              screenshotMediaType: shot.mediaType,
+              code,
+              language,
+              // ── Ground-truth editor text for line-number reconciliation ──
+              // Without this, vision counts lines from the screenshot's gutter
+              // and occasionally miscounts blank lines (off-by-one bug that
+              // made it target the main() signature instead of a stub two
+              // lines below). Passing UIA's accessibility-read text gives
+              // vision a SECOND source of truth — when the screenshot gutter
+              // disagrees with this text, vision should trust THIS for line
+              // numbering. Empty when UIA was blind on this editor.
+              editorText: snapText,
+            }),
+          });
+          if (visRes.ok) {
+            const visPlan = await visRes.json().catch(() => null);
+            if (visPlan && visPlan.ok === true) {
+              aiPlan = visPlan;
+              plannerSource = 'vision-agent';
+              console.log(`[auto-type] vision planner served the plan (conf=${visPlan.confidence})`);
+            } else {
+              console.log('[auto-type] vision returned non-ok plan — falling through to text agent');
+              plannerDetail = 'vision planner returned an unusable plan — fell back';
+            }
+          } else {
+            console.log(`[auto-type] vision endpoint HTTP ${visRes.status} — falling through to text agent`);
+            // The single most common real failure: the app is calling a
+            // server that doesn't have /autotype-vision (production not
+            // deployed, or API_BASE wrong). Make it unmissable.
+            plannerDetail = `vision route returned HTTP ${visRes.status} from ${API_BASE} — server missing the /autotype-vision route (deploy it, or run a local server)`;
+          }
+        } else {
+          console.log('[auto-type] vision capture unavailable — falling through to text agent');
+          plannerDetail = 'screen capture for vision returned nothing (desktopCapturer gave no frame)';
+        }
+      } catch (visErr) {
+        console.warn('[auto-type] vision planner threw, falling through to text agent:', visErr && visErr.message);
+        plannerDetail = `vision call threw: ${visErr && visErr.message} (is ${API_BASE} reachable?)`;
+      }
+
+      // ── TIER 2: text agent ──
+      // Was the original first attempt; now only runs if the vision
+      // planner didn't produce a plan. On a browser editor it is itself
+      // blind (snapText is empty), but it's kept as graceful degradation
+      // for native editors that reached this fallback for other reasons.
+      if (!aiPlan) try {
         const agentRes = await fetch(`${API_BASE}/api/v1/ai/autotype-agent`, {
           method: 'POST',
           headers: {
@@ -1883,18 +3164,71 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         }
       }
 
-      // Plan acceptance — same shape from agent or Haiku, treat
-      // identically. Confidence threshold 0.7 holds for both: lower
-      // confidence falls through to the deterministic plan.
+      // Plan acceptance — confidence threshold 0.7 holds for all planner
+      // shapes. The VISION planner (v2) returns `operations` (an ordered
+      // edit list); the text/Haiku planners return the single-region
+      // skip/cursor shape. Both are accepted here; the multi-op branch
+      // later in the handler routes on `multiOpPlan`.
       if (aiPlan && aiPlan.ok === true
           && Number.isFinite(aiPlan.confidence) && aiPlan.confidence >= 0.7) {
+        // ── Vision v2: multi-operation plan ──
+        if (Array.isArray(aiPlan.operations) && aiPlan.operations.length > 0) {
+          multiOpPlan = aiPlan.operations;
+          aiPlanAccepted = true;
+          plannerLabel = 'vision';
+          const opSummary = aiPlan.operations
+            .map(o => `${o.op} L${o.start_line}${o.op === 'insert' ? '' : '-' + o.end_line}`)
+            .join(', ');
+          plannerDetail = `${aiPlan.operations.length} edit op(s): ${opSummary}`;
+          const visReasoning = (aiPlan.reasoning || '').replace(/\s+/g, ' ').slice(0, 200);
+          console.log(`[auto-type] vision multi-op plan ACCEPTED (conf=${aiPlan.confidence.toFixed(2)}): ${opSummary} — ${visReasoning}`);
+          autoTypePlanLog.record(_atRunId, {
+            plannerSource: 'vision-multi-op',
+            confidence: aiPlan.confidence,
+            reasoning: aiPlan.reasoning,  // full text, not the 200-char truncated visReasoning
+            operations: aiPlan.operations,
+          });
+          if (visReasoning) {
+            autoTypeBroadcast({ phase: 'plan-ready', source: 'vision', reasoning: visReasoning, confidence: aiPlan.confidence });
+          }
+          // Skip the single-region field parsing below — none of it
+          // applies to a multi-op plan. Fall through past the acceptance
+          // block; the multi-op branch downstream does the work.
+        } else if (aiPlan.planner_used === 'vision' && Array.isArray(aiPlan.operations)) {
+          // Vision returned an EMPTY operations list with high confidence.
+          // The agent's prompt explicitly says "empty array = nothing to
+          // do" (e.g. the editor already contains the correct solution).
+          // Without this branch, execution would fall through to the
+          // single-region parser below — which finds undefined skip/cursor
+          // fields, defaults effectiveSkipLines=0, and types the WHOLE
+          // file from the cursor: the exact "writes the code from the
+          // beginning" symptom, just from a different trigger. Instead
+          // skip every line so the single-region path's lines.length===0
+          // early-exit fires and we cleanly broadcast 'done'.
+          const allLineCount = code.split('\n').length;
+          effectiveSkipLines = allLineCount;
+          effectiveSkipTrailing = 0;
+          wipeFirstLine = false;
+          cursorAction = 'use_current';
+          aiPlanAccepted = true;
+          plannerLabel = 'vision';
+          plannerDetail = 'vision: editor already correct, nothing to type';
+          console.log(`[auto-type] vision returned empty operations (conf=${aiPlan.confidence.toFixed(2)}) — explicit no-op`);
+        } else {
         effectiveSkipLines = Number.isInteger(aiPlan.skip_leading) ? Math.max(0, aiPlan.skip_leading) : 0;
         effectiveSkipTrailing = Number.isInteger(aiPlan.skip_trailing) ? Math.max(0, aiPlan.skip_trailing) : 0;
         wipeFirstLine = !!aiPlan.wipe_first_line;
-        let proposedCursor = ['use_current', 'move_to_end', 'go_to_line'].includes(aiPlan.cursor_action)
+        // 'move_relative' is the vision planner's invisible cursor-reposition
+        // (counted arrow keys from the current caret). The text/Haiku
+        // planners never emit it — they use use_current/move_to_end/
+        // go_to_line — so the union of valid actions covers all three
+        // planner sources.
+        let proposedCursor = ['use_current', 'move_to_end', 'go_to_line', 'move_relative'].includes(aiPlan.cursor_action)
           ? aiPlan.cursor_action : 'use_current';
         cursorTargetLine = Number.isInteger(aiPlan.target_line) ? aiPlan.target_line : 0;
         cursorTargetColumn = Number.isInteger(aiPlan.target_column) ? aiPlan.target_column : 0;
+        cursorLinesDelta = Number.isInteger(aiPlan.lines_delta)
+          ? Math.max(-400, Math.min(400, aiPlan.lines_delta)) : 0;
         // ── Cursor-respect override ──
         // The user just dropped their cursor where they want code typed. If
         // the planner says "move to end of file" but the editor has a
@@ -1904,6 +3238,11 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         // place, looks like "started from beginning of new section" to the
         // user. Same for go_to_line(0|1) — that's "jump to top," which
         // overrides the cursor placement the user just made.
+        //
+        // 'move_relative' is NOT overridden here — it's a deliberate,
+        // bounded reposition the VISION planner computed by actually
+        // seeing the caret and the insertion point in the screenshot. If
+        // delta is 0 it's equivalent to use_current anyway.
         const editorHasContentBelowCursor = effectiveSkipTrailing > 0;
         if (proposedCursor === 'move_to_end' && editorHasContentBelowCursor) {
           console.log('[auto-type] cursor: planner asked move_to_end but editor has content below cursor — honoring user cursor instead');
@@ -1911,35 +3250,74 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         } else if (proposedCursor === 'go_to_line' && cursorTargetLine <= 1) {
           console.log(`[auto-type] cursor: planner asked go_to_line(${cursorTargetLine}) — too close to top, honoring user cursor instead`);
           proposedCursor = 'use_current';
+        } else if (proposedCursor === 'move_relative' && cursorLinesDelta === 0) {
+          // Vision planner said "stay on this line" — same as use_current.
+          proposedCursor = 'use_current';
         }
         cursorAction = proposedCursor;
         wipeChars = Number.isInteger(aiPlan.wipe_chars) ? Math.max(0, Math.min(200, aiPlan.wipe_chars)) : 0;
         typePrefix = typeof aiPlan.prefix === 'string' ? aiPlan.prefix.slice(0, 200) : '';
         typeSuffix = typeof aiPlan.suffix === 'string' ? aiPlan.suffix.slice(0, 200) : '';
-        usedHaiku = true;  // Reused name; tracks "AI planner accepted"
+        aiPlanAccepted = true;
         const reasoning = (aiPlan.reasoning || '').replace(/\s+/g, ' ').slice(0, 200);
-        console.log(`[auto-type] ${plannerSource} plan ACCEPTED: cursor=${cursorAction}${cursorAction === 'go_to_line' ? `(L${cursorTargetLine}:C${cursorTargetColumn})` : ''} wipeChars=${wipeChars} skip=${effectiveSkipLines} trail=${effectiveSkipTrailing} wipeLine=${wipeFirstLine} prefix=${JSON.stringify(typePrefix.slice(0, 30))} suffix=${JSON.stringify(typeSuffix.slice(0, 30))} conf=${aiPlan.confidence.toFixed(2)} reason=${reasoning}`);
-        // Surface the agent's reasoning to the renderer so the user (and
-        // future debugging) can see WHY the model chose this plan. This
-        // is a key part of the "Claude-like" UX — the model's thinking
-        // is auditable, not hidden in a JSON blob.
-        // Both Sonnet and Groq paths produce reasoning text — surface
-        // it identically, but tag the source so the renderer can show
-        // a small "served by Groq (Anthropic degraded)" hint when the
-        // fallback fired.
-        if ((plannerSource === 'sonnet-agent' || plannerSource === 'groq-fallback') && reasoning) {
+        const cursorDetail =
+          cursorAction === 'go_to_line' ? `(L${cursorTargetLine}:C${cursorTargetColumn})`
+          : cursorAction === 'move_relative' ? `(${cursorLinesDelta >= 0 ? '+' : ''}${cursorLinesDelta}L:C${cursorTargetColumn})`
+          : '';
+        // Record which cloud planner won, for the user-facing self-report.
+        plannerLabel = plannerSource === 'vision-agent' ? 'vision'
+          : plannerSource === 'haiku-fallback' ? 'haiku'
+          : plannerSource === 'groq-fallback' ? 'text-agent (groq)'
+          : 'text-agent (sonnet)';
+        const cursorHuman = cursorAction === 'move_relative'
+          ? `moved cursor ${cursorLinesDelta >= 0 ? 'down' : 'up'} ${Math.abs(cursorLinesDelta)} line(s) → col ${cursorTargetColumn}`
+          : cursorAction === 'move_to_end' ? 'moved cursor to end of file'
+          : cursorAction === 'go_to_line' ? `jumped to line ${cursorTargetLine}`
+          : 'typed at your cursor';
+        plannerDetail = `skipped ${effectiveSkipLines} line(s) above + ${effectiveSkipTrailing} below; ${cursorHuman}`;
+        console.log(`[auto-type] ${plannerSource} plan ACCEPTED: cursor=${cursorAction}${cursorDetail} wipeChars=${wipeChars} skip=${effectiveSkipLines} trail=${effectiveSkipTrailing} wipeLine=${wipeFirstLine} prefix=${JSON.stringify(typePrefix.slice(0, 30))} suffix=${JSON.stringify(typeSuffix.slice(0, 30))} conf=${aiPlan.confidence.toFixed(2)} reason=${reasoning}`);
+        autoTypePlanLog.record(_atRunId, {
+          plannerSource,
+          confidence: aiPlan.confidence,
+          reasoning: aiPlan.reasoning,
+          singleRegionPlan: {
+            cursorAction,
+            cursorTargetLine,
+            cursorTargetColumn,
+            cursorLinesDelta,
+            wipeChars,
+            skipLines: effectiveSkipLines,
+            skipTrailingLines: effectiveSkipTrailing,
+            wipeFirstLine,
+            prefix: typePrefix,
+            suffix: typeSuffix,
+          },
+        });
+        // Surface the planner's reasoning to the renderer so the user (and
+        // future debugging) can see WHY it chose this plan — the model's
+        // thinking is auditable, not hidden in a JSON blob. Tag the source
+        // so the renderer can show "served by Groq" / "read your screen"
+        // hints. Vision is tagged 'vision' so the UI can say so explicitly.
+        if (reasoning && (plannerSource === 'vision-agent' || plannerSource === 'sonnet-agent' || plannerSource === 'groq-fallback')) {
           autoTypeBroadcast({
             phase: 'plan-ready',
-            source: plannerSource === 'groq-fallback' ? 'groq' : 'agent',
+            source: plannerSource === 'vision-agent' ? 'vision'
+                  : plannerSource === 'groq-fallback' ? 'groq'
+                  : 'agent',
             reasoning,
             confidence: aiPlan.confidence,
           });
         }
+        }  // end single-region branch (else of the multi-op check)
       } else if (aiPlan) {
         console.log(`[auto-type] ${plannerSource} plan rejected (conf=${aiPlan.confidence ?? '?'}, threshold=0.7)`);
+        if (!plannerDetail) {
+          plannerDetail = `${plannerSource} plan rejected — confidence ${aiPlan.confidence ?? '?'} below 0.7 threshold; fell back to basic typing`;
+        }
       }
     } catch (planErr) {
       console.warn('[auto-type] AI plan call failed:', planErr && planErr.message);
+      if (!plannerDetail) plannerDetail = `cloud planner call failed: ${planErr && planErr.message}`;
     }
   }
 
@@ -1950,6 +3328,258 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     autoTypeBroadcast({ phase: 'done', aborted: true });
     autoTypeInFlight = false;
     return { aborted: true };
+  }
+
+  // ── Self-report: tell the renderer (and thus the USER) exactly which
+  // planner drove this run and why. This is the line that ends the
+  // "diagnose → still broken → diagnose" loop — instead of guessing at
+  // runtime state, the app shows it. plannerLabel is one of:
+  //   vision | text-agent (sonnet|groq) | haiku | deterministic-uia |
+  //   deterministic-fallback
+  // plannerDetail is a human-readable "why" (skip counts + cursor move on
+  // success; 404 / local-only / no-token / capture-failed / low-conf on a
+  // miss). apiBase confirms which server was actually called.
+  autoTypeBroadcast({
+    phase: 'planner-decision',
+    planner: plannerLabel,
+    detail: plannerDetail,
+    apiBase: API_BASE,
+    skipLeading: effectiveSkipLines,
+    skipTrailing: effectiveSkipTrailing,
+    cursorAction,
+  });
+
+  // ── MULTI-OP BRANCH (vision planner v2) ──
+  // When the vision planner returned an ordered operation list, execute
+  // that instead of the single-region slice-and-type path below. This is
+  // the structural-edit engine: navigate to each region, make a targeted
+  // replace/insert/delete, bottom-to-top so line numbers stay valid. The
+  // single-region path (everything below) is untouched and still serves
+  // the UIA / text-agent / Haiku plans.
+  if (multiOpPlan) {
+    autoTypeBroadcast({ phase: 'typing' });
+    try {
+      // Pass UIA editor text so the executor can refuse ops that target
+      // structural lines (class/method/import) when vision miscounted
+      // blank lines. `uiaSnapshotBefore.text` is the editor's content at
+      // the start of the run.
+      const uiaText = (uiaSnapshotBefore && typeof uiaSnapshotBefore.text === 'string')
+        ? uiaSnapshotBefore.text
+        : '';
+      const uiaProcName = (uiaSnapshotBefore && typeof uiaSnapshotBefore.processName === 'string')
+        ? uiaSnapshotBefore.processName
+        : '';
+      const result = await executeMultiOpPlan(multiOpPlan, { keyboard, Key, mouse, uiaText, processName: uiaProcName });
+      console.log(`[auto-type] multi-op plan complete: ${result.opCount}/${multiOpPlan.length} operation(s) executed${autoTypeAbort ? ' (aborted mid-run)' : ''}`);
+
+      // ── Guard D: post-execution catastrophic-collapse detection ──
+      // The plan-level guards can't catch an EXECUTION failure — e.g. Monaco
+      // swallowed the content keystrokes and only the indentation landed
+      // (run 82aa473a3f88: a 305-char Java template became 122 chars of pure
+      // whitespace). The per-op verify below MISSES this when UIA is
+      // post-type unreadable, because it treats "can't read" as success
+      // (autoTypeVerifyMultiOp early-returns ok:true on uia_unavailable). So
+      // check the readable-collapse signature explicitly: had real code
+      // before, now essentially whitespace ⇒ don't report success. We do NOT
+      // auto-rebuild here (the capped repair pass can't reconstruct a wiped
+      // function, and firing a vision call would just burn Anthropic spend
+      // for nothing) — we surface an actionable warning and let the user
+      // retry. The real execution fix is Stage 2.
+      let catastrophicCollapse = false;
+      if (!autoTypeAbort) {
+        const beforeNonWs = (uiaText || '').replace(/\s+/g, '').length;
+        if (beforeNonWs > 40) {
+          try {
+            const collapseRead = await readFocusedViaUIA(1200);
+            if (collapseRead && collapseRead.ok && typeof collapseRead.text === 'string'
+                && !isUiaPlaceholderText(collapseRead.text)) {
+              const afterNonWs = collapseRead.text.replace(/\s+/g, '').length;
+              if (afterNonWs < beforeNonWs * 0.25) {
+                catastrophicCollapse = true;
+                console.error(`[auto-type] CATASTROPHIC COLLAPSE detected: editor non-whitespace fell ${beforeNonWs}→${afterNonWs} chars (<25% retained). Execution failed (keystrokes likely swallowed by the editor). NOT reporting success.`);
+                autoTypePlanLog.record(_atRunId, { catastrophicCollapse: true, beforeNonWs, afterNonWs });
+                autoTypeBroadcast({
+                  phase: 'verify-mismatch',
+                  reason: 'catastrophic_collapse',
+                  beforeNonWs,
+                  afterNonWs,
+                  hint: 'Auto-Type may have failed — the editor lost most of its content (it likely intercepted the keystrokes). Check the code and retry; if it repeats, type the remaining lines manually.',
+                });
+              }
+            }
+          } catch (_) { /* collapse read failed — fall through to normal verify */ }
+        }
+      }
+
+      // ── P5c + P5d: Multi-op post-verify with ACTIVE REPAIR iteration ──
+      // 1) Verify each non-delete op's text appears in the editor.
+      // 2) If any op is missing → REPAIR: take a fresh screenshot + UIA
+      //    text, call the vision agent again, get a small fix plan,
+      //    execute it. This is the "human re-reads and fixes" step.
+      // 3) Re-verify after repair. Only broadcast a user-visible mismatch
+      //    toast if a substantial fraction of ops are STILL missing AFTER
+      //    the repair attempt — that's a true catastrophic failure.
+      if (!autoTypeAbort && !catastrophicCollapse) {
+        try {
+          const vRes = await autoTypeVerifyMultiOp(multiOpPlan, { keyboard, Key });
+          const totalOps = multiOpPlan.length;
+          if (vRes.ok) {
+            console.log(`[auto-type] multi-op verify: ALL OPS PRESENT in editor (${totalOps} op(s) checked)`);
+            // P11-4/5: even when verify passes, run a surgical bracket
+            // balance check. Catches the user's "comment delete ate a `}`"
+            // scenario where verify substring-check would pass but the
+            // editor is left syntactically broken. Silent if balanced.
+            try {
+              const brRes = await autoTypeSurgicalBracketRepair(code, language, { keyboard, Key });
+              if (brRes.ok && brRes.repairs > 0) {
+                console.log(`[auto-type] surgical bracket repair applied ${brRes.repairs} fix(es) post-verify`);
+              }
+            } catch (_) {}
+
+            // P5d Part 1: per-op verify passed — but did we cover the WHOLE
+            // target solution? The planner can UNDER-PLAN (never emit an op
+            // for a chunk) or the executor can silently drop one; per-op
+            // verify is blind to both because every op it DID emit is
+            // present. Coverage answers the complementary question: are all
+            // the meaningful lines of CODE_TO_TYPE actually in the editor?
+            // GATE: reliable UIA only (non-browser + multi-line read).
+            // Browser-hosted Monaco/CodeMirror expose only the scrolled-
+            // visible region via UIA, so most of the target would look
+            // "missing" and we'd false-trigger every run. A gap fires the
+            // SAME completeness-aware repair as the missing-op path — so
+            // this is detection, not a new always-on cost (the success case
+            // has full coverage → no repair → no extra spend). We log the
+            // outcome but still broadcast verify-ok: a coverage false alarm
+            // must never surface as a scary toast mid-interview.
+            try {
+              const covBrowserHosted = /(^|\b)(chrome|msedge|edge|firefox|brave|opera|vivaldi|arc)(\b|$)/i.test(String(uiaProcName || ''));
+              const covText = typeof vRes.afterText === 'string' ? vRes.afterText : '';
+              const covReliable = !covBrowserHosted && covText.split('\n').length > 1;
+              if (covReliable) {
+                const gaps = computeCoverageGaps(code, covText);
+                if (shouldTriggerRepair(gaps)) {
+                  const eg = gaps.missingLines[0] ? gaps.missingLines[0].stripped.slice(0, 50) : '';
+                  console.log(`[auto-type] COVERAGE GAP: ${gaps.missingLines.length}/${gaps.meaningfulTotal} target line(s) absent despite all ops verifying (ratio=${gaps.coverageRatio.toFixed(2)}) — e.g. "${eg}". Firing completeness repair…`);
+                  autoTypePlanLog.record(_atRunId, { coverageGap: { missing: gaps.missingLines.length, meaningfulTotal: gaps.meaningfulTotal, ratio: gaps.coverageRatio } });
+                  const covRepair = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText });
+                  console.log(`[auto-type] COVERAGE repair: ${covRepair.ok ? `${covRepair.repairs || 0} op(s)` : 'failed'} (${covRepair.reason || 'ok'})`);
+                }
+              }
+            } catch (covErr) {
+              console.warn('[auto-type] coverage check threw (non-fatal):', covErr && covErr.message);
+            }
+            autoTypeBroadcast({ phase: 'verify-ok', reason: 'multi_op_all_present' });
+          } else if (vRes.missingOps && vRes.missingOps.length > 0) {
+            const summary = vRes.missingOps
+              .map(m => `${m.op} L${m.start_line}: "${m.textPreview}…"`)
+              .join('; ');
+            console.log(`[auto-type] multi-op verify: ${vRes.missingOps.length}/${totalOps} op(s) missing after initial typing — ${summary}. Attempting REPAIR iteration…`);
+
+            const repairRes = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText });
+
+            if (repairRes.ok && repairRes.repairs > 0) {
+              console.log(`[auto-type] REPAIR applied ${repairRes.repairs}/${repairRes.totalAttempted} fix op(s); re-verifying…`);
+              const vRes2 = await autoTypeVerifyMultiOp(multiOpPlan, { keyboard, Key });
+              if (vRes2.ok) {
+                console.log(`[auto-type] multi-op verify (post-repair): ALL OPS PRESENT — silent verify-ok`);
+                autoTypeBroadcast({ phase: 'verify-ok', reason: 'repaired', repairs: repairRes.repairs });
+              } else {
+                const stillMissing = vRes2.missingOps.length;
+                const stillRatio = stillMissing / totalOps;
+                if (stillRatio >= 0.7) {
+                  console.warn(`[auto-type] multi-op verify (post-repair): STILL ${stillMissing}/${totalOps} missing — broadcast mismatch`);
+                  autoTypeBroadcast({
+                    phase: 'verify-mismatch',
+                    reason: 'multi_op_missing_after_repair',
+                    missingCount: stillMissing,
+                    totalOps,
+                    missingOps: vRes2.missingOps,
+                  });
+                } else {
+                  console.log(`[auto-type] multi-op verify (post-repair): ${stillMissing}/${totalOps} still missing but below 70% threshold — broadcast verify-ok with note`);
+                  autoTypeBroadcast({
+                    phase: 'verify-ok',
+                    reason: 'partially_repaired',
+                    repairs: repairRes.repairs,
+                    minorMissingCount: stillMissing,
+                  });
+                }
+              }
+            } else if (repairRes.ok && repairRes.repairs === 0) {
+              // Vision said "nothing more to fix" — editor IS correct,
+              // our per-op substring verify was just too strict (likely
+              // IDE auto-formatting / whitespace differences vision can
+              // see are fine but our string-strip didn't catch).
+              console.log(`[auto-type] REPAIR vision pass says editor is already correct (${repairRes.reason}) — broadcast verify-ok`);
+              autoTypeBroadcast({ phase: 'verify-ok', reason: 'vision_confirms_correct' });
+            } else {
+              // Repair couldn't run (no screenshot, no UIA, too many ops, etc).
+              // Fall back to the loosened-threshold rule: only broadcast
+              // mismatch when MOST ops are missing.
+              const missingRatio = vRes.missingOps.length / totalOps;
+              if (missingRatio >= 0.7) {
+                console.warn(`[auto-type] multi-op verify: ${vRes.missingOps.length}/${totalOps} missing AND repair failed (${repairRes.reason}) — broadcast mismatch`);
+                autoTypeBroadcast({
+                  phase: 'verify-mismatch',
+                  reason: 'multi_op_missing',
+                  missingCount: vRes.missingOps.length,
+                  totalOps,
+                  missingOps: vRes.missingOps,
+                  repairAttempt: repairRes.reason,
+                });
+              } else {
+                console.log(`[auto-type] multi-op verify: ${vRes.missingOps.length}/${totalOps} missing (below 70%), repair unavailable (${repairRes.reason}) — broadcast verify-ok with minor drift note`);
+                autoTypeBroadcast({
+                  phase: 'verify-ok',
+                  reason: 'multi_op_minor_drift',
+                  minorMissingCount: vRes.missingOps.length,
+                  repairAttempt: repairRes.reason,
+                });
+              }
+            }
+          } else {
+            console.log(`[auto-type] multi-op verify: skipped (${vRes.reason || 'unknown'})`);
+          }
+        } catch (vErr) {
+          console.warn('[auto-type] multi-op verify+repair threw (non-fatal):', vErr && vErr.message);
+        }
+      }
+    } catch (err) {
+      console.error('[auto-type] multi-op execution error:', err && err.message);
+      if (!autoTypeAbortReason) {
+        autoTypeAbortReason = 'multi_op_threw';
+        autoTypeAbortDiagnostic = {
+          hint: `Auto-Type stopped during a multi-step edit: ${err && err.message ? err.message : 'unknown'}. The editor may be partially edited — eyeball it before retrying.`,
+        };
+        autoTypeAbort = true;
+      }
+    } finally {
+      restore.forEach(fn => { try { fn(); } catch (_) {} });
+      // Capture the AFTER state for the run log before broadcasting done.
+      // Best-effort: a fresh UIA read shows the editor as it sits post-typing.
+      // Skip if abort fired before any typing happened — afterText would just
+      // duplicate beforeText.
+      try {
+        const _atAfter = await readFocusedViaUIA(1500);
+        if (_atAfter && _atAfter.ok && typeof _atAfter.text === 'string') {
+          autoTypePlanLog.record(_atRunId, { afterText: _atAfter.text, afterCursorOffset: _atAfter.cursorOffset });
+        }
+      } catch (_) { /* UIA unavailable post-run, leave afterText undefined */ }
+      autoTypePlanLog.record(_atRunId, {
+        path: 'multi-op',
+        aborted: autoTypeAbort,
+        abortReason: autoTypeAbortReason || null,
+      });
+      try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+      autoTypeBroadcast({
+        phase: 'done',
+        aborted: autoTypeAbort,
+        reason: autoTypeAbortReason || undefined,
+        hint: autoTypeAbortDiagnostic && autoTypeAbortDiagnostic.hint ? autoTypeAbortDiagnostic.hint : undefined,
+      });
+      autoTypeInFlight = false;
+    }
+    return { ok: !autoTypeAbort, aborted: autoTypeAbort, reason: autoTypeAbortReason || undefined };
   }
 
   autoTypeBroadcast({ phase: 'typing' });
@@ -1982,28 +3612,83 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       return { ok: true };
     }
 
-    // ── Cursor positioning (from Haiku plan) ──
-    // 'use_current': cursor is already at the right spot — no-op.
-    // 'move_to_end': cursor was in the wrong place; jump to end of file.
-    //   Ctrl+End is universal across Monaco/CodeMirror/Notepad/VSCode/etc.
-    // 'go_to_line': v1 falls back to move_to_end. True go-to-line via Ctrl+G
-    //   is editor-specific (works in Monaco/VSCode but not e.g. plain text
-    //   inputs); shipping that reliably is a v2 enhancement.
-    if (cursorAction === 'move_to_end' || cursorAction === 'go_to_line') {
+    // ── Cursor positioning ──
+    // 'use_current'   : cursor is already at the right spot — no-op.
+    // 'move_relative' : VISION planner reposition — move the caret a
+    //   signed number of lines from where the user dropped it, then snap
+    //   to the target column. Pure counted arrow keys: invisible on a
+    //   screen-share (no go-to-line widget, no scroll-to-top flash —
+    //   indistinguishable from a human arrowing around), and the only
+    //   cursor move that works identically across Monaco / CodeMirror /
+    //   native inputs. THIS is what makes "drop the cursor anywhere and
+    //   it goes to the right line itself" actually happen.
+    // 'move_to_end'   : jump to end of file. Ctrl+End is universal.
+    // 'go_to_line'    : legacy text-planner action — falls back to
+    //   Ctrl+End (true Ctrl+G is editor-specific and the vision planner
+    //   supersedes it with move_relative anyway).
+    if (cursorAction === 'move_relative') {
+      try {
+        const delta = cursorLinesDelta;
+        const vKey = delta < 0 ? Key.Up : Key.Down;
+        const steps = Math.abs(delta);
+        // P1a: dwell on each arrow. Previously 0ms — a counted run with no
+        // dwell is the loudest possible nav-key fingerprint.
+        for (let i = 0; i < steps; i++) {
+          if (autoTypeAbort) break;
+          await autoTypePressWithDwell(keyboard, vKey);
+          await autoTypeNavSleep(12, 30);
+        }
+        await autoTypePressWithDwell(keyboard, Key.Home);
+        await autoTypeNavSleep(10, 24);
+        const col = Math.max(0, Math.min(400, cursorTargetColumn));
+        for (let i = 0; i < col; i++) {
+          if (autoTypeAbort) break;
+          await autoTypePressWithDwell(keyboard, Key.Right);
+          await autoTypeNavSleep(6, 16);
+        }
+        await autoTypeNavSleep(45, 88);
+        console.log(`[auto-type] cursor: move_relative ${delta >= 0 ? '+' : ''}${delta} lines, then col ${col}`);
+      } catch (kErr) {
+        console.warn('[auto-type] cursor move_relative failed:', kErr && kErr.message);
+      }
+    } else if (cursorAction === 'go_to_line') {
+      // Counted arrows from the top — invisible on screen-share, no Ctrl+G
+      // widget, works across Monaco / CodeMirror / native inputs.
+      // P1a: dwell on every key in the sequence (Home, Down loop, Home, Right loop).
+      try {
+        const target = Math.max(1, Math.min(100000, cursorTargetLine));
+        await keyboard.pressKey(Key.LeftControl);
+        await autoTypeNavSleep(5, 14);
+        await autoTypePressWithDwell(keyboard, Key.Home);
+        await autoTypeNavSleep(5, 14);
+        await keyboard.releaseKey(Key.LeftControl);
+        await autoTypeNavSleep(30, 60);
+        for (let i = 0; i < target - 1; i++) {
+          if (autoTypeAbort) break;
+          await autoTypePressWithDwell(keyboard, Key.Down);
+          await autoTypeHumanNavSleep();
+        }
+        await autoTypePressWithDwell(keyboard, Key.Home);
+        await autoTypeNavSleep(10, 24);
+        const col = Math.max(0, Math.min(400, cursorTargetColumn));
+        for (let i = 0; i < col; i++) {
+          if (autoTypeAbort) break;
+          await autoTypePressWithDwell(keyboard, Key.Right);
+          await autoTypeNavSleep(6, 16);
+        }
+        console.log(`[auto-type] cursor: go_to_line ${target}:${col}`);
+      } catch (kErr) {
+        console.warn('[auto-type] cursor go_to_line failed:', kErr && kErr.message);
+      }
+    } else if (cursorAction === 'move_to_end') {
       try {
         await keyboard.pressKey(Key.LeftControl);
         await autoTypeNavSleep(5, 14);
-        await keyboard.pressKey(Key.End);
-        await autoTypeNavSleep(5, 14);
-        await keyboard.releaseKey(Key.End);
+        await autoTypePressWithDwell(keyboard, Key.End);
         await autoTypeNavSleep(5, 14);
         await keyboard.releaseKey(Key.LeftControl);
         await autoTypeNavSleep(45, 88);
-        if (cursorAction === 'go_to_line') {
-          console.log(`[auto-type] cursor: go_to_line not yet implemented — used Ctrl+End instead`);
-        } else {
-          console.log(`[auto-type] cursor: moved to end-of-file via Ctrl+End`);
-        }
+        console.log(`[auto-type] cursor: moved to end-of-file via Ctrl+End`);
       } catch (kErr) {
         console.warn('[auto-type] cursor move failed:', kErr && kErr.message);
       }
@@ -2016,8 +3701,8 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       try {
         for (let i = 0; i < wipeChars; i++) {
           if (autoTypeAbort) break;
-          await keyboard.pressKey(Key.Backspace);
-          await keyboard.releaseKey(Key.Backspace);
+          // P1a: dwell on each Backspace.
+          await autoTypePressWithDwell(keyboard, Key.Backspace);
           await autoTypeNavSleep(5, 18);
         }
         console.log(`[auto-type] wiped ${wipeChars} chars before typing`);
@@ -2032,10 +3717,9 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         for (const ch of typePrefix) {
           if (autoTypeAbort) break;
           if (ch === '\n') {
-            await keyboard.pressKey(Key.Enter);
-            await keyboard.releaseKey(Key.Enter);
+            await autoTypePressWithDwell(keyboard, Key.Enter);
           } else {
-            await keyboard.type(ch);
+            await typeCharHumanly(keyboard, Key, ch);
           }
           await autoTypeNavSleep(10, 26);
         }
@@ -2049,21 +3733,18 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     // → Shift+End → Delete neutralizes the line before the first char lands.
     // Sequential key events (not a combo) because nut-js's combo form trips
     // libnut's "Invalid key flag" on some Windows builds.
+    // P1a: dwell on Home, End, Delete.
     if (wipeFirstLine) {
       try {
-        await keyboard.pressKey(Key.Home);
-        await keyboard.releaseKey(Key.Home);
+        await autoTypePressWithDwell(keyboard, Key.Home);
         await autoTypeNavSleep(14, 32);
         await keyboard.pressKey(Key.LeftShift);
         await autoTypeNavSleep(5, 14);
-        await keyboard.pressKey(Key.End);
-        await autoTypeNavSleep(5, 14);
-        await keyboard.releaseKey(Key.End);
+        await autoTypePressWithDwell(keyboard, Key.End);
         await autoTypeNavSleep(5, 14);
         await keyboard.releaseKey(Key.LeftShift);
         await autoTypeNavSleep(14, 32);
-        await keyboard.pressKey(Key.Delete);
-        await keyboard.releaseKey(Key.Delete);
+        await autoTypePressWithDwell(keyboard, Key.Delete);
         await autoTypeNavSleep(22, 45);
       } catch (kErr) {
         // If the wipe fails, continue — worst case is visible double-indent
@@ -2156,6 +3837,14 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
             ci = wj;
             continue;
           }
+          // P5b: Autocomplete acceptance. ~22% of identifiers ≥6 chars get
+          // partial-typed + Tab + UIA-verified. Saves keystrokes naturally.
+          const didAutocomplete = await autoTypeMaybeAutocomplete(keyboard, Key, word, prevCh);
+          if (didAutocomplete) {
+            prevCh = word[word.length - 1];
+            ci = wj;
+            continue;
+          }
         }
 
         try {
@@ -2207,33 +3896,28 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         const editorWillAutoIndent = indentEnd > 0 || /[:{(\[]\s*$/.test(line);
 
         try {
-          await keyboard.pressKey(Key.Enter);
-          await keyboard.releaseKey(Key.Enter);
+          // P1a: every keystroke in the inter-line wipe gets real dwell.
+          await autoTypePressWithDwell(keyboard, Key.Enter);
           await autoTypeNavSleep(38, 70);
 
           if (editorWillAutoIndent) {
             // Wipe the auto-inserted indent so the AI's own leading whitespace
             // (typed on next iter) stands alone instead of compounding.
-            await keyboard.pressKey(Key.Home);
-            await keyboard.releaseKey(Key.Home);
+            await autoTypePressWithDwell(keyboard, Key.Home);
             await autoTypeNavSleep(14, 32);
 
-            // Shift+End as sequential hold rather than pressKey(a, b) combo.
-            // The combo form triggers libnut's "Invalid key flag specified"
-            // on some Windows builds (the native SendInput layer rejects the
-            // combined key-event flags). Sequential press/press/release/release
-            // uses one SendInput per key and works reliably.
+            // Shift+End as sequential hold (combo form trips libnut on some
+            // Windows builds). Shift held, End pressed WITH DWELL, then Shift
+            // released. The dwell-on-End is what closes the biometric signal —
+            // previously End was held for only 5-14ms (zero-ish).
             await keyboard.pressKey(Key.LeftShift);
             await autoTypeNavSleep(5, 14);
-            await keyboard.pressKey(Key.End);
-            await autoTypeNavSleep(5, 14);
-            await keyboard.releaseKey(Key.End);
+            await autoTypePressWithDwell(keyboard, Key.End);
             await autoTypeNavSleep(5, 14);
             await keyboard.releaseKey(Key.LeftShift);
             await autoTypeNavSleep(14, 32);
 
-            await keyboard.pressKey(Key.Delete);
-            await keyboard.releaseKey(Key.Delete);
+            await autoTypePressWithDwell(keyboard, Key.Delete);
             await autoTypeNavSleep(14, 32);
           }
         } catch (kErr) {
@@ -2325,15 +4009,15 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     }
 
     // ── suffix: tiny tail (usually closing brackets) typed after main content ──
+    // P1a: dwell on Enter and each char.
     if (!autoTypeAbort && typeSuffix) {
       try {
         for (const ch of typeSuffix) {
           if (autoTypeAbort) break;
           if (ch === '\n') {
-            await keyboard.pressKey(Key.Enter);
-            await keyboard.releaseKey(Key.Enter);
+            await autoTypePressWithDwell(keyboard, Key.Enter);
           } else {
-            await keyboard.type(ch);
+            await typeCharHumanly(keyboard, Key, ch);
           }
           await autoTypeNavSleep(10, 26);
         }
@@ -2342,34 +4026,49 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       }
     }
 
-    // ── Post-type verify ──
-    // Run when ANY UIA-aware path (deterministic OR Haiku) produced the pre-type
-    // snapshot AND the type completed without abort. Best-effort: on any error
-    // or inconclusive result we don't alert, because false positives during an
-    // interview are worse than missed detections.
-    if (!autoTypeAbort && (usedUIA || usedHaiku) && uiaSnapshotBefore) {
+    // ── P5c: Post-type verify + active correction ──
+    // First, try the ACTIVE corrector (autoTypeVerifyAndCorrect). If the
+    // editor has most of our typed content + just a trailing tail missing
+    // + cursor still in the right place, it appends the missing tail.
+    // (Real coders re-read their code and fix small mistakes; this layer
+    // gives the auto-typer the same self-correcting behavior.)
+    // If active correction can't safely fix it, fall back to the legacy
+    // verify path (verifyTypedContent + broadcast mismatch) so the user
+    // gets a clear diagnostic instead of a silent wrong result.
+    if (!autoTypeAbort && (usedUIA || aiPlanAccepted) && uiaSnapshotBefore) {
       try {
-        // Short settle: some editors debounce their accessibility tree updates.
-        await autoTypeSleep(180);
-        const uiaAfter = await readFocusedViaUIA(1200);
-        if (uiaAfter && uiaAfter.ok) {
-          const verdict = verifyTypedContent(typedContent, uiaAfter.text || '');
-          if (!verdict.ok) {
-            console.warn(`[auto-type] verify: mismatch (ratio=${(verdict.ratio || 0).toFixed(2)}, reason=${verdict.reason})`);
-            autoTypeBroadcast({
-              phase: 'verify-mismatch',
-              ratio: verdict.ratio,
-              reason: verdict.reason,
-            });
+        const correctRes = await autoTypeVerifyAndCorrect(typedContent, { keyboard, Key });
+        if (correctRes.ok) {
+          if (correctRes.corrected > 0) {
+            console.log(`[auto-type] verify+correct: appended ${correctRes.corrected} chars (${correctRes.reason})`);
+            autoTypeBroadcast({ phase: 'verify-ok', reason: 'corrected', corrected: correctRes.corrected });
           } else {
-            console.log(`[auto-type] verify: ok (${verdict.reason})`);
-            autoTypeBroadcast({ phase: 'verify-ok', reason: verdict.reason });
+            console.log(`[auto-type] verify: ok (${correctRes.reason})`);
+            autoTypeBroadcast({ phase: 'verify-ok', reason: correctRes.reason });
           }
-        } else if (uiaAfter) {
-          console.log(`[auto-type] verify: skipped (uia after unavailable: ${uiaAfter.error})`);
+        } else {
+          // Active correction couldn't safely fix. Fall back to legacy
+          // verify so we at least surface a clear mismatch to the user.
+          const uiaAfter = await readFocusedViaUIA(1200);
+          if (uiaAfter && uiaAfter.ok) {
+            const verdict = verifyTypedContent(typedContent, uiaAfter.text || '');
+            console.warn(`[auto-type] verify: ${verdict.ok ? 'ok' : 'mismatch'} (correct-attempt=${correctRes.reason}, legacy-ratio=${(verdict.ratio || 0).toFixed(2)}, legacy-reason=${verdict.reason})`);
+            if (verdict.ok) {
+              autoTypeBroadcast({ phase: 'verify-ok', reason: verdict.reason });
+            } else {
+              autoTypeBroadcast({
+                phase: 'verify-mismatch',
+                ratio: verdict.ratio,
+                reason: verdict.reason,
+                correctReason: correctRes.reason,
+              });
+            }
+          } else {
+            console.log(`[auto-type] verify: inconclusive (correct-attempt=${correctRes.reason}, legacy-uia=unavailable)`);
+          }
         }
       } catch (vErr) {
-        console.warn('[auto-type] verify error (non-fatal):', vErr && vErr.message);
+        console.warn('[auto-type] verify+correct error (non-fatal):', vErr && vErr.message);
       }
     }
   } catch (err) {
@@ -2383,6 +4082,20 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     }
   } finally {
     restore.forEach(fn => { try { fn(); } catch (_) {} });
+    // Capture the AFTER state for the single-region path's run log.
+    try {
+      const _atAfter = await readFocusedViaUIA(1500);
+      if (_atAfter && _atAfter.ok && typeof _atAfter.text === 'string') {
+        autoTypePlanLog.record(_atRunId, { afterText: _atAfter.text, afterCursorOffset: _atAfter.cursorOffset });
+      }
+    } catch (_) { /* UIA unavailable post-run */ }
+    autoTypePlanLog.record(_atRunId, {
+      path: 'single-region',
+      aborted: autoTypeAbort,
+      abortReason: autoTypeAbortReason || null,
+      abortDiagnostic: autoTypeAbortDiagnostic || null,
+    });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
     // Pull abort reason + diagnostic into the 'done' broadcast so the renderer
     // never has to guess WHY a run ended. Without these fields the renderer
     // used to silently reset to idle on aborted=true, leaving the user with
@@ -2661,9 +4374,18 @@ function readFocusedViaUIA(timeoutMs = 2500) {
       if (pollId) { clearInterval(pollId); pollId = null; }
       clearTimeout(hardTimer);
       if (queueEntry) {
+        // Mark done but DO NOT splice the entry out of _uiaQueue. The
+        // PowerShell bridge always emits exactly one response per READ
+        // command, so a timed-out READ's response is still on its way.
+        // The stdout handler matches responses to queue entries via a
+        // FIFO shift() — if we splice the timed-out entry, that late
+        // response gets handed to the NEXT queued entry and resolves it
+        // with stale editor text (a real bug: SID checks can get fed
+        // pre-typing snapshots and either false-abort or false-accept).
+        // Leaving the entry in (marked done) lets the existing
+        // `if (q && !q.done)` guard discard the late response cleanly,
+        // and the next real response aligns with the next pending entry.
         queueEntry.done = true;
-        const idx = _uiaQueue.indexOf(queueEntry);
-        if (idx !== -1) _uiaQueue.splice(idx, 1);
       }
       resolve(result);
     };
@@ -2712,6 +4434,33 @@ function killUIABridge() {
   _uiaReady = false;
 }
 
+// ── UIA accessibility-placeholder detection (Stage 1 safety guard) ──
+// Some editors refuse to expose real content to UI Automation unless an
+// accessibility / screen-reader mode is switched on. The canonical case
+// is VS Code, whose focused element returns the literal stub:
+//   "The editor is not accessible at this time. To enable screen reader
+//    optimized mode, use Shift+Alt+F1"
+// Trusting that string as the editor's text causes THREE failures (all
+// observed in run 9c6ddc12334a):
+//   1. It's handed to the vision planner as "ground-truth editorText",
+//      polluting its line-number reconciliation with nonsense.
+//   2. executeMultiOpPlan's structural-safety filter checks IT instead of
+//      the real code, so the filter is effectively blind.
+//   3. It is ONE logical line, so the flat-UIA Ctrl+A whole-document path
+//      false-triggers — a surgical plan becomes a whole-doc nuke.
+// When detected we treat the read as UIA-blindness (empty text) so the
+// screenshot vision planner takes over — which is the correct tool for
+// these editors anyway. Matching is deliberately narrow: we only catch
+// the known stubs, never real code that happens to mention these words.
+function isUiaPlaceholderText(text) {
+  if (typeof text !== 'string') return false;
+  const t = text.trim();
+  if (!t) return false;
+  if (/editor is not accessible at this time/i.test(t)) return true;
+  if (/screen reader optimized mode/i.test(t) && /shift\s*\+\s*alt\s*\+\s*f1/i.test(t)) return true;
+  return false;
+}
+
 // Deterministic planner: given the editor's text + cursor + the code we're
 // about to type, decide how many leading AND trailing lines of code to skip
 // (because they're already present in the editor around the cursor). Also
@@ -2727,16 +4476,775 @@ function killUIABridge() {
 //   • Cursor at line start → walk code's leading lines against editor lines
 //     before cursor AND walk code's trailing lines against editor lines
 //     below cursor. Blanks in either side are allowed as padding.
+// ── Vision capture ──
+// One-shot, fully-passive screenshot of the screen the user's cursor is
+// on, captured IN the main process via desktopCapturer (no renderer
+// round-trip, no getUserMedia, no visible artifact — nothing happens on
+// screen, it's just a frame grab). Used post-countdown when UIA came
+// back blind: the screenshot sees exactly what the human (and the
+// interviewer) sees, which is the only way to read a virtual-scrolled
+// browser editor's content from outside the browser.
+//
+// setContentProtection on OUR windows does NOT block this — it only
+// stops OTHERS from capturing us; our own desktopCapturer is unaffected.
+// And by the time this runs (post-countdown) our window is hidden anyway.
+async function captureScreenForVision() {
+  try {
+    const cursorPt = screen.getCursorScreenPoint();
+    const targetDisplay = screen.getDisplayNearestPoint(cursorPt);
+    const scaleFactor = targetDisplay.scaleFactor || 1;
+    // Capture at real pixel resolution so code text is crisp for the
+    // vision model. Cap the long edge at 2560 so a 4K monitor doesn't
+    // produce a needlessly huge payload (and slow upload).
+    const rawW = Math.round(targetDisplay.size.width * scaleFactor);
+    const rawH = Math.round(targetDisplay.size.height * scaleFactor);
+    const longEdge = Math.max(rawW, rawH);
+    const CAP = 2560;
+    const shrink = longEdge > CAP ? CAP / longEdge : 1;
+    const thumbW = Math.max(1, Math.round(rawW * shrink));
+    const thumbH = Math.max(1, Math.round(rawH * shrink));
+
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: thumbW, height: thumbH },
+    });
+    if (!sources || sources.length === 0) return null;
+
+    // Multi-monitor: pick the source whose display_id matches the display
+    // the cursor is on. Fall back to the first screen if no match (some
+    // Windows builds report an empty display_id).
+    let src = sources.find(s => String(s.display_id) === String(targetDisplay.id));
+    if (!src) src = sources[0];
+    const img = src.thumbnail;
+    if (!img || img.isEmpty()) return null;
+
+    const png = img.toPNG();
+    if (!png || png.length < 100) return null;
+    return { base64: png.toString('base64'), mediaType: 'image/png' };
+  } catch (e) {
+    console.warn('[auto-type] vision capture failed:', e && e.message);
+    return null;
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  MULTI-OPERATION TYPING ENGINE (vision planner v2)
+//
+//  The vision planner now emits an ordered list of edit operations
+//  (replace / insert / delete), each anchored to a DOCUMENT LINE NUMBER.
+//  These three functions execute that plan. They're SEPARATE from the
+//  single-region typing loop in auto-type:send — that loop is left 100%
+//  untouched so the proven UIA / text-agent paths can't regress. The
+//  shared low-level humanized helpers (autoTypeCharWithTypo, decision
+//  pauses, word backtrack, indent-wipe, mouse twitch) ARE reused, so the
+//  stealth behavior is identical.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Humanized multi-line typer — char-by-char with the same realism layer
+// the single-region path uses. No SID here: SID is an append-model
+// integrity check; multi-op edits are discrete bounded regions.
+async function typeLinesHumanized(lines, ctx) {
+  const { keyboard, Key, mouse } = ctx;
+  let prevCh = null;
+  let prevLineTextForBlockCheck = null;
+  // ── P3c: stop fighting the IDE's auto-indent ──
+  // Set by the inter-line logic when we predict the IDE will pre-supply
+  // indentation that matches (or under-shoots) what we need for the next
+  // line. In those cases, we DON'T wipe + we skip typing the leading
+  // whitespace — letting the IDE do its job, the way a real coder would.
+  // Real humans type code into Monaco/CodeMirror EXPECTING auto-indent;
+  // wiping it and re-typing literal 4-space runs is the most uncanny tell
+  // in the current humanization stack.
+  let skipLeadingChars = 0;
+  for (let li = 0; li < lines.length; li++) {
+    if (autoTypeAbort) break;
+    const line = lines[li];
+
+    let indentEnd = 0;
+    // P8-3a: count both spaces AND tabs. The old loop only counted ' ',
+    // so a tab-indented line registered indentEnd=0 → predictedIndent
+    // miscounted → next-line skipLeadingChars over-skipped and ate the
+    // first letter of identifiers (bug: `def` → `ef`).
+    while (indentEnd < line.length && (line[indentEnd] === ' ' || line[indentEnd] === '\t')) indentEnd++;
+    const prevEndsBlock = !!prevLineTextForBlockCheck && /[:{]\s*$/.test(prevLineTextForBlockCheck);
+    // Indent-mistake operates on the REMAINING indent we'll actually type
+    // after the IDE pre-supplied its share. When skipLeadingChars covers
+    // the whole indent (IDE got it exactly right), there's no indent for
+    // us to mis-type — helper sees 0 and short-circuits.
+    const remainingIndentToType = Math.max(0, indentEnd - skipLeadingChars);
+    if (remainingIndentToType > 0 && prevEndsBlock) {
+      await autoTypeMaybeIndentMistake(keyboard, Key, remainingIndentToType, true);
+    }
+
+    // P8-3b: HARD GUARD against eating non-whitespace chars at line start.
+    // The predictor (P3c, line ~4152) sets skipLeadingChars based on what
+    // it ASSUMES the IDE will auto-indent. If the editor doesn't auto-indent
+    // (or our predictor over-counts), this skip would silently consume the
+    // first letters of the line — visible symptom: `def` → `ef`,
+    // `Scanner` → `canner`, etc. Refuse to skip any non-whitespace char.
+    if (skipLeadingChars > 0) {
+      for (let k = 0; k < skipLeadingChars; k++) {
+        if (k >= line.length || (line[k] !== ' ' && line[k] !== '\t')) {
+          console.warn(`[auto-type] indent-skip guard: refusing to skip ${skipLeadingChars} chars on line "${line.slice(0, 24).replace(/\n/g, '\\n')}" — would eat non-whitespace at col ${k}. Typing full line from col 0.`);
+          skipLeadingChars = 0;
+          break;
+        }
+      }
+    }
+    let ci = skipLeadingChars;
+    skipLeadingChars = 0;  // reset; inter-line logic below may set it for next iter
+    while (ci < line.length) {
+      if (autoTypeAbort) break;
+      const ch = line[ci];
+      const prePause = autoTypeDecisionPause(ch, prevCh);
+      if (prePause > 0) await autoTypeSleep(prePause);
+      if (/[a-zA-Z_]/.test(ch) && (!prevCh || !/[a-zA-Z0-9_]/.test(prevCh))) {
+        let wj = ci + 1;
+        while (wj < line.length && /[a-zA-Z0-9_]/.test(line[wj])) wj++;
+        const word = line.slice(ci, wj);
+        const didBacktrack = await autoTypeMaybeBacktrackWord(keyboard, Key, word);
+        if (didBacktrack) { prevCh = word[word.length - 1]; ci = wj; continue; }
+        // P5b: Autocomplete acceptance via Tab (multi-op path).
+        const didAutocomplete = await autoTypeMaybeAutocomplete(keyboard, Key, word, prevCh);
+        if (didAutocomplete) { prevCh = word[word.length - 1]; ci = wj; continue; }
+      }
+      try {
+        await autoTypeCharWithTypo(keyboard, Key, ch, prevCh);
+      } catch (chErr) {
+        console.warn('[auto-type] char skipped:', JSON.stringify(ch), chErr && chErr.message);
+      }
+      await autoTypeSleep(autoTypeHumanDelay(ch, prevCh));
+      prevCh = ch;
+      ci++;
+    }
+
+    if (li < lines.length - 1 && !autoTypeAbort) {
+      const nextLine = lines[li + 1] || '';
+      let nextIndent = 0;
+      // P8-3a: count tabs too (see indentEnd above for rationale).
+      while (nextIndent < nextLine.length && (nextLine[nextIndent] === ' ' || nextLine[nextIndent] === '\t')) nextIndent++;
+      const atBlockBoundary = nextLine.trim() === '' ||
+        (indentEnd > 0 && nextLine.trim() !== '' && nextIndent < indentEnd);
+      const dwell = atBlockBoundary ? 320 + Math.random() * 820 : 250 + Math.random() * 450;
+      await autoTypeSleep(dwell);
+      if (mouse) await autoTypeMaybeMouseTwitch(mouse);
+
+      // ── P4: tool-switch pause ──
+      // Real coders consult docs / lookup syntax ~35 times/hour (Jellyfish
+      // study). ~1% per line at ~30 lines/run = 1-2 pauses per typical
+      // solution. Pareto-tailed duration: median ~3s, occasional 15s+.
+      // Capped at 30s to bound worst-case.
+      if (Math.random() < 0.012) {
+        const pause = Math.min(2000 + autoTypePareto(2.0, 1500), 30000);
+        await autoTypeSleep(Math.round(pause));
+      }
+
+      // ── Indent reset — always wipe, then type the full indentation ──
+      // This used to be "P3c": it PREDICTED whether the editor would
+      // auto-indent after `:` / `{` and, on a predicted match, SKIPPED
+      // typing the line's leading whitespace (a stealth tweak to avoid
+      // re-typing literal space runs). That assumed code-IDE auto-indent
+      // behavior. On editors that don't auto-indent that way (plain-text,
+      // rich-text, no-gutter targets) the prediction was wrong and every
+      // line landed at column 0 → broken, non-running code. Non-running
+      // code is a far worse tell than a brief indent flicker, so we no
+      // longer predict. After every Enter we wipe whatever the editor
+      // inserted and type the next line's own indentation from a true
+      // column 0 — deterministic on every editor.
+      try {
+        await autoTypePressWithDwell(keyboard, Key.Enter);
+        await autoTypeNavSleep(38, 70);
+        // Select the freshly-created (possibly auto-indented) line and
+        // delete it, leaving the caret at a real column 0.
+        await autoTypePressWithDwell(keyboard, Key.Home);
+        await autoTypeNavSleep(14, 32);
+        await keyboard.pressKey(Key.LeftShift);
+        await autoTypeNavSleep(5, 14);
+        await autoTypePressWithDwell(keyboard, Key.End);
+        await autoTypeNavSleep(5, 14);
+        await keyboard.releaseKey(Key.LeftShift);
+        await autoTypeNavSleep(14, 32);
+        await autoTypePressWithDwell(keyboard, Key.Delete);
+        await autoTypeNavSleep(14, 32);
+      } catch (kErr) {
+        console.warn('[auto-type] indent-reset failed:', kErr && kErr.message);
+      }
+      // Type the next line's full indentation ourselves (no predict-skip).
+      skipLeadingChars = 0;
+      prevCh = null;
+    }
+    prevLineTextForBlockCheck = line;
+  }
+}
+
+// Move the caret to the start of a 1-indexed DOCUMENT line via an
+// ABSOLUTE reference: Ctrl+Home (→ line 1, col 0), counted Down, Home.
+// Counted arrows are invisible on screen-share — indistinguishable from
+// a human navigating. Ctrl+Home briefly scrolls to the top, but it's the
+// only reliable absolute anchor across Monaco / CodeMirror / native
+// inputs, and it's a keystroke humans use constantly.
+async function navigateToDocLine(lineNum, ctx) {
+  const { keyboard, Key } = ctx;
+  const target = Math.max(1, lineNum | 0);
+  // Ctrl+Home combo — hold Ctrl, press Home WITH DWELL (P1a), release Home,
+  // release Ctrl. Real human key dwell of ~85ms instead of the previous
+  // 5-14ms — closes the #1 keystroke-biometric fingerprint signal.
+  await keyboard.pressKey(Key.LeftControl);
+  await autoTypeNavSleep(5, 14);
+  await autoTypePressWithDwell(keyboard, Key.Home);
+  await autoTypeNavSleep(5, 14);
+  await keyboard.releaseKey(Key.LeftControl);
+  await autoTypeNavSleep(30, 60);
+  for (let i = 0; i < target - 1; i++) {
+    if (autoTypeAbort) break;
+    // Real dwell on each Down — previous code released the key in ~0ms
+    // which is the cleanest possible bot signature (Aalto study: human
+    // arrow-key dwell is 60-150ms, sampled log-normal).
+    await autoTypePressWithDwell(keyboard, Key.Down);
+    await autoTypeHumanNavSleep();
+  }
+  await autoTypePressWithDwell(keyboard, Key.Home);
+  await autoTypeNavSleep(10, 24);
+}
+
+// ── navigateToUiaLine — the COORDINATE-SAFE navigator ──
+//
+// Why this exists: navigateToDocLine uses Ctrl+Home + Down×N to land on
+// "document line N." On browser editors (HackerRank Monaco, CoderPad
+// CodeMirror, CodeSignal), the editor often has LOCKED TEMPLATE LINES
+// above the editable region — `class OddStream(object):`, imports, etc.
+// — that are NOT included in UIA's TextPattern read. The vision planner
+// counts lines from UIA's view (L1 = first editable line), but Ctrl+Home
+// goes to the DOCUMENT top (above the template). So "navigateToDocLine(11)"
+// in a HackerRank Python problem with 3 hidden template lines actually
+// lands at planner's L8 — off by 3. The user-visible symptom: "the
+// executor over-reaches and deletes correct code I wanted preserved"
+// (the May-2026 EvenStream/OddStream incident captured in the JSONL log).
+//
+// Fix: read the cursor's CURRENT position via UIA (cursorOffset is in
+// UIA-text coordinates — same as planner's), compute which UIA line
+// the cursor sits on (1-indexed), then navigate with RELATIVE arrows
+// (Up or Down) instead of an absolute Ctrl+Home reset. No path through
+// the hidden template means no off-by-N. If UIA is unavailable for
+// this read, fall back to navigateToDocLine — same legacy behavior
+// (which is at least correct for native editors without hidden templates).
+async function navigateToUiaLine(targetUiaLine, ctx) {
+  const { keyboard, Key } = ctx;
+  const target = Math.max(1, targetUiaLine | 0);
+
+  // Best-effort UIA re-read. 800ms budget — short enough that a stuck
+  // bridge doesn't stall the whole op, long enough for the common case.
+  let uia = null;
+  try { uia = await readFocusedViaUIA(800); } catch (_) { uia = null; }
+
+  if (!uia || !uia.ok || typeof uia.text !== 'string' || typeof uia.cursorOffset !== 'number') {
+    // UIA blind — Monaco/CodeMirror may genuinely not expose TextPattern
+    // here. Fall through to the legacy absolute navigator. This editor
+    // probably DOESN'T have hidden template (the bug only manifests on
+    // browser editors with both UIA AND a partial-text exposure), so the
+    // legacy path is likely fine.
+    console.warn(`[auto-type] navigateToUiaLine(${target}): UIA unavailable, falling back to navigateToDocLine (absolute, may miscount on browser editors with hidden template)`);
+    return navigateToDocLine(target, ctx);
+  }
+
+  // Compute current cursor's UIA line. cursorOffset is in code units of
+  // uia.text; counting newlines before the offset gives the 1-indexed
+  // line number the cursor sits on (or just past — both yield the
+  // correct cursor line for navigation purposes).
+  const prefix = uia.text.slice(0, uia.cursorOffset);
+  const currentLine = prefix.split('\n').length;
+  const totalUiaLines = uia.text.split('\n').length;
+  const delta = target - currentLine;
+
+  // ── Flat-UIA detection ──
+  // Some editors (notably the new Windows 11 Notepad / Store app) flatten
+  // line breaks through UIA's TextPattern — uia.text comes back as a
+  // single logical "line" even though the user sees many visual rows.
+  // In that mode, currentLine is always 1 and our relative-delta math
+  // is meaningless (the cursor's REAL visual line is unknowable from
+  // the flat UIA snapshot). The planner, per the updated vision prompt,
+  // numbers lines by what it sees in the SCREENSHOT — so its "target L3"
+  // means visual line 3 from the top of the doc, which Ctrl+Home +
+  // Down×(target-1) actually reaches in Notepad-style editors.
+  //
+  // Fall back to navigateToDocLine (absolute Ctrl+Home + Down) when:
+  //   • UIA reports a single flat line (totalUiaLines === 1), AND
+  //   • the planner is asking for a line > 1 (the case where relative
+  //     navigation would mis-anchor).
+  //
+  // For multi-line UIA (HackerRank / CoderPad with proper newlines)
+  // we still use relative navigation — that's where the off-by-template
+  // bug lives and the relative fix correctly avoids it.
+  if (totalUiaLines === 1 && target > 1) {
+    console.log(`[auto-type] navigateToUiaLine: flat UIA detected (uia.text = 1 logical line, ${uia.text.length} chars), target L${target} > 1 — falling back to absolute Ctrl+Home navigation (safe in Notepad-style editors with no hidden template)`);
+    return navigateToDocLine(target, ctx);
+  }
+
+  console.log(`[auto-type] navigateToUiaLine: cursor at UIA L${currentLine} (offset ${uia.cursorOffset} of ${uia.text.length}, totalLines=${totalUiaLines}), target L${target}, delta=${delta}`);
+
+  if (delta === 0) {
+    // Already on the right line — just snap to column 0.
+    await autoTypePressWithDwell(keyboard, Key.Home);
+    await autoTypeNavSleep(10, 24);
+    return;
+  }
+
+  // Sanity rail: a delta > 200 lines almost certainly means the planner
+  // emitted a bogus line number (or UIA misreported cursor). Log loudly
+  // but still attempt — capping silently would mis-navigate. The structural
+  // -line filter and no-op detection guard further damage downstream.
+  if (Math.abs(delta) > 200) {
+    console.warn(`[auto-type] navigateToUiaLine: SUSPICIOUSLY LARGE delta=${delta} — possible planner bug or UIA cursor desync. Attempting anyway.`);
+  }
+
+  const dirKey = delta > 0 ? Key.Down : Key.Up;
+  const steps = Math.abs(delta);
+  for (let i = 0; i < steps; i++) {
+    if (autoTypeAbort) break;
+    await autoTypePressWithDwell(keyboard, dirKey);
+    await autoTypeHumanNavSleep();
+  }
+  await autoTypePressWithDwell(keyboard, Key.Home);
+  await autoTypeNavSleep(10, 24);
+}
+
+// Select the CONTENT of document lines [s..e] — from (s,0) through the
+// END of line e, NOT including the newline after line e. Caret must
+// already be at (s,0). After this the selection is live; caller Deletes.
+//   replace: Delete then type → new content lands, line e+1 stays put.
+//   delete : Delete then one more Delete → consumes the now-orphan
+//            newline so the lines are fully gone, not left blank.
+async function selectLineRangeContent(s, e, ctx) {
+  const { keyboard, Key } = ctx;
+  const span = Math.max(0, (e | 0) - (s | 0));
+  await keyboard.pressKey(Key.LeftShift);
+  await autoTypeHumanNavSleep();
+  for (let i = 0; i < span; i++) {
+    if (autoTypeAbort) break;
+    // Real dwell per arrow (P1a). Shift stays held throughout the loop —
+    // that's the natural pattern for range selection.
+    await autoTypePressWithDwell(keyboard, Key.Down);
+    await autoTypeHumanNavSleep();
+  }
+  await autoTypePressWithDwell(keyboard, Key.End);
+  await autoTypeHumanNavSleep();
+  await keyboard.releaseKey(Key.LeftShift);
+  await autoTypeNavSleep(10, 22);
+}
+
+// Execute an ordered list of edit operations. Sorted BOTTOM-TO-TOP so an
+// edit never shifts the line numbers of an edit still pending above it.
+// Returns { typed, opCount } — `typed` is the concatenation of everything
+// we typed, for the post-run log.
+// Best-effort "is focus still on a non-self editor" check, run between
+// multi-op steps. Returns false ONLY when UIA gives us a clean signal
+// that focus is on our own process; on any uncertainty (bridge missing,
+// timeout, parse error, etc.) returns true so we don't false-abort.
+// Tight 450ms budget — this fires per-op and must not stall the run.
+async function checkFocusStillOnEditor() {
+  try {
+    const uia = await readFocusedViaUIA(450);
+    if (!uia) return true;
+    if (!uia.ok && (
+      uia.error === 'bridge_unavailable' || uia.error === 'not_ready_timeout' ||
+      uia.error === 'timeout' || uia.error === 'parse_error' ||
+      uia.error === 'write_failed' || uia.error === 'bridge_exited'
+    )) {
+      return true;
+    }
+    const ourPid = process.pid;
+    if (Number.isInteger(uia.processId) && uia.processId === ourPid) return false;
+    const pname = (uia.processName || '').toLowerCase();
+    if (pname.startsWith('interview copilot') || pname.startsWith('interviewcopilot')) return false;
+    return true;
+  } catch (_) {
+    return true;
+  }
+}
+
+// Detects whether a line of code contains a STRUCTURAL declaration that
+// would be catastrophic to delete (class, method signature, import, etc).
+// Used by executeMultiOpPlan to refuse ops where the vision planner has
+// miscounted blank lines and would target a structural line by mistake.
+function autoTypeIsStructuralLine(line) {
+  const t = (line || '').trim();
+  if (!t) return false;
+  // Java / C# / C++ method signatures: visibility modifiers + return + name(
+  if (/^(public|private|protected|static|final|abstract|override|async)\b.*\b\w+\s*\(/.test(t)) return true;
+  if (/\bpublic\s+(static\s+)?\w[\w<>\[\],\s]*\s+\w+\s*\(/.test(t)) return true;
+  // Python def / class
+  if (/^(def|class|async\s+def)\s+\w+/.test(t)) return true;
+  // JavaScript function / class / arrow functions assigned to a name
+  if (/^(function|class|async\s+function)\s+\w+/.test(t)) return true;
+  if (/^(const|let|var)\s+\w+\s*=\s*(\([^)]*\)|\basync\s*(\([^)]*\))?)\s*=>/.test(t)) return true;
+  // C-family functions: return-type name(...)
+  if (/^(int|void|char|float|double|bool|short|long|unsigned|signed|String|String\[\])\s+\w+\s*\(/.test(t)) return true;
+  // Imports / includes / package declarations
+  if (/^(import|from|using|#include|#import|package|namespace)\b/.test(t)) return true;
+  // Class declaration shorthand without modifier
+  if (/^class\s+\w+/.test(t)) return true;
+  return false;
+}
+
+async function executeMultiOpPlan(operations, ctx) {
+  const { keyboard, Key, uiaText, processName } = ctx;
+  // Browser-hosted editors (Monaco on HackerRank/CodeSignal, CodeMirror on
+  // CoderPad) expose only a truncated slice of the document to UIA. That
+  // distinction matters for the flat-UIA Ctrl+A guard below: a single-line
+  // UIA read from a BROWSER is almost always truncation, not a genuinely
+  // one-line document, so a whole-doc Ctrl+A nuke there would destroy code
+  // we can't even see. Native flat editors (Notepad) are the only safe
+  // target for the Ctrl+A path.
+  const browserHosted = /(^|\b)(chrome|msedge|edge|firefox|brave|opera|vivaldi|arc)(\b|$)/i.test(String(processName || ''));
+
+  // ── Validate operations (overlap check only) ──
+  // Earlier I tried to also drop ops whose start_line was past
+  // uiaLineCount (= uiaSnapshotBefore.text.split('\n').length). That was
+  // WRONG and produced the "stopped after thinking" bug:
+  //   - Vision reads line numbers from the editor's GUTTER in a
+  //     screenshot — those are the real document line numbers.
+  //   - UIA, on browser-hosted editors (Monaco / CodeMirror), often
+  //     only exposes a small visible/focused slice of the document via
+  //     TextPattern. So uiaLineCount routinely UNDERSTATES the real doc
+  //     size. Filtering against it dropped legitimate ops anchored to
+  //     real (but UIA-invisible) lines — a "replace L25-26" on a real
+  //     30-line file would be dropped because UIA only saw 12 lines.
+  //   - The vision agent saw the gutter; its line numbers ARE the
+  //     authoritative ones. There's no reliable second source to
+  //     validate against.
+  // The original concern (model hallucinates a line past the file end)
+  // is a real but rare risk that can't be safely detected from UIA;
+  // better to trust the model than drop valid ops in the common case.
+  //
+  // Overlap is still safe to check — it's purely op-vs-op, needs no
+  // editor knowledge. Two overlapping replace/delete ops executed
+  // bottom-to-top scramble line numbers and corrupt the file. Drop the
+  // later (lower start_line) one — the earlier (higher start_line) one
+  // runs first under bottom-to-top order and the lower one would then
+  // mis-anchor against shifted lines.
+  const sortedAsc = (Array.isArray(operations) ? operations.slice() : [])
+    .sort((a, b) => a.start_line - b.start_line);
+  const validated = [];
+  for (const op of sortedAsc) {
+    const last = validated[validated.length - 1];
+    if (last && op.op !== 'insert' && last.op !== 'insert'
+        && op.start_line <= last.end_line) {
+      console.warn(`[auto-type] multi-op: DROPPING overlapping ${op.op} L${op.start_line}-${op.end_line} (conflicts with prior L${last.start_line}-${last.end_line})`);
+      continue;
+    }
+    validated.push(op);
+  }
+  if (validated.length === 0) {
+    console.warn('[auto-type] multi-op: all ops dropped by validation — nothing to do');
+    return { typed: '', opCount: 0 };
+  }
+  if (validated.length !== (operations || []).length) {
+    console.log(`[auto-type] multi-op: ${operations.length - validated.length} op(s) dropped by validation, ${validated.length} will execute`);
+  }
+
+  // ── Structural-line safety filter ──
+  // Vision occasionally MISCOUNTS blank lines and emits line numbers that
+  // are off by one (or more), causing replace/delete to target a line
+  // containing a class/method/import declaration instead of the intended
+  // stub/junk. The user-visible symptom: "Auto-Type cleared my main()
+  // signature." We have the editor's text from UIA — use it to refuse any
+  // op that would delete a structural line WITHOUT preserving that
+  // structure in the replacement text.
+  //
+  // When uiaText is unavailable (UIA-blind editor), we skip this check —
+  // the vision planner's gutter reading is our only source of truth then.
+  const uiaLines = (typeof uiaText === 'string' && uiaText.length > 0)
+    ? uiaText.split('\n')
+    : null;
+  const ops = validated.sort((a, b) => b.start_line - a.start_line);
+  const safeOps = [];
+  for (const op of ops) {
+    if (!uiaLines || op.op === 'insert') { safeOps.push(op); continue; }
+    let structuralLineHit = null;
+    for (let lineNum = op.start_line; lineNum <= op.end_line && lineNum <= uiaLines.length; lineNum++) {
+      const content = uiaLines[lineNum - 1] || '';
+      if (!autoTypeIsStructuralLine(content)) continue;
+      // Is the same structural keyword preserved in the op's replacement?
+      const opText = String(op.text || '');
+      const m = content.trim().match(/(public\s+(static\s+)?[\w<>\[\],\s]*\s+\w+\s*\(|class\s+\w+|def\s+\w+|function\s+\w+|import\s+\S+|package\s+\S+|using\s+\S+|#include\s+\S+)/);
+      const keyword = m ? m[0].replace(/\s+/g, ' ').trim() : null;
+      const opTextNormalized = opText.replace(/\s+/g, ' ');
+      if (keyword && opTextNormalized.includes(keyword)) {
+        // Replacement keeps the structural keyword — vision is legitimately
+        // editing a method signature etc. Allow.
+        continue;
+      }
+      structuralLineHit = { lineNum, content: content.trim().slice(0, 80) };
+      break;
+    }
+    if (structuralLineHit) {
+      console.warn(`[auto-type] multi-op: REFUSING ${op.op} L${op.start_line}-${op.end_line} — would delete structural line ${structuralLineHit.lineNum}: "${structuralLineHit.content}" without preserving it in the replacement. Vision likely miscounted blank lines.`);
+      continue;
+    }
+    safeOps.push(op);
+  }
+  if (safeOps.length === 0) {
+    console.warn('[auto-type] multi-op: all ops refused by structural-line safety filter — nothing safe to do');
+    return { typed: '', opCount: 0 };
+  }
+  if (safeOps.length !== ops.length) {
+    console.log(`[auto-type] multi-op: structural-line filter dropped ${ops.length - safeOps.length} unsafe op(s); ${safeOps.length} will execute`);
+  }
+
+  // ── P8.6: NO-OP REWRITE DETECTION ──
+  // Vision sometimes emits `replace L5-15` even when L5-15 ALREADY matches
+  // the replacement text. The executor would then visibly delete + re-type
+  // the same content — the "writing the same code again instead of
+  // intelligently choosing where to write" symptom. Skip any replace whose
+  // current editor content matches the replacement (per-line, trailing-
+  // whitespace tolerant). Bottom-to-top execution order means uiaLines
+  // (snapshot at session start) stays accurate for each op's turn —
+  // earlier (lower) ops haven't yet shifted later (higher) lines.
+  // The vision REPAIR pass already does this (search "SKIP NO-OP REWRITES");
+  // adding it here closes the same gap on the primary planning path.
+  const finalOps = [];
+  let noOpSkipped = 0;
+  const trimRight = (s) => String(s).replace(/[ \t]+$/, '');
+  const linesEqualTrimRight = (curLines, txt) => {
+    const tLines = String(txt).split('\n');
+    if (curLines.length !== tLines.length) return false;
+    for (let i = 0; i < curLines.length; i++) {
+      if (trimRight(curLines[i]) !== trimRight(tLines[i])) return false;
+    }
+    return true;
+  };
+  for (const op of safeOps) {
+    if (op.op === 'replace' && uiaLines && uiaLines.length > 0 && typeof op.text === 'string') {
+      const startIdx = op.start_line - 1;
+      const endIdx = op.end_line - 1;
+      // Only attempt no-op detection when we have full coverage of the
+      // target range in uiaLines (browser editors truncate UIA — partial
+      // coverage = can't confirm match = execute conservatively).
+      if (startIdx >= 0 && endIdx < uiaLines.length) {
+        const currentLines = uiaLines.slice(startIdx, endIdx + 1);
+        if (linesEqualTrimRight(currentLines, op.text)) {
+          console.log(`[auto-type] multi-op: SKIPPING no-op rewrite — L${op.start_line}-${op.end_line} already matches the replacement text (${op.text.split('\n').length} line(s)). Reason was: "${(op.reason || '').slice(0, 60)}"`);
+          noOpSkipped++;
+          continue;
+        }
+      }
+    }
+    finalOps.push(op);
+  }
+  if (noOpSkipped > 0) {
+    console.log(`[auto-type] multi-op: dropped ${noOpSkipped} no-op rewrite(s); ${finalOps.length} of ${safeOps.length} op(s) will actually execute`);
+  }
+  if (finalOps.length === 0) {
+    console.log('[auto-type] multi-op: all ops were no-op rewrites — editor already matches target, nothing to type');
+    return { typed: '', opCount: 0 };
+  }
+
+  // ── Guard C: content-loss safety refusal (Stage 1) ──
+  // Backstop for the "wholesale replace wiped my working code" class: if
+  // the destructive ops (replace/delete) would NET-REMOVE the majority of
+  // the editor's real (non-whitespace) characters without reproducing them
+  // in the replacement text, refuse all destructive ops. Inserts are kept
+  // — they can't delete anything.
+  //
+  // Reliability gate — runs ONLY when uiaText is trustworthy for measuring
+  // "how much real code is in the editor":
+  //   • NOT browser-hosted (browser UIA truncates → understates the total
+  //     → would inflate the deletion ratio into a FALSE alarm; the 120-
+  //     spaces browser disaster is handled by Guard D instead),
+  //   • uiaLines present and multi-line (a 1-line read is flat/truncated),
+  //   • every destructive op's range fully covered by uiaLines.
+  // When the gate fails we self-disable and trust the vision plan — per
+  // feedback_defensive_checks_premise, dropping legitimate work is worse
+  // than the rare problem this prevents.
+  const nonWs = (x) => String(x == null ? '' : x).replace(/\s+/g, '').length;
+  const destructive = finalOps.filter(o => o.op === 'replace' || o.op === 'delete');
+  const reliableUia = !browserHosted && uiaLines && uiaLines.length > 1
+    && destructive.every(o => (o.start_line | 0) >= 1 && (o.end_line | 0) <= uiaLines.length);
+  if (reliableUia && destructive.length > 0) {
+    const totalNonWs = nonWs(uiaText);
+    let removedNonWs = 0;
+    let reproducedNonWs = 0;
+    for (const o of destructive) {
+      removedNonWs += nonWs(uiaLines.slice((o.start_line | 0) - 1, (o.end_line | 0)).join('\n'));
+      if (o.op === 'replace') reproducedNonWs += nonWs(o.text);
+    }
+    const netRemoved = removedNonWs - reproducedNonWs;
+    if (totalNonWs >= 30 && netRemoved > 0 && (netRemoved / totalNonWs) > 0.5) {
+      console.error(`[auto-type] multi-op: CONTENT-LOSS GUARD tripped — destructive ops would net-remove ${netRemoved}/${totalNonWs} non-whitespace chars (${Math.round(100 * netRemoved / totalNonWs)}% of the editor) without reproducing them. Refusing ${destructive.length} destructive op(s) to avoid wiping required code.`);
+      const insertsOnly = finalOps.filter(o => o.op === 'insert');
+      if (insertsOnly.length === 0) {
+        return { typed: '', opCount: 0, refused: 'content_loss_guard' };
+      }
+      finalOps.length = 0;
+      finalOps.push(...insertsOnly);
+    }
+  } else if (destructive.length > 0) {
+    console.log('[auto-type] multi-op: content-loss guard skipped — UIA not reliable for measurement (browser-hosted, flat/truncated, or partial coverage). Trusting the vision plan.');
+  }
+
+  let typedAll = '';
+  let done = 0;
+  for (const op of finalOps) {
+    if (autoTypeAbort) break;
+
+    // ── Per-op focus re-check ──
+    // A multi-op run can span many seconds. The handler's preflight ran
+    // once at the start; that doesn't help if a notification, click, or
+    // app switch hijacks focus partway through. Without this check, the
+    // navigate+select+delete burst for the next op could land in the
+    // WRONG window — at worst, deleting content in another app. Skip on
+    // the FIRST op (just passed preflight, no time has elapsed).
+    if (done > 0 && !(await checkFocusStillOnEditor())) {
+      console.warn('[auto-type] multi-op: focus left the editor mid-run — aborting before next op');
+      autoTypeAbort = true;
+      autoTypeAbortReason = 'focus_lost_during_multi_op';
+      autoTypeAbortDiagnostic = {
+        hint: 'Focus moved off the editor during a multi-step edit (likely a notification or stray click). Stopped to avoid editing the wrong window.',
+      };
+      break;
+    }
+
+    const s = Math.max(1, op.start_line | 0);
+    const e = Math.max(s, op.end_line | 0);
+
+    if (op.op === 'insert') {
+      await navigateToDocLine(s, ctx);
+      // P1a: dwell on each key in the insert sequence.
+      await autoTypePressWithDwell(keyboard, Key.End);
+      await autoTypeNavSleep(10, 24);
+      await autoTypePressWithDwell(keyboard, Key.Enter);
+      await autoTypeNavSleep(38, 70);
+      // Wipe any auto-indent the editor inserted — the op text carries
+      // its own indentation.
+      await autoTypePressWithDwell(keyboard, Key.Home);
+      await autoTypeNavSleep(10, 22);
+      await keyboard.pressKey(Key.LeftShift);
+      await autoTypeNavSleep(4, 10);
+      await autoTypePressWithDwell(keyboard, Key.End);
+      await autoTypeNavSleep(4, 10);
+      await keyboard.releaseKey(Key.LeftShift);
+      await autoTypeNavSleep(10, 22);
+      await autoTypePressWithDwell(keyboard, Key.Delete);
+      await autoTypeNavSleep(14, 30);
+      const lines = String(op.text || '').split('\n');
+      await typeLinesHumanized(lines, ctx);
+      typedAll += lines.join('\n') + '\n';
+      done++;
+      console.log(`[auto-type] multi-op ${done}/${ops.length}: insert after L${s} (${lines.length} line(s)) — ${op.reason || ''}`);
+      continue;
+    }
+
+    // ── Flat-UIA whole-doc replace path ──
+    // When UIA returns the entire editor as one flat logical line (no \n
+    // characters in uiaText), it's almost always because the editor's
+    // accessibility tree flattens line breaks — observed in the new
+    // Windows 11 Notepad (Store version, tabbed). In that mode our
+    // line-based selection (Home + Shift+End) operates on the VISUAL
+    // line bounds (~80 chars per row), NOT the full 246-char flat
+    // logical line. Symptom: replace deletes only one visual row of
+    // text, then types the new content INTO THE MIDDLE of the leftover
+    // — the May-2026 Notepad palindrome regression.
+    //
+    // Fix: detect flat UIA (single line in uiaText) AND a replace op
+    // that covers L1 — that's "replace the whole document". Use
+    // Ctrl+A + Delete instead of navigate+select+delete. Ctrl+A is
+    // universal (works in every editor incl. Notepad / Monaco / IDEs)
+    // and selects the actual whole document regardless of visual
+    // wrapping. Safe-narrow guard: only when uiaLines.length === 1
+    // AND op.start_line === 1, so a SUBSET-replace on a normal multi-
+    // line editor still uses the surgical path.
+    // Guard B: a single-line UIA read from a BROWSER editor is truncation,
+    // not a one-line document — refuse the whole-doc Ctrl+A there and let
+    // the surgical navigate+select path below handle the real line range.
+    if (op.op === 'replace' && uiaLines && uiaLines.length === 1 && s === 1 && browserHosted) {
+      console.warn(`[auto-type] multi-op: NOT using Ctrl+A whole-doc nuke — editor is browser-hosted (${processName}) and its single-line UIA read is truncation, not a flat document. Falling through to surgical line-range replace to avoid wiping unseen code.`);
+    }
+    if (op.op === 'replace' && uiaLines && uiaLines.length === 1 && s === 1 && !browserHosted) {
+      console.log(`[auto-type] multi-op ${done + 1}/${ops.length}: replace L1-${e} via Ctrl+A (flat-UIA whole-doc path, ${uiaLines[0].length} chars in single logical line, native editor "${processName || '?'}") — ${op.reason || ''}`);
+      await keyboard.pressKey(Key.LeftControl);
+      await autoTypeNavSleep(5, 14);
+      await autoTypePressWithDwell(keyboard, Key.A);
+      await autoTypeNavSleep(5, 14);
+      await keyboard.releaseKey(Key.LeftControl);
+      await autoTypeNavSleep(40, 80);
+      // Glance pause before deleting selection — humans look at what
+      // they highlighted before nuking it.
+      await autoTypeSleep(200 + Math.random() * 350);
+      await autoTypePressWithDwell(keyboard, Key.Delete);
+      await autoTypeNavSleep(18, 38);
+      const lines = String(op.text || '').split('\n');
+      await typeLinesHumanized(lines, ctx);
+      typedAll += lines.join('\n') + '\n';
+      done++;
+      continue;
+    }
+
+    // replace / delete — both select the content of [s..e] first.
+    await navigateToDocLine(s, ctx);
+    await selectLineRangeContent(s, e, ctx);
+    // Glance pause — a human looks at what they've highlighted before
+    // hitting Delete. Selecting then instantly deleting is a robot tell.
+    await autoTypeSleep(200 + Math.random() * 350);
+    // P1a: dwell on Delete.
+    await autoTypePressWithDwell(keyboard, Key.Delete);
+    await autoTypeNavSleep(18, 38);
+
+    if (op.op === 'delete') {
+      // Lines s..e are now one empty line. One more Delete consumes the
+      // orphan newline so the following content rises into place — the
+      // junk/dead lines are fully gone, not left as a blank.
+      await autoTypePressWithDwell(keyboard, Key.Delete);
+      await autoTypeNavSleep(14, 30);
+      done++;
+      console.log(`[auto-type] multi-op ${done}/${ops.length}: delete L${s}-${e} — ${op.reason || ''}`);
+    } else {
+      // replace — caret at (s,0), content of s..e gone, the newline
+      // before old line e+1 preserved. Type the replacement; line e+1
+      // stays on its own line with its original indentation intact.
+      const lines = String(op.text || '').split('\n');
+      await typeLinesHumanized(lines, ctx);
+      typedAll += lines.join('\n') + '\n';
+      done++;
+      console.log(`[auto-type] multi-op ${done}/${ops.length}: replace L${s}-${e} with ${lines.length} line(s) — ${op.reason || ''}`);
+    }
+  }
+  return { typed: typedAll, opCount: done };
+}
+
 function planAutoTypeFromUIA(params) {
   const code = typeof params.code === 'string' ? params.code : '';
   const editorText = typeof params.editorText === 'string' ? params.editorText : '';
   const cursorOffsetRaw = typeof params.cursorOffset === 'number' ? params.cursorOffset : 0;
   const cursorOffset = Math.max(0, Math.min(cursorOffsetRaw, editorText.length));
+  const processName = String(params.processName || '').toLowerCase();
 
   const codeLines = code.split('\n');
 
   if (!editorText || editorText.trim().length === 0) {
-    return { skipLines: 0, skipTrailingLines: 0, wipeFirstLine: false, confidence: 1.0, reason: 'empty_editor' };
+    // An empty UIA read is AMBIGUOUS — it is EITHER a genuinely empty
+    // native editor (fresh Notepad/blank file) OR — far more often in
+    // the interview-coding context — UIA BLINDNESS: Monaco/CodeMirror
+    // keep only a tiny IME buffer in the focusable textarea, so UIA sees
+    // ~nothing even though the editor is full of template/starter code.
+    //
+    // The old code returned confidence 1.0 here. That was the core bug:
+    // a UIA-blind browser editor got treated as "definitely empty, type
+    // everything", which DUMPED the AI's full file (imports + signature)
+    // on top of the template's existing ones AND suppressed every
+    // fallback (the AI/vision planner only fires when UIA is NOT
+    // confident). Confidence here must be LOW so the caller falls
+    // through to the vision planner — which can actually SEE the editor.
+    //
+    // When the focused process is a browser, blindness is near-certain
+    // (interview platforms always ship starter code) → confidence floor.
+    const browserHosted = /(^|\b)(chrome|msedge|edge|firefox|brave|opera|vivaldi|arc)(\b|$)/.test(processName);
+    return {
+      skipLines: 0,
+      skipTrailingLines: 0,
+      wipeFirstLine: false,
+      confidence: browserHosted ? 0.15 : 0.4,
+      reason: browserHosted ? 'uia_blind_browser_editor' : 'empty_editor_ambiguous',
+    };
   }
 
   const beforeCursor = editorText.slice(0, cursorOffset);
@@ -2923,6 +5431,423 @@ function verifyTypedContent(typedText, afterText) {
   return { ok: false, reason: 'mismatch', ratio, expected: typedCondensed.length, matched };
 }
 
+// ── P5c: Post-typing verify + active auto-correct ──
+// Real coders re-read their code after typing it and fix mistakes they
+// notice. Previous behavior: detect mismatches via verifyTypedContent but
+// only broadcast — never auto-edit. This helper UPGRADES that: when the
+// mismatch is small and SAFE to fix (most of intended content present + a
+// trailing tail missing + cursor still at the right place), it actively
+// types the missing tail.
+//
+// Safety rails (we only correct when ALL of these hold):
+//   • 85%+ of the intended content is already present in the editor (in
+//     order, allowing whitespace flex)
+//   • cursor is within ±12 chars of where the prefix ends in the editor
+//     (so an "append at cursor" actually puts the tail in the right place)
+//   • the missing tail is ≤ 80 chars (anything bigger is a different
+//     failure mode and likely needs human review)
+//   • autoTypeAbort is not set
+//
+// Returns: { ok: bool, corrected: number-of-chars-typed, reason: string }
+//
+// When ok=false, the caller should fall back to broadcasting a verify-
+// mismatch so the user can manually inspect.
+async function autoTypeVerifyAndCorrect(intendedContent, ctx) {
+  const { keyboard, Key } = ctx;
+  if (!intendedContent || intendedContent.length === 0) {
+    return { ok: true, corrected: 0, reason: 'nothing_typed' };
+  }
+
+  // Settle — let the editor's accessibility tree catch up to what we typed.
+  await autoTypeSleep(220);
+
+  const after = await readFocusedViaUIA(1200);
+  if (!after || !after.ok || typeof after.text !== 'string') {
+    return { ok: true, corrected: 0, reason: 'uia_unavailable' };
+  }
+
+  const actual = after.text;
+  const cursorPos = after.cursorOffset || 0;
+
+  // Tier 1 — exact substring match (no correction needed).
+  if (actual.indexOf(intendedContent) !== -1) {
+    return { ok: true, corrected: 0, reason: 'exact_match' };
+  }
+
+  // Tier 2 — whitespace-tolerant substring (editor auto-formatted some
+  // whitespace but content is all there).
+  const stripWs = (s) => s.replace(/\s+/g, '');
+  const intendedStrip = stripWs(intendedContent);
+  const actualStrip = stripWs(actual);
+  if (actualStrip.includes(intendedStrip)) {
+    return { ok: true, corrected: 0, reason: 'whitespace_match' };
+  }
+
+  // Tier 3 — find the LONGEST prefix of intendedContent that appears in
+  // actual. If it's most of the content (≥85%) and the cursor is right at
+  // the end of that prefix, we can safely append the missing tail.
+  let prefixEnd = 0;
+  let prefixPosInActual = -1;
+  // Walk down from full length to find the longest matching prefix. Stop
+  // early once we find one (longest wins).
+  for (let i = intendedContent.length; i >= Math.floor(intendedContent.length * 0.5); i--) {
+    const candidate = intendedContent.slice(0, i);
+    const idx = actual.lastIndexOf(candidate);
+    if (idx !== -1) {
+      prefixEnd = i;
+      prefixPosInActual = idx;
+      break;
+    }
+  }
+
+  if (prefixEnd === 0) {
+    return { ok: false, corrected: 0, reason: 'no_match_in_editor' };
+  }
+
+  const fractionPresent = prefixEnd / intendedContent.length;
+  if (fractionPresent < 0.85) {
+    return { ok: false, corrected: 0, reason: 'mismatch_too_complex', fractionPresent };
+  }
+
+  const missing = intendedContent.slice(prefixEnd);
+  if (missing.length > 80) {
+    return { ok: false, corrected: 0, reason: 'missing_tail_too_large', missingLen: missing.length };
+  }
+
+  // Safety: cursor must be near the end of the matched prefix. If cursor
+  // moved elsewhere (user clicked away, autocomplete navigated, etc.),
+  // appending would land in the wrong place — abort the correction.
+  const expectedCursor = prefixPosInActual + prefixEnd;
+  if (Math.abs(cursorPos - expectedCursor) > 12) {
+    return {
+      ok: false,
+      corrected: 0,
+      reason: 'cursor_drifted',
+      cursorPos,
+      expectedCursor,
+    };
+  }
+
+  // Safe to append.
+  console.log(`[auto-type] verify+correct: ${prefixEnd}/${intendedContent.length} chars present in editor; appending ${missing.length} missing chars (cursor at ${cursorPos}, expected ${expectedCursor})`);
+  let curPrev = prefixEnd > 0 ? intendedContent[prefixEnd - 1] : null;
+  let typed = 0;
+  for (let k = 0; k < missing.length; k++) {
+    if (autoTypeAbort) return { ok: false, corrected: typed, reason: 'aborted_mid_correction' };
+    const cN = missing[k];
+    try {
+      if (cN === '\n') {
+        await autoTypePressWithDwell(keyboard, Key.Enter);
+      } else {
+        await autoTypeCharWithTypo(keyboard, Key, cN, curPrev);
+      }
+      typed++;
+    } catch (e) {
+      return { ok: false, corrected: typed, reason: 'append_failed', error: e && e.message };
+    }
+    await autoTypeSleep(autoTypeHumanDelay(cN, curPrev));
+    curPrev = cN;
+  }
+
+  return { ok: true, corrected: typed, reason: 'tail_appended' };
+}
+
+// Per-op verification for the multi-op typing engine. For each non-delete
+// op that ran, check that its `text` appears (whitespace-tolerant) in the
+// post-typing editor. Returns the list of ops whose text is MISSING so the
+// caller can broadcast a clear diagnostic. Doesn't actively re-execute
+// missing ops — that requires re-navigating to shifted line numbers, which
+// gets fragile fast (left as a future P5d if needed).
+async function autoTypeVerifyMultiOp(operations, ctx) {
+  if (!Array.isArray(operations) || operations.length === 0) {
+    return { ok: true, missingOps: [], reason: 'no_ops' };
+  }
+  await autoTypeSleep(220);
+  const after = await readFocusedViaUIA(1200);
+  if (!after || !after.ok || typeof after.text !== 'string') {
+    return { ok: true, missingOps: [], reason: 'uia_unavailable' };
+  }
+  const actual = after.text;
+  const stripWs = (s) => s.replace(/\s+/g, '');
+  const actualStrip = stripWs(actual);
+
+  const missingOps = [];
+  for (const op of operations) {
+    if (op.op === 'delete') continue;
+    if (!op.text) continue;
+    const textStrip = stripWs(op.text);
+    if (textStrip.length < 8) continue;  // tiny ops are noisy to verify
+    if (!actualStrip.includes(textStrip)) {
+      missingOps.push({
+        op: op.op,
+        start_line: op.start_line,
+        end_line: op.end_line,
+        textPreview: op.text.replace(/\s+/g, ' ').slice(0, 60),
+      });
+    }
+  }
+  return { ok: missingOps.length === 0, missingOps, afterText: actual };
+}
+
+// ── P5d: Active repair iteration ──
+// Real coders re-read their finished code and FINISH/FIX what's left —
+// a half-written chunk, a missed function body, a stray bracket. We do the
+// same: after the initial multi-op typing, if per-op verify shows missing
+// ops OR the coverage check finds target content absent, take a fresh
+// screenshot + UIA text, call the vision agent AGAIN with current state +
+// target code, get a fix plan, execute it.
+//
+// CRITICAL — repair must COMPLETE what's left WITHOUT regressing what's
+// already right. Two failure modes to guard, in tension:
+//   • DON'T regress: the original bug was a repair plan emitting
+//     "replace L7-15 with [same 9-line content]" — a NO-OP REWRITE that
+//     visibly re-selected and re-typed an already-correct chunk ("it's
+//     writing the code AGAIN from the beginning").
+//   • DO finish: the earlier typo-only size caps (per-op ≤2 lines, total
+//     ≤150 chars) over-corrected — they let repair fix a bracket but
+//     REFUSED to complete a chunk the first pass left half-written. Those
+//     size caps are gone, replaced by completeness-aware rails.
+//
+// Guards enforced in autoTypeMultiOpRepair (see inline comments there):
+//   • Rail 1 — total repair text ≤ target length + 40. More chars than
+//     CODE_TO_TYPE itself isn't a repair, it's a rewrite → refuse.
+//   • Rail 2 — refuse any single replace/delete spanning ≥90% of the
+//     editor (when ≥12 lines): that's the "rewrite the whole file" shape.
+//   • Cap 3 — max 3 ops.   • Cap 4 — confidence ≥0.78.
+//   • Cap 5 — SKIP NO-OP REWRITES: if an op's text already matches what's
+//     at those lines (whitespace-tolerant), skip it.
+//   • Structural-line safety filter still applies via executeMultiOpPlan.
+//   • Single pass — don't loop.
+
+// ── P11-4/5: Surgical bracket repair ──
+// After typing finishes, compare bracket balance of the actual editor text
+// vs the intended code. If we introduced ≤2 imbalances (e.g. a missing `}`
+// because a comment delete ate the brace on the adjacent line — the user's
+// described scenario), surgically insert/delete the offending chars WITHOUT
+// retyping any lines. Returns { ok, repairs, reason }.
+async function autoTypeSurgicalBracketRepair(intendedCode, language, ctx) {
+  const { keyboard, Key } = ctx;
+  try {
+    // Read actual editor state (UIA first; clipboard via Ctrl+A would be more
+    // reliable but more visible — UIA is sufficient for the local-edit case).
+    const after = await readFocusedViaUIA(1500);
+    if (!after || !after.ok || typeof after.text !== 'string') {
+      return { ok: false, reason: 'uia_unavailable' };
+    }
+
+    const intendedBal = bracketTracker.balance(intendedCode, language);
+    const actualBal = bracketTracker.balance(after.text, language);
+
+    // Only act on imbalances that EXIST IN ACTUAL but NOT IN INTENDED — i.e.,
+    // damage WE caused, not pre-existing imbalances in the intended code.
+    if (intendedBal.unclosed.length !== 0 || intendedBal.orphans.length !== 0) {
+      // Target code itself has imbalances (unusual — probably a parser limitation
+      // on string literals). Skip repair rather than guess.
+      return { ok: false, reason: 'intended_already_imbalanced' };
+    }
+
+    if (actualBal.balanced) {
+      return { ok: true, repairs: 0, reason: 'balanced' };
+    }
+
+    const plan = bracketTracker.planSurgicalRepair(actualBal, after.text);
+    if (!plan.ok) {
+      return { ok: false, reason: plan.reason };
+    }
+    if (plan.ops.length === 0) {
+      return { ok: true, repairs: 0, reason: 'no_repair_needed' };
+    }
+
+    console.log(`[auto-type] surgical bracket repair: ${plan.ops.length} op(s) — ${plan.ops.map(o => `${o.action} ${o.char} at L${o.line}c${o.col}`).join(', ')}`);
+
+    // Execute each surgical op: navigate to (line, col), insert/delete one char.
+    // Sort bottom-to-top so earlier ops don't shift later ones.
+    const sortedOps = [...plan.ops].sort((a, b) => b.line - a.line || b.col - a.col);
+    let applied = 0;
+    for (const op of sortedOps) {
+      if (autoTypeAbort) break;
+      try {
+        await navigateToDocLine(op.line, ctx);
+        // Counted Right to reach the target column. Capped by line length
+        // (rough — we don't have actual line length here; the UIA snapshot
+        // is stale by this point). Use the snapshot.
+        const snapLines = after.text.split('\n');
+        const snapLine = snapLines[op.line - 1] || '';
+        const targetCol = Math.min(op.col, snapLine.length);
+        for (let i = 0; i < targetCol; i++) {
+          if (autoTypeAbort) break;
+          await autoTypePressWithDwell(keyboard, Key.Right);
+          await autoTypeNavSleep(6, 12);
+        }
+        // Brief "spotted a problem" pause — humanizes the surgical action.
+        await autoTypeSleep(180 + Math.random() * 280);
+        if (op.action === 'insert') {
+          await autoTypeCharWithTypo(keyboard, Key, op.char, null);
+        } else if (op.action === 'delete') {
+          // We're at col `op.col` which is the position of the char to delete.
+          // One Right + Backspace removes it. Or just Delete from current position.
+          await autoTypePressWithDwell(keyboard, Key.Delete);
+          await autoTypeNavSleep(14, 30);
+        }
+        applied++;
+      } catch (e) {
+        console.warn(`[auto-type] surgical bracket op failed:`, e && e.message);
+      }
+    }
+
+    return { ok: true, repairs: applied, totalAttempted: sortedOps.length };
+  } catch (e) {
+    return { ok: false, reason: `exception:${e && e.message}` };
+  }
+}
+
+async function autoTypeMultiOpRepair(originalCode, language, authToken, apiBase, ctx) {
+  try {
+    const shot = await captureScreenForVision();
+    if (!shot || !shot.base64) {
+      return { ok: false, reason: 'no_screenshot' };
+    }
+    const uia = await readFocusedViaUIA(1500);
+    const editorText = (uia && uia.ok && typeof uia.text === 'string') ? uia.text : '';
+    if (editorText.length === 0) {
+      return { ok: false, reason: 'no_editor_text' };
+    }
+
+    const fetchUrl = `${apiBase}/api/v1/ai/autotype-vision`;
+    let visRes;
+    try {
+      visRes = await fetch(fetchUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({
+          screenshotBase64: shot.base64,
+          screenshotMediaType: shot.mediaType,
+          code: originalCode,
+          language,
+          editorText,
+        }),
+      });
+    } catch (netErr) {
+      return { ok: false, reason: `network:${netErr && netErr.message}` };
+    }
+
+    if (!visRes.ok) {
+      return { ok: false, reason: `vision_http_${visRes.status}` };
+    }
+
+    const repairPlan = await visRes.json().catch(() => null);
+    if (!repairPlan || !repairPlan.ok || !Array.isArray(repairPlan.operations)) {
+      return { ok: false, reason: 'no_repair_plan' };
+    }
+
+    if (repairPlan.operations.length === 0) {
+      // Vision agrees: nothing more to fix. Editor matches target.
+      return { ok: true, repairs: 0, reason: 'already_correct' };
+    }
+
+    // ── Cap 3: max 3 ops total ──
+    if (repairPlan.operations.length > 3) {
+      return { ok: false, reason: `too_many_repairs_${repairPlan.operations.length}` };
+    }
+
+    // ── Cap 4: confidence ≥0.78 ──
+    if (typeof repairPlan.confidence !== 'number' || repairPlan.confidence < 0.78) {
+      return { ok: false, reason: `repair_low_conf_${repairPlan.confidence}` };
+    }
+
+    // ── Completeness-aware caps (P5d v2) ──
+    // The OLD caps here were "typo-only": per-op span ≤2 lines AND total
+    // ≤150 chars. They let repair fix a stray bracket but made it REFUSE to
+    // COMPLETE a chunk the first pass left half-written (a navigation miss, an
+    // under-typed function body). That's the "finish what's actually left"
+    // behavior we want — so the size caps are gone.
+    //
+    // The protection against the ORIGINAL regression — "re-selecting a chunk
+    // that was already correct and re-typing it from the top" — was NEVER the
+    // size cap. It's Cap 5 below (skip no-op rewrites) + the structural-line
+    // filter + the content-loss guard, all enforced inside executeMultiOpPlan.
+    // Those stay. We replace the size caps with two legible rails that map
+    // directly to the user-reported symptom.
+    //
+    // Rail 1 — never type MORE than the intended solution. A "repair" that
+    // emits more characters than CODE_TO_TYPE itself isn't a repair, it's a
+    // rewrite. (+40 slack absorbs indentation / format drift.)
+    const totalRepairChars = repairPlan.operations.reduce((sum, op) => sum + (op.text || '').length, 0);
+    const targetChars = (originalCode || '').length;
+    if (totalRepairChars > targetChars + 40) {
+      return { ok: false, reason: `repair_exceeds_target_${totalRepairChars}v${targetChars}` };
+    }
+
+    // Rail 2 — refuse any single replace/delete that swallows (near-)the whole
+    // document. "replace L1..end" is exactly the "start from the beginning and
+    // rewrite everything" symptom the user reported. A chunk-sized op (one
+    // function body inside a larger file) is fine — that's what completing a
+    // leftover chunk looks like. Floor at 12 lines: in a tiny mostly-stub file
+    // a near-full fill is legitimate and Cap 5 / content-loss guard cover it.
+    const editorLineCount = Math.max(1, editorText.split('\n').length);
+    if (editorLineCount >= 12) {
+      for (const op of repairPlan.operations) {
+        if (op.op === 'insert') continue;
+        const span = (op.end_line || op.start_line) - op.start_line + 1;
+        if (span >= editorLineCount * 0.9) {
+          return { ok: false, reason: `repair_wholesale_refused_${span}of${editorLineCount}` };
+        }
+      }
+    }
+
+    // ── Cap 5: SKIP NO-OP REWRITES ──
+    // Before executing each op, check what's actually at the target lines
+    // RIGHT NOW. If the op's replacement text matches what's already there
+    // (whitespace-tolerant), it's a no-op rewrite — skip it. This is what
+    // produced the "re-typing the same chunk" regression.
+    const editorLines = editorText.split('\n');
+    const stripWs = (s) => s.replace(/\s+/g, '');
+    const meaningfulOps = [];
+    let noOpSkipped = 0;
+    for (const op of repairPlan.operations) {
+      if (op.op === 'replace' && op.text) {
+        const startIdx = op.start_line - 1;
+        const endIdx = op.end_line - 1;
+        if (startIdx >= 0 && endIdx < editorLines.length) {
+          const currentContent = editorLines.slice(startIdx, endIdx + 1).join('\n');
+          if (stripWs(currentContent) === stripWs(op.text)) {
+            console.log(`[auto-type] REPAIR: skipping no-op rewrite — L${op.start_line}-${op.end_line} already matches target (whitespace-tolerant)`);
+            noOpSkipped++;
+            continue;
+          }
+        }
+      }
+      meaningfulOps.push(op);
+    }
+
+    if (meaningfulOps.length === 0) {
+      // All proposed repairs were no-op rewrites. Editor is correct.
+      return { ok: true, repairs: 0, reason: `noop_rewrites_skipped_${noOpSkipped}` };
+    }
+
+    const opSummary = meaningfulOps
+      .map(o => `${o.op}[L${o.start_line}${o.op !== 'insert' ? '-' + o.end_line : ''}]`)
+      .join(', ');
+    console.log(`[auto-type] REPAIR: ${meaningfulOps.length} surgical fix(es) at conf=${repairPlan.confidence}${noOpSkipped > 0 ? ` (skipped ${noOpSkipped} no-op rewrites)` : ''} — ${opSummary}`);
+
+    // Re-use executeMultiOpPlan with the LATEST UIA text so the structural-
+    // line filter still refuses any unsafe repair.
+    const ctxWithLatestUIA = { ...ctx, uiaText: editorText };
+    const result = await executeMultiOpPlan(meaningfulOps, ctxWithLatestUIA);
+    return {
+      ok: true,
+      repairs: result.opCount,
+      totalAttempted: meaningfulOps.length,
+      noOpSkipped,
+    };
+  } catch (e) {
+    return { ok: false, reason: `exception:${e && e.message}` };
+  }
+}
+
 // Capability query for the renderer: tells App.tsx whether to skip the
 // slow OCR pre-check (because UIA is available) or run it (fallback path).
 ipcMain.handle('auto-type:capabilities', () => {
@@ -2954,6 +5879,10 @@ ipcMain.handle('db:claim-orphan-sessions', (_event, userId) => {
 });
 
 ipcMain.handle('db:get-active-session', (_event, userId) => {
+  // Cache so the X-close / tray-Quit path can demote/delete-empty the
+  // active session without a renderer roundtrip (renderer may be torn
+  // down by the time we'd otherwise need to ask it). See endSessionCleanly.
+  _maybeCacheUserId(userId);
   return database.getOrCreateActiveSession(userId);
 });
 
@@ -3173,6 +6102,15 @@ function wireTrayHandlers(stealth) {
       {
         label: 'Quit',
         click: () => {
+          // Quit is the deliberate "I'm really done" signal — always
+          // clean up regardless of popout state (X respects popout,
+          // Quit does not). Runs synchronously: DB demote/delete is
+          // sync SQLite, and we fire-and-forget cmd-end-session at the
+          // renderer (mic/Auto state matters in-memory only; mic dies
+          // with the process and Auto resets to false on next boot).
+          // Done BEFORE app.quit() so the DB write completes well
+          // before before-quit closes the SQLite handle.
+          endSessionCleanly();
           // Tray-Quit race fix: if there's NO pending update, mark
           // isQuitting=true now so mainWindow.on('close') (which fires as
           // part of app.quit()'s window-close cascade) takes its
@@ -3224,6 +6162,13 @@ app.whenReady().then(() => {
   // it would briefly create a window, register a tray, and start a second
   // updater check, all of which then fight the primary instance.
   if (!app.hasSingleInstanceLock()) return;
+
+  // Resolve which API server main.cjs talks to. Fire-and-forget: the
+  // ~1.2s probe finishes long before the user can trigger an auto-type
+  // (window paint + navigate + click a code block + 3s countdown). In
+  // dev with a local server up, this redirects API_BASE to localhost so
+  // server-side route changes are actually exercised.
+  resolveDevApiBase();
 
   // AppUserModelId — without this, Windows toast notifications either
   // show under "electron.app.Interview Copilot" or fail to display at
@@ -3293,6 +6238,32 @@ app.whenReady().then(() => {
       console.log('[auto-type] UIA bridge pre-warming in background');
     } catch (e) {
       console.warn('[auto-type] UIA bridge pre-warm failed:', e && e.message);
+    }
+  }
+
+  // Pre-warm nut-js on macOS. Native binding load is the same on every
+  // platform but on Mac it carries an extra ~500ms–1s of cost from
+  // CoreGraphics initialization that the user otherwise pays at
+  // first-Auto-Type-click. There's no UIA bridge equivalent on Mac (UIA
+  // is win32-only — see `auto-type:capabilities`), so the AI planner
+  // tier always fires regardless. Pre-warming `loadNut` doesn't trigger
+  // the Accessibility permission prompt (that's deferred until the
+  // first keyboard/mouse call); it just gets the native module loaded
+  // into memory so the synchronous keystrokes-per-character path runs
+  // at warm latency from the first user interaction. No-op on Win/Linux
+  // — Win has its own pre-warm above, Linux pays the load lazily and
+  // there's no way to grant Linux the equivalent of macOS Accessibility
+  // pre-grant.
+  if (process.platform === 'darwin') {
+    try {
+      loadNut();
+      console.log('[auto-type] nut-js pre-warmed (mac)');
+    } catch (e) {
+      // Don't crash the whole app if nut-js fails to load — the
+      // user-facing Auto-Type click will surface the error with a
+      // clear message via the existing auto-type:check-permission
+      // handler. Just log here.
+      console.warn('[auto-type] nut-js pre-warm failed (mac):', e && e.message);
     }
   }
 
@@ -3399,6 +6370,20 @@ app.whenReady().then(() => {
       // so there is exactly one install owner at quit.
       autoUpdater.autoInstallOnAppQuit = false;
 
+      // ── Force FULL downloads — no differential/blockmap ──
+      // Differential downloads reconstruct the new installer locally from a
+      // cached baseline + a downloaded .blockmap. When that reconstruction
+      // fails its sha512 check (common across an NSIS rebuild, a re-sign, or
+      // any non-byte-identical republish) electron-updater silently re-downloads
+      // the FULL file — that is the "it downloads 2 times" users report. Worse,
+      // a subtly-corrupt reconstruction can yield an installer that RUNS but
+      // doesn't cleanly replace the on-disk binary, so the next launch is still
+      // the old version → the "opens old, installs, reopens new, every launch"
+      // loop. Full downloads are larger but byte-exact and deterministic, and
+      // they make the on-disk install reliable. Applies to Windows NSIS, macOS
+      // zip, and Linux AppImage alike. (2026-06 update-loop fix.)
+      autoUpdater.disableDifferentialDownload = true;
+
       function sendUpdateStatus(status, info) {
         const payload = { status, ...info };
         BrowserWindow.getAllWindows().forEach((win) => {
@@ -3416,12 +6401,28 @@ app.whenReady().then(() => {
         pendingUpdate = null;
         installPendingUpdate = null;
         app.isQuitting = true;
-        try {
-          electronLog.info(`[updater] installing ${target && target.version} silent=${isSilent}`);
-          autoUpdater.quitAndInstall(isSilent, true);
-        } catch (err) {
-          electronLog.error('[updater] quitAndInstall threw:', err && err.message);
-          app.quit();
+        const proceed = () => {
+          try {
+            electronLog.info(`[updater] installing ${target && target.version} silent=${isSilent}`);
+            autoUpdater.quitAndInstall(isSilent, true);
+          } catch (err) {
+            electronLog.error('[updater] quitAndInstall threw:', err && err.message);
+            app.quit();
+          }
+        };
+        // Mac equivalent of the NSIS oneClick progress dialog. The MacUpdater
+        // ditto-swap is silent at the OS level, so without this the user sees
+        // the window vanish with no signal that an update is being applied —
+        // looks like a crash. Show the modal, hold for ~1.5s (matches the
+        // ~1s visible NSIS window on Windows), then let MacUpdater take over.
+        // isSilent=true callers (none today, but reserved) skip the modal so
+        // a future "background update at midnight" path can stay invisible.
+        if (process.platform === 'darwin' && !isSilent) {
+          showMacInstallerModal({ version: target && target.version })
+            .catch((err) => electronLog.warn('[updater] installer modal failed:', err && err.message))
+            .finally(() => setTimeout(proceed, 1500));
+        } else {
+          proceed();
         }
       }
 

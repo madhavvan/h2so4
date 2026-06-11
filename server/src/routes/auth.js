@@ -492,11 +492,42 @@ router.get('/google/callback', async (req, res) => {
       },
     });
 
-    // Show success page — try to auto-close the tab, fall back to a clear
-    // "return to app" message. The Electron renderer polls /google/poll and,
-    // on success, sends a 'focus-main-window' IPC so the desktop app jumps
-    // to the foreground while this tab fades.
-    res.send(`<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><div style="width:64px;height:64px;border-radius:16px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;margin:0 auto 24px;font-size:28px">✓</div><h2 style="color:#4ade80;margin:0 0 8px">Signed in successfully!</h2><p style="color:#9ca3af;margin:0">Returning to Interview Copilot…</p><p style="color:#6b7280;margin:16px 0 0;font-size:12px">You can close this tab.</p></div><script>setTimeout(function(){try{window.close();}catch(e){}},600);</script></body></html>`);
+    // Show success page → immediately hand control back to the desktop
+    // app via a custom-protocol redirect. The Electron main process
+    // registers `interview-copilot://` (see electron/main.cjs:76 single-
+    // instance + second-instance + open-url handlers); navigating the
+    // browser to that URL causes the OS to focus the running app and
+    // — critically — the browser auto-closes the protocol-launch tab.
+    // Falls back gracefully to manual close instructions if the user's
+    // browser blocks the protocol or the app isn't installed.
+    //
+    // The poll path still works in parallel: even if the protocol
+    // redirect is denied, the renderer's existing /google/poll loop
+    // signs the user in.
+    const safeSessionId = encodeURIComponent(String(session_id));
+    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signed in</title></head><body style="background:#050507;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center;max-width:420px;padding:0 20px"><div style="width:56px;height:56px;border-radius:14px;background:linear-gradient(135deg,#10b981,#3b82f6);display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:24px;color:#fff">✓</div><h2 style="color:#e5e7eb;margin:0 0 6px;font-weight:600;font-size:18px">Signed in</h2><p style="color:#9ca3af;margin:0;font-size:13px">Returning to Interview Copilot…</p><p id="fallback-msg" style="color:#6b7280;margin:18px 0 0;font-size:11px;opacity:0;transition:opacity 0.3s">You can close this tab now.</p></div><script>
+(function(){
+  // Hand off to the desktop app via the custom protocol. Browsers will
+  // close (or blank) this tab automatically when the OS protocol
+  // handler claims the navigation. If the OS doesn't recognize the
+  // protocol (older install, sandboxed browser), the redirect is a
+  // no-op and the fallback message after ~1.6s tells the user to close
+  // the tab manually.
+  var url = 'interview-copilot://signin-complete?session_id=${safeSessionId}';
+  try { window.location.href = url; } catch (e) { /* CSP or sandbox */ }
+  setTimeout(function(){
+    // Try the explicit window.close() as a second attempt (works when
+    // the original tab was opened via window.open from our app).
+    try { window.close(); } catch (e) {}
+    // Show the manual-close hint if we're still alive after the
+    // protocol attempt failed and window.close() was blocked.
+    setTimeout(function(){
+      var m = document.getElementById('fallback-msg');
+      if (m) m.style.opacity = '1';
+    }, 400);
+  }, 1200);
+})();
+</script></body></html>`);
 
   } catch (err) {
     console.error('Google OAuth callback error:', err);

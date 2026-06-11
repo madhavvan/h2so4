@@ -30,7 +30,12 @@ import { backfillAllConversations, BackfillProgress } from './services/aiProxySe
 import { RefundPolicy } from './RefundPolicy';
 import { useAnimatedModal } from './hooks/useAnimatedModal';
 
-const API_BASE = 'https://api.minicaai.com';
+// Vite inlines import.meta.env.PROD at build time. In dev, fall through to
+// VITE_SERVER_URL so a local-server setup actually reaches the local API
+// instead of silently hitting prod (which returns 401 on local JWTs).
+const API_BASE = (import.meta as any).env?.PROD
+  ? 'https://api.minicaai.com'
+  : ((import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com');
 
 interface SubscriptionStatus {
   status: 'active' | 'canceling' | 'trial' | 'expired' | 'revoked' | 'paused' | 'refunded' | 'disputed' | 'none';
@@ -218,6 +223,14 @@ export function ManageSubscription({
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [cancelConfirm, setCancelConfirm] = useState(false);
+  // Cancel-flow reason capture — feeds the audit_log on the server side
+  // so churn analytics can attribute lost users to fixable causes (price
+  // too high vs feature gap vs competitor switch). Reason picker is
+  // OPTIONAL (server doesn't gate cancel on it), but every enterprise
+  // billing portal — Stripe, Notion, Linear, Vercel — asks before they
+  // let you out the door.
+  const [cancelReason, setCancelReason] = useState<string>('');
+  const [cancelReasonDetail, setCancelReasonDetail] = useState<string>('');
   // Refund-policy modal state. Surfaced as an in-app overlay instead of
   // an external link to minicaai.com so the policy a user reads matches
   // the version of the app they're on, and works offline.
@@ -392,7 +405,14 @@ export function ManageSubscription({
       if (!token) throw new Error('Not signed in');
       const res = await fetch(`${API_BASE}/api/v1/payments/cancel-subscription`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` },
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          reason: cancelReason || null,
+          reason_detail: cancelReasonDetail || null,
+        }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -435,7 +455,7 @@ export function ManageSubscription({
     } finally {
       if (mountedRef.current) setActionLoading(null);
     }
-  }, [fetchSubscription, onLicenseUpdated]);
+  }, [fetchSubscription, onLicenseUpdated, cancelReason, cancelReasonDetail]);
 
   const handleBackfillHistory = useCallback(async () => {
     if (!userProfile?.id) return;
@@ -606,10 +626,15 @@ export function ManageSubscription({
       // entire surface (it's full-screen scrollable; a 2% scale on a
       // 1080p surface looks weirder than no scale at all) and instead
       // get the "lifted" feel from the inner content's translate-y.
+      // Light-mode wired 2026-05-13: backdrop stays translucent-dark (the
+      // "dim what's behind" semantic works in both modes), but the modal
+      // surface itself gets a solid bg via the sheet wrapper below so the
+      // content reads cleanly. Default text color is set on the surface
+      // wrapper so individual nodes don't need to repeat text-zinc-900.
       className={`fixed inset-0 z-[99999] overflow-y-auto custom-scrollbar transition-opacity duration-200 ease-out ${
         isVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
-      }`}
-      style={{ backgroundColor: 'rgba(0,0,0,0.85)', WebkitAppRegion: 'no-drag' } as any}
+      } bg-slate-50/95 dark:bg-black/85 text-zinc-900 dark:text-white`}
+      style={{ WebkitAppRegion: 'no-drag' } as any}
       role="dialog"
       aria-modal="true"
       aria-label="Manage subscription"
@@ -618,11 +643,11 @@ export function ManageSubscription({
           wrap the body in a transform-gpu element because position:sticky
           attaches to the nearest scroll ancestor and a transformed
           ancestor would create a new containing block that breaks it. */}
-      <div className="sticky top-0 z-10 bg-[#0a0a0d]/95 border-b border-white/[0.06] px-6 py-3 flex items-center justify-between">
-        <h2 className="text-lg font-bold text-white">Manage subscription</h2>
+      <div className="sticky top-0 z-10 bg-white/95 dark:bg-[#0a0a0d]/95 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-200 dark:border-white/[0.06] px-6 py-3 flex items-center justify-between">
+        <h2 className="text-lg font-bold text-zinc-900 dark:text-white">Manage subscription</h2>
         <button
           onClick={onClose}
-          className="w-8 h-8 rounded-lg hover:bg-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+          className="w-8 h-8 rounded-lg hover:bg-zinc-100 dark:hover:bg-white/[0.08] flex items-center justify-center text-zinc-500 dark:text-gray-400 hover:text-zinc-900 dark:hover:text-white transition-colors"
           aria-label="Close"
         >
           <X size={18} />
@@ -741,7 +766,7 @@ export function ManageSubscription({
             handles both Stripe and Razorpay in-place server-side, so the
             same handleUpgradeTier call works for either provider. */}
         <div className="space-y-3">
-          <h4 className="text-xs font-bold uppercase tracking-wider text-white/50">Available plans</h4>
+          <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500 dark:text-white/50">Available plans</h4>
 
           {/* === Free tier → all paid options === */}
           {tier === 'free' && (
@@ -754,15 +779,15 @@ export function ManageSubscription({
                 <div className="flex items-center gap-3">
                   <Crown size={18} className="text-blue-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">
+                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
                       {upgradePending === 'pro' ? 'Preparing checkout…' : 'Upgrade to Pro'}
                     </div>
-                    <div className="text-xs text-white/60">Unlimited time · GPT-5.5, Grok, Llama · Pop-out · Auto-Solve</div>
+                    <div className="text-xs text-zinc-600 dark:text-white/60">Unlimited time · GPT-5.5, Grok, Llama · Pop-out · Auto-Solve</div>
                   </div>
                 </div>
                 {upgradePending === 'pro'
                   ? <Loader2 size={16} className="animate-spin text-blue-400" />
-                  : <ChevronRight size={16} className="text-white/40" />}
+                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
               </button>
               <button
                 onClick={() => onUpgradeRequested('max')}
@@ -772,15 +797,15 @@ export function ManageSubscription({
                 <div className="flex items-center gap-3">
                   <WizardHat size={18} className="text-amber-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">
+                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
                       {upgradePending === 'max' ? 'Preparing checkout…' : 'Upgrade to Max'}
                     </div>
-                    <div className="text-xs text-white/60">Pro + Claude Sonnet 4.6 + Auto-Type + Train Model</div>
+                    <div className="text-xs text-zinc-600 dark:text-white/60">Pro + Claude Sonnet 4.6 + Auto-Type + Train Model</div>
                   </div>
                 </div>
                 {upgradePending === 'max'
                   ? <Loader2 size={16} className="animate-spin text-amber-400" />
-                  : <ChevronRight size={16} className="text-white/40" />}
+                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
               </button>
               <button
                 onClick={() => onUpgradeRequested('basic')}
@@ -790,15 +815,15 @@ export function ManageSubscription({
                 <div className="flex items-center gap-3">
                   <Zap size={18} className="text-emerald-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">
+                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
                       {upgradePending === 'basic' ? 'Preparing checkout…' : 'Get Basic'}
                     </div>
-                    <div className="text-xs text-white/60">3 hours · 14-day window · GPT, Grok, Llama (no Claude)</div>
+                    <div className="text-xs text-zinc-600 dark:text-white/60">3 hours · 14-day window · GPT, Grok, Llama (no Claude)</div>
                   </div>
                 </div>
                 {upgradePending === 'basic'
                   ? <Loader2 size={16} className="animate-spin text-emerald-400" />
-                  : <ChevronRight size={16} className="text-white/40" />}
+                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
               </button>
             </>
           )}
@@ -815,15 +840,15 @@ export function ManageSubscription({
                   <div className="flex items-center gap-3">
                     <Zap size={18} className="text-emerald-400" />
                     <div className="text-left">
-                      <div className="font-semibold text-white text-sm">
+                      <div className="font-semibold text-zinc-900 dark:text-white text-sm">
                         {renewPending ? 'Preparing checkout…' : 'Renew · +1 hour'}
                       </div>
-                      <div className="text-xs text-white/60">Adds another hour of session time to your Basic plan.</div>
+                      <div className="text-xs text-zinc-600 dark:text-white/60">Adds another hour of session time to your Basic plan.</div>
                     </div>
                   </div>
                   {renewPending
                     ? <Loader2 size={16} className="animate-spin text-emerald-400" />
-                    : <ChevronRight size={16} className="text-white/40" />}
+                    : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
                 </button>
               )}
               <button
@@ -834,15 +859,15 @@ export function ManageSubscription({
                 <div className="flex items-center gap-3">
                   <Crown size={18} className="text-blue-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">
+                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
                       {upgradePending === 'pro' ? 'Preparing checkout…' : 'Upgrade to Pro'}
                     </div>
-                    <div className="text-xs text-white/60">Unlimited time, no expiry · keep your remaining Basic hours.</div>
+                    <div className="text-xs text-zinc-600 dark:text-white/60">Unlimited time, no expiry · keep your remaining Basic hours.</div>
                   </div>
                 </div>
                 {upgradePending === 'pro'
                   ? <Loader2 size={16} className="animate-spin text-blue-400" />
-                  : <ChevronRight size={16} className="text-white/40" />}
+                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
               </button>
               <button
                 onClick={() => onUpgradeRequested('max')}
@@ -852,15 +877,15 @@ export function ManageSubscription({
                 <div className="flex items-center gap-3">
                   <WizardHat size={18} className="text-amber-400" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">
+                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
                       {upgradePending === 'max' ? 'Preparing checkout…' : 'Upgrade to Max'}
                     </div>
-                    <div className="text-xs text-white/60">Adds Claude + Auto-Type + Train Model.</div>
+                    <div className="text-xs text-zinc-600 dark:text-white/60">Adds Claude + Auto-Type + Train Model.</div>
                   </div>
                 </div>
                 {upgradePending === 'max'
                   ? <Loader2 size={16} className="animate-spin text-amber-400" />
-                  : <ChevronRight size={16} className="text-white/40" />}
+                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
               </button>
             </>
           )}
@@ -877,11 +902,11 @@ export function ManageSubscription({
               <div className="flex items-center gap-3">
                 <WizardHat size={18} className="text-amber-400" />
                 <div className="text-left">
-                  <div className="font-semibold text-white text-sm">Upgrade to Max</div>
-                  <div className="text-xs text-white/60">Adds Claude Sonnet 4.6 + Auto-Type + Train Model. Effective immediately, prorated diff next invoice.</div>
+                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">Upgrade to Max</div>
+                  <div className="text-xs text-zinc-600 dark:text-white/60">Adds Claude Sonnet 4.6 + Auto-Type + Train Model. Effective immediately, prorated diff next invoice.</div>
                 </div>
               </div>
-              {actionLoading === 'upgrade-max' ? <Loader2 size={16} className="animate-spin text-amber-400" /> : <ChevronRight size={16} className="text-white/40" />}
+              {actionLoading === 'upgrade-max' ? <Loader2 size={16} className="animate-spin text-amber-400" /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
             </button>
           )}
 
@@ -897,11 +922,110 @@ export function ManageSubscription({
               <div className="flex items-center gap-3">
                 <Crown size={18} className="text-blue-400" />
                 <div className="text-left">
-                  <div className="font-semibold text-white text-sm">Switch to Pro</div>
-                  <div className="text-xs text-white/60">Removes Claude + Auto-Type + Train Model. {isRazorpay ? 'Effective at next renewal — keep Max access until then.' : 'Effective immediately, prorated credit next invoice.'}</div>
+                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">Switch to Pro</div>
+                  <div className="text-xs text-zinc-600 dark:text-white/60">Removes Claude + Auto-Type + Train Model. {isRazorpay ? 'Effective at next renewal — keep Max access until then.' : 'Effective immediately, prorated credit next invoice.'}</div>
                 </div>
               </div>
-              {actionLoading === 'upgrade-pro' ? <Loader2 size={16} className="animate-spin text-blue-400" /> : <ChevronRight size={16} className="text-white/40" />}
+              {actionLoading === 'upgrade-pro' ? <Loader2 size={16} className="animate-spin text-blue-400" /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
+            </button>
+          )}
+
+          {/* === Pro/Max → Switch to Basic (deep downgrade) ===
+              Provider-aware: real users with a Stripe/Razorpay sub go
+              through the cancel modal (with reason capture + the
+              save-attempt UX); admin grants (no payment provider on
+              file) call /upgrade-tier directly because there's no
+              subscription to cancel — server's grantAdminTier path
+              handles the DB-only tier flip in one round-trip.
+              Without this branch, admins clicked the button and
+              nothing visible happened (the cancel modal is gated on
+              `isPaidProvider` further down). */}
+          {(tier === 'pro' || tier === 'max') && (
+            <button
+              onClick={() => {
+                if (isPaidProvider) {
+                  setCancelReason('switching_to_basic');
+                  setCancelReasonDetail('I want to downgrade to Basic ($25 one-time / 3 sessions). Please cancel my recurring subscription so I can purchase Basic after the current cycle ends.');
+                  setCancelConfirm(true);
+                } else {
+                  // No payment provider → admin-grant path. Hits
+                  // /upgrade-tier which short-circuits to grantAdminTier
+                  // for ADMIN_EMAILS callers. For non-admin users
+                  // without a provider (which shouldn't happen — every
+                  // paid tier requires a checkout that sets the
+                  // provider), the server will return a polite error
+                  // and we surface it in the existing error toast.
+                  handleUpgradeTier('basic' as any);
+                }
+              }}
+              disabled={!!actionLoading}
+              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-emerald-500/25 bg-emerald-500/[0.06] hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
+            >
+              <div className="flex items-center gap-3">
+                <Zap size={18} className="text-emerald-400" />
+                <div className="text-left">
+                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">Switch to Basic{!isPaidProvider && ' (admin)'}</div>
+                  <div className="text-xs text-zinc-600 dark:text-white/60">{isPaidProvider
+                    ? '$25 one-time, 3 sessions, 14-day window. Basic isn\'t a subscription — your current sub cancels at cycle end, then you re-purchase Basic. Keeps your account intact.'
+                    : 'No payment provider on file — instant tier flip (admin grant).'
+                  }</div>
+                </div>
+              </div>
+              <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />
+            </button>
+          )}
+
+          {/* === Pro/Max → Switch to Free (cancel subscription) ===
+              Same provider-aware branch as Switch to Basic: real users
+              go through cancel modal; admin grants flip the tier
+              instantly. */}
+          {(tier === 'pro' || tier === 'max') && (
+            <button
+              onClick={() => {
+                if (isPaidProvider) {
+                  setCancelConfirm(true);
+                } else {
+                  handleUpgradeTier('free' as any);
+                }
+              }}
+              disabled={!!actionLoading}
+              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-zinc-100 dark:bg-white/[0.06] transition-colors disabled:opacity-50"
+            >
+              <div className="flex items-center gap-3">
+                <X size={18} className="text-white/60" />
+                <div className="text-left">
+                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">Switch to Free{!isPaidProvider && ' (admin)'}</div>
+                  <div className="text-xs text-zinc-600 dark:text-white/60">{isPaidProvider
+                    ? `Stop paying. You keep ${tierMeta.label} access until ${formatExpiry(expiresAt)}, then drop to Free (5 sessions/month, Gemini only).`
+                    : 'No payment provider on file — instant tier flip to Free (admin grant).'
+                  }</div>
+                </div>
+              </div>
+              <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />
+            </button>
+          )}
+
+          {/* === Basic → switch to Free (let it expire) ===
+              Basic auto-expires after 14 days or 3 sessions, so there's
+              no recurring sub to cancel. This button is informational
+              — clicking it shows the expiry date and a note that no
+              cancellation is needed. */}
+          {tier === 'basic' && (
+            <button
+              onClick={() => {
+                setSuccess(`Basic doesn't auto-renew — your current credits expire on ${formatExpiry(expiresAt)} and your tier will drop to Free automatically. No cancellation needed.`);
+              }}
+              disabled={!!actionLoading}
+              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-zinc-100 dark:bg-white/[0.06] transition-colors disabled:opacity-50"
+            >
+              <div className="flex items-center gap-3">
+                <X size={18} className="text-white/60" />
+                <div className="text-left">
+                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">Stay on Basic / let it expire to Free</div>
+                  <div className="text-xs text-zinc-600 dark:text-white/60">Basic is a one-time purchase — it doesn't renew. Your access ends on {formatExpiry(expiresAt)}.</div>
+                </div>
+              </div>
+              <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />
             </button>
           )}
         </div>
@@ -913,7 +1037,7 @@ export function ManageSubscription({
             users see nothing here — there's no billing relationship yet. */}
         {(tier === 'pro' || tier === 'max') && (
           <div className="space-y-3">
-            <h4 className="text-xs font-bold uppercase tracking-wider text-white/50">Billing</h4>
+            <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500 dark:text-white/50">Billing</h4>
 
             {/* Cancel-pending state: surface explicit "scheduled to end"
                 copy + a one-click Reactivate CTA. The Stripe Portal can do
@@ -921,7 +1045,7 @@ export function ManageSubscription({
                 users won't bother. Inline reactivation is the retention
                 lever — it converts canceled-then-regretted users back to
                 active without losing them to the Portal's friction. */}
-            {isStripe && status === 'canceling' && (
+            {status === 'canceling' && (
               <div className="p-4 rounded-xl border border-amber-500/30 bg-amber-500/[0.06] space-y-3">
                 <div className="flex items-start gap-3">
                   <AlertTriangle size={18} className="text-amber-400 shrink-0 mt-0.5" />
@@ -946,16 +1070,16 @@ export function ManageSubscription({
               <button
                 onClick={handleStripePortal}
                 disabled={actionLoading === 'portal'}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-white/[0.06] transition-colors disabled:opacity-50"
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-zinc-100 dark:bg-white/[0.06] transition-colors disabled:opacity-50"
               >
                 <div className="flex items-center gap-3">
                   <ExternalLink size={18} className="text-white/70" />
                   <div className="text-left">
-                    <div className="font-semibold text-white text-sm">Manage billing in Stripe</div>
-                    <div className="text-xs text-white/60">{status === 'canceling' ? 'Update card, view invoices, change billing cycle.' : 'Update card, view invoices, change billing cycle, or cancel subscription.'}</div>
+                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">Manage billing in Stripe</div>
+                    <div className="text-xs text-zinc-600 dark:text-white/60">{status === 'canceling' ? 'Update card, view invoices, change billing cycle.' : 'Update card, view invoices, change billing cycle, or cancel subscription.'}</div>
                   </div>
                 </div>
-                {actionLoading === 'portal' ? <Loader2 size={16} className="animate-spin text-white/70" /> : <ChevronRight size={16} className="text-white/40" />}
+                {actionLoading === 'portal' ? <Loader2 size={16} className="animate-spin text-white/70" /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
               </button>
             )}
 
@@ -970,29 +1094,128 @@ export function ManageSubscription({
                 {!cancelConfirm ? (
                   <button
                     onClick={() => setCancelConfirm(true)}
-                    className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-white/[0.06] transition-colors"
+                    className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-zinc-100 dark:bg-white/[0.06] transition-colors"
                   >
                     <div className="flex items-center gap-3">
                       <X size={18} className="text-red-400" />
                       <div className="text-left">
-                        <div className="font-semibold text-white text-sm">Cancel subscription</div>
-                        <div className="text-xs text-white/60">You'll keep access until the end of your current billing cycle. You can reactivate any time before then.</div>
+                        <div className="font-semibold text-zinc-900 dark:text-white text-sm">Cancel subscription</div>
+                        <div className="text-xs text-zinc-600 dark:text-white/60">You'll keep access until the end of your current billing cycle. You can reactivate any time before then.</div>
                       </div>
                     </div>
-                    <ChevronRight size={16} className="text-white/40" />
+                    <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />
                   </button>
                 ) : (
-                  <div className="p-4 rounded-xl border border-red-500/30 bg-red-500/10 space-y-3">
+                  <div className="p-4 rounded-xl border border-red-500/30 bg-red-500/10 space-y-4">
                     <div className="flex items-start gap-3">
                       <AlertTriangle size={18} className="text-red-400 shrink-0 mt-0.5" />
                       <div>
                         <div className="font-semibold text-red-200 text-sm">Cancel your {tierMeta.label} subscription?</div>
-                        <div className="text-xs text-red-200/80 mt-1">Your subscription will be canceled at the end of the current billing cycle. You'll keep full access until {formatExpiry(expiresAt)}. No refund for the partial period. You can reactivate at any time before {formatExpiry(expiresAt)} to keep your subscription going.</div>
+                        <div className="text-xs text-red-200/80 mt-1">
+                          You'll keep full {tierMeta.label} access until <strong>{formatExpiry(expiresAt)}</strong>, then drop to Free. No partial-period refund. Reactivate any time before then to keep going.
+                        </div>
                       </div>
                     </div>
-                    <div className="flex justify-end gap-2">
+
+                    {/* Save attempt: offer a cheaper plan instead of full
+                        cancellation. Standard enterprise pattern (Notion,
+                        Linear, Vercel all do this) — many users churn
+                        because they need less, not because they're done. */}
+                    {(tier === 'max' || tier === 'pro') && (
+                      <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 space-y-2">
+                        <div className="flex items-center gap-2 text-amber-200">
+                          <Sparkles size={13} />
+                          <span className="text-[12px] font-bold uppercase tracking-wider">Before you go — would a cheaper plan work?</span>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {tier === 'max' && (
+                            <button
+                              type="button"
+                              onClick={() => { setCancelConfirm(false); handleUpgradeTier('pro'); }}
+                              disabled={!!actionLoading}
+                              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30 border border-indigo-500/40 transition-colors disabled:opacity-50"
+                            >
+                              Switch to Pro instead
+                            </button>
+                          )}
+                          {(tier === 'max' || tier === 'pro') && isStripe && (
+                            <button
+                              type="button"
+                              onClick={() => { setCancelConfirm(false); window.open(`${API_BASE}/api/v1/payments/portal-redirect?token=${licenseService.getToken() || ''}`, '_blank'); }}
+                              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white/10 text-white/80 hover:bg-white/15 border border-white/15 transition-colors"
+                            >
+                              Pause via billing portal
+                            </button>
+                          )}
+                        </div>
+                        <div className="text-[10.5px] text-amber-200/70 leading-relaxed">
+                          Pro is half the price and still gives you every model except Claude.
+                        </div>
+                      </div>
+                    )}
+
+                    {/* What you'll lose — feature-loss preview computed
+                        from the FEATURE_GATES table (mirrored in the
+                        bot's preview_tier_change tool). Pulled inline
+                        so we don't fetch the bot endpoint just for
+                        labels. */}
+                    <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3 space-y-1.5">
+                      <div className="text-[11px] font-bold uppercase tracking-wider text-white/60">What you'll lose at {formatExpiry(expiresAt)}</div>
+                      <ul className="text-[12px] text-white/80 space-y-1 ml-2 list-disc list-inside">
+                        {tier === 'max' && <li>Claude Sonnet 4.6 access</li>}
+                        {tier === 'max' && <li>Auto-Type (typing into the editor for you)</li>}
+                        {tier === 'max' && <li>Reasoning effort control</li>}
+                        {(tier === 'max' || tier === 'pro' || tier === 'basic') && <li>Gemini, Groq, GPT, and Grok models</li>}
+                        {(tier === 'max' || tier === 'pro' || tier === 'basic') && <li>Auto-Solve (screen-capture problem solving)</li>}
+                        {(tier === 'max' || tier === 'pro' || tier === 'basic') && <li>Pop-out window (screen-share invisible)</li>}
+                        {(tier === 'max' || tier === 'pro' || tier === 'basic') && <li>Unlimited context files + export history</li>}
+                        <li>Five sessions/month limit (Free)</li>
+                      </ul>
+                    </div>
+
+                    {/* Reason capture — for churn analytics. Optional,
+                        but defaults to encouraging the user to tell us
+                        why. We record this in the audit log on the
+                        server side. */}
+                    <div className="space-y-2">
+                      <div className="text-[11px] font-bold uppercase tracking-wider text-white/60">Why are you canceling? <span className="text-white/40 font-normal normal-case tracking-normal">(optional, helps us improve)</span></div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {[
+                          { v: 'too_expensive', l: 'Too expensive' },
+                          { v: 'not_using', l: 'Not using it enough' },
+                          { v: 'switching', l: 'Switching to another tool' },
+                          { v: 'missing_feature', l: 'Missing a feature I need' },
+                          { v: 'bug_or_bad_quality', l: 'Quality / bugs' },
+                          { v: 'other', l: 'Other' },
+                        ].map(opt => (
+                          <button
+                            key={opt.v}
+                            type="button"
+                            onClick={() => setCancelReason(opt.v)}
+                            className={`px-2.5 py-1.5 rounded-md text-[12px] text-left transition-colors border ${
+                              cancelReason === opt.v
+                                ? 'bg-blue-500/20 border-blue-500/50 text-blue-100'
+                                : 'bg-white/[0.03] border-white/10 text-white/75 hover:bg-zinc-100 dark:bg-white/[0.06]'
+                            }`}
+                          >
+                            {opt.l}
+                          </button>
+                        ))}
+                      </div>
+                      {cancelReason && (
+                        <textarea
+                          value={cancelReasonDetail}
+                          onChange={(e) => setCancelReasonDetail(e.target.value.slice(0, 500))}
+                          rows={2}
+                          placeholder="Tell us more (optional, 500 char max)…"
+                          className="w-full px-2.5 py-2 rounded-md text-[12px] bg-white/[0.03] border border-white/10 text-white placeholder-white/40 resize-none focus:outline-none focus:border-white/30"
+                        />
+                      )}
+                    </div>
+
+                    <div className="flex justify-end gap-2 pt-1">
                       <button
-                        onClick={() => setCancelConfirm(false)}
+                        onClick={() => { setCancelConfirm(false); setCancelReason(''); setCancelReasonDetail(''); }}
                         className="px-4 py-2 rounded-lg text-sm font-medium bg-white/10 text-white hover:bg-white/15 transition-colors"
                       >
                         Keep subscription
@@ -1014,7 +1237,7 @@ export function ManageSubscription({
 
         {/* Plan comparison */}
         <div className="space-y-3">
-          <h4 className="text-xs font-bold uppercase tracking-wider text-white/50">Compare plans</h4>
+          <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500 dark:text-white/50">Compare plans</h4>
           <div className="overflow-x-auto rounded-xl border border-white/10">
             <table className="w-full text-sm">
               <thead>
@@ -1059,7 +1282,7 @@ export function ManageSubscription({
 
         {/* Account section */}
         <div className="space-y-3">
-          <h4 className="text-xs font-bold uppercase tracking-wider text-white/50">Account</h4>
+          <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500 dark:text-white/50">Account</h4>
           <div className="rounded-xl border border-white/10 bg-white/[0.02] divide-y divide-white/5">
             {/* Display name — read-only by default, click to edit. We keep
                 the row visually quiet (no always-on input) so the section
@@ -1079,7 +1302,7 @@ export function ManageSubscription({
                         if (e.key === 'Enter') { e.preventDefault(); handleSaveName(); }
                         else if (e.key === 'Escape') { e.preventDefault(); setNameEditing(false); setNameError(null); }
                       }}
-                      className="w-full bg-white/[0.04] border border-white/10 rounded-lg px-2.5 py-1.5 text-sm text-white outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20"
+                      className="w-full bg-zinc-100 dark:bg-white/[0.04] border border-white/10 rounded-lg px-2.5 py-1.5 text-sm text-white outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20"
                       placeholder="Your name"
                     />
                   ) : (
@@ -1105,7 +1328,7 @@ export function ManageSubscription({
                       <button
                         onClick={() => { setNameEditing(false); setNameError(null); }}
                         disabled={nameSaving}
-                        className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 text-white/70 hover:text-white disabled:opacity-50 transition-colors"
+                        className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-zinc-100 dark:bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 text-white/70 hover:text-white disabled:opacity-50 transition-colors"
                       >
                         Cancel
                       </button>
@@ -1121,7 +1344,7 @@ export function ManageSubscription({
                   ) : (
                     <button
                       onClick={() => { setDraftName(userProfile?.name || ''); setNameError(null); setNameEditing(true); }}
-                      className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 text-white/70 hover:text-white transition-colors"
+                      className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-zinc-100 dark:bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 text-white/70 hover:text-white transition-colors"
                     >
                       Edit
                     </button>

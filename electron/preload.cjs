@@ -48,6 +48,13 @@ const SEND_CHANNELS = new Set([
   // Decision from the in-app update-on-close prompt (replaces the native
   // dialog.showMessageBox response). Payload: { decision: 'install' | 'dismiss' }
   'update-prompt-decision',
+  // Support bot inbox alerts (admin only). Renderer's background WS
+  // hook in App.tsx forwards customer_joined / message events to main
+  // for native OS notifications + tray badge + dock counter. See
+  // electron/main.cjs SUPPORT INBOX ALERT BRIDGE block.
+  'support:alert',          // payload: { threadId, title, body, kind, customerEmail, customerName }
+  'support:clear-unread',   // payload: none — admin opened the inbox, reset badge
+  'support:thread-viewed',  // payload: { threadId } — admin opened a specific thread
 ]);
 
 // Renderer → main, request/response (ipcRenderer.invoke)
@@ -101,6 +108,16 @@ const RECEIVE_CHANNELS = new Set([
   'app-hidden-to-tray',
   // In-app update-on-close prompt (replaces native dialog.showMessageBox)
   'show-update-prompt',
+  // Main → renderer deeplink: admin tapped a support notification.
+  // Payload: { threadId, customerEmail }. Renderer opens the bot
+  // panel + jumps to that specific thread in the inbox.
+  'support:open-inbox',
+  // Clean-close signal from main → main renderer. Fires when the user
+  // hits X (with no popout) or tray Quit. Renderer reacts by stopping
+  // the mic (if listening) and turning off Auto mode (if on). Conversation
+  // state is handled separately via the existing db:active-session-changed
+  // broadcast that endSessionCleanly also emits.
+  'cmd-end-session',
 ]);
 
 function send(channel, data) {

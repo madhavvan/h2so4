@@ -5,6 +5,7 @@
 
 const express = require('express');
 const { authMiddleware } = require('../middleware/auth');
+const { writeAudit } = require('../middleware/admin');
 const db = require('../database');
 
 const router = express.Router();
@@ -48,6 +49,12 @@ function getPaymentProvider(countryCode) {
 // recurring and unlimited (lifecycle managed by provider webhooks).
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
 function grantConfigForTier(tier) {
+  if (tier === 'free') {
+    // Free tier: rolling 30-day window, 5 practice sessions/month.
+    // Mirrors db.transitionLicenseToFree() so the admin-grant path
+    // produces identical state to the cycle-end downgrade path.
+    return { tier: 'free', sessions_limit: 5, expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000 };
+  }
   if (tier === 'basic') {
     return { tier: 'basic', sessions_limit: 3, expires_at: Date.now() + FOURTEEN_DAYS_MS };
   }
@@ -55,7 +62,12 @@ function grantConfigForTier(tier) {
 }
 
 // ── Normalize/validate the tier coming in from the client ──
-const VALID_TIERS = ['basic', 'pro', 'max'];
+// `free` is included for admin grants (testing the downgrade-to-free
+// path without going through cancel-and-wait-for-cycle-end). For
+// non-admin callers, /upgrade-tier rejects `free` (they should cancel
+// the subscription instead — that triggers the proper webhook + email
+// chain at cycle end).
+const VALID_TIERS = ['free', 'basic', 'pro', 'max'];
 function normalizeTier(t) {
   return VALID_TIERS.includes(t) ? t : 'pro';
 }
@@ -292,7 +304,14 @@ router.post('/upgrade-tier', authMiddleware, async (req, res) => {
 
     if (targetTier === 'basic') {
       return res.status(400).json({
-        error: 'Switching to Basic from a paid subscription is not supported. Cancel your current subscription first.',
+        error: 'Switching to Basic from a paid subscription is not supported. Cancel your current subscription first — at cycle end you\'ll be on Free, and you can then purchase Basic ($25 one-time) from the Manage Subscription screen.',
+        suggested_action: 'cancel-subscription',
+      });
+    }
+    if (targetTier === 'free') {
+      return res.status(400).json({
+        error: 'Switching directly to Free isn\'t supported via /upgrade-tier. Cancel your subscription instead — you\'ll keep paid access until the end of your billing cycle, then drop to Free automatically.',
+        suggested_action: 'cancel-subscription',
       });
     }
 
@@ -435,10 +454,40 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
   });
   const license = db.getLicenseByUserId(user.id);
 
+  // Audit trail — every tier change writes a row so compliance/support
+  // can answer "when did this user go Pro → Max + who initiated it".
+  try {
+    writeAudit(req, 'user-change-tier', { id: user.id, email: user.email }, {
+      provider: 'stripe',
+      from_tier: currentTier,
+      to_tier: targetTier,
+      proration: 'next_invoice',
+    });
+  } catch (auditErr) {
+    console.warn('[upgrade-tier:stripe] audit log failed:', auditErr.message);
+  }
+
+  // Tier-transition email — fire-and-forget so a transient email
+  // outage doesn't fail the upgrade. The render function lives in
+  // server/src/email.js; if it's not exported, we just skip.
+  try {
+    const { sendMail, renderTierChangeEmail } = require('../email');
+    if (typeof renderTierChangeEmail === 'function') {
+      const { subject, html, text } = renderTierChangeEmail({
+        name: user.name, fromTier: currentTier, toTier: targetTier,
+        provider: 'stripe', effectiveDate: 'now (prorated on next invoice)',
+      });
+      sendMail({ to: user.email, subject, html, text }).catch(() => { /* mail outage */ });
+    }
+  } catch { /* email module missing or threw — non-fatal */ }
+
   return res.json({
     provider: 'stripe-upgrade',
     tier: targetTier,
     previous_tier: currentTier,
+    effective_date: Date.now(),
+    effective_date_label: 'now',
+    proration: 'next_invoice',
     license: license ? { ...license, last_validated: Date.now() } : null,
     message: `Plan changed to ${targetTier.toUpperCase()}. The prorated difference will appear on your next invoice.`,
   });
@@ -513,15 +562,53 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
   }
   const license = db.getLicenseByUserId(user.id);
 
+  // Effective date: upgrades are immediate; downgrades wait for cycle end
+  // (Razorpay's schedule_change_at='cycle_end' semantics). license.expires_at
+  // is the current period end for an active sub, so that's the right
+  // moment for a scheduled downgrade.
+  const effectiveAt = isUpgrade ? Date.now() : (license?.expires_at || null);
+
+  // Audit trail
+  try {
+    writeAudit(req, 'user-change-tier', { id: user.id, email: user.email }, {
+      provider: 'razorpay',
+      from_tier: currentTier,
+      to_tier: targetTier,
+      direction: isUpgrade ? 'upgrade' : 'downgrade',
+      effective_at: effectiveAt,
+    });
+  } catch (auditErr) {
+    console.warn('[upgrade-tier:razorpay] audit log failed:', auditErr.message);
+  }
+
+  // Tier-transition email
+  try {
+    const { sendMail, renderTierChangeEmail } = require('../email');
+    if (typeof renderTierChangeEmail === 'function') {
+      const dateLabel = effectiveAt && effectiveAt > 0
+        ? new Date(effectiveAt).toISOString().slice(0, 10)
+        : (isUpgrade ? 'now' : 'end of current cycle');
+      const { subject, html, text } = renderTierChangeEmail({
+        name: user.name, fromTier: currentTier, toTier: targetTier,
+        provider: 'razorpay', effectiveDate: dateLabel,
+      });
+      sendMail({ to: user.email, subject, html, text }).catch(() => { /* mail outage */ });
+    }
+  } catch { /* non-fatal */ }
+
   return res.json({
     provider: 'razorpay-upgrade',
     tier: isUpgrade ? targetTier : currentTier,
     previous_tier: currentTier,
     pending_tier: isUpgrade ? null : targetTier,
+    effective_date: effectiveAt,
+    effective_date_label: effectiveAt
+      ? new Date(effectiveAt).toISOString().slice(0, 10)
+      : (isUpgrade ? 'now' : 'end of current cycle'),
     license: license ? { ...license, last_validated: Date.now() } : null,
     message: isUpgrade
       ? `Plan upgraded to ${targetTier.toUpperCase()}. The prorated difference has been charged today.`
-      : `Plan will switch to ${targetTier.toUpperCase()} at the end of your current billing cycle. You keep ${currentTier.toUpperCase()} access until then.`,
+      : `Plan will switch to ${targetTier.toUpperCase()} at the end of your current billing cycle (${effectiveAt ? new Date(effectiveAt).toISOString().slice(0, 10) : 'end of cycle'}). You keep ${currentTier.toUpperCase()} access until then.`,
   });
 }
 
@@ -1306,51 +1393,143 @@ router.get('/subscription', authMiddleware, async (req, res) => {
 // UI flip immediately without waiting for the next webhook tick.
 router.post('/reactivate-subscription', authMiddleware, async (req, res) => {
   try {
-    if (!stripe) return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
-
     const user = db.getUserById(req.user.id);
-    if (!user || !user.stripe_customer_id || !user.stripe_customer_id.startsWith('cus_')) {
-      return res.status(400).json({ error: 'No Stripe subscription on file. If you canceled and the period has ended, start a new subscription instead.' });
-    }
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Pick the most recent sub. If multiple are active (shouldn't happen
-    // with /upgrade-tier doing in-place swaps, but defensively), the
-    // newest is the one the user is currently being billed for.
-    const subs = await stripe.subscriptions.list({ customer: user.stripe_customer_id, status: 'all', limit: 5 });
-    const candidate = subs.data.find(s => s.status === 'active' && s.cancel_at_period_end === true);
-    if (!candidate) {
-      // Either nothing is canceling, or the period already ended.
-      return res.status(400).json({ error: 'No active subscription is scheduled to cancel. Nothing to reactivate.' });
-    }
+    const customerId = user.stripe_customer_id || '';
+    const isRazorpay = customerId.startsWith('rzp_');
+    const isStripe = customerId.startsWith('cus_');
 
-    const updated = await stripe.subscriptions.update(candidate.id, { cancel_at_period_end: false });
-
-    // Mirror local license back to 'active'. expires_at goes back to the
-    // grant default (-1 unlimited) since the sub will renew normally now.
-    // Strict tier resolution — never default to 'pro' on a missing
-    // metadata.tier (a stripe quirk could otherwise silently upgrade a
-    // Basic buyer). Fall through to the existing license tier if metadata
-    // is missing.
-    const safeTier = (t) => VALID_TIERS.includes(t) ? t : null;
-    const tier = safeTier(candidate.metadata?.tier) || safeTier(db.getLicenseByUserId(user.id)?.tier);
-    if (tier) {
-      const grant = grantConfigForTier(tier);
-      db.updateLicenseOnPayment(user.id, {
-        tier: grant.tier,
-        status: 'active',
-        expires_at: grant.expires_at,
-        sessions_limit: grant.sessions_limit,
+    if (!isRazorpay && !isStripe) {
+      return res.status(400).json({
+        error: 'No subscription on file to reactivate. If your billing cycle already ended, start a new subscription from the Manage Subscription screen.',
       });
     }
 
-    const license = db.getLicenseByUserId(user.id);
-    res.json({
-      provider: 'stripe-reactivate',
-      tier,
-      license: license ? { ...license, last_validated: Date.now() } : null,
-      message: 'Subscription reactivated — your plan will continue to renew normally.',
-      stripe_subscription_id: updated.id,
-    });
+    // ── Stripe path: native un-cancel via cancel_at_period_end=false ──
+    if (isStripe) {
+      if (!stripe) return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
+      const subs = await stripe.subscriptions.list({ customer: customerId, status: 'all', limit: 5 });
+      const candidate = subs.data.find(s => s.status === 'active' && s.cancel_at_period_end === true);
+      if (!candidate) {
+        return res.status(400).json({ error: 'No active subscription is scheduled to cancel. Nothing to reactivate.' });
+      }
+      const updated = await stripe.subscriptions.update(candidate.id, { cancel_at_period_end: false });
+      const safeTier = (t) => VALID_TIERS.includes(t) ? t : null;
+      const tier = safeTier(candidate.metadata?.tier) || safeTier(db.getLicenseByUserId(user.id)?.tier);
+      if (tier) {
+        const grant = grantConfigForTier(tier);
+        db.updateLicenseOnPayment(user.id, {
+          tier: grant.tier,
+          status: 'active',
+          expires_at: grant.expires_at,
+          sessions_limit: grant.sessions_limit,
+        });
+      }
+      // Audit trail
+      try {
+        writeAudit(req, 'user-reactivate-subscription', { id: user.id, email: user.email }, {
+          provider: 'stripe',
+          subscription_id: updated.id,
+          tier_restored: tier,
+        });
+      } catch (auditErr) {
+        console.warn('[reactivate] audit log failed:', auditErr.message);
+      }
+      const license = db.getLicenseByUserId(user.id);
+      return res.json({
+        provider: 'stripe-reactivate',
+        tier,
+        effective_date: Date.now(),
+        effective_date_label: 'now',
+        license: license ? { ...license, last_validated: Date.now() } : null,
+        message: 'Subscription reactivated — your plan will continue to renew normally.',
+        stripe_subscription_id: updated.id,
+      });
+    }
+
+    // ── Razorpay path: Razorpay's REST API has no direct un-cancel for
+    //    a sub that was scheduled with cancel_at_cycle_end=false. The
+    //    cycle still completes (user has access until current_end), but
+    //    no renewal will fire. To restore renewal we have to mirror the
+    //    user's intent in our DB and ALSO try the Razorpay update API
+    //    in case Razorpay has flipped on a reactivate endpoint we
+    //    haven't seen yet. Worst case we fall through with a clear
+    //    "contact support" message so the user isn't stranded.
+    if (isRazorpay) {
+      if (!razorpay) return res.status(503).json({ error: 'Razorpay is not configured. Contact support.' });
+
+      const subscriptionId = db.getLatestRazorpaySubscriptionId(user.id);
+      if (!subscriptionId) {
+        return res.status(404).json({ error: 'No Razorpay subscription on file to reactivate.' });
+      }
+
+      // Best-effort: try the Razorpay update API. If they've enabled a
+      // resume/reactivate API on the sub object, this will succeed.
+      let razorpayResumed = false;
+      let razorpayErr = null;
+      try {
+        // The update API accepts schedule_change_at to swap a plan; it
+        // doesn't directly clear a scheduled cancellation. Fetching the
+        // subscription tells us whether it's still active.
+        const sub = await razorpay.subscriptions.fetch(subscriptionId);
+        if (sub && sub.status === 'active') {
+          // Razorpay sub is still active — we can't programmatically
+          // clear `cancel_at_cycle_end`. The user has access until
+          // `current_end`; after that the sub stops renewing. We mark
+          // the license back to 'active' locally so the UI doesn't
+          // show "canceling" anymore, but we surface the limitation in
+          // the response so the user knows the cycle still ends.
+          razorpayResumed = true;
+        } else {
+          razorpayErr = `Razorpay subscription is in '${sub?.status || 'unknown'}' state; needs a new subscription, not a reactivation.`;
+        }
+      } catch (rpErr) {
+        razorpayErr = rpErr.message || String(rpErr);
+      }
+
+      if (!razorpayResumed) {
+        return res.status(400).json({
+          provider: 'razorpay',
+          error: razorpayErr || 'Razorpay subscriptions can\'t be reactivated programmatically once the cycle ends. Start a new subscription from the Manage Subscription screen.',
+          fallback: 'start_new_subscription',
+        });
+      }
+
+      // Local mirror: flip status back to 'active'. expires_at stays
+      // anchored to the original cycle_end (Razorpay won't renew past
+      // it without a new subscription, so we don't lie about lifetime).
+      const license = db.getLicenseByUserId(user.id);
+      if (license) {
+        db.updateLicenseOnPayment(user.id, {
+          tier: license.tier,
+          status: 'active',
+          expires_at: license.expires_at,
+          sessions_limit: license.sessions_limit,
+        });
+      }
+      try {
+        writeAudit(req, 'user-reactivate-subscription', { id: user.id, email: user.email }, {
+          provider: 'razorpay',
+          subscription_id: subscriptionId,
+          razorpay_note: 'sub still active in current cycle; renewal stays cancelled (Razorpay API limitation)',
+        });
+      } catch (auditErr) {
+        console.warn('[reactivate] razorpay audit log failed:', auditErr.message);
+      }
+
+      const refreshed = db.getLicenseByUserId(user.id);
+      return res.json({
+        provider: 'razorpay-reactivate',
+        tier: refreshed?.tier || null,
+        effective_date: Date.now(),
+        effective_date_label: 'now',
+        license: refreshed ? { ...refreshed, last_validated: Date.now() } : null,
+        message: 'Reactivated within the current cycle. Heads-up: Razorpay can\'t resume the auto-renewal once it\'s been scheduled to stop — to renew past your current cycle end, start a new subscription from Manage Subscription before then.',
+        razorpay_subscription_id: subscriptionId,
+        renewal_caveat: true,
+      });
+    }
   } catch (err) {
     console.error('[reactivate-subscription] error:', err.message);
     res.status(500).json({ error: err.message || 'Failed to reactivate. Please try again.' });
@@ -1502,6 +1681,15 @@ router.post('/cancel-subscription', authMiddleware, async (req, res) => {
     const user = db.getUserById(req.user.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
+    // Capture an OPTIONAL cancellation reason. The ManageSubscription UI
+    // now asks "why are you leaving?" before submit (Too expensive / Not
+    // using / Switching tools / Other + free-form). We persist it to the
+    // audit trail for churn analysis. Server doesn't gate on the reason
+    // — leaving it blank still cancels — so users who skip the dropdown
+    // aren't trapped.
+    const reasonRaw = String(req.body?.reason || '').trim().slice(0, 200);
+    const reasonDetail = String(req.body?.reason_detail || '').trim().slice(0, 500);
+
     const customerId = user.stripe_customer_id || '';
     const isRazorpay = customerId.startsWith('rzp_');
     const isStripe = customerId.startsWith('cus_');
@@ -1572,12 +1760,58 @@ router.post('/cancel-subscription', authMiddleware, async (req, res) => {
     // as the legacy /cancel-razorpay route. (P1-G from the audit.)
     db.gateAndRecordEventForUser(user.id, Math.floor(Date.now() / 1000));
 
+    // Audit trail — captures who canceled, when, on which provider, and
+    // the optional reason the user gave. Critical for churn analysis +
+    // for support to honor "I canceled by mistake" claims. The audit row
+    // is best-effort: if it fails, the cancellation still succeeds.
+    try {
+      writeAudit(req, 'user-cancel-subscription', { id: user.id, email: user.email }, {
+        provider: providerLabel,
+        subscription_id: subscriptionId,
+        tier_at_cancel: license?.tier || null,
+        cancels_at: periodEndMs,
+        reason: reasonRaw || null,
+        reason_detail: reasonDetail || null,
+      });
+    } catch (auditErr) {
+      console.warn('[cancel-subscription] audit log failed:', auditErr.message);
+    }
+
+    // Confirmation email — receipt + one-click reactivate link. Best
+    // effort: if the email transport isn't configured (Resend/SMTP both
+    // unset in dev), the function logs and returns rather than throws,
+    // so the cancellation still completes.
+    try {
+      const { sendMail, renderCancellationEmail } = require('../email');
+      if (typeof renderCancellationEmail === 'function') {
+        const effectiveLabel = periodEndMs
+          ? new Date(periodEndMs).toISOString().slice(0, 10)
+          : 'end of current cycle';
+        const manageUrl = `${process.env.FRONTEND_URL || 'https://minicaai.com'}/manage`;
+        const { subject, html, text } = renderCancellationEmail({
+          name: user.name,
+          tier: license?.tier || 'subscription',
+          effectiveDate: effectiveLabel,
+          manageUrl,
+        });
+        sendMail({ to: user.email, subject, html, text }).catch(() => { /* email outage non-fatal */ });
+      }
+    } catch { /* email module missing or threw — non-fatal */ }
+
     res.json({
       success: true,
       provider: providerLabel,
       subscription_id: subscriptionId,
       cancels_at: periodEndMs,
-      message: 'Your subscription will be cancelled at the end of the current billing period. You keep full access until then — and you can reactivate any time before that date from the Manage subscription screen.',
+      // ISO label for the UI — avoids re-formatting client-side.
+      effective_date: periodEndMs ? new Date(periodEndMs).toISOString() : null,
+      effective_date_label: periodEndMs
+        ? new Date(periodEndMs).toISOString().slice(0, 10)
+        : 'end of current period',
+      reason_recorded: !!reasonRaw,
+      message: periodEndMs
+        ? `Your subscription will be cancelled on ${new Date(periodEndMs).toISOString().slice(0, 10)}. You keep full access until then — and you can reactivate any time before that date from Manage subscription.`
+        : 'Your subscription will be cancelled at the end of the current billing period. You keep full access until then — and you can reactivate any time before that date from Manage subscription.',
       license: updatedLicense ? { ...updatedLicense, last_validated: Date.now() } : null,
     });
   } catch (err) {

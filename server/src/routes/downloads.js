@@ -24,17 +24,21 @@ const router = express.Router();
 const REPO = 'madhavvan/h2so4';
 
 // Artifact filenames must match the patterns in package.json's
-// build.{win,mac,linux}.artifactName — keep them in sync. Mac builds two
-// variants because Apple Silicon (arm64) and Intel (x64) need different
-// binaries; /mac defaults to x64 because Rosetta runs x64 on Apple
-// Silicon (slightly slower but always works), while arm64 won't run at
-// all on Intel Macs. Apple Silicon users who want native performance
-// can hit /mac-arm64 directly.
+// build.{win,mac,linux}.artifactName — keep them in sync.
+//
+// Mac ships as a Universal Binary (single .app bundle containing both
+// arm64 + x64 slices). One download for every Mac since 2009; macOS
+// picks the right slice at launch. The /mac-x64 and /mac-arm64
+// historical aliases are preserved as fallbacks so users with cached
+// old links still resolve, and so the picker page below can keep its
+// existing layout. All three URLs now redirect to the same Universal
+// DMG — the architecture distinction is no longer meaningful.
+const UNIVERSAL_MAC_DMG = 'InterviewCopilot-Mac.dmg';
 const FILES = {
   'windows':    'InterviewCopilot-Setup.exe',
-  'mac':        'InterviewCopilot-Mac-x64.dmg',
-  'mac-x64':    'InterviewCopilot-Mac-x64.dmg',
-  'mac-arm64':  'InterviewCopilot-Mac-arm64.dmg',
+  'mac':        UNIVERSAL_MAC_DMG,
+  'mac-x64':    UNIVERSAL_MAC_DMG,
+  'mac-arm64':  UNIVERSAL_MAC_DMG,
   'linux':      'InterviewCopilot-Linux.AppImage',
 };
 
@@ -72,8 +76,7 @@ router.get('/', (req, res) => {
   <p>Pick the build for your operating system.</p>
   <div class="row">
     <a href="/windows">Windows · Setup.exe</a>
-    <a href="/mac">macOS · DMG (Universal via Rosetta)</a>
-    <a href="/mac-arm64">macOS · DMG (Apple Silicon native)</a>
+    <a href="/mac">macOS · DMG (Apple Silicon + Intel)</a>
     <a href="/linux">Linux · AppImage</a>
   </div>
 </div></body></html>`);

@@ -2,6 +2,17 @@
 //  GEO SERVICE — Country detection, VPN/proxy blocking
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+// Same env-aware API base pattern used by licenseService / pricingService.
+// In prod (built bundle) we always hit api.minicaai.com; in dev a Vite
+// env override lets us point at a local server. The geo lookup goes
+// through our /api/v1/geo proxy now (was direct browser → ipapi.co),
+// which fixes the recurring CORS errors users saw on every render
+// when ipapi.co rate-limited the source IP and returned 429s without
+// Access-Control-Allow-Origin headers.
+const API_BASE = (import.meta as any).env?.PROD
+  ? 'https://api.minicaai.com'
+  : ((import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com');
+
 export interface GeoData {
   ip: string;
   country_code: string;
@@ -40,26 +51,31 @@ class GeoService {
       return this.cachedGeo;
     }
 
+    // Primary path: our own /api/v1/geo proxy. Same-origin (no CORS
+    // friction), the server handles ipapi.co rate-limiting / outages
+    // gracefully, and the response shape is filtered to exactly the
+    // keys we use. Wrapped in try/catch so a server outage degrades
+    // to the timezone-only fallback instead of a red console error.
+    const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     try {
-      // Primary: ipapi.co (free, reliable, includes proxy detection)
-      const response = await fetch('https://ipapi.co/json/', {
+      const response = await fetch(`${API_BASE}/api/v1/geo`, {
         headers: { 'Accept': 'application/json' },
       });
 
-      if (!response.ok) throw new Error('Primary geo API failed');
+      if (!response.ok) throw new Error(`Geo proxy returned ${response.status}`);
 
       const data = await response.json();
-
-      const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
       const timezoneCountries = TIMEZONE_COUNTRY_MAP[browserTimezone] || [];
-      const ipCountry = data.country_code?.toUpperCase() || 'US';
+      const ipCountry = (data.country_code || 'US').toUpperCase();
 
-      // VPN/Proxy detection heuristics
+      // VPN/Proxy detection heuristics. Same logic as before — the
+      // proxy / hosting fields are passed through unchanged by the
+      // server route so we can still surface "may be on a VPN"
+      // signals where needed.
       const timezoneMatch = timezoneCountries.length === 0 || timezoneCountries.includes(ipCountry);
       const isProxy = data.proxy === true || data.hosting === true;
       const isVpn = !timezoneMatch || isProxy;
 
-      // Threat assessment
       let threat_level: 'low' | 'medium' | 'high' = 'low';
       if (isProxy && !timezoneMatch) threat_level = 'high';
       else if (isProxy || !timezoneMatch) threat_level = 'medium';
@@ -79,10 +95,10 @@ class GeoService {
 
       this.cacheExpiry = Date.now() + this.CACHE_TTL;
       return this.cachedGeo;
-
-    } catch (err) {
-      // Fallback: use browser timezone to infer country
-      const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    } catch {
+      // Silent timezone-only fallback. Intentionally swallowed —
+      // geo is best-effort, and surfacing the error to console
+      // would re-create the noise the proxy was supposed to remove.
       const countries = TIMEZONE_COUNTRY_MAP[browserTimezone] || ['US'];
 
       this.cachedGeo = {

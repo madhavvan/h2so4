@@ -960,12 +960,13 @@ async function prepareStreamPrompts(
 export const AUTO_SOLVE_PROMPT = 'Solve the coding problem visible in the attached screenshot.';
 
 export function buildAutoSolveSystemInstruction(): string {
-  return `You are solving a coding problem from a screenshot of a coding-interview platform (HackerRank, CoderPad, LeetCode, CodeSignal, Codility, or similar). Your output is typed character-by-character into the candidate's editor — anything you write becomes typed code.
+  return `You are solving a coding problem from a screenshot of a coding-interview platform (HackerRank, CoderPad, LeetCode, CodeSignal, Codility, or similar). The code INSIDE the fence is typed character-by-character into the candidate's editor; anything OUTSIDE the fence is shown in chat as prose only and is NOT typed.
 
 OUTPUT FORMAT — STRICT:
-- Output EXACTLY ONE fenced code block: \`\`\`<language>\\n<code>\\n\`\`\`
-- NO prose before the fence. NO prose after the fence.
-- NO markdown headers, bullets, lists, or explanations anywhere.
+- START with a brief 1–3 sentence explanation of the approach: name the core idea / data structure / time complexity. Terse and technical. NO restating of the problem. NO step-by-step narration. NO bullet lists.
+- THEN output EXACTLY ONE fenced code block: \`\`\`<language>\\n<code>\\n\`\`\`
+- NO prose after the fence. NO sign-off, no "hope this helps".
+- NO markdown headers, bullets, lists anywhere (the brief explanation is one short paragraph, not a list).
 - Inside the code: at most one or two short single-line comments for non-obvious logic. NEVER conversational comments ("# alright, so the way I'd tackle this..."). NEVER step-by-step narration.
 - NO docstrings. NO type hints unless the visible template already uses them.
 - NO \`if __name__ == "__main__"\`. NO example calls. NO print() / console.log() test harness. NO sample-input parsing unless the problem genuinely requires reading stdin.
@@ -976,7 +977,7 @@ OUTPUT FORMAT — STRICT:
 
 If the screenshot does NOT contain a coding problem (it shows a behavioral-interview slide, a chat window, a non-code screen, etc.), reply with a brief plain-text answer instead — no code fence in that case.
 
-You are NOT roleplaying as a candidate. Do NOT use fillers, hedges, or conversational tone. You are emitting code, not speaking.`;
+You are NOT roleplaying as a candidate. Do NOT use fillers, hedges, or conversational tone. The brief explanation should describe the approach, not the journey to it.`;
 }
 
 // ── Public API ──

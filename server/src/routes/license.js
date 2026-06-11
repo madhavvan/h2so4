@@ -34,7 +34,7 @@ router.post('/validate', async (req, res) => {
     }
 
     // Look up license in database
-    const license = db.getLicenseByKey(key);
+    let license = db.getLicenseByKey(key);
     if (!license) {
       return res.status(404).json({ error: 'License not found' });
     }
@@ -43,7 +43,46 @@ router.post('/validate', async (req, res) => {
     if (license.status === 'revoked') {
       return res.status(403).json({ error: 'license_revoked', message: 'License revoked.' });
     }
-    if (license.status === 'expired' || (license.expires_at > 0 && Date.now() > license.expires_at)) {
+
+    // ── Auto-transition: 'canceling' past its expires_at → 'free' ──
+    // The cycle-end sweeper (server/src/index.js) and webhook handlers
+    // are the primary paths for this transition. /validate is the
+    // third defensive layer — any time the client re-validates (on
+    // app boot, on focus, every 30 min) and we observe an expired
+    // canceling license, we transition NOW so the response reflects
+    // the new state instead of saying "still Pro" for hours/days
+    // until the next sweep tick lands.
+    if (license.status === 'canceling' && license.expires_at > 0 && Date.now() > license.expires_at) {
+      try {
+        const transitioned = db.transitionLicenseToFree(license.user_id, { reason: 'validate-fallback' });
+        if (transitioned && transitioned.transitioned) {
+          console.log(`[license/validate] cycle-end transition: user=${license.user_id} ${transitioned.from.tier} → free (sweep missed)`);
+          // Fire the goodbye email here too — same shape as the
+          // sweeper, so the user gets exactly one email regardless of
+          // which path catches the transition first. (We don't dedup
+          // server-side yet; webhook + sweep + validate-fallback can
+          // theoretically each fire one. That's the next iteration.)
+          try {
+            const { sendMail, renderAccessEndedEmail } = require('../email');
+            const u = db.getUserById(license.user_id);
+            if (u && typeof renderAccessEndedEmail === 'function') {
+              const buyBasicUrl = (process.env.FRONTEND_URL || 'https://minicaai.com') + '/#pricing';
+              const signInUrl = process.env.FRONTEND_URL || 'https://minicaai.com';
+              const { subject, html, text } = renderAccessEndedEmail({
+                name: u.name, previousTier: transitioned.from.tier, buyBasicUrl, signInUrl,
+              });
+              sendMail({ to: u.email, subject, html, text }).catch(() => { /* mail outage non-fatal */ });
+            }
+          } catch { /* email module unavailable */ }
+          // Re-read the row so the response below reflects the new state.
+          license = db.getLicenseByKey(key);
+        }
+      } catch (transErr) {
+        console.warn('[license/validate] transition-to-free failed:', transErr.message);
+      }
+    }
+
+    if (license.status === 'expired' || (license.expires_at > 0 && Date.now() > license.expires_at && license.tier !== 'free')) {
       db.updateLicenseStatus(key, 'expired');
       return res.status(403).json({ error: 'license_expired', message: 'License expired. Please renew.' });
     }

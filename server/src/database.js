@@ -179,6 +179,101 @@ function getDB() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
+    -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    --  SUPPORT BOT — live-chat threads + persistence (2026-05-13)
+    --
+    --  Up until now, every support conversation lived ONLY in two
+    --  ephemeral places: the in-memory supportClients Map on the
+    --  server, and React state inside SupportBot.tsx. A server
+    --  restart, a customer reload, or the admin closing the bot
+    --  panel = total history loss. That made it impossible to:
+    --    • show an admin who returns later what's open
+    --    • compute SLA timers (no first-response timestamp)
+    --    • email a customer a delayed reply
+    --    • give the customer their own past conversations
+    --  These tables are the foundation for all of that.
+    --
+    --  support_threads:  one row per "conversation" between a single
+    --                    customer and the team. Created on first
+    --                    customer message OR on /handoff POST. Lives
+    --                    until resolved (or 90 days for cleanup).
+    --  support_messages: each message in a thread. Customer, agent,
+    --                    bot, or system message — distinguished by
+    --                    sender_role.
+    --  support_agent_presence: per-admin online/away/offline, plus
+    --                    their notification prefs and a private
+    --                    ntfy.sh topic for phone push.
+    --  support_escalation_queue: cron-style table the timer worker
+    --                    scans every 10s; rows are deleted-on-fire
+    --                    via fired_at and cleaned up on resolve.
+    -- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    CREATE TABLE IF NOT EXISTS support_threads (
+      id TEXT PRIMARY KEY,                       -- UUID
+      customer_email TEXT NOT NULL,
+      customer_name TEXT,
+      customer_tier TEXT,                        -- snapshot at thread open
+      customer_user_id TEXT,                     -- nullable for anonymous
+      status TEXT NOT NULL DEFAULT 'open',       -- open / assigned / resolved / spam
+      assigned_agent_email TEXT,                 -- nullable until claimed
+      initial_question TEXT,                     -- what they wrote in the handoff form
+      channel TEXT NOT NULL DEFAULT 'bot',       -- bot / handoff-form / email-reply
+      customer_ip TEXT,
+      customer_ua TEXT,
+      tags TEXT,                                 -- JSON array, e.g. ["billing","bug"]
+      created_at INTEGER NOT NULL,
+      first_response_at INTEGER,                 -- ms timestamp, SLA metric
+      resolved_at INTEGER,
+      satisfaction_rating INTEGER,               -- 1-5, nullable
+      satisfaction_comment TEXT,
+      -- Last-customer-message timestamp drives the SLA color. We
+      -- maintain this on every message insert via the helper rather
+      -- than computing it on read — keeps the inbox query cheap even
+      -- with thousands of threads.
+      last_customer_message_at INTEGER,
+      last_agent_message_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS support_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      thread_id TEXT NOT NULL,
+      sender_role TEXT NOT NULL,                 -- customer / agent / bot / system
+      sender_email TEXT,                         -- nullable for system/bot
+      sender_name TEXT,
+      text TEXT NOT NULL,
+      attachment_url TEXT,                       -- nullable; for v2 file uploads
+      attachment_kind TEXT,                      -- image / file / null
+      created_at INTEGER NOT NULL,
+      read_by_other_at INTEGER,                  -- when the OTHER side last read
+      FOREIGN KEY (thread_id) REFERENCES support_threads(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS support_agent_presence (
+      agent_email TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'offline',    -- online / away / offline
+      last_heartbeat_at INTEGER NOT NULL,
+      notification_prefs TEXT,                   -- JSON: { desktop, slack, ntfy, email_after_min }
+      ntfy_topic TEXT,                           -- per-agent topic on https://ntfy.sh/<topic>
+      twilio_phone TEXT,                         -- E.164, optional, for SMS escalation
+      ntfy_topic_visible INTEGER DEFAULT 0       -- has admin already seen + subscribed
+    );
+
+    -- Scheduled escalation alerts. The cron-style worker in
+    -- server/src/index.js scans this table every 10s. Rows are
+    -- INSERTed when a customer joins (4 rows: t+30s ntfy, t+2m email,
+    -- t+5m sms, t+24h fallback) and marked fired_at when sent. A row
+    -- with fired_at set != NULL is a no-op going forward. Worker
+    -- skips rows where the parent thread has been claimed (i.e.
+    -- assigned_agent_email IS NOT NULL) — agent picked up before
+    -- escalation, no need to spam phone.
+    CREATE TABLE IF NOT EXISTS support_escalation_queue (
+      thread_id TEXT NOT NULL,
+      channel TEXT NOT NULL,                     -- ntfy / email / sms / fallback
+      fire_at INTEGER NOT NULL,
+      fired_at INTEGER,                          -- nullable; set when sent
+      PRIMARY KEY (thread_id, channel),
+      FOREIGN KEY (thread_id) REFERENCES support_threads(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS payments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id TEXT NOT NULL,
@@ -225,6 +320,19 @@ function getDB() {
     CREATE INDEX IF NOT EXISTS idx_webhook_events_received ON webhook_events(received_at);
     CREATE INDEX IF NOT EXISTS idx_reset_tokens_user ON password_reset_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_reset_tokens_expires ON password_reset_tokens(expires_at);
+
+    -- Support bot indexes. The inbox query "show me all open threads
+    -- ordered by SLA urgency" filters on status and sorts by
+    -- last_customer_message_at; this is the hot path for an admin
+    -- with hundreds of threads. The customer history query filters
+    -- on customer_email; the agent's "my threads" tab filters on
+    -- assigned_agent_email.
+    CREATE INDEX IF NOT EXISTS idx_support_threads_status   ON support_threads(status, last_customer_message_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_support_threads_customer ON support_threads(customer_email, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_support_threads_agent    ON support_threads(assigned_agent_email, status);
+    CREATE INDEX IF NOT EXISTS idx_support_messages_thread  ON support_messages(thread_id, created_at);
+    -- Escalation worker scans for un-fired rows whose fire_at has passed.
+    CREATE INDEX IF NOT EXISTS idx_support_escalation_due   ON support_escalation_queue(fire_at) WHERE fired_at IS NULL;
   `);
 
   // Set default app config. Per-tier device limits — admin can tune each via
@@ -327,6 +435,25 @@ function getDB() {
   const loginCols = db.prepare("PRAGMA table_info(login_logs)").all();
   if (!loginCols.find(c => c.name === 'platform')) {
     db.exec('ALTER TABLE login_logs ADD COLUMN platform TEXT');
+  }
+
+  // ── Support agent presence — ntfy verification timestamps ──
+  // 2026-05-13 follow-up: admins were confused whether they had to
+  // re-subscribe to ntfy on every alert. Persisting these two
+  // timestamps lets the inbox card render an unambiguous "✓ Push
+  // active · last alert 3m ago" status instead of the open-ended
+  // setup card every time.
+  //   ntfy_verified_at  — when the most recent /test-alert returned
+  //                       OK; set on the server so it survives a
+  //                       client wipe / re-install.
+  //   ntfy_last_alert_at — any successful push (test or production).
+  //                        Drives the "last alert N ago" label.
+  const presenceCols = db.prepare("PRAGMA table_info(support_agent_presence)").all();
+  if (presenceCols.length > 0 && !presenceCols.find(c => c.name === 'ntfy_verified_at')) {
+    db.exec('ALTER TABLE support_agent_presence ADD COLUMN ntfy_verified_at INTEGER');
+  }
+  if (presenceCols.length > 0 && !presenceCols.find(c => c.name === 'ntfy_last_alert_at')) {
+    db.exec('ALTER TABLE support_agent_presence ADD COLUMN ntfy_last_alert_at INTEGER');
   }
 
   // ── Webhook event ordering (out-of-order resurrection guard) ──
@@ -658,6 +785,69 @@ function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_lim
   }
   args.push(userId);
   getDB().prepare(`UPDATE licenses SET ${sets.join(', ')} WHERE user_id = ?`).run(...args);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+//  END-OF-CYCLE DOWNGRADE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+// Central transition: paid → free. Called from THREE places so the
+// state-machine never depends on a single signal:
+//   1. Webhook handler (subscription.deleted / .halted / .completed)
+//      — primary path, fastest reaction
+//   2. Scheduled sweeper in server/src/index.js — fallback if the
+//      webhook gets lost, retries exhaust, or there's a queue lag
+//   3. /api/v1/license/validate — opportunistic: any time we observe
+//      a 'canceling' license whose expires_at has passed, transition
+//      it on the spot
+//
+// Idempotent: if the user is already on free, no-op + returns false.
+// Otherwise updates the row to free-tier defaults (5 sessions/month
+// for the free plan, no time credits) and returns true so the caller
+// can fire the goodbye email exactly once.
+function transitionLicenseToFree(userId, opts = {}) {
+  const d = getDB();
+  const cur = d.prepare('SELECT tier, status FROM licenses WHERE user_id = ?').get(userId);
+  if (!cur) return false;
+  if (cur.tier === 'free' && cur.status !== 'canceling') return false;
+
+  const FREE_SESSIONS_LIMIT = 5;
+  const FREE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  d.prepare(`
+    UPDATE licenses
+    SET tier = 'free',
+        status = 'active',
+        expires_at = ?,
+        sessions_limit = ?
+    WHERE user_id = ?
+  `).run(now + FREE_PERIOD_MS, FREE_SESSIONS_LIMIT, userId);
+
+  // Mirror tier onto the user row so downstream code that reads from
+  // users.tier (rather than licenses.tier) stays consistent.
+  try {
+    d.prepare('UPDATE users SET tier = \'free\', updated_at = ? WHERE id = ?').run(now, userId);
+  } catch { /* schema may not have updated_at; ignore */ }
+
+  return {
+    transitioned: true,
+    from: { tier: cur.tier, status: cur.status },
+    reason: opts.reason || 'cycle-end',
+  };
+}
+
+// Returns user IDs whose licenses are 'canceling' AND past their
+// expires_at — these are the rows the cycle-end sweeper should
+// transition. Filtered to expires_at > 0 because -1 means "never"
+// (lifetime grant — admin tools may set this).
+function getExpiredCancelingUserIds(limit = 100) {
+  return getDB().prepare(`
+    SELECT user_id
+    FROM licenses
+    WHERE status = 'canceling'
+      AND expires_at > 0
+      AND expires_at < ?
+    LIMIT ?
+  `).all(Date.now(), limit).map(r => r.user_id);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1486,7 +1676,12 @@ function hasPaymentBeenRefunded(provider, providerPaymentId) {
 function recordAdminRefund({ originalPayment, refundId, amount, reason, initiatedBy }) {
   if (!originalPayment) return null;
   const d = getDB();
-  d.prepare(`
+  // Was previously fire-and-forget — the caller (refund_payment bot
+  // tool) used `const refundRow = db.recordAdminRefund(...)` and
+  // serialized refundRow back to the model, which would JSON-stringify
+  // to undefined. Return a useful summary so the bot can confirm the
+  // refund row exists.
+  const result = d.prepare(`
     INSERT INTO payments (user_id, email, provider, provider_payment_id, provider_subscription_id, amount, currency, status, tier_granted, metadata, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -1508,6 +1703,14 @@ function recordAdminRefund({ originalPayment, refundId, amount, reason, initiate
     }),
     Date.now(),
   );
+  return {
+    id: result.lastInsertRowid,
+    original_payment_id: originalPayment.id,
+    amount: -(Math.abs(amount) || 0),
+    currency: originalPayment.currency || 'USD',
+    provider: originalPayment.provider,
+    provider_refund_id: refundId || null,
+  };
 }
 
 // Filtered payment query for the admin Payments tab. All filters are
@@ -1853,6 +2056,440 @@ function getStats() {
   };
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SUPPORT BOT — helpers for thread/message persistence
+//  (2026-05-13 — replaces ephemeral in-memory supportClients Map)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Thread create — first time we see a customer or they POST to /handoff.
+// Generates a UUID via crypto.randomUUID (Node 14.17+). Status starts
+// 'open'; gets flipped to 'assigned' on first agent message via
+// claimSupportThread, and 'resolved' on resolveSupportThread.
+function createSupportThread({
+  customer_email,
+  customer_name = null,
+  customer_tier = null,
+  customer_user_id = null,
+  initial_question = null,
+  channel = 'bot',
+  customer_ip = null,
+  customer_ua = null,
+}) {
+  const { randomUUID } = require('crypto');
+  const id = randomUUID();
+  const now = Date.now();
+  getDB().prepare(`
+    INSERT INTO support_threads (
+      id, customer_email, customer_name, customer_tier, customer_user_id,
+      status, initial_question, channel, customer_ip, customer_ua,
+      created_at, last_customer_message_at
+    ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    String(customer_email).toLowerCase(),
+    customer_name,
+    customer_tier,
+    customer_user_id,
+    initial_question,
+    channel,
+    customer_ip,
+    customer_ua,
+    now,
+    now,   // last_customer_message_at — they just opened; first SLA tick starts now
+  );
+  return getSupportThread(id);
+}
+
+function getSupportThread(threadId) {
+  return getDB().prepare('SELECT * FROM support_threads WHERE id = ?').get(threadId) || null;
+}
+
+// "Find the customer's MOST RECENT open or recently-resolved thread
+// so we can resume it instead of opening a new one." Window of 7 days
+// — older than that, treat as a fresh conversation. Prevents the
+// inbox from accumulating one-thread-per-message for chatty users.
+function findResumableSupportThread(customerEmail) {
+  const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - SEVEN_DAYS;
+  return getDB().prepare(`
+    SELECT * FROM support_threads
+     WHERE customer_email = ?
+       AND status IN ('open', 'assigned')
+       AND created_at > ?
+     ORDER BY created_at DESC
+     LIMIT 1
+  `).get(String(customerEmail).toLowerCase(), cutoff) || null;
+}
+
+// Inbox query — the hot path for an admin staring at "what's waiting".
+// Returns threads with their last message + unread-from-customer
+// count so the UI doesn't have to do N+1 queries. `assignedTo` filter
+// is optional (omit to see EVERY open thread, including unclaimed).
+function listOpenSupportThreads({ assignedTo = null, limit = 100, includeResolved = false } = {}) {
+  const statusFilter = includeResolved
+    ? "(t.status = 'open' OR t.status = 'assigned' OR t.status = 'resolved')"
+    : "(t.status = 'open' OR t.status = 'assigned')";
+  const assignFilter = assignedTo ? "AND (t.assigned_agent_email = ? OR t.assigned_agent_email IS NULL)" : "";
+  const stmt = getDB().prepare(`
+    SELECT
+      t.*,
+      (SELECT COUNT(*) FROM support_messages m
+         WHERE m.thread_id = t.id
+           AND m.sender_role = 'customer'
+           AND (m.read_by_other_at IS NULL OR m.read_by_other_at = 0))
+        AS unread_from_customer,
+      (SELECT text FROM support_messages m
+         WHERE m.thread_id = t.id
+         ORDER BY m.created_at DESC LIMIT 1)
+        AS last_message_text,
+      (SELECT sender_role FROM support_messages m
+         WHERE m.thread_id = t.id
+         ORDER BY m.created_at DESC LIMIT 1)
+        AS last_message_role
+    FROM support_threads t
+    WHERE ${statusFilter} ${assignFilter}
+    ORDER BY
+      CASE t.status WHEN 'open' THEN 0 WHEN 'assigned' THEN 1 ELSE 2 END,
+      COALESCE(t.last_customer_message_at, t.created_at) DESC
+    LIMIT ?
+  `);
+  const rows = assignedTo
+    ? stmt.all(assignedTo, Math.max(1, Math.min(500, limit | 0)))
+    : stmt.all(Math.max(1, Math.min(500, limit | 0)));
+  return rows;
+}
+
+function listSupportThreadsForCustomer(customerEmail, limit = 20) {
+  return getDB().prepare(`
+    SELECT * FROM support_threads
+     WHERE customer_email = ?
+     ORDER BY created_at DESC
+     LIMIT ?
+  `).all(String(customerEmail).toLowerCase(), Math.max(1, Math.min(100, limit | 0)));
+}
+
+// First agent to message a customer claims the thread. If already
+// claimed by someone else, return null (caller surfaces a "taken by
+// X" message to the second agent). This prevents two admins from
+// double-replying when both are in the inbox simultaneously.
+function claimSupportThread(threadId, agentEmail) {
+  const now = Date.now();
+  const existing = getSupportThread(threadId);
+  if (!existing) return null;
+  if (existing.assigned_agent_email && existing.assigned_agent_email !== agentEmail) {
+    return { ok: false, reason: 'already_assigned', currentAgent: existing.assigned_agent_email };
+  }
+  // first_response_at is the SLA metric. Set only on FIRST claim — a
+  // reclaim by the same agent after a customer reply must not reset it.
+  const setFirstResponse = existing.first_response_at ? '' : ', first_response_at = ?';
+  const args = existing.first_response_at
+    ? [agentEmail, now, threadId]
+    : [agentEmail, now, now, threadId];
+  getDB().prepare(`
+    UPDATE support_threads
+       SET assigned_agent_email = ?,
+           status = 'assigned',
+           last_agent_message_at = ?
+           ${setFirstResponse}
+     WHERE id = ?
+  `).run(...args);
+  return { ok: true, thread: getSupportThread(threadId) };
+}
+
+function resolveSupportThread(threadId, { rating = null, comment = null } = {}) {
+  const now = Date.now();
+  getDB().prepare(`
+    UPDATE support_threads
+       SET status = 'resolved',
+           resolved_at = ?,
+           satisfaction_rating = COALESCE(?, satisfaction_rating),
+           satisfaction_comment = COALESCE(?, satisfaction_comment)
+     WHERE id = ?
+  `).run(now, rating, comment, threadId);
+  // Cancel any pending escalations — agent already resolved, don't
+  // page their phone in 4 minutes for a closed ticket.
+  cancelSupportEscalations(threadId);
+  return getSupportThread(threadId);
+}
+
+function setSupportThreadTags(threadId, tagsArray) {
+  const tags = Array.isArray(tagsArray) ? tagsArray.slice(0, 8).map(String) : [];
+  getDB().prepare('UPDATE support_threads SET tags = ? WHERE id = ?')
+    .run(JSON.stringify(tags), threadId);
+}
+
+// Append a message + bump the thread's recency markers in a single
+// transaction. Returns the inserted message row so the WS handler can
+// echo back its `created_at` for client-side dedup.
+function appendSupportMessage({
+  thread_id,
+  sender_role,
+  sender_email = null,
+  sender_name = null,
+  text,
+  attachment_url = null,
+  attachment_kind = null,
+}) {
+  const d = getDB();
+  const now = Date.now();
+  let inserted;
+  const tx = d.transaction(() => {
+    const info = d.prepare(`
+      INSERT INTO support_messages (
+        thread_id, sender_role, sender_email, sender_name, text,
+        attachment_url, attachment_kind, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(thread_id, sender_role, sender_email, sender_name, String(text || ''),
+            attachment_url, attachment_kind, now);
+    inserted = { id: info.lastInsertRowid, thread_id, sender_role, sender_email, sender_name,
+                  text, attachment_url, attachment_kind, created_at: now };
+
+    // Recency markers — used by SLA computation and inbox ordering.
+    if (sender_role === 'customer') {
+      d.prepare('UPDATE support_threads SET last_customer_message_at = ? WHERE id = ?')
+        .run(now, thread_id);
+    } else if (sender_role === 'agent') {
+      d.prepare(`
+        UPDATE support_threads
+           SET last_agent_message_at = ?,
+               first_response_at = COALESCE(first_response_at, ?)
+         WHERE id = ?
+      `).run(now, now, thread_id);
+    }
+  });
+  tx();
+  return inserted;
+}
+
+function getSupportMessages(threadId, { since = null, limit = 500 } = {}) {
+  const cap = Math.max(1, Math.min(2000, limit | 0));
+  if (since) {
+    return getDB().prepare(`
+      SELECT * FROM support_messages
+       WHERE thread_id = ? AND created_at > ?
+       ORDER BY created_at ASC
+       LIMIT ?
+    `).all(threadId, since, cap);
+  }
+  return getDB().prepare(`
+    SELECT * FROM support_messages
+     WHERE thread_id = ?
+     ORDER BY created_at ASC
+     LIMIT ?
+  `).all(threadId, cap);
+}
+
+// Mark every message in this thread NOT sent by `readerRole` as
+// read by the other side. Caller passes 'agent' to mark all
+// customer messages read (admin viewed the thread); 'customer' to
+// mark all agent messages read (customer is reading replies).
+function markSupportMessagesRead(threadId, readerRole) {
+  const now = Date.now();
+  getDB().prepare(`
+    UPDATE support_messages
+       SET read_by_other_at = ?
+     WHERE thread_id = ?
+       AND sender_role != ?
+       AND (read_by_other_at IS NULL OR read_by_other_at = 0)
+  `).run(now, threadId, readerRole);
+}
+
+// SLA classification. Mirrors the Zendesk/Intercom color scheme:
+// green <30s, yellow 30s-2min, red >2min, gray once an agent has
+// replied (waiting on customer now). Returns a string for the
+// frontend; we don't store this — it's a function of NOW().
+function computeSupportSlaState(thread) {
+  if (!thread) return 'gray';
+  if (thread.status === 'resolved') return 'gray';
+  // If the last message was from the agent, the ball is in the
+  // customer's court — no SLA pressure on us.
+  const lastCust = thread.last_customer_message_at || 0;
+  const lastAgent = thread.last_agent_message_at || 0;
+  if (lastAgent > lastCust) return 'gray';
+  // Customer is waiting. Compute their wait time.
+  const waitMs = Date.now() - lastCust;
+  if (waitMs < 30_000) return 'green';
+  if (waitMs < 120_000) return 'yellow';
+  return 'red';
+}
+
+// ── Agent presence ──
+function getSupportAgentPresence(agentEmail) {
+  const row = getDB().prepare('SELECT * FROM support_agent_presence WHERE agent_email = ?')
+    .get(String(agentEmail).toLowerCase());
+  return row || null;
+}
+
+// Upsert. Auto-generates an ntfy.sh topic on first call so each agent
+// gets a private subscription URL they can install on their phone.
+function setSupportAgentPresence({
+  agent_email,
+  status = 'offline',
+  notification_prefs = null,
+  ntfy_topic = null,
+  twilio_phone = null,
+}) {
+  const now = Date.now();
+  const email = String(agent_email).toLowerCase();
+  const existing = getSupportAgentPresence(email);
+  if (!existing) {
+    const { randomBytes } = require('crypto');
+    // 16 random url-safe bytes — collision probability is astronomical
+    // even at 1M users, and the topic stays private (admin scans a
+    // QR code or types it into the ntfy app).
+    const topic = ntfy_topic || `minicaai-${randomBytes(8).toString('hex')}`;
+    const defaultPrefs = JSON.stringify({
+      desktop: true,
+      slack: true,
+      ntfy: true,
+      email_after_min: 3,
+      sms: false,
+    });
+    getDB().prepare(`
+      INSERT INTO support_agent_presence (
+        agent_email, status, last_heartbeat_at, notification_prefs, ntfy_topic, twilio_phone
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(email, status, now, notification_prefs || defaultPrefs, topic, twilio_phone);
+    return getSupportAgentPresence(email);
+  }
+  // UPDATE — but only fields the caller passed. Pattern: build sets
+  // dynamically so null arguments don't clobber existing values.
+  const sets = ['status = ?', 'last_heartbeat_at = ?'];
+  const args = [status, now];
+  if (notification_prefs !== null) { sets.push('notification_prefs = ?'); args.push(notification_prefs); }
+  if (ntfy_topic !== null)         { sets.push('ntfy_topic = ?'); args.push(ntfy_topic); }
+  if (twilio_phone !== null)       { sets.push('twilio_phone = ?'); args.push(twilio_phone); }
+  args.push(email);
+  getDB().prepare(`UPDATE support_agent_presence SET ${sets.join(', ')} WHERE agent_email = ?`)
+    .run(...args);
+  return getSupportAgentPresence(email);
+}
+
+// Mark this agent's ntfy subscription verified. Called by /inbox/test-
+// alert when the upstream POST returns 2xx — the assumption being
+// that if our POST landed and they hit Send-test, their phone got
+// the notification. (We can't actually CONFIRM the phone received
+// it without a round-trip from the phone back to us, which ntfy
+// hosted doesn't offer. This is the best signal we have.)
+function markNtfyVerified(agentEmail) {
+  const email = String(agentEmail).toLowerCase();
+  const now = Date.now();
+  // INSERT-or-UPDATE pattern: setSupportAgentPresence handles the
+  // create-if-missing case, then we patch the verification fields.
+  let presence = getSupportAgentPresence(email);
+  if (!presence) presence = setSupportAgentPresence({ agent_email: email, status: 'online' });
+  getDB().prepare(`
+    UPDATE support_agent_presence
+       SET ntfy_verified_at = ?, ntfy_last_alert_at = ?
+     WHERE agent_email = ?
+  `).run(now, now, email);
+  return getSupportAgentPresence(email);
+}
+
+// Mark "we just sent an alert to this agent's topic" — used by the
+// production escalation worker so the inbox card can show "last
+// alert 3m ago" without the admin needing to send a test.
+function markNtfyAlertSent(agentEmail) {
+  const email = String(agentEmail).toLowerCase();
+  getDB().prepare(`
+    UPDATE support_agent_presence
+       SET ntfy_last_alert_at = ?
+     WHERE agent_email = ?
+  `).run(Date.now(), email);
+}
+
+function heartbeatSupportAgent(agentEmail) {
+  const now = Date.now();
+  const email = String(agentEmail).toLowerCase();
+  const existing = getSupportAgentPresence(email);
+  if (!existing) {
+    return setSupportAgentPresence({ agent_email: email, status: 'online' });
+  }
+  getDB().prepare('UPDATE support_agent_presence SET last_heartbeat_at = ?, status = ? WHERE agent_email = ?')
+    .run(now, existing.status === 'offline' ? 'online' : existing.status, email);
+  return getSupportAgentPresence(email);
+}
+
+// Online = heartbeat within last 90s. Awareness: agent that closed
+// the app without explicit logout still flips to offline naturally.
+function listOnlineSupportAgents() {
+  const cutoff = Date.now() - 90_000;
+  return getDB().prepare(`
+    SELECT * FROM support_agent_presence
+     WHERE last_heartbeat_at > ? AND status != 'offline'
+     ORDER BY agent_email
+  `).all(cutoff);
+}
+
+// ── Escalation queue ──
+// On customer thread open, enqueue 4 escalation rows: ntfy at +30s,
+// email at +2min, sms at +5min, fallback at +24h. Worker scans every
+// 10s. Cancellation happens on claim or resolve.
+function enqueueSupportEscalations(threadId, rows) {
+  const stmt = getDB().prepare(`
+    INSERT OR IGNORE INTO support_escalation_queue (thread_id, channel, fire_at)
+    VALUES (?, ?, ?)
+  `);
+  for (const r of (rows || [])) {
+    stmt.run(threadId, r.channel, r.fire_at);
+  }
+}
+
+function getDueSupportEscalations(now = Date.now()) {
+  return getDB().prepare(`
+    SELECT q.*, t.assigned_agent_email, t.status, t.customer_email, t.customer_name, t.initial_question, t.id AS thread_id
+      FROM support_escalation_queue q
+      JOIN support_threads t ON t.id = q.thread_id
+     WHERE q.fired_at IS NULL
+       AND q.fire_at <= ?
+       AND t.status = 'open'        -- skip if agent already claimed
+     ORDER BY q.fire_at ASC
+     LIMIT 50
+  `).all(now);
+}
+
+function markSupportEscalationFired(threadId, channel) {
+  getDB().prepare(`
+    UPDATE support_escalation_queue
+       SET fired_at = ?
+     WHERE thread_id = ? AND channel = ? AND fired_at IS NULL
+  `).run(Date.now(), threadId, channel);
+}
+
+// Called on claim/resolve — wipes any pending alerts for this thread
+// so we don't phone-spam the admin after they've already replied.
+function cancelSupportEscalations(threadId) {
+  getDB().prepare(`
+    UPDATE support_escalation_queue
+       SET fired_at = ?
+     WHERE thread_id = ? AND fired_at IS NULL
+  `).run(Date.now(), threadId);
+}
+
+// Inbox stats — bottom-of-panel "X open · Y avg response time · Z today".
+function getSupportInboxStats() {
+  const d = getDB();
+  const open = d.prepare("SELECT COUNT(*) AS n FROM support_threads WHERE status = 'open'").get().n;
+  const assigned = d.prepare("SELECT COUNT(*) AS n FROM support_threads WHERE status = 'assigned'").get().n;
+  const today = d.prepare("SELECT COUNT(*) AS n FROM support_threads WHERE created_at > ?")
+    .get(Date.now() - 24 * 60 * 60 * 1000).n;
+  // Average first-response time across resolved-with-response threads
+  // in the last 7 days. NULL filtered out (no-response threads).
+  const sevenDays = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const avg = d.prepare(`
+    SELECT AVG(first_response_at - created_at) AS ms
+      FROM support_threads
+     WHERE first_response_at IS NOT NULL
+       AND created_at > ?
+  `).get(sevenDays);
+  return {
+    open,
+    assigned,
+    today,
+    avg_first_response_ms: Math.round(avg?.ms || 0),
+  };
+}
+
 // ── Cleanup ──
 function closeDB() {
   if (db) {
@@ -1876,6 +2513,8 @@ module.exports = {
   extendLicenseExpiry, grantCreditSessions, grantBasicRenewal,
   getLatestRazorpaySubscriptionId,
   setRazorpaySubscriptionId,
+  // Cycle-end downgrade (paid → free safety net)
+  transitionLicenseToFree, getExpiredCancelingUserIds,
   // Devices
   registerDevice, getUserDevices, deactivateDevice, isDeviceAuthorized, resetUserDevices,
   revokeSingleDevice,
@@ -1903,6 +2542,19 @@ module.exports = {
   // Admin actions / audit
   logAdminAction, getAuditLog, forceLogoutUser, getTokensRevokedAfter,
   queryAuditLog, getAuditActions, getAuditAdmins,
+  // Support bot — threads + messages
+  createSupportThread, getSupportThread, findResumableSupportThread,
+  listOpenSupportThreads, listSupportThreadsForCustomer,
+  claimSupportThread, resolveSupportThread, setSupportThreadTags,
+  appendSupportMessage, getSupportMessages, markSupportMessagesRead,
+  computeSupportSlaState,
+  // Support bot — agent presence + escalations
+  getSupportAgentPresence, setSupportAgentPresence, heartbeatSupportAgent,
+  markNtfyVerified, markNtfyAlertSent,
+  listOnlineSupportAgents,
+  enqueueSupportEscalations, getDueSupportEscalations,
+  markSupportEscalationFired, cancelSupportEscalations,
+  getSupportInboxStats,
   // Cleanup
   closeDB,
   // Password utils (for testing)

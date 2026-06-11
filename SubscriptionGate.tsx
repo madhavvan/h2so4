@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search, Copy, ChevronUp } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, Suspense, lazy } from 'react';
+import SupportBot from './SupportBot';
+import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search, Copy, ChevronUp, FileText } from 'lucide-react';
 import { WizardHat } from './WizardHat';
 // Phosphor duotone — used on the public landing + auth surfaces for the
 // editorial, premium feel that lucide's flat strokes can't quite reach.
@@ -32,6 +33,18 @@ import { licenseService, UserProfile, LicenseData } from './services/licenseServ
 // either bounce out to the Stripe portal or wait until they install
 // the desktop binary.
 import { ManageSubscription as ManageSubscriptionModal } from './ManageSubscription';
+// Public docs surface — same component the landing nav links to.
+// Renders the contents of /docs (markdown bundled at build via Vite ?raw)
+// in a Stripe-style three-column layout. Theme-aware so it adopts the
+// landing page's cream palette by default; URL is synced to /docs/<slug>
+// so links are shareable and SEO-indexable.
+//
+// Lazy-loaded so the marketing landing's initial bundle doesn't carry
+// react-markdown + remark-gfm + react-syntax-highlighter + ~80 KB of
+// markdown that 90 %+ of visitors will never look at. Deep-links to
+// /docs trigger the chunk fetch immediately on mount; the fallback
+// matches the docs chrome so the swap is visually quiet.
+const Documentation = lazy(() => import('./Documentation'));
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '179380214544-5r338sqpqr6ke6tnsf165ic7qi9th0ht.apps.googleusercontent.com';
 
@@ -44,7 +57,7 @@ interface SubscriptionGateProps {
   onAuthenticated: (user: UserProfile, license: LicenseData) => void;
 }
 
-type View = 'landing' | 'login' | 'signup' | 'forgot_password' | 'pricing' | 'vpn_blocked' | 'download' | 'tutorials' | 'admin' | 'support';
+type View = 'landing' | 'login' | 'signup' | 'forgot_password' | 'pricing' | 'vpn_blocked' | 'download' | 'tutorials' | 'admin' | 'support' | 'docs';
 
 // ── Detect if running inside Electron ──
 // Reads window.electronAPI (set by electron/preload.cjs) — works under
@@ -573,7 +586,11 @@ const TutorialCard = ({ step, title, desc, duration }: { step: string; title: st
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  ADMIN DASHBOARD — Live data from server
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-const API_BASE = 'https://api.minicaai.com';
+// Same env-aware pattern licenseService / SupportBot / ManageSubscription
+// use — admin actions in a local dev session need to hit local, not prod.
+const API_BASE = (import.meta as any).env?.PROD
+  ? 'https://api.minicaai.com'
+  : ((import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com');
 
 type Tier = 'free' | 'basic' | 'pro' | 'max';
 const TIERS: Tier[] = ['free', 'basic', 'pro', 'max'];
@@ -3985,6 +4002,13 @@ const LandingMobile: React.FC<LandingMobileProps> = ({
                 Pricing
               </button>
               <button
+                onClick={() => { closeSheet(); setView('docs'); }}
+                className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[16px] font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
+                Docs
+              </button>
+              <button
                 onClick={() => { closeSheet(); setView('login'); }}
                 className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[16px] font-medium"
                 style={{ color: 'var(--ink)' }}
@@ -4161,7 +4185,7 @@ const AuthMobile: React.FC<AuthMobileProps> = ({
       <div className="px-5 pt-2 pb-7">
         <Logo size="md" theme="light" />
         <h2
-          className="mt-7 text-[28px]"
+          className="mt-5 text-[22px]"
           style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em', lineHeight: 1.15 }}
         >
           {headline}
@@ -4823,6 +4847,11 @@ interface DownloadMobileProps {
   initiateRenewal: () => Promise<void> | void;
   initiateCheckout: (tier?: 'basic' | 'pro' | 'max') => Promise<void> | void;
   basicExpiryLabel: (expiresAt: number | undefined | null) => string | null;
+  // Opens Documentation as a modal layer OVER the mobile profile sheet
+  // so closing docs returns to the still-open profile. Lifted to
+  // SubscriptionGateInner so its single <Documentation> instance covers
+  // both desktop /download nav and the mobile DownloadMobile flow.
+  onOpenDocs?: () => void;
 }
 
 const DOWNLOAD_PLATFORMS = [
@@ -4843,7 +4872,7 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
     setView, currentUser, setCurrentUser, currentLicense, handleLogout, justSignedUp, setJustSignedUp,
     paymentError, paymentSuccess, paymentLoading, geo, pricing, lastSuccessfulTier,
     cancelConfirm, setCancelConfirm, handleManageSubscription, handleCancelSubscription,
-    initiateRenewal, initiateCheckout, basicExpiryLabel,
+    initiateRenewal, initiateCheckout, basicExpiryLabel, onOpenDocs,
   } = props;
 
   const [showAccountSheet, setShowAccountSheet] = useState(false);
@@ -5335,6 +5364,13 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
                 Tutorials
               </button>
               <button
+                onClick={() => { setShowAccountSheet(false); setView('docs'); }}
+                className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[15px] font-medium"
+                style={{ color: 'var(--ink)' }}
+              >
+                Documentation
+              </button>
+              <button
                 onClick={() => { setShowAccountSheet(false); handleLogout(); }}
                 className="ios-press w-full text-left px-5 py-4 rounded-2xl text-[15px] font-medium"
                 style={{ color: 'var(--accent)' }}
@@ -5360,6 +5396,7 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
         geo={geo}
         onLogout={handleLogout}
         onOpenPlanSheet={() => setPlanSheetOpen(true)}
+        onOpenDocs={onOpenDocs}
       />
 
       {/* Plan & billing sheet — every switch path lives here. Opening it
@@ -5479,6 +5516,12 @@ interface ProfileSheetMobileProps {
   geo: GeoData | null;
   onLogout: () => void;
   onOpenPlanSheet: () => void;
+  // Optional: open the documentation surface ON TOP of this profile
+  // sheet (rather than navigating away). Passed by SubscriptionGateInner
+  // so signed-in users can read product + (for admins) engineering docs
+  // without leaving their profile context. If not provided, the
+  // documentation card is hidden.
+  onOpenDocs?: () => void;
 }
 
 // Coarse country-code → display-name map. Covers the top markets we see in
@@ -5516,7 +5559,7 @@ function avatarColorFor(seed: string): { bg: string; fg: string } {
 
 const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
   open, onClose, currentUser, setCurrentUser, currentLicense, geo,
-  onLogout, onOpenPlanSheet,
+  onLogout, onOpenPlanSheet, onOpenDocs,
 }) => {
   // Sheet open/close state machine — same pattern as PlanSheetMobile so the
   // exit animation lands before the node unmounts.
@@ -5743,7 +5786,7 @@ const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
               Subscriptions" pattern, where the upper-level identity surface
               hands off to the billing surface. */}
           <button
-            onClick={() => { onClose(); window.setTimeout(onOpenPlanSheet, 360); }}
+            onClick={onOpenPlanSheet}
             className="ios-press inline-flex items-center gap-2 mt-4 px-3 py-1.5 rounded-full text-[12.5px] font-medium"
             style={{
               background: tierMeta.bg,
@@ -5887,7 +5930,7 @@ const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
             Subscription
           </div>
           <button
-            onClick={() => { onClose(); window.setTimeout(onOpenPlanSheet, 360); }}
+            onClick={onOpenPlanSheet}
             className="ios-press w-full text-left flex items-center gap-3 px-4 py-3.5 rounded-2xl"
             style={{
               background: 'var(--cream-soft)',
@@ -5915,6 +5958,44 @@ const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
             <ChevronRight size={16} style={{ color: 'var(--ink-muted)' }} />
           </button>
         </section>
+
+        {/* Documentation link — opens docs ON TOP of the profile sheet
+            (when onOpenDocs is provided) so closing returns the user to
+            their profile instead of dumping them on the marketing
+            landing. Public docs visible to everyone; engineering docs
+            section auto-appears for admins (server gates per-request
+            via detectSession role check). */}
+        {onOpenDocs && (
+          <section className="px-5 pt-5">
+            <div className="px-1 mb-3 text-[11px] font-medium uppercase tracking-[0.18em]" style={{ color: 'var(--ink-muted)' }}>
+              Documentation
+            </div>
+            <button
+              onClick={onOpenDocs}
+              className="ios-press w-full text-left flex items-center gap-3 px-4 py-3.5 rounded-2xl"
+              style={{
+                background: 'var(--cream-soft)',
+                border: '1px solid var(--cream-line)',
+              }}
+            >
+              <div
+                className="shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center"
+                style={{ background: 'rgba(168, 85, 247, 0.14)' }}
+              >
+                <FileText size={20} style={{ color: '#7c3aed' }} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-[15px] font-medium" style={{ color: 'var(--ink)' }}>
+                  Docs &amp; guides
+                </div>
+                <div className="text-[12.5px] mt-0.5" style={{ color: 'var(--ink-muted)' }}>
+                  Getting started, features, FAQ, troubleshooting, privacy{currentUser?.email && licenseService.isDeveloper(currentUser.email) ? ' — and admin/internal docs' : ''}.
+                </div>
+              </div>
+              <ChevronRight size={16} style={{ color: 'var(--ink-muted)' }} />
+            </button>
+          </section>
+        )}
 
         {/* Sign out */}
         <section className="px-5 pt-7 pb-2">
@@ -5993,7 +6074,12 @@ const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
 //  while loading (geo.country_code === 'IN' → razorpay).
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-const API_BASE_PLAN = 'https://api.minicaai.com';
+// Env-aware: dev (vite) → localhost:4000, prod build → api.minicaai.com.
+// Was hardcoded to prod, which caused every plan-sheet fetch in dev to
+// hit production with a local JWT and silently fail.
+const API_BASE_PLAN = (import.meta as any).env?.PROD
+  ? 'https://api.minicaai.com'
+  : ((import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com');
 
 interface PlanSheetMobileProps {
   open: boolean;
@@ -6228,6 +6314,69 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
       effective: 'Effective at next renewal · keep Max access until then',
       onClick: wrapAction('downgrade-pro', () => initiateCheckout('pro')),
     });
+  }
+
+  // Admin actions — admin users can instant-grant themselves any tier
+  // via /upgrade-tier (server short-circuits to grantAdminTier for
+  // ADMIN_EMAILS callers, bypassing Stripe/Razorpay payment). Without
+  // these rows the plan sheet shows only the hero card for admin —
+  // perceived as a near-empty / "marketing-landing-ish" surface.
+  //
+  // We call /upgrade-tier directly here (not initiateCheckout) because
+  // for free/basic targets the in-place-vs-checkout branching in
+  // initiateCheckout falls through to /create-checkout, which doesn't
+  // accept those targets. /upgrade-tier with admin bypass handles all
+  // four targets in one round-trip.
+  const adminGrant = async (target: 'pro' | 'max' | 'basic' | 'free') => {
+    const token = licenseService.getToken();
+    if (!token) return;
+    try {
+      const r = await fetch(`${API_BASE_PLAN}/api/v1/payments/upgrade-tier`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tier: target }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (r.ok && data.license) {
+        // Mirror new license into client state via licenseService so the
+        // tier badge + plan sheet refresh immediately.
+        const saved = licenseService.loadAuth();
+        if (saved.user) {
+          licenseService.saveAuth(
+            { ...saved.user, tier: (data.tier || target) as any },
+            { ...data.license, last_validated: Date.now() },
+          );
+        }
+        // Re-fetch live status in this sheet too so the hero card flips.
+        try {
+          const sub = await fetch(`${API_BASE_PLAN}/api/v1/payments/subscription`, {
+            headers: { 'Authorization': `Bearer ${token}` },
+          });
+          if (sub.ok) {
+            const sd = await sub.json();
+            setServerStatus(sd);
+          }
+        } catch { /* refresh failure is OK; reload picks it up */ }
+      }
+    } catch { /* network error — surface via paymentError eventually */ }
+  };
+
+  if (isAdminUser) {
+    const adminTargets: Array<{ key: 'pro' | 'max' | 'basic' | 'free'; title: string; subtitle: string; Icon: any; iconBg: string; iconColor: string }> = [
+      { key: 'max',   title: 'Switch to Max (admin)',   subtitle: 'Claude + Auto-Type + Train Model. Instant grant, no checkout.',                       Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309' },
+      { key: 'pro',   title: 'Switch to Pro (admin)',   subtitle: 'Unlimited time + 4 models (no Claude). Instant grant, no checkout.',                 Icon: Crown,     iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb' },
+      { key: 'basic', title: 'Switch to Basic (admin)', subtitle: '3 sessions / 14 days. Instant grant, no checkout — admin override.',                  Icon: Zap,       iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857' },
+      { key: 'free',  title: 'Switch to Free (admin)',  subtitle: 'Drop to Free with 5 sessions/month default. Instant grant, no checkout.',             Icon: Sparkles,  iconBg: 'var(--cream-soft)',        iconColor: 'var(--ink-muted)' },
+    ];
+    for (const a of adminTargets) {
+      actions.push({
+        key: `admin-grant-${a.key}`,
+        Icon: a.Icon, iconBg: a.iconBg, iconColor: a.iconColor,
+        title: a.title,
+        subtitle: a.subtitle,
+        onClick: wrapAction(`admin-grant-${a.key}`, () => adminGrant(a.key)),
+      });
+    }
   }
 
   // Manage section — Stripe portal vs Razorpay cancel.
@@ -6649,7 +6798,7 @@ const SupportMobile: React.FC<SupportMobileProps> = ({
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     setChatMessages([{
       from: 'agent',
-      text: `Hi ${currentUser.name || 'there'}! I'm Hari, your support agent. How can I help you today?`,
+      text: `Hi ${currentUser.name || 'there'}! I'm Minica, your support agent. How can I help you today?`,
       time,
     }]);
     const serverUrl = import.meta.env.PROD ? 'https://api.minicaai.com' : (import.meta.env.VITE_SERVER_URL || 'https://api.minicaai.com');
@@ -6759,7 +6908,7 @@ const SupportMobile: React.FC<SupportMobileProps> = ({
               <Headphones size={16} className="text-white" />
             </div>
             <div className="flex flex-col items-start">
-              <div className="text-[14.5px] font-medium leading-tight" style={{ color: 'var(--ink)' }}>Hari</div>
+              <div className="text-[14.5px] font-medium leading-tight" style={{ color: 'var(--ink)' }}>Minica</div>
               <div className="flex items-center gap-1 text-[10.5px] leading-none mt-0.5" style={{ color: '#059669' }}>
                 <span
                   className="w-1.5 h-1.5 rounded-full animate-pulse"
@@ -6870,7 +7019,48 @@ const SupportMobile: React.FC<SupportMobileProps> = ({
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticated }) => {
-  const [view, setView] = useState<View>('landing');
+  // Initial view: respect the URL on first paint so a deep-link to
+  // /docs (or /docs/<slug>) doesn't briefly flash the landing page.
+  // We only honor /docs paths — the rest of the app is single-route at
+  // / so we don't try to URL-sync views like /login, /pricing, etc.
+  const initialView: View = useMemo(() => {
+    if (typeof window === 'undefined') return 'landing';
+    const p = window.location.pathname;
+    if (p === '/docs' || p.startsWith('/docs/')) return 'docs';
+    return 'landing';
+  }, []);
+  const [view, setView] = useState<View>(initialView);
+
+  // ── URL ↔ view sync for /docs ─────────────────────────────────
+  // Only the docs surface gets a real URL; everything else stays at /.
+  // pushState on enter/leave so the browser back button takes the user
+  // from /docs back to /. Documentation itself manages /docs/<slug>
+  // refinement via replaceState so doc switches don't pollute history.
+  useEffect(() => {
+    const onPop = () => {
+      const p = window.location.pathname;
+      if (p === '/docs' || p.startsWith('/docs/')) {
+        setView('docs');
+      } else if (p === '/' || p === '') {
+        // Only override if we were on /docs — don't stomp on
+        // auth-flow transitions that share the / URL.
+        setView((prev) => (prev === 'docs' ? 'landing' : prev));
+      }
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  useEffect(() => {
+    const path = window.location.pathname;
+    const onDocs = path === '/docs' || path.startsWith('/docs/');
+    if (view === 'docs' && !onDocs) {
+      window.history.pushState(null, '', '/docs');
+    } else if (view !== 'docs' && onDocs) {
+      window.history.pushState(null, '', '/');
+    }
+  }, [view]);
+
   // iPhone-feel landing on phones; desktop landing unchanged. Flips live on
   // window resize / orientation change so DevTools mobile-emulation toggles
   // and tablet rotations Just Work.
@@ -6886,6 +7076,19 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // path to manage their subscription besides the Stripe Customer Portal,
   // which doesn't surface the cancel-pending state or expose Reactivate.
   const [webManageSubOpen, setWebManageSubOpen] = useState(false);
+  // Web Documentation modal — opens the same Documentation component
+  // used as a /docs view, but as an OVERLAY on top of the profile
+  // sheet. Without this, the docs link inside the profile would have
+  // to navigate the view to 'docs' which closes the profile and dumps
+  // the user on the docs page; closing docs then drops them on landing
+  // (because that view's onClose is setView('landing')). User reported:
+  // "to read them I have to come out of my profile they are not inside
+  // my profile". Rendering Documentation as a z-200 modal lets us keep
+  // the profile sheet mounted underneath, so closing the docs returns
+  // to the still-open profile cleanly. Documentation already uses
+  // createPortal with z-[200] (modals at z-[210]) so it sits above the
+  // profile sheet's zIndex 41 without any extra wrapper.
+  const [webDocsOpen, setWebDocsOpen] = useState(false);
   const [geo, setGeo] = useState<GeoData | null>(null);
   const [pricing, setPricing] = useState<RegionPricing | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -7293,7 +7496,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setAuthError(null);
 
     try {
-      const serverUrl = 'https://api.minicaai.com';
+      // Env-aware so dev hits localhost:4000, prod hits the public URL.
+      const viteEnvFp = (import.meta as any).env || {};
+      const serverUrl = viteEnvFp.PROD
+        ? 'https://api.minicaai.com'
+        : (viteEnvFp.VITE_SERVER_URL || 'https://api.minicaai.com');
       const res = await fetch(`${serverUrl}/api/v1/auth/forgot-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -7623,7 +7830,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       const timeoutId = window.setTimeout(() => controller.abort(), 30000);
       let response: Response;
       try {
-        response = await fetch('https://api.minicaai.com/api/v1/payments/create-renewal', {
+        response = await fetch(`${API_BASE_PLAN}/api/v1/payments/create-renewal`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
           body: JSON.stringify({ country_code: countryCode }),
@@ -7692,7 +7899,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     try {
       const token = licenseService.getToken();
       if (!token) throw new Error('Please sign in first');
-      const res = await fetch('https://api.minicaai.com/api/v1/payments/portal', {
+      const res = await fetch(`${API_BASE_PLAN}/api/v1/payments/portal`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}` },
       });
@@ -7723,7 +7930,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     try {
       const token = licenseService.getToken();
       if (!token) throw new Error('Please sign in first');
-      const res = await fetch('https://api.minicaai.com/api/v1/payments/cancel-razorpay', {
+      const res = await fetch(`${API_BASE_PLAN}/api/v1/payments/cancel-razorpay`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}` },
       });
@@ -7759,7 +7966,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             // Payment successful — verify on server
             try {
               const token = licenseService.getToken();
-              const verifyRes = await fetch('https://api.minicaai.com/api/v1/payments/verify-razorpay', {
+              const verifyRes = await fetch(`${API_BASE_PLAN}/api/v1/payments/verify-razorpay`, {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
@@ -7952,7 +8159,18 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     googlePollAbortRef.current = false;
 
     const sessionId = crypto.randomUUID();
-    const serverUrl = 'https://api.minicaai.com';
+    // Env-aware: in dev (vite serves on :3005) we point at VITE_SERVER_URL
+    // so Google OAuth lands on the local server's /auth/google/callback,
+    // not on prod. PROD short-circuit guards against a stray env var
+    // leaking into a production installer (same defense-in-depth pattern
+    // as licenseService.API_BASE and SupportBot's DEFAULT_API_BASE).
+    // Note: for local Google OAuth to actually work you also need
+    // http://localhost:4000/api/v1/auth/google/callback registered in the
+    // Google Cloud Console OAuth client's Authorized redirect URIs.
+    const viteEnv = (import.meta as any).env || {};
+    const serverUrl = viteEnv.PROD
+      ? 'https://api.minicaai.com'
+      : (viteEnv.VITE_SERVER_URL || 'https://api.minicaai.com');
     const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}`;
 
     // Open Google sign-in in system browser. We MUST await + catch here —
@@ -8314,6 +8532,39 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     );
   }
 
+  // ── DOCS VIEW ──
+  // Public-facing technical reference. Linked from the landing nav and
+  // deep-linkable via /docs/<slug>. The component owns its own scroll,
+  // keyboard shortcuts (⌘K), and URL sync. Closing returns the user to
+  // the landing page (matches the back-button convention used by the
+  // tutorials/pricing branches below). Lazy-loaded behind Suspense so
+  // the initial landing bundle stays lean.
+  if (view === 'docs') {
+    return (
+      <Suspense
+        fallback={
+          <div
+            className="fixed inset-0 flex items-center justify-center"
+            style={{ background: 'var(--cream, #faf8f5)', color: 'var(--ink-muted, #6b7280)' }}
+          >
+            <div className="flex items-center gap-2.5 text-sm">
+              <Loader2 size={16} className="animate-spin" />
+              <span>Loading documentation…</span>
+            </div>
+          </div>
+        }
+      >
+        <Documentation
+          open
+          onClose={() => setView('landing')}
+          appVersion={typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : ''}
+          isDark={false}
+          authToken={licenseService.getToken() || null}
+        />
+      </Suspense>
+    );
+  }
+
   // ── TUTORIALS VIEW ──
   if (view === 'tutorials') {
     if (isMobile) {
@@ -8365,28 +8616,58 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   if (view === 'download' && !isElectron) {
     if (isMobile) {
       return (
-        <DownloadMobile
-          setView={setView}
-          currentUser={currentUser}
-          setCurrentUser={setCurrentUser}
-          currentLicense={currentLicense}
-          handleLogout={handleLogout}
-          justSignedUp={justSignedUp}
-          setJustSignedUp={setJustSignedUp}
-          paymentError={paymentError}
-          paymentSuccess={paymentSuccess}
-          paymentLoading={paymentLoading}
-          geo={geo}
-          pricing={pricing}
-          lastSuccessfulTier={lastSuccessfulTier}
-          cancelConfirm={cancelConfirm}
-          setCancelConfirm={setCancelConfirm}
-          handleManageSubscription={handleManageSubscription}
-          handleCancelSubscription={handleCancelSubscription}
-          initiateRenewal={initiateRenewal}
-          initiateCheckout={initiateCheckout}
-          basicExpiryLabel={basicExpiryLabel}
-        />
+        <>
+          <DownloadMobile
+            setView={setView}
+            currentUser={currentUser}
+            setCurrentUser={setCurrentUser}
+            currentLicense={currentLicense}
+            handleLogout={handleLogout}
+            justSignedUp={justSignedUp}
+            setJustSignedUp={setJustSignedUp}
+            paymentError={paymentError}
+            paymentSuccess={paymentSuccess}
+            paymentLoading={paymentLoading}
+            geo={geo}
+            pricing={pricing}
+            lastSuccessfulTier={lastSuccessfulTier}
+            cancelConfirm={cancelConfirm}
+            setCancelConfirm={setCancelConfirm}
+            handleManageSubscription={handleManageSubscription}
+            handleCancelSubscription={handleCancelSubscription}
+            initiateRenewal={initiateRenewal}
+            initiateCheckout={initiateCheckout}
+            basicExpiryLabel={basicExpiryLabel}
+            onOpenDocs={() => setWebDocsOpen(true)}
+          />
+          {/* Documentation overlay sibling — mobile branch early-returns
+              here so the desktop branch's Documentation mount wouldn't be
+              reached. Render it adjacent to DownloadMobile so the mobile
+              profile sheet's "Docs & guides" row has a real modal to open. */}
+          {webDocsOpen && (
+            <Suspense
+              fallback={
+                <div
+                  className="fixed inset-0 flex items-center justify-center"
+                  style={{ background: 'var(--cream, #faf8f5)', color: 'var(--ink-muted, #6b7280)', zIndex: 200 }}
+                >
+                  <div className="flex items-center gap-2.5 text-sm">
+                    <Loader2 size={16} className="animate-spin" />
+                    <span>Loading documentation…</span>
+                  </div>
+                </div>
+              }
+            >
+              <Documentation
+                open
+                onClose={() => setWebDocsOpen(false)}
+                appVersion={typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : ''}
+                isDark={false}
+                authToken={licenseService.getToken() || null}
+              />
+            </Suspense>
+          )}
+        </>
       );
     }
     return (
@@ -8504,14 +8785,48 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           geo={geo}
           onLogout={handleLogout}
           onOpenPlanSheet={() => {
-            // Close the profile sheet first, then defer the view change so
-            // the .ios-sheet-exit animation has time to play (320ms) before
-            // the /download branch unmounts and takes the sheet with it.
-            // Without the defer the sheet hard-cuts to the pricing page.
-            setDesktopProfileOpen(false);
-            window.setTimeout(() => setView('pricing'), 360);
+            // Open the proper ManageSubscription modal (in-app billing
+            // surface with current plan + upgrade/downgrade/cancel/
+            // reactivate flows). Previously this called setView('pricing')
+            // which navigated to the unauthenticated marketing "Choose
+            // your plan" page (the one with Back + Sign In in the nav) —
+            // exactly the wrong UX for a signed-in user who clicked
+            // "Plan & billing" from their profile. Keep the profile sheet
+            // open behind so closing ManageSubscription returns to it.
+            setWebManageSubOpen(true);
           }}
+          onOpenDocs={() => setWebDocsOpen(true)}
         />
+
+        {/* Web Documentation overlay — opens ABOVE the profile sheet
+            so closing it returns the user to the still-open profile
+            instead of dumping them on the landing page. Lazy-loaded
+            (same Suspense fallback pattern as the standalone /docs
+            view above). z-[200] inside Documentation guarantees it
+            covers the profile sheet's zIndex 41. */}
+        {webDocsOpen && (
+          <Suspense
+            fallback={
+              <div
+                className="fixed inset-0 flex items-center justify-center"
+                style={{ background: 'var(--cream, #faf8f5)', color: 'var(--ink-muted, #6b7280)', zIndex: 200 }}
+              >
+                <div className="flex items-center gap-2.5 text-sm">
+                  <Loader2 size={16} className="animate-spin" />
+                  <span>Loading documentation…</span>
+                </div>
+              </div>
+            }
+          >
+            <Documentation
+              open
+              onClose={() => setWebDocsOpen(false)}
+              appVersion={typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : ''}
+              isDark={false}
+              authToken={licenseService.getToken() || null}
+            />
+          </Suspense>
+        )}
 
         <div className="relative z-10 max-w-3xl mx-auto px-6 pt-16 pb-20 text-center">
           <div className="w-20 h-20 mx-auto rounded-3xl bg-gradient-to-br from-blue-500 via-blue-600 to-purple-600 flex items-center justify-center mb-8 shadow-2xl shadow-blue-500/30">
@@ -8898,6 +9213,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 Pricing
               </button>
               <button
+                onClick={() => setView('docs')}
+                className="px-4 py-2 text-sm font-medium hover:opacity-100 transition-opacity"
+                style={{ color: 'var(--ink-muted)' }}
+              >
+                Docs
+              </button>
+              <button
                 onClick={() => setView('login')}
                 className="px-4 py-2 text-sm font-medium hover:opacity-100 transition-opacity"
                 style={{ color: 'var(--ink-muted)' }}
@@ -9260,12 +9582,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     if (isMobile) return renderAuthMobile('login');
     return (
       <div
-        className="fixed inset-0 flex items-center justify-center p-6 overflow-y-auto"
+        className="fixed inset-0 overflow-y-auto"
         style={{ background: 'var(--cream)', color: 'var(--ink)', fontFamily: 'var(--sans)' }}
       >
-        <div className="w-full max-w-md">
+        <div className="min-h-full flex items-center justify-center px-4 py-8">
+        <div className="w-full max-w-[400px]">
           <div
-            className="auth-card relative rounded-3xl p-9 pt-7"
+            className="auth-card relative rounded-2xl p-7 pt-6"
             style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
           >
             <button
@@ -9279,24 +9602,24 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
             <Logo size="md" theme="light" />
             <h2
-              className="mt-7 text-[28px]"
+              className="mt-5 text-[22px]"
               style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em' }}
             >
               Welcome back.
             </h2>
-            <p className="mt-1.5 text-[14px] mb-7" style={{ color: 'var(--ink-muted)' }}>
+            <p className="mt-1 text-[13px] mb-5" style={{ color: 'var(--ink-muted)' }}>
               Sign in to continue with your interview copilot.
             </p>
 
-            <form onSubmit={handleLogin} className="space-y-4">
+            <form onSubmit={handleLogin} className="space-y-3">
               <div>
-                <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>EMAIL</label>
+                <label className="block text-[10.5px] font-semibold mb-1" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>EMAIL</label>
                 <input
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="you@example.com"
-                  className="auth-input w-full px-4 py-3 rounded-xl text-[14px]"
+                  className="auth-input w-full px-3.5 py-2.5 rounded-lg text-[13.5px]"
                   style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   required
                   autoFocus
@@ -9321,7 +9644,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Enter your password"
-                    className="auth-input w-full px-4 py-3 pr-10 rounded-xl text-[14px]"
+                    className="auth-input w-full px-3.5 py-2.5 pr-10 rounded-lg text-[13.5px]"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                     required
                     autoComplete="current-password"
@@ -9351,7 +9674,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               <button
                 type="submit"
                 disabled={isSubmitting || googleSubmitting || !email.trim() || !password.trim()}
-                className="auth-submit w-full py-3 rounded-full text-[14px] font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="auth-submit w-full py-2.5 rounded-full text-[13.5px] font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                 style={{ background: 'var(--ink)', color: 'var(--cream)' }}
               >
                 {/* Always render an icon slot (spinner during submit, arrow
@@ -9366,7 +9689,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             {/* Google Sign-In */}
             {GOOGLE_CLIENT_ID && (
               <>
-                <div className="mt-7 flex items-center gap-3">
+                <div className="mt-5 flex items-center gap-3">
                   <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
                   <span className="text-[10px] uppercase tracking-[0.18em]" style={{ color: 'var(--ink-faint)' }}>or</span>
                   <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
@@ -9375,7 +9698,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   <button
                     onClick={handleGoogleElectron}
                     disabled={isSubmitting || googleSubmitting}
-                    className="auth-submit mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="auth-submit mt-3 w-full py-2.5 px-4 rounded-full text-[13.5px] font-medium flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   >
                     {googleSubmitting ? (
@@ -9386,13 +9709,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                     {googleSubmitting ? 'Waiting for sign-in…' : 'Continue with Google'}
                   </button>
                 ) : (
-                  <div className="mt-5 flex justify-center [&_iframe]:rounded-full">
+                  <div className="mt-3 flex justify-center [&_iframe]:rounded-full">
                     <GoogleLogin
                       onSuccess={handleGoogleSuccess}
                       onError={handleGoogleError}
                       theme="outline"
                       size="large"
-                      width="384"
+                      width="340"
                       text="signin_with"
                       shape="pill"
                     />
@@ -9402,7 +9725,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </>
             )}
 
-            <div className="mt-7 text-center text-[13px]" style={{ color: 'var(--ink-muted)' }}>
+            <div className="mt-5 text-center text-[12.5px]" style={{ color: 'var(--ink-muted)' }}>
               No account?{' '}
               <button
                 onClick={() => setView('signup')}
@@ -9413,11 +9736,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </button>
             </div>
             {geo && (
-              <div className="mt-5 flex items-center justify-center gap-1.5 text-[11px]" style={{ color: 'var(--ink-faint)' }}>
+              <div className="mt-4 flex items-center justify-center gap-1.5 text-[10.5px]" style={{ color: 'var(--ink-faint)' }}>
                 <PhLock size={11} weight="duotone" /> Secure connection from {geo.country_name}
               </div>
             )}
           </div>
+        </div>
         </div>
       </div>
     );
@@ -9430,12 +9754,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     if (isMobile) return renderAuthMobile('forgot_password');
     return (
       <div
-        className="fixed inset-0 flex items-center justify-center p-6 overflow-y-auto"
+        className="fixed inset-0 overflow-y-auto"
         style={{ background: 'var(--cream)', color: 'var(--ink)', fontFamily: 'var(--sans)' }}
       >
-        <div className="w-full max-w-md">
+        <div className="min-h-full flex items-center justify-center px-4 py-8">
+        <div className="w-full max-w-[400px]">
           <div
-            className="auth-card relative rounded-3xl p-9 pt-7"
+            className="auth-card relative rounded-2xl p-7 pt-6"
             style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
           >
             <button
@@ -9476,15 +9801,15 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             </div>
 
             {!forgotSent ? (
-              <form onSubmit={handleForgotPassword} className="space-y-4">
+              <form onSubmit={handleForgotPassword} className="space-y-3">
                 <div>
-                  <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>EMAIL</label>
+                  <label className="block text-[10.5px] font-semibold mb-1" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>EMAIL</label>
                   <input
                     type="email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     placeholder="you@example.com"
-                    className="auth-input w-full px-4 py-3 rounded-xl text-[14px]"
+                    className="auth-input w-full px-3.5 py-2.5 rounded-lg text-[13.5px]"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                     required
                     autoFocus
@@ -9504,7 +9829,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 <button
                   type="submit"
                   disabled={isSubmitting || !email.trim()}
-                  className="auth-submit w-full py-3 rounded-full text-[14px] font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="auth-submit w-full py-2.5 rounded-full text-[13.5px] font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{ background: 'var(--ink)', color: 'var(--cream)' }}
                 >
                   {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
@@ -9514,14 +9839,14 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             ) : (
               <button
                 onClick={() => { setForgotSent(false); setAuthError(null); setView('login'); }}
-                className="auth-submit w-full py-3 rounded-full text-[14px] font-medium"
+                className="auth-submit w-full py-2.5 rounded-full text-[13.5px] font-medium"
                 style={{ background: 'var(--ink)', color: 'var(--cream)' }}
               >
                 Back to sign in
               </button>
             )}
 
-            <div className="mt-7 text-center text-[13px]" style={{ color: 'var(--ink-muted)' }}>
+            <div className="mt-5 text-center text-[12.5px]" style={{ color: 'var(--ink-muted)' }}>
               Remembered it?{' '}
               <button
                 onClick={() => { setAuthError(null); setForgotSent(false); setView('login'); }}
@@ -9532,6 +9857,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </button>
             </div>
           </div>
+        </div>
         </div>
       </div>
     );
@@ -9544,12 +9870,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     if (isMobile) return renderAuthMobile('signup');
     return (
       <div
-        className="fixed inset-0 flex items-center justify-center p-6 overflow-y-auto"
+        className="fixed inset-0 overflow-y-auto"
         style={{ background: 'var(--cream)', color: 'var(--ink)', fontFamily: 'var(--sans)' }}
       >
-        <div className="w-full max-w-md">
+        <div className="min-h-full flex items-center justify-center px-4 py-8">
+        <div className="w-full max-w-[400px]">
           <div
-            className="auth-card relative rounded-3xl p-9 pt-7"
+            className="auth-card relative rounded-2xl p-7 pt-6"
             style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)' }}
           >
             <button
@@ -9563,51 +9890,51 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
             <Logo size="md" theme="light" />
             <h2
-              className="mt-7 text-[28px]"
+              className="mt-5 text-[22px]"
               style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em' }}
             >
               Create your account.
             </h2>
-            <p className="mt-1.5 text-[14px] mb-7" style={{ color: 'var(--ink-muted)' }}>
+            <p className="mt-1 text-[13px] mb-5" style={{ color: 'var(--ink-muted)' }}>
               Free 30-minute trial. No card. Upgrade only if it earned the offer.
             </p>
 
-            <form onSubmit={handleSignup} className="space-y-4">
+            <form onSubmit={handleSignup} className="space-y-3">
               <div>
-                <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>NAME</label>
+                <label className="block text-[10.5px] font-semibold mb-1" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>NAME</label>
                 <input
                   type="text"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="Your name"
-                  className="auth-input w-full px-4 py-3 rounded-xl text-[14px]"
+                  className="auth-input w-full px-3.5 py-2.5 rounded-lg text-[13.5px]"
                   style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   autoFocus
                   autoComplete="name"
                 />
               </div>
               <div>
-                <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>EMAIL</label>
+                <label className="block text-[10.5px] font-semibold mb-1" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>EMAIL</label>
                 <input
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="you@example.com"
-                  className="auth-input w-full px-4 py-3 rounded-xl text-[14px]"
+                  className="auth-input w-full px-3.5 py-2.5 rounded-lg text-[13.5px]"
                   style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   required
                   autoComplete="email"
                 />
               </div>
               <div>
-                <label className="block text-[11.5px] font-medium mb-1.5" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>PASSWORD</label>
+                <label className="block text-[10.5px] font-semibold mb-1" style={{ color: 'var(--ink-muted)', letterSpacing: '0.02em' }}>PASSWORD</label>
                 <div className="relative">
                   <input
                     type={showPassword ? 'text' : 'password'}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Create a password (min 8 chars)"
-                    className="auth-input w-full px-4 py-3 pr-10 rounded-xl text-[14px]"
+                    className="auth-input w-full px-3.5 py-2.5 pr-10 rounded-lg text-[13.5px]"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                     required
                     minLength={8}
@@ -9638,7 +9965,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               <button
                 type="submit"
                 disabled={isSubmitting || googleSubmitting || !email.trim() || !password.trim()}
-                className="auth-submit w-full py-3 rounded-full text-[14px] font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="auth-submit w-full py-2.5 rounded-full text-[13.5px] font-medium inline-flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                 style={{ background: 'var(--ink)', color: 'var(--cream)' }}
               >
                 {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
@@ -9653,7 +9980,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             {/* Google Sign-Up */}
             {GOOGLE_CLIENT_ID && (
               <>
-                <div className="mt-7 flex items-center gap-3">
+                <div className="mt-5 flex items-center gap-3">
                   <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
                   <span className="text-[10px] uppercase tracking-[0.18em]" style={{ color: 'var(--ink-faint)' }}>or</span>
                   <div className="flex-1 h-px" style={{ background: 'var(--cream-line)' }} />
@@ -9662,7 +9989,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   <button
                     onClick={handleGoogleElectron}
                     disabled={isSubmitting || googleSubmitting}
-                    className="auth-submit mt-5 w-full py-3 px-4 rounded-full text-[14px] font-medium flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="auth-submit mt-3 w-full py-2.5 px-4 rounded-full text-[13.5px] font-medium flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
                   >
                     {googleSubmitting ? (
@@ -9673,13 +10000,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                     {googleSubmitting ? 'Waiting for sign-up…' : 'Continue with Google'}
                   </button>
                 ) : (
-                  <div className="mt-5 flex justify-center [&_iframe]:rounded-full">
+                  <div className="mt-3 flex justify-center [&_iframe]:rounded-full">
                     <GoogleLogin
                       onSuccess={handleGoogleSuccess}
                       onError={handleGoogleError}
                       theme="outline"
                       size="large"
-                      width="384"
+                      width="340"
                       text="signup_with"
                       shape="pill"
                     />
@@ -9689,7 +10016,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </>
             )}
 
-            <div className="mt-7 text-center text-[13px]" style={{ color: 'var(--ink-muted)' }}>
+            <div className="mt-5 text-center text-[12.5px]" style={{ color: 'var(--ink-muted)' }}>
               Already have an account?{' '}
               <button
                 onClick={() => setView('login')}
@@ -9700,155 +10027,34 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               </button>
             </div>
             {geo && (
-              <div className="mt-5 flex items-center justify-center gap-1.5 text-[11px]" style={{ color: 'var(--ink-faint)' }}>
+              <div className="mt-4 flex items-center justify-center gap-1.5 text-[10.5px]" style={{ color: 'var(--ink-faint)' }}>
                 <PhGlobe size={11} weight="duotone" /> {geo.country_name} &middot; {pricing?.currencySymbol} {pricing?.currency}
               </div>
             )}
           </div>
+        </div>
         </div>
       </div>
     );
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  //  LIVE SUPPORT CHAT
+  //  LIVE SUPPORT CHAT — full-screen "Minica" view
+  //  Backed by the universal SupportBot component (AI-first, with Slack +
+  //  email handoff to a real human). Anonymous OK — we no longer require
+  //  login here, so prospects can talk to Minica before signing up.
+  //  The legacy WebSocket-based /ws/support backbone (server/src/index.js)
+  //  remains intact as future scaffolding for a real agent dashboard.
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'support') {
-    // If not logged in, redirect to login
-    if (!currentUser) {
-      setView('login');
-      setAuthError('Please sign in to access support');
-      return null;
-    }
-
-    if (isMobile) {
-      return (
-        <SupportMobile
-          setView={setView}
-          currentUser={currentUser}
-          chatMessages={chatMessages}
-          setChatMessages={setChatMessages}
-          chatInput={chatInput}
-          setChatInput={setChatInput}
-          chatEndRef={chatEndRef}
-          chatWsRef={chatWsRef}
-        />
-      );
-    }
-
-    const sendChatMessage = () => {
-      const text = chatInput.trim();
-      if (!text) return;
-      const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      setChatMessages(prev => [...prev, { from: 'user', text, time }]);
-      setChatInput('');
-
-      // Send via WebSocket if connected
-      if (chatWsRef.current?.readyState === WebSocket.OPEN) {
-        chatWsRef.current.send(JSON.stringify({ type: 'message', text, user: currentUser.email }));
-      }
-
-      // Auto-scroll
-      setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
-    };
-
-    // Initialize chat with welcome message if empty
-    if (chatMessages.length === 0) {
-      const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      setChatMessages([{
-        from: 'agent',
-        text: `Hi ${currentUser.name || 'there'}! I'm Hari, your support agent. How can I help you today?`,
-        time
-      }]);
-
-      // Connect WebSocket for live chat
-      const serverUrl = import.meta.env.PROD ? 'https://api.minicaai.com' : (import.meta.env.VITE_SERVER_URL || 'https://api.minicaai.com');
-      const wsUrl = serverUrl.replace(/^http/, 'ws') + '/ws/support';
-      try {
-        const ws = new WebSocket(wsUrl);
-        ws.onopen = () => {
-          ws.send(JSON.stringify({ type: 'join', user: currentUser.email, name: currentUser.name }));
-        };
-        ws.onmessage = (e) => {
-          try {
-            const data = JSON.parse(e.data);
-            if (data.type === 'message') {
-              const msgTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-              setChatMessages(prev => [...prev, { from: 'agent', text: data.text, time: msgTime }]);
-              setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
-            }
-          } catch {}
-        };
-        ws.onerror = () => {};
-        ws.onclose = () => {};
-        chatWsRef.current = ws;
-      } catch {}
-    }
-
     return (
-      <div className="fixed inset-0 bg-[#050507] flex items-center justify-center p-6">
-        <AnimatedBackground />
-        <NoiseOverlay />
-        <div className="relative z-10 w-full max-w-lg h-[600px] max-h-[85vh] flex flex-col">
-          <div className="rounded-3xl border border-white/[0.08] bg-gradient-to-b from-white/[0.06] to-white/[0.02] backdrop-blur-xl shadow-2xl shadow-black/40 flex flex-col h-full overflow-hidden">
-            {/* Chat header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.08]">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-green-400 to-emerald-600 flex items-center justify-center shadow-lg shadow-green-500/20">
-                  <Headphones size={18} className="text-white" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-semibold text-white">Hari</h3>
-                  <div className="flex items-center gap-1.5">
-                    <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-                    <span className="text-[10px] text-green-400 font-medium">Live Support Agent</span>
-                  </div>
-                </div>
-              </div>
-              <button onClick={() => { setView('landing'); if (chatWsRef.current) { chatWsRef.current.close(); chatWsRef.current = null; } setChatMessages([]); }}
-                className="w-8 h-8 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] flex items-center justify-center text-gray-500 hover:text-white transition-all">
-                <X size={16} />
-              </button>
-            </div>
-
-            {/* Chat messages */}
-            <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
-              {chatMessages.map((msg, i) => (
-                <div key={i} className={`flex ${msg.from === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[80%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${
-                    msg.from === 'user'
-                      ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-br-md'
-                      : 'bg-white/[0.06] border border-white/[0.08] text-gray-200 rounded-bl-md'
-                  }`}>
-                    <p>{msg.text}</p>
-                    <p className={`text-[9px] mt-1 ${msg.from === 'user' ? 'text-blue-200' : 'text-gray-600'}`}>{msg.time}</p>
-                  </div>
-                </div>
-              ))}
-              <div ref={chatEndRef} />
-            </div>
-
-            {/* Chat input */}
-            <div className="px-4 py-3 border-t border-white/[0.08]">
-              <form onSubmit={(e) => { e.preventDefault(); sendChatMessage(); }} className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  placeholder="Type your message..."
-                  className="flex-1 px-4 py-3 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white placeholder-gray-600 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-all"
-                  autoFocus
-                />
-                <button type="submit"
-                  className="w-11 h-11 rounded-xl bg-gradient-to-r from-blue-500 to-blue-600 text-white flex items-center justify-center hover:from-blue-400 hover:to-blue-500 transition-all shadow-lg shadow-blue-500/25 flex-shrink-0">
-                  <Send size={16} />
-                </button>
-              </form>
-              <p className="text-[10px] text-gray-600 text-center mt-2">Live chat with our support team</p>
-            </div>
-          </div>
-        </div>
-      </div>
+      <SupportBot
+        mode="view"
+        currentUser={currentUser ? { email: currentUser.email, name: currentUser.name, id: (currentUser as any).id } : null}
+        tier={currentLicense?.tier ?? null}
+        authToken={licenseService.getToken() || null}
+        onClose={() => setView(currentUser ? 'download' : 'landing')}
+      />
     );
   }
 
@@ -9963,14 +10169,28 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   return null;
 };
 
-// Wrap with Google OAuth Provider
+// Wrap with Google OAuth Provider + mount the floating "Minica" bubble
+// alongside the page content. The bubble sits at z-[60], so any z-[100]
+// full-screen takeover (e.g., the view==='support' takeover) naturally
+// covers it — no double-rendering of chat surfaces.
+//
+// The floating bubble lives OUTSIDE SubscriptionGateInner so it isn't
+// affected by the inner's many early-return view branches. It pulls the
+// auth token (if any) from licenseService directly; the server resolves
+// the tier from the JWT in /api/v1/support/tier, so anonymous and
+// authenticated users both work without prop drilling.
 export const SubscriptionGate: React.FC<SubscriptionGateProps> = (props) => {
-  if (GOOGLE_CLIENT_ID) {
-    return (
-      <GoogleOAuthProvider clientId={GOOGLE_CLIENT_ID}>
-        <SubscriptionGateInner {...props} />
-      </GoogleOAuthProvider>
-    );
-  }
-  return <SubscriptionGateInner {...props} />;
+  const inner = GOOGLE_CLIENT_ID ? (
+    <GoogleOAuthProvider clientId={GOOGLE_CLIENT_ID}>
+      <SubscriptionGateInner {...props} />
+    </GoogleOAuthProvider>
+  ) : (
+    <SubscriptionGateInner {...props} />
+  );
+  return (
+    <>
+      {inner}
+      <SupportBot mode="floating" authToken={licenseService.getToken() || null} />
+    </>
+  );
 };

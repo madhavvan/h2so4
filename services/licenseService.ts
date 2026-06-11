@@ -260,9 +260,15 @@ class LicenseService {
   // Gate answer is based on EFFECTIVE tier: Free users with an active 30-min
   // trial are treated as Basic for this window so they can experience the
   // full product before the wall comes up.
+  //
+  // Tier gating is STRICT — including for admins. Previously this method
+  // returned true unconditionally for admin email matches, which meant an
+  // admin who downgraded their own license to "pro" still had max features
+  // (Auto-Type, Claude) — a loophole that made tier testing impossible and
+  // hid real bugs. The admin-tools surface (admin dashboard, admin bot
+  // tools) is gated separately on the server-side ADMIN_EMAILS check;
+  // personal feature usage honors the license tier exactly.
   canUseFeature(license: LicenseData | null, feature: keyof typeof FEATURE_GATES.free): boolean {
-    // Admin gets every gate (incl. Max-only Auto-Type) regardless of stored tier.
-    if (this.isAdmin()) return true;
     if (!license) return false;
     const tier = this.getEffectiveTier(license);
     const gates = FEATURE_GATES[tier];
@@ -273,8 +279,6 @@ class LicenseService {
   }
 
   canUseModel(license: LicenseData | null, model: string): boolean {
-    // Admin can use any model (mirrors Max's `models` whitelist).
-    if (this.isAdmin()) return true;
     if (!license) return false;
     const tier = this.getEffectiveTier(license);
     return FEATURE_GATES[tier].models.includes(model);
@@ -283,11 +287,15 @@ class LicenseService {
   // ── Effective tier resolution (4-way) ──
   // Free user inside their 30-min trial window gets Basic features.
   // Basic user with expired credits falls back to Free features.
+  //
+  // Admins are NOT auto-promoted to max here. Strict tier gating means
+  // an admin who downgrades their own license to "pro" sees pro features
+  // (no Claude, no Auto-Type), matching what every other pro user sees.
+  // Admin-tool surfaces (admin dashboard, admin bot tools) are gated
+  // independently on the server-side ADMIN_EMAILS check. To test max
+  // features as an admin, set your own license tier to max via the
+  // change_user_tier admin tool or the ManageSubscription UI.
   getEffectiveTier(license: LicenseData | null): 'free' | 'basic' | 'pro' | 'max' {
-    // Admin always renders + gates as Max so the UI shows "Max Active" and
-    // Auto-Type is unlocked even if the stored tier is 'free' (e.g. before
-    // any /create-checkout self-grant fires).
-    if (this.isAdmin()) return 'max';
     if (!license) return 'free';
     if (license.tier === 'max') return 'max';
     if (license.tier === 'pro') return 'pro';
@@ -306,6 +314,11 @@ class LicenseService {
     localStorage.setItem(this.AUTH_KEY, JSON.stringify(user));
     localStorage.setItem(this.STORAGE_KEY, JSON.stringify(license));
     if (token) localStorage.setItem(this.TOKEN_KEY, token);
+    // Notify in-tab listeners (e.g. floating SupportBot, Documentation
+    // admin-docs panel) that auth state changed. The 'storage' event
+    // only fires for OTHER tabs, so for same-tab login/logout we
+    // dispatch a custom event explicitly.
+    this.emitAuthChange('save');
   }
 
   loadAuth(): { user: UserProfile | null; license: LicenseData | null; token: string | null } {
@@ -345,10 +358,24 @@ class LicenseService {
     } catch {
       // localStorage unavailable / quota — non-fatal.
     }
+    this.emitAuthChange('logout');
   }
 
   getToken(): string | null {
     return localStorage.getItem(this.TOKEN_KEY);
+  }
+
+  // Notify in-tab listeners that auth state changed. Used by floating
+  // SupportBot, Documentation admin-docs section, and any other
+  // component that mounts outside the auth-state-owning component
+  // and so doesn't naturally re-render on login/logout.
+  // Wrapped in try/catch because CustomEvent isn't available in older
+  // jsdom test environments and we don't want test infra to crash auth.
+  private emitAuthChange(reason: 'save' | 'logout'): void {
+    if (typeof window === 'undefined') return;
+    try {
+      window.dispatchEvent(new CustomEvent('minicaai-auth-changed', { detail: { reason } }));
+    } catch { /* CustomEvent unavailable */ }
   }
 
   // ── License validation ──
@@ -800,9 +827,15 @@ class LicenseService {
       const updatedUser = (user && typeof serverIsAdmin === 'boolean' && user.is_admin !== serverIsAdmin)
         ? { ...user, is_admin: serverIsAdmin }
         : user;
-      // If server rotated the token, save the new one so the next
-      // request doesn't hit 401. Falls back to existing token otherwise.
-      const newToken = serverData.token || token;
+      // Only write the token back when the server ACTUALLY rotated it.
+      // Previously: `newToken = serverData.token || token` — if no
+      // rotation, the captured-at-start `token` got written back. That
+      // raced with SupportBot's invalid-token cleanup (which removes the
+      // token from localStorage on tier probe) — the stale value got
+      // restored and the bot kept getting 401s. saveAuth's `if (token)`
+      // guard means an undefined newToken simply leaves the existing
+      // localStorage value alone.
+      const newToken = serverData.token ? String(serverData.token) : undefined;
       if (updatedUser) this.saveAuth(updatedUser, updatedLicense, newToken);
       return updatedLicense;
     } catch {

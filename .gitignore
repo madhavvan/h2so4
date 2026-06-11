@@ -20,6 +20,30 @@ server/.env
 server/.env.*
 !server/.env.example
 
+# ── Engineering docs — NEVER on github, in any form ──
+# Both the plaintext .md AND the AES-256-GCM ciphertext (.md.enc) are
+# excluded. Earlier policy committed the encrypted blobs on the theory
+# that they were meaningless without ENGINEERING_DOCS_KEY. We're now
+# stricter: defense in depth means if the key ever leaks (env-var
+# accidentally logged, dev laptop compromised, CI pipeline scraped),
+# the attacker shouldn't also have a copy of the ciphertext sitting
+# in a public-or-stolen git repo.
+#
+# Deployment workflow (no git involvement):
+#   1. Edit plaintext in docs/private/*.md on the dev machine.
+#   2. Run `npm run docs:encrypt` to produce *.md.enc next to each.
+#   3. Upload the *.md.enc files to the server out-of-band:
+#        railway run -- bash -c 'cat > server/docs/private/X.md.enc' < X.md.enc
+#        (or rsync over SSH, or whatever the deploy target supports)
+#   4. Server reads from PRIVATE_DOCS_DIR at boot; key comes from
+#      ENGINEERING_DOCS_KEY env var on the deploy target.
+#
+# The whole docs/private/ directory is excluded. On a fresh clone the
+# directory simply won't exist; the server logs "engineering docs
+# disabled — docs/private/ directory missing" and admin chat falls
+# back to public docs only, which is the safe default.
+docs/private/
+
 # ── Database files ──
 server/data/
 *.db
@@ -66,3 +90,13 @@ Desktop.ini
 # Downloaded by scripts/install-signing-dlib.ps1 on the build machine.
 # Never commit binaries.
 .signing/
+
+# ── Auto-Type runtime debug artifacts — NEVER commit ──
+# Generated during Auto-Type runs. `.autotype-screenshots/` holds raw screen
+# captures of the candidate's editor (i.e. live interview content), and
+# `.autotype-plans.jsonl` logs the editor text + code that was typed. Both
+# can contain sensitive captured screen content — keep them off git entirely.
+.autotype-screenshots/
+.autotype-plans.jsonl
+.autotype-test/
+server/scripts/.autotype-test/

@@ -1,3 +1,258 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   LIGHT-MODE COMPATIBILITY LAYER (2026-05-13)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   The chat surface was originally built dark-only. A Light toggle
+   was exposed but never wired up; flipping it left a light page
+   with dark cards floating on top. This layer fixes those at scale
+   without touching hundreds of components individually.
+
+   PALETTE NOTE: the light theme uses a WARM off-white (cream),
+   not pure #ffffff. User feedback 2026-05-13: "pure white look[s]
+   pure white make it look rich". The cream tokens were already
+   defined in index.html for the marketing/auth surfaces (Anthropic-
+   inspired); we now extend them to the in-app surface in light
+   mode. Dark mode keeps the cool zinc palette unchanged.
+
+   Cream palette tokens used here (defined in index.html :root):
+     --cream      #faf7f0  surface (panels, modals, sidebar)
+     --cream-soft #f3eee2  recessed surface (cards on a panel)
+     --cream-line #e8e2d1  subtle borders, dividers
+     --ink        #141413  primary text
+     --ink-soft   #2a2925  secondary text
+     --ink-muted  #6b6a64  metadata, captions
+     --ink-faint  #9b988e  disabled / tertiary
+
+   Selectors: `:root:not(.dark)` fires only when settings.theme === 'light'
+   (App.tsx:3848 toggles .dark on <html>). Dark-mode behavior is
+   never touched.
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+/* Page background — replace the cool slate-50 default with cream,
+   so the in-app light theme reads as "Anthropic / Claude.ai" warm
+   rather than "generic SaaS cool". This swap also softens the
+   contrast against the cream panel surfaces below, giving the
+   whole surface a paper-like cohesion. */
+:root:not(.dark) body { background-color: #faf6ec; }
+:root:not(.dark) .bg-slate-50 { background-color: #faf6ec !important; }
+
+/* Translucent-white background overlays → cream/sand in light mode.
+   Originally rgba(255,255,255,0.04) etc., meant for dark surfaces.
+   On a light surface they vanish. We promote them to graduated
+   cream tones so a 4% white overlay reads as the lightest tint of
+   recessed surface, a 12% overlay reads as a clearly-darker hover
+   target, etc. The progression mirrors zinc-50→zinc-300 but in
+   warm cream-space. */
+:root:not(.dark) .bg-white\/\[0\.02\] { background-color: #fefcf7; }   /* faintest tint */
+:root:not(.dark) .bg-white\/\[0\.04\] { background-color: #f7f1e2; }   /* cream-soft */
+:root:not(.dark) .bg-white\/\[0\.06\] { background-color: #f3eee2; }   /* cream-soft, denser */
+:root:not(.dark) .bg-white\/\[0\.08\] { background-color: #ede6d2; }
+:root:not(.dark) .bg-white\/\[0\.1\]  { background-color: #e8e0c8; }
+:root:not(.dark) .bg-white\/\[0\.12\] { background-color: #e1d8bd; }
+:root:not(.dark) .bg-white\/\[0\.15\] { background-color: #d8ceae; }
+
+/* Hover states — step one shade darker so the press affordance
+   stays perceptible on cream surfaces. */
+:root:not(.dark) .hover\:bg-white\/\[0\.04\]:hover { background-color: #ede6d2; }
+:root:not(.dark) .hover\:bg-white\/\[0\.06\]:hover { background-color: #e8e0c8; }
+:root:not(.dark) .hover\:bg-white\/\[0\.08\]:hover { background-color: #e1d8bd; }
+:root:not(.dark) .hover\:bg-white\/\[0\.1\]:hover  { background-color: #d8ceae; }
+:root:not(.dark) .hover\:bg-white\/\[0\.12\]:hover { background-color: #cdc09c; }
+
+/* Translucent-white borders → warm cream-line in light mode. */
+:root:not(.dark) .border-white\/\[0\.04\] { border-color: #efe8d4; }
+:root:not(.dark) .border-white\/\[0\.06\] { border-color: #e8e2d1; }
+:root:not(.dark) .border-white\/\[0\.08\] { border-color: #e0d8c2; }
+:root:not(.dark) .border-white\/\[0\.1\]  { border-color: #d6ccb3; }
+:root:not(.dark) .border-white\/\[0\.12\] { border-color: #cdc09c; }
+:root:not(.dark) .border-white\/\[0\.15\] { border-color: #c0b288; }
+:root:not(.dark) .border-white\/10        { border-color: #d6ccb3; }
+:root:not(.dark) .border-white\/15        { border-color: #c0b288; }
+
+/* Hardcoded near-black backgrounds used as panel surfaces (sidebar,
+   modals, sheets). Promote to cream in light mode. Components that
+   already paired `bg-white dark:bg-[...]` in JSX continue to work
+   because Tailwind's `bg-white` wins source-order. */
+:root:not(.dark) .bg-\[\#0a0a0d\]       { background-color: #faf7f0; }   /* --cream */
+:root:not(.dark) .bg-\[\#0a0a0f\]       { background-color: #faf7f0; }
+:root:not(.dark) .bg-\[\#09090b\]       { background-color: #faf6ec; }
+:root:not(.dark) .bg-\[\#111116\]       { background-color: #faf7f0; }
+:root:not(.dark) .bg-\[\#050507\]       { background-color: #faf6ec; }
+:root:not(.dark) .bg-\[\#0a0a0d\]\/95   { background-color: rgba(250, 247, 240, 0.95); }
+:root:not(.dark) .bg-\[\#1a1a2e\]       { background-color: #faf7f0; }   /* Modal Electron path */
+
+/* Pure `bg-white` (rare; mostly used for icons-on-white): swap to
+   cream so we don't get a stark pure-white island on the warm
+   surface. */
+:root:not(.dark) .bg-white:not([class*="dark:"]) { background-color: #faf7f0; }
+
+/* Tailwind zinc/slate utilities that some recently-converted components
+   use as their "light" sibling. We override these too so the whole
+   light surface reads as cream rather than a mix of cool zinc + warm
+   cream. */
+:root:not(.dark) .bg-zinc-50   { background-color: #fefcf7 !important; }
+:root:not(.dark) .bg-zinc-100  { background-color: #f3eee2 !important; }
+:root:not(.dark) .bg-zinc-200  { background-color: #e8e2d1 !important; }
+:root:not(.dark) .bg-zinc-200\/50 { background-color: rgba(232, 226, 209, 0.5) !important; }
+:root:not(.dark) .border-zinc-200 { border-color: #e8e2d1 !important; }
+:root:not(.dark) .border-zinc-300 { border-color: #d6ccb3 !important; }
+:root:not(.dark) .hover\:bg-zinc-50:hover  { background-color: #f3eee2 !important; }
+:root:not(.dark) .hover\:bg-zinc-100:hover { background-color: #e8e2d1 !important; }
+:root:not(.dark) .hover\:bg-zinc-200:hover { background-color: #d6ccb3 !important; }
+
+/* Text in light mode: warm near-black (--ink) instead of cool zinc-900.
+   The :not([class*="bg-gradient-"]) etc. exclusions keep gradient/
+   colored-button text white-on-color, which is correct in both modes. */
+:root:not(.dark) .text-white:not([class*="bg-gradient-"]):not([class*="bg-blue-5"]):not([class*="bg-emerald-5"]):not([class*="bg-red-5"]):not([class*="bg-purple-5"]):not([class*="bg-amber-5"]):not([class*="bg-cyan-5"]) {
+  color: #141413;  /* --ink */
+}
+
+/* Dim-text variants → warm ink hierarchy. */
+:root:not(.dark) .text-white\/40 { color: #b8b4a5; }   /* faint */
+:root:not(.dark) .text-white\/50 { color: #9b988e; }   /* --ink-faint */
+:root:not(.dark) .text-white\/60 { color: #807c70; }
+:root:not(.dark) .text-white\/70 { color: #6b6a64; }   /* --ink-muted */
+:root:not(.dark) .text-white\/80 { color: #4a4842; }
+:root:not(.dark) .text-white\/90 { color: #2a2925; }   /* --ink-soft */
+
+/* hover:text-white on dim text → darken to full ink on hover. */
+:root:not(.dark) .hover\:text-white:hover { color: #141413; }
+
+/* Tailwind zinc text utilities used by recently-converted components. */
+:root:not(.dark) .text-zinc-900 { color: #141413 !important; }
+:root:not(.dark) .text-zinc-800 { color: #2a2925 !important; }
+:root:not(.dark) .text-zinc-700 { color: #3a3833 !important; }
+:root:not(.dark) .text-zinc-600 { color: #6b6a64 !important; }
+:root:not(.dark) .text-zinc-500 { color: #807c70 !important; }
+:root:not(.dark) .text-zinc-400 { color: #9b988e !important; }
+
+/* Gray utilities scattered throughout — warm them in light mode
+   so we don't end up with cool gray text on warm cream surfaces. */
+:root:not(.dark) .text-gray-300 { color: #4a4842; }
+:root:not(.dark) .text-gray-400 { color: #6b6a64; }
+:root:not(.dark) .text-gray-500 { color: #807c70; }
+:root:not(.dark) .text-gray-600 { color: #9b988e; }
+
+/* Subtle paper-like depth on the most prominent panel surfaces.
+   A faint inner highlight gives the cream a hand-finished feel
+   (similar to high-end note-taking apps like iA Writer / Bear).
+   Cheap CSS, zero JS. */
+:root:not(.dark) aside,
+:root:not(.dark) [role="dialog"] {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.6),
+    0 1px 2px rgba(20, 20, 19, 0.04);
+}
+
+/* The model-picker rich cards (mp-card family) are styled inline in
+   index.html with dark-surface assumptions. Override in light mode
+   so the cards read as elegant warm cards instead of dark plates. */
+:root:not(.dark) .mp-row {
+  color: #2a2925;
+}
+:root:not(.dark) .mp-row:hover         { background: rgba(20, 20, 19, 0.05); }
+:root:not(.dark) .mp-row.is-selected   { background: rgba(20, 20, 19, 0.03); }
+:root:not(.dark) .mp-row.is-locked     { color: rgba(20, 20, 19, 0.42); }
+:root:not(.dark) .mp-row.is-locked:hover { background: rgba(20, 20, 19, 0.03); }
+:root:not(.dark) .mp-card {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0)),
+    #fdfaf2;
+  border-color: #e8e2d1;
+  color: #2a2925;
+}
+:root:not(.dark) .mp-card:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.7), rgba(255, 255, 255, 0)),
+    #f7f2e3;
+}
+:root:not(.dark) .mp-card-max {
+  background:
+    radial-gradient(140% 100% at 0% 0%, rgba(201, 99, 66, 0.08), transparent 55%),
+    radial-gradient(120% 100% at 100% 100%, rgba(168, 85, 247, 0.06), transparent 55%),
+    #fefcf6;
+}
+:root:not(.dark) .mp-card-name { color: #141413; }
+:root:not(.dark) .mp-card-tag  { color: #6b6a64; }
+:root:not(.dark) .mp-card-mono {
+  background: #f3eee2;
+  border-color: #d6ccb3;
+  color: #2a2925;
+}
+:root:not(.dark) .mp-mono { color: #2a2925; }
+
+/* ─── Minica bot output styling ───────────────────────────────────
+   Renders markdown from ReactMarkdown cleanly inside the support
+   bot's chat bubbles. Default prose padding looks oversized against
+   a 13.5px bubble — these rules give just enough hierarchy to read
+   bold, lists, code, and headings as a formatted document without
+   bursting the bubble. */
+.minica-md > * + * { margin-top: 0.6em; }
+.minica-md strong { font-weight: 700; }
+.minica-md em { font-style: italic; }
+.minica-md ul, .minica-md ol {
+  padding-left: 1.25em;
+  margin: 0.25em 0;
+}
+.minica-md ul { list-style: disc; }
+.minica-md ol { list-style: decimal; }
+.minica-md li { margin: 0.15em 0; }
+.minica-md h1, .minica-md h2, .minica-md h3, .minica-md h4 {
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 0.4em 0 0.2em;
+}
+.minica-md h1 { font-size: 1.15em; }
+.minica-md h2 { font-size: 1.08em; }
+.minica-md h3 { font-size: 1.04em; }
+.minica-md h4 { font-size: 1.0em; }
+.minica-md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+  background: rgba(127, 127, 127, 0.16);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.minica-md pre {
+  background: rgba(0, 0, 0, 0.45);
+  color: #e5e7eb;
+  padding: 10px 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 0.9em;
+  margin: 0.4em 0;
+}
+.minica-md pre code { background: transparent; padding: 0; }
+.minica-md a {
+  color: #3b82f6;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.minica-md blockquote {
+  border-left: 3px solid rgba(127, 127, 127, 0.35);
+  padding-left: 0.75em;
+  color: inherit;
+  opacity: 0.85;
+}
+.minica-md hr {
+  border: none;
+  border-top: 1px solid rgba(127, 127, 127, 0.25);
+  margin: 0.6em 0;
+}
+.minica-md table {
+  border-collapse: collapse;
+  font-size: 0.9em;
+  margin: 0.4em 0;
+}
+.minica-md th, .minica-md td {
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  padding: 4px 8px;
+  text-align: left;
+}
+.minica-md th { font-weight: 700; background: rgba(127, 127, 127, 0.08); }
+.minica-md p { margin: 0; }
+.minica-md p + p { margin-top: 0.5em; }

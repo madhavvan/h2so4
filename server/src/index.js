@@ -9,6 +9,12 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const database = require('./database');
+// Alias used by the support WS persistence handlers below. The
+// WebSocket block was written against `db.` while the historical
+// import at the top of this file uses `database.` — keeping both
+// names live so existing call sites stay readable AND the new
+// code reads identically to routes/support.js which also uses `db`.
+const db = database;
 
 const authRoutes = require('./routes/auth');
 const paymentRoutes = require('./routes/payments');
@@ -18,6 +24,12 @@ const adminRoutes = require('./routes/admin');
 const aiRoutes = require('./routes/ai');
 const conversationRoutes = require('./routes/conversations');
 const downloadRoutes = require('./routes/downloads');
+const supportRoutes = require('./routes/support');
+const geoRoutes = require('./routes/geo');
+// Support escalation worker — fires staged ntfy/email/sms alerts when
+// no agent claims a customer chat. Lazy-required so missing optional
+// deps (twilio) don't break server boot for users not using them.
+const supportEscalation = require('./services/supportEscalation');
 // Semver compare — extracted to utils/version.js so unit tests can hit
 // it without booting Express. Used by /version + /license/validate.
 const { compareVersions } = require('./utils/version');
@@ -121,6 +133,17 @@ const adminDestructiveLimiter = new RateLimiterMemory({ points: 30, duration: 30
 // inference, but breathing room for normal interview pace.
 const aiLimiter = new RateLimiterMemory({ points: 90, duration: 60 });
 
+// Support bot limiters — keyed by IP (endpoint is anonymous). Two tiers:
+//   • supportChatLimiter — 10 streams / minute / IP, 50 / hour / IP.
+//     A single attacker IP costs us at most ~50 × $0.005 ≈ $0.25/hour
+//     even on the most expensive question, and the hourly cap dominates.
+//   • supportHandoffLimiter — 5 handoffs / hour / IP. Each handoff fires
+//     Slack + Resend; this stops a scripted form-spam loop from filling
+//     support@minicaai.com or paging the Slack channel.
+const supportChatLimiter = new RateLimiterMemory({ points: 10, duration: 60 });
+const supportChatHourly = new RateLimiterMemory({ points: 50, duration: 3600 });
+const supportHandoffLimiter = new RateLimiterMemory({ points: 5, duration: 3600 });
+
 // Optional IP allowlist for admin endpoints. Comma-separated CIDR-free list
 // (single IPs and IPv4/IPv6 exact match). Empty string = no restriction
 // (this is the default for dev). In prod we strongly recommend setting
@@ -211,6 +234,30 @@ app.use(async (req, res, next) => {
       }
     }
 
+    // Support bot rate limits. Anonymous, IP-keyed, two windows: a tight
+    // burst cap (10/min) plus a slower drip cap (50/hour) so an attacker
+    // can't both spike *and* sustain. Hits BEFORE the route to keep us
+    // from spending OpenAI tokens on the abuse traffic.
+    if (req.path.startsWith('/api/v1/support/chat')) {
+      try {
+        await supportChatLimiter.consume(key);
+        await supportChatHourly.consume(key);
+      } catch {
+        return res.status(429).json({
+          error: 'Slow down — too many support requests from this address. Wait a minute and try again, or email support@minicaai.com.',
+        });
+      }
+    }
+    if (req.path.startsWith('/api/v1/support/handoff')) {
+      try {
+        await supportHandoffLimiter.consume(key);
+      } catch {
+        return res.status(429).json({
+          error: "You've sent several handoff requests recently. We've already got your earlier message — please wait for a reply.",
+        });
+      }
+    }
+
     // AI cost control. Authenticated AI endpoints are real money per call —
     // a leaked or compromised JWT must NOT be able to grind unbounded
     // inference. Key by user_id when present (so two users on the same
@@ -289,6 +336,14 @@ app.use('/api/v1/license', licenseRoutes);
 app.use('/api/v1/admin', adminRoutes);
 app.use('/api/v1/ai', aiRoutes);
 app.use('/api/v1/conversations', conversationRoutes);
+// Support bot — anonymous-allowed (no auth middleware), rate-limited
+// above per IP. Chat = SSE stream to OpenAI; handoff = Slack + email.
+app.use('/api/v1/support', supportRoutes);
+// Geo lookup proxy — replaces direct browser → ipapi.co call which
+// kept tripping CORS + free-tier rate limits. Caches per-IP for 10min
+// so the SPA doesn't burn upstream quota on every render. Silent
+// fallback on upstream failure (never surfaces a 5xx to the client).
+app.use('/api/v1/geo', geoRoutes);
 // Public download redirects mounted at root — explicit per-platform paths
 // inside the router (no /:platform catch-all) so unmatched paths still
 // fall through to the 404 handler below. Reachable on get.minicaai.com.
@@ -487,6 +542,30 @@ process.on('SIGTERM', () => {
 const server = app.listen(PORT, () => {
   console.log(`minicaai API running on port ${PORT}`);
   console.log(`Database initialized`);
+  // Support escalation worker — scans support_escalation_queue every
+  // 10s, fires staged ntfy/email/sms/fallback rungs. Started AFTER
+  // listen() so route registration completes first.
+  try { supportEscalation.start(); }
+  catch (e) { console.warn('[support/escalation] failed to start:', e.message); }
+  // Loud warning: in production, SERVER_URL controls the OAuth
+  // redirect_uri Google sees. If it's unset on Railway, Express's
+  // req.host returns the internal Railway hostname (e.g. 5ejjp94w.up.
+  // railway.app) and the consent screen shows that ugly URL instead of
+  // api.minicaai.com. The code has a fallback to req.host, but the
+  // fallback is wrong on Railway — keep this warning so the next deploy
+  // notices.
+  if (process.env.NODE_ENV === 'production' && !process.env.SERVER_URL) {
+    console.warn('');
+    console.warn('================================================================');
+    console.warn('  WARNING: SERVER_URL is not set.');
+    console.warn('  Google OAuth redirect_uri will be built from req.host, which');
+    console.warn('  on Railway returns the internal hostname. The consent screen');
+    console.warn('  will show the Railway URL instead of your subdomain.');
+    console.warn('  Fix: set SERVER_URL=https://api.minicaai.com in Railway env');
+    console.warn('  AND add that exact callback URI to Google Cloud Console.');
+    console.warn('================================================================');
+    console.warn('');
+  }
 });
 
 // ── Periodic chores ──
@@ -504,6 +583,61 @@ function runResetTokenCleanup() {
 }
 runResetTokenCleanup();
 setInterval(runResetTokenCleanup, RESET_TOKEN_CLEANUP_INTERVAL_MS).unref();
+
+// ── Cycle-end downgrade sweeper ──
+// Belt-and-suspenders for the subscription lifecycle. Webhooks
+// (Stripe customer.subscription.deleted, Razorpay subscription.halted)
+// are the primary signal that a paid cycle has ended and the user
+// should drop to Free. But webhooks can be delayed, lost, or
+// duplicated. This sweep runs every 5 min and catches any license in
+// 'canceling' state whose expires_at has passed and the webhook never
+// landed — transitions them to Free with the standard free-tier
+// defaults (5 sessions, gemini-only, 30-day rolling window) and
+// fires the "your access has ended" email with a "Get Basic now"
+// CTA. Idempotent via transitionLicenseToFree which no-ops when the
+// user is already on free.
+const CYCLE_END_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+async function runCycleEndSweep() {
+  try {
+    const userIds = database.getExpiredCancelingUserIds(100);
+    if (!userIds || userIds.length === 0) return;
+    const { sendMail, renderAccessEndedEmail } = require('./email');
+    for (const userId of userIds) {
+      try {
+        const user = database.getUserById(userId);
+        if (!user) continue;
+        const prevTier = database.getLicenseByUserId(userId)?.tier || 'paid';
+        const result = database.transitionLicenseToFree(userId, { reason: 'sweep' });
+        if (!result || !result.transitioned) continue;
+        console.log(`[cycle-end-sweep] transitioned user ${userId} (${user.email}) from ${prevTier} to free`);
+
+        // Goodbye email — fire-and-forget. Suppressed silently if no
+        // email transport is configured (Resend + SMTP both unset in
+        // dev) so the sweep loop never throws on mail.
+        try {
+          if (typeof renderAccessEndedEmail === 'function') {
+            const buyBasicUrl = (process.env.FRONTEND_URL || 'https://minicaai.com') + '/#pricing';
+            const signInUrl = process.env.FRONTEND_URL || 'https://minicaai.com';
+            const { subject, html, text } = renderAccessEndedEmail({
+              name: user.name, previousTier: prevTier, buyBasicUrl, signInUrl,
+            });
+            sendMail({ to: user.email, subject, html, text }).catch(() => { /* mail outage */ });
+          }
+        } catch (mailErr) {
+          console.warn('[cycle-end-sweep] mail render/send failed:', mailErr && mailErr.message);
+        }
+      } catch (perUserErr) {
+        console.warn('[cycle-end-sweep] per-user transition failed for', userId, ':', perUserErr.message);
+      }
+    }
+  } catch (err) {
+    console.warn('[cycle-end-sweep] outer error:', err && err.message);
+  }
+}
+// Run once at boot to catch anything that expired while the server
+// was down. After that, every 5 min via interval.
+runCycleEndSweep();
+setInterval(runCycleEndSweep, CYCLE_END_SWEEP_INTERVAL_MS).unref();
 
 // Daily SQLite VACUUM INTO snapshot. Single-file SQLite has no replication;
 // this is the one defense against volume corruption / accidental delete /
@@ -528,27 +662,49 @@ const wss = new WebSocket.Server({ server, path: '/ws/support' });
 // detect dead-but-not-closed sockets (firewall NAT timeout, broken Wi-Fi
 // where TCP FIN never lands) that would otherwise leak forever.
 const supportClients = new Map(); // sessionId -> { ws, type, email, name, lastSeen, pingPending }
+// Expose the live-socket map to routes so the resolve handler can
+// push csat_request to a connected customer without needing its own
+// WebSocket plumbing. routes/support.js reads req.app.locals.supportClients.
+app.locals.supportClients = supportClients;
+app.locals.WebSocketState = WebSocket;   // for OPEN constant
 
 // Tunables. 30-min idle close matches typical support-chat patience; ping
-// every 60s is well under common 2-min NAT timeouts. MAX_PER_USER prevents
-// a flapping client from inflating the map without bound.
+// every 60s is well under common 2-min NAT timeouts.
+//
+// Connection caps — per role, not a single global. (2026-05-13 fix: a
+// universal `1 per email` was evicting an admin's browser-tab WS the
+// moment Electron also opened one, causing a flap loop where ZERO of
+// the admin's sockets stayed alive long enough to receive a real
+// customer message.) Customers stay at 1 — the most-recent click of
+// Talk to a human wins, prior tabs disconnect cleanly. Agents go to
+// 4: admin might run main + popout in Electron AND have a browser
+// tab open, plus the test/staging admin probe; all should coexist.
 const SUPPORT_IDLE_MS = 30 * 60 * 1000;
 const SUPPORT_PING_INTERVAL_MS = 60 * 1000;
-const SUPPORT_MAX_PER_USER = 1; // one active connection per email
+const SUPPORT_MAX_PER_USER = { customer: 1, agent: 4 };
 
-// Helper: find any existing connection for the same logical user (same
-// role + email). Used to evict the older session when a new one joins, so
-// reconnect storms don't accumulate stale entries.
-function findExistingClientId(role, email) {
-  if (!email) return null;
+// Helper: list connections for the same logical user (same role +
+// email). When count >= cap we evict the OLDEST so the newest tab
+// always wins and an in-flight reconnect doesn't get itself kicked.
+function listClientsForRoleEmail(role, email) {
+  if (!email) return [];
+  const out = [];
   for (const [id, c] of supportClients) {
-    if (c.type === role && c.email === email) return id;
+    if (c.type === role && c.email === email) out.push({ id, c });
   }
-  return null;
+  return out;
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   let clientId = null;
+
+  // Best-effort capture of the customer's IP / UA so support_threads
+  // can store provenance. The WS upgrade carries these in the same
+  // headers as a normal HTTP request — req.socket.remoteAddress is
+  // overridden by trust-proxy upstream when behind Railway.
+  const remoteIp = req?.headers?.['x-forwarded-for']?.split(',')[0]?.trim()
+    || req?.socket?.remoteAddress || '';
+  const remoteUa = String(req?.headers?.['user-agent'] || '').slice(0, 200);
 
   ws.on('message', (raw) => {
     try {
@@ -556,36 +712,242 @@ wss.on('connection', (ws) => {
 
       if (data.type === 'join') {
         const role = data.role || 'customer';
-        const email = data.user || `anon_${Date.now()}`;
+        // Normalize email to lowercase. The DB stores customer_email
+        // lowercased in createSupportThread/getUserByEmail, and the
+        // REST inbox returns them lowercased. If we keep mixed-case
+        // here, the agent's `to` field (sourced from the inbox REST
+        // payload) won't match supportClients[c].email — and the
+        // agent's message silently drops. Reported 2026-05-13 as
+        // "messages not reflecting in user portal".
+        const email = String(data.user || `anon_${Date.now()}`).toLowerCase();
 
-        // Per-user cap: if this user already has an active connection, evict
-        // the older one. Mirrors how mobile apps handle reconnect — newest
-        // wins, the orphan socket gets a clean close instead of lingering.
-        if (SUPPORT_MAX_PER_USER === 1) {
-          const existing = findExistingClientId(role, email);
-          if (existing) {
-            const prev = supportClients.get(existing);
-            try { prev.ws.close(4000, 'Replaced by newer connection'); } catch {}
-            supportClients.delete(existing);
+        // Per-role connection cap. Customers default to 1 — most-recent
+        // click of Talk to a human wins. Agents default to 4 — admin can
+        // run Electron + browser + popout simultaneously without sockets
+        // evicting each other in a flap loop.
+        //
+        // CRITICAL: clientId must be UNIQUE PER CONNECTION, not just
+        // role+email. The earlier `${role}_${email}` clientId caused
+        // every new connection from the same email to OVERWRITE the
+        // prior entry in the supportClients Map (which keys on
+        // clientId). Result: even with cap=4, the map only ever held
+        // 1 entry per email, and broadcasts iterated 1 entry instead
+        // of 4. Symptom: Electron admin and browser admin both signed
+        // in as nippu, only the last-to-connect ever received
+        // customer_joined / message frames. Fixed by appending a
+        // monotonic counter so each socket gets a stable, unique
+        // map key.
+        const cap = SUPPORT_MAX_PER_USER[role] || 1;
+        const existing = listClientsForRoleEmail(role, email);
+        if (existing.length >= cap) {
+          // Sort by lastSeen ASC — oldest first — and evict until we're
+          // under cap. The newest connection (this one) always survives.
+          existing.sort((a, b) => (a.c.lastSeen || 0) - (b.c.lastSeen || 0));
+          const toEvict = existing.slice(0, existing.length - cap + 1);
+          for (const { id, c } of toEvict) {
+            try { c.ws.close(4000, 'Replaced by newer connection'); } catch {}
+            supportClients.delete(id);
           }
         }
 
-        clientId = `${role}_${email}`;
+        // ── DB-backed thread lifecycle ──
+        // Customer: find a resumable thread (open or assigned, <7 days
+        // old) or create one. Agent: register presence, no thread
+        // creation. Per-customer-message persistence happens below in
+        // the 'message' handler — we don't double-insert on join.
+        let threadId = null;
+        if (role === 'customer') {
+          let thread = db.findResumableSupportThread(email);
+          if (!thread) {
+            thread = db.createSupportThread({
+              customer_email: email,
+              customer_name: data.name || null,
+              customer_tier: data.tier || null,
+              customer_user_id: data.userId || null,
+              initial_question: data.initialQuestion || null,
+              channel: 'bot',
+              customer_ip: remoteIp,
+              customer_ua: remoteUa,
+            });
+            // Enqueue the staged escalation alerts. Worker picks them up
+            // and fires as each deadline passes UNLESS an agent claims.
+            try {
+              db.enqueueSupportEscalations(
+                thread.id,
+                supportEscalation.buildEscalationsFor(thread)
+              );
+            } catch (e) {
+              console.warn('[support/ws] failed to enqueue escalations:', e.message);
+            }
+
+            // INSTANT ntfy push — user wanted phone buzz the moment a
+            // customer clicks Talk to a human, not 30 seconds later.
+            // The escalation queue stays as a follow-up safety net
+            // (admin who missed the instant push gets another buzz at
+            // t+2min via email + t+5min via SMS if configured).
+            // Fire-and-forget; failures are logged in the ntfy module.
+            (async () => {
+              try {
+                const { sendNewCustomerAlert } = require('./services/ntfy');
+                const agents = db.listOnlineSupportAgents();
+                const targets = agents.filter(a => a.ntfy_topic && a.ntfy_topic.length > 0);
+                if (targets.length === 0) {
+                  console.log('[support/ws] instant ntfy SKIP — no online agents with topic');
+                  return;
+                }
+                console.log(`[support/ws] instant ntfy fanout to ${targets.length} agent(s) for thread=${thread.id}`);
+                await Promise.all(targets.map(a =>
+                  sendNewCustomerAlert(a.ntfy_topic, {
+                    customerName: thread.customer_name,
+                    customerEmail: thread.customer_email,
+                    question: thread.initial_question,
+                    threadId: thread.id,
+                  }).then(r => {
+                    if (r.ok) {
+                      try { db.markNtfyAlertSent(a.agent_email); } catch {}
+                    }
+                  })
+                ));
+              } catch (e) {
+                console.warn('[support/ws] instant ntfy failed:', e.message);
+              }
+            })();
+          }
+          threadId = thread.id;
+        } else if (role === 'agent') {
+          try { db.heartbeatSupportAgent(email); }
+          catch (e) { console.warn('[support/ws] presence upsert failed:', e.message); }
+        }
+
+        // Unique per-socket clientId. role + email alone collides when
+        // the same email opens N tabs/devices — the Map's set()
+        // silently replaces the prior entry, which is why broadcasts
+        // ended up reaching only the most-recent admin. Counter
+        // increments per connection; survives until server restart.
+        if (typeof global.__supportConnSeq === 'undefined') global.__supportConnSeq = 0;
+        global.__supportConnSeq += 1;
+        clientId = `${role}_${email}_${global.__supportConnSeq}`;
         supportClients.set(clientId, {
           ws,
           type: role,
           email,
           name: data.name || 'User',
+          threadId,         // null for agents, set for customers
           lastSeen: Date.now(),
           pingPending: false,
         });
-        console.log(`Support chat: ${data.name || email} connected as ${role}`);
+        console.log(`Support chat: ${data.name || email} connected as ${role} thread=${threadId || '-'}`);
 
-        // Notify agents of new customer
+        // Notify the OTHER side of this join.
         if (role !== 'agent') {
+          // 1. Send the customer their resumed conversation history so the
+          //    bot panel doesn't open blank. The client renders these in
+          //    order before any new live message.
+          if (threadId) {
+            try {
+              const history = db.getSupportMessages(threadId, { limit: 200 });
+              if (history.length > 0) {
+                ws.send(JSON.stringify({
+                  type: 'history',
+                  threadId,
+                  messages: history.map(m => ({
+                    id: m.id,
+                    role: m.sender_role,
+                    name: m.sender_name,
+                    text: m.text,
+                    at: m.created_at,
+                    readAt: m.read_by_other_at,
+                  })),
+                }));
+              }
+            } catch (e) {
+              console.warn('[support/ws] history snapshot failed:', e.message);
+            }
+          }
+          // 2. If any agent is ALREADY online (live socket OR
+          //    presence-fresh in last 90s), tell the customer "agent
+          //    is here" right now. Without this, a customer who joins
+          //    AFTER the admin's WS connects sits on "finding agent…"
+          //    forever, because the agent_joined-on-agent-join handler
+          //    below only fires when the AGENT is the new joiner.
+          //    Resume path: if the thread already has an
+          //    assigned_agent_email, use that name so the customer
+          //    sees the SAME agent they had before, not a generic
+          //    "an agent is here".
+          try {
+            const thread = threadId ? db.getSupportThread(threadId) : null;
+            let agentNameForCustomer = null;
+            if (thread?.assigned_agent_email) {
+              agentNameForCustomer = thread.assigned_agent_email.split('@')[0];
+            } else {
+              // No assignment yet — any live agent will do.
+              for (const [, c] of supportClients) {
+                if (c.type === 'agent' && c.ws.readyState === WebSocket.OPEN) {
+                  agentNameForCustomer = c.name || (c.email || '').split('@')[0] || 'support';
+                  break;
+                }
+              }
+              if (!agentNameForCustomer) {
+                // No live agent socket — but maybe one is just heartbeat-
+                // fresh (between WS reconnects). Check presence rows.
+                try {
+                  const online = db.listOnlineSupportAgents();
+                  if (online && online.length > 0) {
+                    agentNameForCustomer = (online[0].agent_email || '').split('@')[0] || 'support';
+                  }
+                } catch { /* non-critical */ }
+              }
+            }
+            if (agentNameForCustomer) {
+              ws.send(JSON.stringify({ type: 'agent_joined', name: agentNameForCustomer }));
+            }
+          } catch (e) {
+            console.warn('[support/ws] agent_joined-on-customer-join failed:', e.message);
+          }
+          // 3. Notify all agents (live sockets) that a new/resumed
+          //    customer joined. Persistence-driven inbox state is
+          //    fetched via REST; this live event is just a "ping the
+          //    UI to refresh now" signal.
           for (const [, client] of supportClients) {
             if (client.type === 'agent' && client.ws.readyState === WebSocket.OPEN) {
-              client.ws.send(JSON.stringify({ type: 'customer_joined', email, name: data.name }));
+              client.ws.send(JSON.stringify({
+                type: 'customer_joined', email, name: data.name, threadId,
+              }));
+            }
+          }
+        } else {
+          // New agent → snapshot ALL open threads from DB (not just live
+          // customers). Persistence means an admin returning hours
+          // later sees every unresolved chat, not just ones still in
+          // someone's tab. Also broadcast agent_joined to every
+          // currently-connected customer.
+          try {
+            const openThreads = db.listOpenSupportThreads({ limit: 200 });
+            ws.send(JSON.stringify({
+              type: 'inbox_snapshot',
+              threads: openThreads.map(t => ({
+                id: t.id,
+                email: t.customer_email,
+                name: t.customer_name,
+                tier: t.customer_tier,
+                status: t.status,
+                assignedAgent: t.assigned_agent_email,
+                unread: t.unread_from_customer,
+                lastText: t.last_message_text,
+                lastRole: t.last_message_role,
+                createdAt: t.created_at,
+                lastCustomerAt: t.last_customer_message_at,
+                lastAgentAt: t.last_agent_message_at,
+                sla: db.computeSupportSlaState(t),
+                initialQuestion: t.initial_question,
+              })),
+            }));
+          } catch (e) {
+            console.warn('[support/ws] inbox snapshot failed:', e.message);
+          }
+          for (const [, client] of supportClients) {
+            if (client.type === 'customer' && client.ws.readyState === WebSocket.OPEN) {
+              client.ws.send(JSON.stringify({ type: 'agent_joined', name: data.name || 'A support agent' }));
             }
           }
         }
@@ -593,23 +955,192 @@ wss.on('connection', (ws) => {
 
       if (data.type === 'message') {
         const sender = supportClients.get(clientId);
-        if (!sender) return;
+        if (!sender) {
+          console.warn(`[support/ws/msg] DROPPED — no sender for clientId=${clientId} (incoming data.to=${data.to}, text="${String(data.text||'').slice(0,40)}")`);
+          return;
+        }
         sender.lastSeen = Date.now();
+        const text = String(data.text || '').trim();
+        if (!text) {
+          console.warn(`[support/ws/msg] DROPPED — empty text from ${sender.type}=${sender.email}`);
+          return;
+        }
+        console.log(`[support/ws/msg] IN  type=${sender.type} from=${sender.email} to=${data.to || '(broadcast)'} text="${text.slice(0,60)}"`);
 
-        // Route message: customer->agents, agent->specific customer
-        if (sender.type === 'customer') {
-          // Send to all agents
-          for (const [, client] of supportClients) {
-            if (client.type === 'agent' && client.ws.readyState === WebSocket.OPEN) {
-              client.ws.send(JSON.stringify({ type: 'message', text: data.text, from: sender.email, name: sender.name }));
+        // ── Persist BEFORE live-broadcast ──
+        // Order matters: if the broadcast fires and the recipient ACKs
+        // before the DB write commits, we have a window where a refresh
+        // would show no message. Persist first; broadcast carries the
+        // DB id back so clients can dedup against optimistic UI.
+        let inserted = null;
+        try {
+          if (sender.type === 'customer' && sender.threadId) {
+            inserted = db.appendSupportMessage({
+              thread_id: sender.threadId,
+              sender_role: 'customer',
+              sender_email: sender.email,
+              sender_name: sender.name,
+              text,
+            });
+          } else if (sender.type === 'agent' && data.to) {
+            // Find the recipient's thread. We trust the agent client to
+            // pass `to` as the customer email; resolve to thread id via
+            // the live socket OR via findResumable (if the customer is
+            // currently offline, they may not have an open WS but the
+            // thread is still in the DB). Email matching is
+            // case-INsensitive: supportClients now stores email lower-
+            // cased on join, and we lowercase data.to here too, so a
+            // Mixed-Case email from the admin's inbox matches the
+            // canonical lowercase stored on the WS join.
+            const toEmail = String(data.to).toLowerCase();
+            let targetThreadId = null;
+            for (const [, c] of supportClients) {
+              if (c.type === 'customer' && c.email === toEmail && c.threadId) {
+                targetThreadId = c.threadId; break;
+              }
+            }
+            if (!targetThreadId) {
+              const offlineThread = db.findResumableSupportThread(toEmail);
+              if (offlineThread) targetThreadId = offlineThread.id;
+            }
+            if (targetThreadId) {
+              inserted = db.appendSupportMessage({
+                thread_id: targetThreadId,
+                sender_role: 'agent',
+                sender_email: sender.email,
+                sender_name: sender.name,
+                text,
+              });
+              // First agent reply auto-claims the thread + cancels the
+              // escalation ladder. claimSupportThread is idempotent: a
+              // second agent message by the same email is a no-op on
+              // status, but a different agent's message returns
+              // already_assigned (we still let the message through —
+              // the customer hears them, the DB just remembers the
+              // ORIGINAL claimer for routing).
+              const claim = db.claimSupportThread(targetThreadId, sender.email);
+              if (claim && claim.ok) {
+                db.cancelSupportEscalations(targetThreadId);
+              }
             }
           }
-        } else if (sender.type === 'agent' && data.to) {
-          // Send to specific customer
+        } catch (e) {
+          console.warn('[support/ws] persist failed:', e.message);
+        }
+
+        // ── Live route to opposite side ──
+        if (sender.type === 'customer') {
+          let agentCount = 0;
           for (const [, client] of supportClients) {
-            if (client.type === 'customer' && client.email === data.to && client.ws.readyState === WebSocket.OPEN) {
-              client.ws.send(JSON.stringify({ type: 'message', text: data.text }));
+            if (client.type === 'agent' && client.ws.readyState === WebSocket.OPEN) {
+              client.ws.send(JSON.stringify({
+                type: 'message',
+                id: inserted?.id || null,
+                text,
+                from: sender.email,
+                name: sender.name,
+                threadId: sender.threadId,
+                at: inserted?.created_at || Date.now(),
+              }));
+              agentCount++;
             }
+          }
+          console.log(`[support/ws/msg] OUT customer→${agentCount} agents (persisted_id=${inserted?.id || 'NONE'})`);
+        } else if (sender.type === 'agent' && data.to) {
+          // Same lowercase-match rule as the persist branch above.
+          const toEmail = String(data.to).toLowerCase();
+          // Frame for the CUSTOMER — no `from` field; the renderer
+          // assumes agent-side and the `name` is what the customer sees.
+          const customerFrame = JSON.stringify({
+            type: 'message',
+            id: inserted?.id || null,
+            text,
+            name: sender.name,
+            at: inserted?.created_at || Date.now(),
+          });
+          // Frame for OTHER AGENTS — carries `from` (customer email
+          // the message is destined to) plus `threadId` so co-admin
+          // tabs route it to the correct conversation in their inbox.
+          // Without this, two admin tabs viewing the same thread would
+          // diverge: only the sender's tab sees the message until they
+          // refetch. The sender's OWN socket is skipped (it already
+          // shows the message optimistically — re-broadcasting would
+          // double-render).
+          const agentFanoutFrame = JSON.stringify({
+            type: 'message',
+            id: inserted?.id || null,
+            text,
+            from: toEmail,
+            agentFrom: sender.email,
+            name: sender.name,
+            threadId: inserted?.thread_id || null,
+            at: inserted?.created_at || Date.now(),
+            outbound: true,
+          });
+          let customerDelivered = 0;
+          let agentFanout = 0;
+          const sawCustomerEmails = [];
+          const sawAgentEmails = [];
+          for (const [id, client] of supportClients) {
+            if (client.type === 'customer') sawCustomerEmails.push(`${client.email}(${client.ws.readyState})`);
+            if (client.type === 'agent') sawAgentEmails.push(`${client.email}(${id===clientId?'SENDER':'other'},rs=${client.ws.readyState})`);
+            if (client.ws.readyState !== WebSocket.OPEN) continue;
+            if (client.type === 'customer' && client.email === toEmail) {
+              client.ws.send(customerFrame);
+              customerDelivered++;
+            } else if (client.type === 'agent' && id !== clientId) {
+              client.ws.send(agentFanoutFrame);
+              agentFanout++;
+            }
+          }
+          console.log(`[support/ws/msg] OUT agent→customer:${customerDelivered}, agent-fanout:${agentFanout}, persisted_id=${inserted?.id || 'NONE'}, target=${toEmail}, customers_in_map=[${sawCustomerEmails.join(', ')}], agents_in_map=[${sawAgentEmails.join(', ')}]`);
+          if (customerDelivered === 0) {
+            console.warn(`[support/ws/msg] ⚠ agent→customer delivered 0! target="${toEmail}". DB persist did${inserted ? '' : ' NOT'} succeed (thread_id=${inserted?.thread_id || 'n/a'}). Customer will only see this on their next reconnect via history replay.`);
+          }
+        }
+      }
+
+      // Mark-read signal: client viewed messages, server records the
+      // read receipt so the OTHER side can show "Read 3:24 PM".
+      if (data.type === 'mark_read') {
+        const sender = supportClients.get(clientId);
+        if (!sender) return;
+        let targetThreadId = sender.threadId;
+        if (!targetThreadId && sender.type === 'agent' && data.threadId) {
+          // Agents don't have a per-connection threadId; they pass it
+          // explicitly when viewing a specific customer's thread.
+          targetThreadId = String(data.threadId);
+        }
+        if (targetThreadId) {
+          try { db.markSupportMessagesRead(targetThreadId, sender.type); }
+          catch (e) { console.warn('[support/ws] mark_read failed:', e.message); }
+        }
+      }
+
+      // Heartbeat from agent client — refreshes presence so the
+      // online-agents list stays accurate even on long-lived sockets.
+      if (data.type === 'heartbeat') {
+        const sender = supportClients.get(clientId);
+        if (sender?.type === 'agent') {
+          try { db.heartbeatSupportAgent(sender.email); } catch { /* non-fatal */ }
+        }
+      }
+
+      // Typing indicator — ephemeral, NOT persisted. Server just relays
+      // {type:'typing', isTyping:bool} to the opposite side. Debouncing
+      // is the client's job.
+      if (data.type === 'typing') {
+        const sender = supportClients.get(clientId);
+        if (!sender) return;
+        const payload = { type: 'typing', isTyping: !!data.isTyping, from: sender.email, name: sender.name };
+        if (sender.type === 'customer') {
+          for (const [, c] of supportClients) {
+            if (c.type === 'agent' && c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(payload));
+          }
+        } else if (sender.type === 'agent' && data.to) {
+          const toEmail = String(data.to).toLowerCase();
+          for (const [, c] of supportClients) {
+            if (c.type === 'customer' && c.email === toEmail && c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(payload));
           }
         }
       }

@@ -21,16 +21,41 @@
   --dur-ios-slow: 420ms;
 }
 
+/* Light variant — driven by App.tsx flipping `.dark` on <html> when
+   settings.theme === 'dark'. We use class-based detection (not
+   prefers-color-scheme) so the popout follows the user's explicit
+   choice from the main window's Settings → Theme toggle. The main
+   window writes settings.theme to localStorage('THEME') AND adds/
+   removes `.dark` on its own documentElement; the popout's own
+   App.tsx instance runs the same useEffect (App.tsx:3848) so the
+   class is in sync without extra IPC plumbing.
+
+   Cream palette (warmer than #fff) keeps the popout consistent with
+   the main app's light-mode aesthetic: rich cream surface, warm
+   ink text, soft warm borders. The popout's transparent-window
+   nature means these alpha values still let the desktop show
+   through, but with warm tinting instead of stark white. */
+:root:not(.dark) {
+  --glass-bg: transparent;
+  --glass-border: rgba(20, 20, 19, 0.22);    /* warm ink line */
+  --text-main: #141413;                      /* --ink */
+  --text-muted: rgba(20, 20, 19, 0.55);
+  --bubble-user: rgba(20, 20, 19, 0.06);     /* warm-tinted bubble */
+  --bubble-ai: rgba(20, 20, 19, 0.04);
+  --icon-color: #141413;
+}
+
+/* Fallback for the rare case where the popout opens before App.tsx
+   has set the .dark class. If the OS is in light mode and we have
+   no explicit class yet, fall back to light tokens. */
 @media (prefers-color-scheme: light) {
-  :root {
-    /* Crystal Clear Plastic — Light */
-    --glass-bg: transparent;
-    --glass-border: rgba(0, 0, 0, 0.22);
-    --text-main: #000000;
-    --text-muted: rgba(0, 0, 0, 0.5);
-    --bubble-user: rgba(0, 0, 0, 0.06);
-    --bubble-ai: rgba(0, 0, 0, 0.04);
-    --icon-color: #000000;
+  :root:not(.dark) {
+    --glass-border: rgba(20, 20, 19, 0.22);
+    --text-main: #141413;
+    --text-muted: rgba(20, 20, 19, 0.55);
+    --bubble-user: rgba(20, 20, 19, 0.06);
+    --bubble-ai: rgba(20, 20, 19, 0.04);
+    --icon-color: #141413;
   }
 }
 
@@ -134,7 +159,7 @@
   text-shadow: 0 1px 4px rgba(0,0,0,0.6);
 }
 
-.dot { 
+.dot {
   width: 6px; height: 6px; background: var(--text-main); border-radius: 50%;
   opacity: 0.8;
 }
@@ -275,7 +300,7 @@
   box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.06);
 }
 .pip-textarea::placeholder { color: var(--text-muted); }
-.pip-textarea:focus { 
+.pip-textarea:focus {
   border-color: rgba(255,255,255,0.55);
   background: transparent;
 }
@@ -318,7 +343,7 @@
    ELECTRON TRANSPARENCY OVERRIDES
    When running in Electron pop-out with transparent:true,
    everything must be truly see-through.
-   
+
    NO backdrop-filter allowed — it crashes transparent windows.
    ═══════════════════════════════════════════════════ */
 
@@ -376,6 +401,62 @@ html.electron-transparent .pip-textarea {
 
 html.electron-transparent .send-btn {
   background: rgba(255, 255, 255, 0.08) !important;
+}
+
+/* ═══════════════════════════════════════════════════
+   LIGHT-THEME OVERRIDES for electron-transparent popout
+   When the user picks Light in Settings, the popout's
+   surfaces should tint cream/warm instead of navy. We
+   keep them translucent so the desktop still shows
+   through (the whole point of the see-through popout),
+   but with a light tint instead of dark.
+
+   Text colors and shadow direction also flip: dark text
+   with a light shadow lifts off the wallpaper the same
+   way white text with a dark shadow did. ═══════════════════════════════════════════════════ */
+html.electron-transparent:not(.dark) .popup-header {
+  background: rgba(250, 247, 240, 0.78) !important;   /* cream @ 78% */
+  border-bottom: 1px solid rgba(20, 20, 19, 0.14) !important;
+}
+html.electron-transparent:not(.dark) .bubble {
+  background: rgba(250, 247, 240, 0.72) !important;
+  border: 1px solid rgba(20, 20, 19, 0.14) !important;
+  color: #141413 !important;
+  text-shadow: 0 1px 4px rgba(255, 255, 255, 0.55) !important;
+}
+html.electron-transparent:not(.dark) .msg.user .bubble {
+  background: rgba(20, 20, 19, 0.08) !important;
+}
+html.electron-transparent:not(.dark) .input-area {
+  background: rgba(250, 247, 240, 0.78) !important;
+  border-top: 1px solid rgba(20, 20, 19, 0.14) !important;
+}
+html.electron-transparent:not(.dark) .pip-textarea {
+  background: rgba(20, 20, 19, 0.04) !important;
+  color: #141413 !important;
+  text-shadow: 0 1px 4px rgba(255, 255, 255, 0.5) !important;
+}
+html.electron-transparent:not(.dark) .send-btn {
+  background: rgba(20, 20, 19, 0.06) !important;
+}
+html.electron-transparent:not(.dark) .send-btn svg {
+  color: #141413 !important;
+  filter: drop-shadow(0 1px 3px rgba(255, 255, 255, 0.5)) !important;
+}
+html.electron-transparent:not(.dark) .header-info h4,
+html.electron-transparent:not(.dark) .header-info span,
+html.electron-transparent:not(.dark) .msg-name,
+html.electron-transparent:not(.dark) .msg-time {
+  text-shadow: 0 1px 4px rgba(255, 255, 255, 0.55) !important;
+}
+html.electron-transparent:not(.dark) .messages::-webkit-scrollbar-thumb {
+  background: rgba(20, 20, 19, 0.4) !important;
+}
+html.electron-transparent:not(.dark) .messages:hover::-webkit-scrollbar-thumb {
+  background: rgba(20, 20, 19, 0.6) !important;
+}
+html.electron-transparent:not(.dark) .messages {
+  scrollbar-color: rgba(20, 20, 19, 0.4) transparent !important;
 }
 
 /* Respect reduced-motion — kills bubble-in, caret blink, and

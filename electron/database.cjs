@@ -91,6 +91,41 @@ function startNewSession(name, userId) {
   return d.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
 }
 
+// Called from the close/quit path when the user signals "I'm done with this
+// session" (X-close with popout not in use, or tray Quit). Two behaviors based
+// on whether the active session has any messages:
+//
+//   - Empty (0 messages) — DELETE the row entirely. The session was opened
+//     but nothing was asked, so leaving an "Interview <date>" placeholder
+//     would just clutter the sidebar. CASCADE handles context_files and
+//     messages tables (both empty by definition for an empty session, but
+//     the foreign-key CASCADE is the contract we rely on).
+//   - Has messages — DEMOTE to is_active=0. Keep the conversation in history
+//     (user can still click into it from the sidebar), but next launch's
+//     getOrCreateActiveSession will see no active row and mint a fresh one.
+//
+// Result shape lets the caller log what happened. action is one of:
+//   'noop'    — no active session existed
+//   'deleted' — empty session was removed
+//   'demoted' — non-empty session was set to is_active=0
+function endActiveSession(userId) {
+  if (!userId) return { ok: false, action: 'noop' };
+  const d = getDB();
+  const active = d
+    .prepare('SELECT id FROM sessions WHERE is_active = 1 AND user_id = ?')
+    .get(userId);
+  if (!active) return { ok: true, action: 'noop', sessionId: null };
+  const { n: msgCount } = d
+    .prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?')
+    .get(active.id);
+  if (msgCount === 0) {
+    d.prepare('DELETE FROM sessions WHERE id = ? AND user_id = ?').run(active.id, userId);
+    return { ok: true, action: 'deleted', sessionId: active.id };
+  }
+  d.prepare('UPDATE sessions SET is_active = 0 WHERE id = ? AND user_id = ?').run(active.id, userId);
+  return { ok: true, action: 'demoted', sessionId: active.id };
+}
+
 // List every session that belongs to this user. Returns a projection the
 // sidebar can render directly — id, name, created_at, active flag, message
 // count, and the first user message as a preview line.
@@ -274,6 +309,7 @@ module.exports = {
   claimOrphanSessions,
   getOrCreateActiveSession,
   startNewSession,
+  endActiveSession,
   listSessionsForUser,
   switchToSession,
   renameSession,

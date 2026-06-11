@@ -87,7 +87,7 @@ function getTransporter() {
   return transporterPromise;
 }
 
-async function sendMail({ to, subject, html, text }) {
+async function sendMail({ to, subject, html, text, replyTo }) {
   const from = process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER || 'noreply@minicaai.com';
 
   // ── Primary: Resend (HTTPS, survives cloud egress restrictions) ──
@@ -103,6 +103,7 @@ async function sendMail({ to, subject, html, text }) {
         subject,
         html,
         text,
+        ...(replyTo ? { reply_to: replyTo } : {}),
       });
       if (result && result.error) {
         const msg = result.error.message || JSON.stringify(result.error);
@@ -131,7 +132,7 @@ async function sendMail({ to, subject, html, text }) {
   }
 
   try {
-    const info = await transporter.sendMail({ from, to, subject, html, text });
+    const info = await transporter.sendMail({ from, to, subject, html, text, ...(replyTo ? { replyTo } : {}) });
     return { ok: true, messageId: info.messageId };
   } catch (err) {
     console.error('[email:smtp] send failed:', err && err.message);
@@ -244,4 +245,186 @@ function renderPaymentFailedEmail({ name, tier, manageUrl, reason }) {
   return { subject: `Payment failed for your minicaai ${safeTier} subscription`, html, text };
 }
 
-module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail };
+// ── Tier change confirmation ─────────────────────────────────
+// Sent when a user's subscription tier changes (upgrade, downgrade, or
+// cycle-end-scheduled downgrade). Keeps the body short — the user
+// already saw the in-app confirmation when they clicked the button; the
+// email is the durable receipt + the moment they can audit "did this
+// actually happen". Receipt-style, not marketing-style.
+//
+// Used by /payments/upgrade-tier (both Stripe and Razorpay paths).
+function renderTierChangeEmail({ name, fromTier, toTier, provider, effectiveDate }) {
+  const safeName = (name || 'there').toString().replace(/</g, '&lt;');
+  const fromLabel = (fromTier || 'your current plan').toString().toUpperCase().replace(/</g, '&lt;');
+  const toLabel = (toTier || 'a new plan').toString().toUpperCase().replace(/</g, '&lt;');
+  const safeProvider = String(provider || 'your card').replace(/</g, '&lt;');
+  const safeDate = String(effectiveDate || 'now').replace(/</g, '&lt;');
+
+  const tierRank = { free: 0, basic: 1, pro: 2, max: 3 };
+  const direction = (tierRank[toTier] > tierRank[fromTier]) ? 'upgrade'
+    : (tierRank[toTier] < tierRank[fromTier]) ? 'downgrade'
+    : 'change';
+
+  const text = [
+    `Hi ${safeName},`,
+    '',
+    `Your minicaai plan ${direction} is confirmed.`,
+    '',
+    `  From: ${fromLabel}`,
+    `  To:   ${toLabel}`,
+    `  When: ${safeDate}`,
+    `  Via:  ${safeProvider}`,
+    '',
+    direction === 'upgrade'
+      ? 'New features are unlocked already — open the app to use them.'
+      : direction === 'downgrade'
+        ? 'Your existing features stay live until the effective date above.'
+        : 'No feature change — same access, different plan.',
+    '',
+    'If you didn\'t make this change, reply to this email and we\'ll revert it.',
+    '',
+    '— The minicaai team',
+  ].join('\n');
+
+  const html = `<!doctype html>
+<html><body style="margin:0;padding:0;background:#050507;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e5e7eb">
+  <div style="max-width:560px;margin:0 auto;padding:40px 24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:32px">
+      <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6)"></div>
+      <div style="font-weight:700;font-size:18px;color:#fff">minicaai</div>
+    </div>
+    <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 12px">Plan ${direction} confirmed</h1>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 20px">Hi ${safeName}, your subscription was ${direction === 'change' ? 'updated' : direction === 'upgrade' ? 'upgraded' : 'downgraded'}.</p>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;margin:0 0 24px">
+      <tr><td style="padding:8px 0;color:#6b7280;width:90px">From</td><td style="padding:8px 0;color:#e5e7eb;font-weight:600">${fromLabel}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280">To</td><td style="padding:8px 0;color:#e5e7eb;font-weight:600">${toLabel}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280">When</td><td style="padding:8px 0;color:#e5e7eb">${safeDate}</td></tr>
+      <tr><td style="padding:8px 0;color:#6b7280">Via</td><td style="padding:8px 0;color:#e5e7eb">${safeProvider}</td></tr>
+    </table>
+    <p style="font-size:13px;line-height:1.6;color:#9ca3af;margin:0 0 20px">${
+      direction === 'upgrade'
+        ? 'New features are unlocked already — open the app to use them.'
+        : direction === 'downgrade'
+          ? 'Your existing features stay live until the effective date above.'
+          : 'No feature change — same access, different plan.'
+    }</p>
+    <div style="border-top:1px solid #1f2937;padding-top:16px;font-size:12px;color:#6b7280;line-height:1.6">
+      Didn't make this change? Reply to this email and we'll revert it.
+    </div>
+  </div>
+</body></html>`;
+
+  return { subject: `minicaai plan ${direction}: ${fromLabel} → ${toLabel}`, html, text };
+}
+
+// ── Cancellation confirmation ───────────────────────────────
+// Sent when a user cancels their subscription. Includes the period-end
+// date and a one-click "reactivate" CTA (deep-links into the app's
+// Manage Subscription screen via the existing minicaai://signin-complete
+// protocol that we registered for Google OAuth handoff).
+function renderCancellationEmail({ name, tier, effectiveDate, manageUrl }) {
+  const safeName = (name || 'there').toString().replace(/</g, '&lt;');
+  const safeTier = (tier || 'your plan').toString().toUpperCase().replace(/</g, '&lt;');
+  const safeDate = String(effectiveDate || 'end of current cycle').replace(/</g, '&lt;');
+  const url = manageUrl || 'https://minicaai.com/manage';
+
+  const text = [
+    `Hi ${safeName},`,
+    '',
+    `Your minicaai ${safeTier} subscription has been scheduled to cancel.`,
+    `Your access continues until: ${safeDate}.`,
+    '',
+    `Changed your mind? Reactivate any time before then: ${url}`,
+    '',
+    '— The minicaai team',
+  ].join('\n');
+
+  const html = `<!doctype html>
+<html><body style="margin:0;padding:0;background:#050507;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e5e7eb">
+  <div style="max-width:560px;margin:0 auto;padding:40px 24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:32px">
+      <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6)"></div>
+      <div style="font-weight:700;font-size:18px;color:#fff">minicaai</div>
+    </div>
+    <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 12px">Cancellation scheduled</h1>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 16px">Hi ${safeName}, your <strong style="color:#e5e7eb">${safeTier}</strong> subscription is set to cancel on <strong style="color:#e5e7eb">${safeDate}</strong>. You keep full access until then.</p>
+    <div style="margin:24px 0">
+      <a href="${url}" style="display:inline-block;padding:12px 24px;border-radius:10px;background:#f59e0b;color:#000;font-weight:700;font-size:14px;text-decoration:none">
+        Changed your mind? Reactivate
+      </a>
+    </div>
+    <div style="border-top:1px solid #1f2937;padding-top:16px;font-size:12px;color:#6b7280;line-height:1.6">
+      No further action is required. We'll send one more email when access actually ends.
+    </div>
+  </div>
+</body></html>`;
+
+  return { subject: `Cancellation scheduled — keep ${safeTier} until ${safeDate}`, html, text };
+}
+
+// ── Access ended (cycle-end goodbye) ─────────────────────────
+// Fires when the paid subscription cycle actually closes and the
+// license has been transitioned to Free. This is the SECOND mail in
+// the cancellation arc — the first was renderCancellationEmail
+// ("scheduled to cancel"); this one says "your access has ended,
+// here's what you keep and how to come back". Includes a one-click
+// "Buy Basic now" CTA because Basic is the easiest path back in
+// (one-time $25, no recurring commitment).
+function renderAccessEndedEmail({ name, previousTier, buyBasicUrl, signInUrl }) {
+  const safeName = (name || 'there').toString().replace(/</g, '&lt;');
+  const safeTier = (previousTier || 'paid').toString().toUpperCase().replace(/</g, '&lt;');
+  const basicUrl = buyBasicUrl || 'https://minicaai.com/#pricing';
+  const inUrl = signInUrl || 'https://minicaai.com';
+
+  const text = [
+    `Hi ${safeName},`,
+    '',
+    `Your ${safeTier} access just ended and your account is now on the Free plan.`,
+    '',
+    `What you keep:`,
+    `  - Your account, settings, custom instructions, and conversation history`,
+    `  - 5 free practice sessions per month with Gemini`,
+    '',
+    `Easiest way back in: pick up Basic ($25 one-time, 3 sessions, 14-day window — no auto-renewal).`,
+    basicUrl,
+    '',
+    `Or you can subscribe to Pro/Max again any time from Manage Subscription:`,
+    inUrl,
+    '',
+    '— The minicaai team',
+  ].join('\n');
+
+  const html = `<!doctype html>
+<html><body style="margin:0;padding:0;background:#050507;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e5e7eb">
+  <div style="max-width:560px;margin:0 auto;padding:40px 24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:32px">
+      <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6)"></div>
+      <div style="font-weight:700;font-size:18px;color:#fff">minicaai</div>
+    </div>
+    <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 12px">Your ${safeTier} access has ended</h1>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 16px">Hi ${safeName}, the cancellation we scheduled has taken effect. You're on the <strong style="color:#e5e7eb">Free plan</strong> now — your account, settings, custom instructions, and conversation history are all intact.</p>
+    <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:14px 18px;margin:18px 0">
+      <div style="font-size:12px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">What you keep on Free</div>
+      <ul style="font-size:13px;line-height:1.7;color:#d1d5db;margin:0;padding-left:18px">
+        <li>5 practice sessions per month</li>
+        <li>Gemini model access</li>
+        <li>Account, settings, custom instructions, history</li>
+      </ul>
+    </div>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 8px">Easiest way back in is <strong style="color:#e5e7eb">Basic</strong> — $25 one-time, no auto-renewal, 3 sessions over 14 days:</p>
+    <div style="margin:18px 0">
+      <a href="${basicUrl}" style="display:inline-block;padding:12px 24px;border-radius:10px;background:linear-gradient(135deg,#10b981,#3b82f6);color:#fff;font-weight:700;font-size:14px;text-decoration:none">
+        Get Basic — $25
+      </a>
+    </div>
+    <p style="font-size:13px;line-height:1.6;color:#9ca3af;margin:14px 0 24px">Or come back to <a href="${inUrl}" style="color:#60a5fa">Manage Subscription</a> any time to switch to Pro or Max.</p>
+    <div style="border-top:1px solid #1f2937;padding-top:16px;font-size:12px;color:#6b7280;line-height:1.6">
+      Thanks for being a minicaai customer — we'd love to see you back.
+    </div>
+  </div>
+</body></html>`;
+
+  return { subject: `Your ${safeTier} access has ended — Free plan is active`, html, text };
+}
+
+module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail, renderTierChangeEmail, renderCancellationEmail, renderAccessEndedEmail };

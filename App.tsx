@@ -1,6 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Download, Monitor, Laptop, Terminal, LogOut, Crown, Sparkles, Loader2, EyeOff, ShieldCheck, ScanSearch } from 'lucide-react';
+import { Settings, Mic, MicOff, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Download, Monitor, Laptop, Terminal, LogOut, Crown, Sparkles, Loader2, EyeOff, ShieldCheck, ScanSearch, Headphones } from 'lucide-react';
+// Minica support chat — mounted as a Help → Support modal inside MainApp so
+// signed-in users can talk to the bot (or escalate to a human) without
+// leaving the app. The component is shared with SubscriptionGate's
+// landing-page floating bubble + full-screen view; here we use mode="panel"
+// to fill the modal body and inherit the user's light/dark theme.
+import SupportBot from './SupportBot';
 import { WizardHat } from './WizardHat';
 import { PaperAirplane } from './GitHubIcons';
 import { GeminiIcon, OpenAIIcon, ClaudeIcon, GrokIcon, GroqIcon } from './ProviderIcons';
@@ -759,10 +765,24 @@ const MessageRenderer = React.memo(({ content, fontSize, canAutoType, isStreamin
 const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: any) => {
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const lastFocusRef = useRef<HTMLElement | null>(null);
+  // Hold onClose in a ref so the focus-trap effect below does NOT depend on
+  // its identity. Call sites pass an inline arrow (onClose={() => setX(false)})
+  // which is a NEW function on every parent render. If the effect depended on
+  // onClose it would tear down + re-run on EVERY parent render — and its
+  // re-run calls focusables[0].focus(), yanking focus to the ✕ button out of
+  // whatever input the user is typing in. THAT is the Custom Instructions
+  // "can't type" bug: that textarea is bound directly to a parent state that
+  // updates on every keystroke, so each keystroke re-rendered the parent,
+  // re-ran this effect, and stole focus back to the close button after a
+  // single character.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
 
   // Escape closes; Tab cycles focus inside the dialog (focus trap). Without
   // these, keyboard users had no way out of the modal and could tab into the
-  // dimmed background.
+  // dimmed background. Depends ONLY on isOpen — see onCloseRef above for why
+  // onClose must NOT be a dependency (it would re-run on every parent render
+  // and steal focus from inputs mid-typing).
   useEffect(() => {
     if (!isOpen) return;
     lastFocusRef.current = document.activeElement as HTMLElement | null;
@@ -784,7 +804,7 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
       if (target && dlg && !dlg.contains(target)) return;
       if (e.key === 'Escape') {
         e.stopPropagation();
-        onClose?.();
+        onCloseRef.current?.();
         return;
       }
       if (e.key === 'Tab' && dlg) {
@@ -815,7 +835,7 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
       // where they were before.
       try { lastFocusRef.current?.focus(); } catch {}
     };
-  }, [isOpen, onClose]);
+  }, [isOpen]);
 
   if (!isOpen) return null;
   const inElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
@@ -884,6 +904,7 @@ const ChatInterface = ({
     onOpenSettings,
     onOpenContext,
     onOpenHelp,
+    onOpenSupport,
     onOpenDownload,
     isPipMode,
     togglePip,
@@ -1482,6 +1503,9 @@ const ChatInterface = ({
                         <button onClick={onNewSession} className="p-2 text-gray-400 hover:text-green-400 hover:bg-green-500/10 border border-transparent hover:border-green-500/20 rounded-lg transition-all" aria-label="New Interview Session"><Plus size={20} /></button>
                     )}
                     <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Audio Help"><HelpCircle size={20} /></button>
+                    {onOpenSupport && (
+                        <button onClick={onOpenSupport} className="p-2 text-gray-400 hover:text-emerald-400 hover:bg-emerald-500/10 border border-transparent hover:border-emerald-500/20 rounded-lg transition-all" aria-label="Chat with Minica (Support)"><Headphones size={20} /></button>
+                    )}
                     <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Files (Knowledge Base)"><FileText size={20} /></button>
                     <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border text-gray-400 hover:text-text hover:bg-surface`} aria-label="Settings"><Settings size={20} /></button>
                     <button onClick={onLogout} className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 rounded-lg transition-all" aria-label="Logout"><LogOut size={20} /></button>
@@ -3451,6 +3475,181 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       }
       runTrainingNow();
   }, [db.contextFiles.length, isTraining, hasTrainedCache, isAdmin, runTrainingNow]);
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  //  SUPPORT AGENT BACKGROUND CHANNEL (admins only)
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  //  Root WebSocket to /ws/support that survives the SupportBot panel
+  //  being closed. Replaces the previous SupportBot-owned WS which died
+  //  on panel close — that bug made customer 'Talk to human' clicks
+  //  vanish unless the admin had the inbox open at that exact moment.
+  //
+  //  Event-bus pattern (see SupportBot.tsx lines 1707-1818 + 2144):
+  //   • Inbound: WS frame → dispatch CustomEvent('minicaai-support-event')
+  //   • Outbound: SupportBot dispatches 'minicaai-support-send' → forward to WS
+  //   • Status: dispatch 'minicaai-support-status' on open/close
+  //   • IPC bridge: main.cjs `support:open-inbox` (fired when admin
+  //     clicks a native notification) → dispatch 'minicaai-support-deeplink'
+  //     so the inbox auto-selects that thread.
+  //
+  //  Gated on isAdmin AND isElectron — browser tabs don't get the WS
+  //  because the IPC bridge doesn't exist there and the tray badge
+  //  wouldn't fire anyway. Non-admin users' SupportBot panel uses REST
+  //  (/api/v1/support/chat) which needs none of this plumbing.
+  useEffect(() => {
+    if (!isAdmin) return;
+    const email = userProfile?.email;
+    if (!email) return;
+
+    // Same env-aware base as licenseService / SupportBot / admin dashboard
+    // — see note on App.tsx:589.
+    const viteEnv = (import.meta as any).env || {};
+    const httpBase = viteEnv.PROD
+      ? 'https://api.minicaai.com'
+      : (viteEnv.VITE_SERVER_URL || 'https://api.minicaai.com');
+    const wsBase = httpBase.replace(/^http/, 'ws');
+    const wsUrl = `${wsBase}/ws/support`;
+
+    let ws: WebSocket | null = null;
+    let pingTimer: number | null = null;
+    let reconnectTimer: number | null = null;
+    let cancelled = false;
+    let backoffMs = 1000;
+
+    const dispatchStatus = (status: 'connecting' | 'online' | 'offline') => {
+      try { window.dispatchEvent(new CustomEvent('minicaai-support-status', { detail: { status } })); }
+      catch { /* SSR / window stripped */ }
+    };
+
+    // Outbound: SupportBot's inbox sends 'minicaai-support-send' → forward over WS.
+    const onSendRequest = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (!detail || !ws || ws.readyState !== 1 /* OPEN */) return;
+      try { ws.send(JSON.stringify(detail)); }
+      catch (err) { console.warn('[support-ws] send failed:', err); }
+    };
+
+    // IPC: main.cjs deeplink from a clicked tray notification.
+    let unsubscribeIPC: (() => void) | null = null;
+    if (isElectron) {
+      try {
+        const electronApi = (window as any).electronAPI;
+        if (electronApi?.on) {
+          const handler = (payload: any) => {
+            try { window.dispatchEvent(new CustomEvent('minicaai-support-deeplink', { detail: payload })); }
+            catch { /* SSR / window stripped */ }
+            // Auto-open the support modal so the admin lands in the inbox.
+            setShowSupport(true);
+          };
+          unsubscribeIPC = electronApi.on('support:open-inbox', handler);
+        }
+      } catch (err) {
+        console.warn('[support-ws] IPC subscribe failed:', err);
+      }
+    }
+
+    const connect = () => {
+      if (cancelled) return;
+      dispatchStatus('connecting');
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch (err) {
+        console.warn('[support-ws] construct failed:', err);
+        scheduleReconnect();
+        return;
+      }
+
+      ws.onopen = () => {
+        if (cancelled) return;
+        backoffMs = 1000;
+        try {
+          ws!.send(JSON.stringify({
+            type: 'join',
+            role: 'agent',
+            user: email,
+            name: userProfile?.name || null,
+          }));
+          dispatchStatus('online');
+        } catch (err) {
+          console.warn('[support-ws] join failed:', err);
+        }
+        // Heartbeat — server's idle sweep is 30 min but NAT can drop earlier.
+        // 30s ping matches SupportBot's old internal cadence.
+        if (pingTimer) window.clearInterval(pingTimer);
+        pingTimer = window.setInterval(() => {
+          if (ws && ws.readyState === 1) {
+            try { ws.send(JSON.stringify({ type: 'heartbeat' })); } catch {}
+          }
+        }, 30000);
+      };
+
+      ws.onmessage = (ev) => {
+        let data: any;
+        try { data = JSON.parse(typeof ev.data === 'string' ? ev.data : ''); }
+        catch { return; }
+        if (!data || typeof data !== 'object') return;
+
+        // Dispatch to SupportBot inbox listener (always — even when
+        // panel is closed — so opening it doesn't show a blank state).
+        try { window.dispatchEvent(new CustomEvent('minicaai-support-event', { detail: data })); }
+        catch { /* SSR / window stripped */ }
+
+        // Tray badge / OS notification: fire IPC for customer-originated
+        // events. Suppressed by main.cjs during sessionActive, so we
+        // always send and let main decide whether to surface.
+        if (isElectron && (data.type === 'customer_joined' || (data.type === 'message' && data.outbound !== true))) {
+          try {
+            const electronApi = (window as any).electronAPI;
+            if (electronApi?.send) {
+              electronApi.send('support:alert', {
+                threadId: data.threadId || null,
+                title: data.type === 'message' ? `New message from ${data.name || data.from || 'a customer'}` : `New support request from ${data.name || data.email || 'a customer'}`,
+                body: data.type === 'message' ? String(data.text || '').slice(0, 140) : (data.initialQuestion || data.question || 'Click to open the inbox'),
+                kind: data.type,
+                customerEmail: String(data.from || data.email || '').toLowerCase(),
+                customerName: data.name || null,
+              });
+            }
+          } catch (err) {
+            console.warn('[support-ws] support:alert IPC failed:', err);
+          }
+        }
+      };
+
+      ws.onclose = () => {
+        dispatchStatus('offline');
+        if (pingTimer) { window.clearInterval(pingTimer); pingTimer = null; }
+        scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        // onclose will fire next; let it own the reconnect.
+      };
+    };
+
+    const scheduleReconnect = () => {
+      if (cancelled) return;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      const jitter = Math.floor(Math.random() * 500);
+      reconnectTimer = window.setTimeout(connect, backoffMs + jitter);
+      backoffMs = Math.min(backoffMs * 2, 30000);
+    };
+
+    window.addEventListener('minicaai-support-send', onSendRequest as EventListener);
+    connect();
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener('minicaai-support-send', onSendRequest as EventListener);
+      if (pingTimer) window.clearInterval(pingTimer);
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (ws) {
+        try { ws.close(1000, 'unmount'); } catch {}
+      }
+      if (unsubscribeIPC) { try { unsubscribeIPC(); } catch {} }
+      dispatchStatus('offline');
+    };
+  }, [isAdmin, userProfile?.email, userProfile?.name]);
   const [inputText, setInputText] = useState("");
   const [interimText, setInterimText] = useState("");
   
@@ -3516,6 +3715,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const [showContext, setShowContext] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
+  // Minica support modal — separate from the audio Help modal so opening
+  // "Chat with Minica" doesn't collide with the existing first-launch
+  // tutorial trigger.
+  const [showSupport, setShowSupport] = useState(false);
   
   // Local state for Quick Paste in Context Modal
   const [pasteContent, setPasteContent] = useState("");
@@ -4523,6 +4726,32 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     enabled: !isProcessing,
   });
 
+  // ── Clean-close listener ─────────────────────────────────────────────
+  // Main process broadcasts 'cmd-end-session' on the user's "I'm done"
+  // signals: X-close when popout is NOT in use, and tray Quit (always).
+  // We react by stopping the mic and turning off Auto so the next launch
+  // (or the next show-from-tray) starts in a clean state.
+  //
+  // Conversation switch is NOT done here — main's endSessionCleanly also
+  // emits the existing db:active-session-changed broadcast, which
+  // useDatabase.ts already handles by reloading messages/files for the
+  // newly-active (fresh empty) session.
+  //
+  // Main window only — popout mirrors mic/Auto state via the existing
+  // state-sync effect, no separate listener needed there.
+  //
+  // _rawStopListening is idempotent — it checks mediaRecorderRef / socketRef
+  // before doing anything, so calling it when not listening is a no-op.
+  // setSettings function-updater form reads latest state so we never write
+  // a stale autoSend. Result: this handler is mount-once, stale-closure-safe.
+  useEffect(() => {
+    if (!isElectron || isPopoutMode) return;
+    return electronIPC.on('cmd-end-session', () => {
+      try { _rawStopListening(); } catch (err) { console.warn('[end-session] stopListening threw:', err); }
+      setSettings(prev => prev.autoSend ? { ...prev, autoSend: false } : prev);
+    });
+  }, [_rawStopListening]);
+
   // Pop-out: shadow state received from main window via IPC
   const [remoteIsListening, setRemoteIsListening] = useState(false);
   const [remoteIsProcessing, setRemoteIsProcessing] = useState(false);
@@ -4775,6 +5004,136 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     if (saved.user) setUserProfile(saved.user);
     if (saved.license) setUserLicense(saved.license);
   }, [setUserProfile, setUserLicense]);
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  //  SUPPORT-BOT ACTION DISPATCHER
+  //
+  //  The in-app "Chat with Minica" panel runs SupportBot in mode="panel",
+  //  which gives Minica renderer-side tools (set theme, swap model, open
+  //  Manage Subscription, cancel/reactivate subscription, sign out…).
+  //  The server executes the tool, emits an SSE `tool_call`
+  //  { payload: { action, args } }, and synthesizes an optimistic ok:true
+  //  back into the model loop. SupportBot.tsx forwards that payload here
+  //  via its onBotAction prop. Without this wiring every client-side tool
+  //  is a silent no-op — the bot claims "done" and nothing changes.
+  //  `open_handoff_form` is intentionally NOT handled here: SupportBot
+  //  owns the handoff form and dispatches it internally.
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  const botActionDispatcher = useCallback(async ({ action, args }: { action: string; args?: any }) => {
+    const a = args || {};
+    try {
+      switch (action) {
+        case 'set_theme':
+          if (a.theme === 'light' || a.theme === 'dark') {
+            setSettings(prev => ({ ...prev, theme: a.theme }));
+          }
+          break;
+        case 'set_font_size':
+          if (a.size === 'small' || a.size === 'medium' || a.size === 'large') {
+            setSettings(prev => ({ ...prev, fontSize: a.size }));
+            try { localStorage.setItem('FONT_SIZE', a.size); } catch { /* quota */ }
+          }
+          break;
+        case 'set_ai_model':
+          if (['gemini', 'groq', 'openai', 'xai', 'claude'].includes(a.model)) {
+            setSettings(prev => ({ ...prev, selectedModel: a.model }));
+            try { localStorage.setItem('SELECTED_MODEL', a.model); } catch { /* quota */ }
+          }
+          break;
+        case 'set_reasoning_effort':
+          if (['none', 'low', 'medium', 'high'].includes(a.effort)) {
+            setSettings(prev => ({ ...prev, reasoningEffort: a.effort }));
+          }
+          break;
+        case 'toggle_auto_send':
+          setSettings(prev => ({ ...prev, autoSend: !!a.enabled }));
+          break;
+        case 'toggle_general_mode':
+          setSettings(prev => ({ ...prev, generalMode: !!a.enabled }));
+          break;
+        case 'set_custom_instructions':
+          setSettings(prev => ({ ...prev, customInstructions: String(a.instructions || '') }));
+          break;
+        case 'open_popout':
+          if (isElectron) electronIPC.send('open-popout', { width: 450, height: 700 });
+          break;
+        case 'replay_tutorial':
+          handleReplayTutorial();
+          break;
+        case 'sign_out':
+          onLogout();
+          break;
+        // No standalone password dialog exists in-app; account management
+        // (incl. the route to change credentials) lives in Manage Subscription.
+        case 'open_password_change_dialog':
+        case 'open_manage_subscription':
+          setManageSubOpen(true);
+          break;
+        case 'refresh_user_profile':
+          refreshAuthFromStorage();
+          break;
+        case 'open_external_url':
+          if (typeof a.url === 'string' && /^https?:\/\//i.test(a.url)) {
+            const api = (window as any).electronAPI;
+            if (isElectron && api?.openExternalRobust) {
+              api.openExternalRobust(a.url).catch(() => { /* swallow */ });
+            } else {
+              window.open(a.url, '_blank', 'noopener,noreferrer');
+            }
+          }
+          break;
+        case 'call_authed_endpoint': {
+          // Used by cancel_subscription / reactivate_subscription — the bot
+          // routes the mutation through the renderer so it carries the live
+          // JWT and the licenseService cache refreshes in one path.
+          const path = String(a.path || '');
+          if (!path.startsWith('/api/')) break;
+          const method = String(a.method || 'POST').toUpperCase();
+          const viteEnv = (import.meta as any).env || {};
+          const httpBase = viteEnv.PROD
+            ? 'https://api.minicaai.com'
+            : (viteEnv.VITE_SERVER_URL || 'https://api.minicaai.com');
+          const token = licenseService.getToken();
+          try {
+            await fetch(`${httpBase}${path}`, {
+              method,
+              headers: {
+                'Content-Type': 'application/json',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              },
+            });
+          } catch { /* never bubble — server already synthesized ok */ }
+          // Re-pull license state after the mutation lands. The periodic
+          // revalidation tick will catch the authoritative tier; this just
+          // refreshes from whatever the payment flow persisted.
+          if (a.refresh_license) {
+            window.setTimeout(() => { try { refreshAuthFromStorage(); } catch { /* */ } }, 800);
+          }
+          break;
+        }
+        case 'download_json': {
+          // emit_to_client.args = { content: <JSON string>, filename }
+          const blob = new Blob([String(a.content ?? '{}')], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = String(a.filename || 'minicaai-export.json');
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+          break;
+        }
+        default:
+          console.warn('[botActionDispatcher] unhandled bot action:', action);
+      }
+    } catch (err) {
+      // Fire-and-forget contract: the server already told the model the
+      // action succeeded. Swallow renderer-side failures; the user can
+      // re-ask and the next turn surfaces any real problem.
+      console.warn('[botActionDispatcher] action failed:', action, err);
+    }
+  }, [setSettings, setManageSubOpen, handleReplayTutorial, refreshAuthFromStorage, onLogout]);
 
   const handleRenewCredit = useCallback(async () => {
     // Routes to /create-renewal (the +1h top-up) so a Basic user clicking
@@ -5425,6 +5784,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     onOpenSettings: () => setShowSettings(true),
     onOpenContext: () => setShowContext(true),
     onOpenHelp: () => setShowHelp(true),
+    onOpenSupport: () => setShowSupport(true),
     onOpenDownload: () => { if (!isElectron) setShowDownloadModal(true); },
     isPipMode,
     togglePip: () => {
@@ -6467,6 +6827,24 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                    {settings.generalMode ? <ToggleRight size={32} /> : <ToggleLeft size={32} />}
                </button>
            </div>
+        </div>
+      </Modal>
+
+      {/* --- Support Modal (Chat with Minica) ---
+          Panel mode fills the modal body. SupportBot uses bg-surface/text-text
+          tokens so it auto-themes with the user's light/dark choice. Pinning
+          a fixed height keeps the chat scrollable inside the modal instead of
+          letting the modal grow with the conversation. */}
+      <Modal isOpen={showSupport} onClose={() => setShowSupport(false)} title="Chat with Minica">
+        <div className="h-[min(70vh,720px)] -mx-6 -mb-6 -mt-2 border-t border-border">
+          <SupportBot
+            mode="panel"
+            currentUser={userProfile ? { email: userProfile.email, name: userProfile.name, id: (userProfile as any).id } : null}
+            tier={userLicense?.tier ?? null}
+            authToken={licenseService.getToken() || null}
+            onBotAction={botActionDispatcher}
+            onClose={() => setShowSupport(false)}
+          />
         </div>
       </Modal>
 
