@@ -13,9 +13,15 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 
-// Default 30d for regular user sessions. Callers that need a shorter-lived
-// scoped token (e.g. admin impersonation) pass an explicit expiresIn.
-function generateToken(payload, expiresIn = '30d') {
+// Default session-token lifetime. Shorter than the historical 30d so a
+// leaked token is useful for days, not a month. Active clients never feel
+// it: the app revalidates every ~30 min and /license/validate rotates the
+// token when it nears expiry (licenseService saves the rotated value), so
+// only users offline longer than this must sign in again. Override with
+// JWT_TTL (e.g. '7d'). Callers needing a shorter scoped token (admin
+// impersonation, step-up reauth) still pass an explicit expiresIn.
+const DEFAULT_TOKEN_TTL = process.env.JWT_TTL || '14d';
+function generateToken(payload, expiresIn = DEFAULT_TOKEN_TTL) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn });
 }
 

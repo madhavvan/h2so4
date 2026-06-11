@@ -1,12 +1,24 @@
 const express = require('express');
-const { authMiddleware } = require('../middleware/auth');
+const { authMiddleware, generateToken } = require('../middleware/auth');
 const { adminOnly, stepUpOnly, writeAudit, ADMIN_EMAILS } = require('../middleware/admin');
 const db = require('../database');
 
 const router = express.Router();
 
+// Sliding-window token rotation: /validate mints a fresh token when the
+// caller's current one is within this window of expiry. With the 14d
+// default TTL and the client revalidating every ~30 min, active users keep
+// a continuously-renewed token and never see a forced re-login; only users
+// offline past the TTL must sign in again (bounding a leaked token's life).
+const TOKEN_ROTATE_WHEN_S = 7 * 24 * 60 * 60;
+
 // ── Validate license (called by Electron app on startup + every 30 min) ──
-router.post('/validate', async (req, res) => {
+// authMiddleware: /validate mutates (registers the caller's device,
+// transitions canceling→free) and discloses tier/credits, so it must be
+// tied to a verified identity — previously ANY unauthenticated caller could
+// present ANY key to squat a device slot or read someone's subscription
+// state. The Electron client already sends Authorization: Bearer here.
+router.post('/validate', authMiddleware, async (req, res) => {
   try {
     const { key, device_id, app_version } = req.body;
 
@@ -37,6 +49,15 @@ router.post('/validate', async (req, res) => {
     let license = db.getLicenseByKey(key);
     if (!license) {
       return res.status(404).json({ error: 'License not found' });
+    }
+
+    // The key must belong to the authenticated caller. Admins are exempt so
+    // support/impersonation tooling can validate any account. Without this,
+    // an authenticated user could present someone else's key to register a
+    // device onto it (evicting the owner's devices) or read its tier/credits.
+    const callerIsAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (license.user_id !== req.user.id && !callerIsAdmin) {
+      return res.status(403).json({ error: 'license_mismatch', message: 'This license does not belong to your account.' });
     }
 
     // Check license status
@@ -124,6 +145,20 @@ router.post('/validate', async (req, res) => {
     // admin's email from ADMIN_EMAILS leaves them with admin powers
     // until they manually log out — a stale-flag insider risk.
     const isAdmin = ADMIN_EMAILS.includes((user.email || '').toLowerCase());
+
+    // Rotate the caller's token if it's nearing expiry (TOKEN_ROTATE_WHEN_S).
+    // Best-effort: licenseService saves serverData.token when present and
+    // ignores it otherwise, so this seamlessly keeps active sessions alive
+    // under the shorter TTL. Only rotate for the token's real owner, never
+    // when an admin is validating another account's key.
+    let rotatedToken;
+    try {
+      const nowS = Math.floor(Date.now() / 1000);
+      if (!callerIsAdmin && req.user.exp && (req.user.exp - nowS) < TOKEN_ROTATE_WHEN_S) {
+        rotatedToken = generateToken({ id: user.id, email: user.email, tier: license.tier });
+      }
+    } catch { /* rotation is non-critical */ }
+
     res.json({
       valid: true,
       key: license.key,
@@ -141,6 +176,8 @@ router.post('/validate', async (req, res) => {
       credits_expire_at: license.credits_expire_at,
       trial_remaining_seconds: license.trial_remaining_seconds,
       trial_granted_at: license.trial_granted_at,
+      // Present only when rotated (see above); omitted on most calls.
+      token: rotatedToken,
     });
   } catch (err) {
     console.error('License validation error:', err);
