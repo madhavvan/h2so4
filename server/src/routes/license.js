@@ -78,11 +78,15 @@ router.post('/validate', authMiddleware, async (req, res) => {
         const transitioned = db.transitionLicenseToFree(license.user_id, { reason: 'validate-fallback' });
         if (transitioned && transitioned.transitioned) {
           console.log(`[license/validate] cycle-end transition: user=${license.user_id} ${transitioned.from.tier} → free (sweep missed)`);
-          // Fire the goodbye email here too — same shape as the
-          // sweeper, so the user gets exactly one email regardless of
-          // which path catches the transition first. (We don't dedup
-          // server-side yet; webhook + sweep + validate-fallback can
-          // theoretically each fire one. That's the next iteration.)
+          // Fire the goodbye email here too — same shape as the sweeper.
+          // Dedup IS handled: transitionLicenseToFree is atomic and
+          // idempotent (better-sqlite3 is synchronous), so only the FIRST
+          // path to catch an expired 'canceling' license gets
+          // transitioned:true. Both the sweeper and this validate-fallback
+          // gate the email on that flag, so the user gets exactly one
+          // access-ended email. (The cancel webhook sends a separate
+          // cancellation-confirmation email — a different template, not this
+          // one — so there is no triple-fire of the access-ended message.)
           try {
             const { sendMail, renderAccessEndedEmail } = require('../email');
             const u = db.getUserById(license.user_id);

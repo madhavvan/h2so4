@@ -956,7 +956,14 @@ async function createRazorpayCheckout(req, res, tier) {
 
       const subscription = await razorpay.subscriptions.create({
         plan_id: planId,
-        total_count: 12, // 12 months max
+        // 120 monthly cycles (~10 years) ≈ "until cancelled". The old value
+        // of 12 made Razorpay auto-COMPLETE the subscription after 12 months,
+        // silently churning the subscriber at month 13 with no renewal prompt
+        // (subscription.completed webhook flips them to free). 120 is
+        // Razorpay's documented monthly max — VERIFY in sandbox before this
+        // path serves live traffic (it was unreachable until the country_code
+        // checkout fix, so it has never run against real subscribers).
+        total_count: 120,
         quantity: 1,
         notes: {
           user_email: req.user.email,

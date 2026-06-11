@@ -425,17 +425,19 @@ app.get('/stealth-test', (req, res) => {
 const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/h2so4/releases/latest';
 const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
-// Bump this on every release. If GitHub is unreachable AND the in-memory
-// cache is cold (server just restarted), every running 3.4.3 client would
-// otherwise get told "latest is 3.3.5" and see a misleading downgrade prompt.
-// MUST match the package.json version that's currently being released —
-// pointing at a version that doesn't have a GitHub release yet would make
-// every client see an "update available" prompt for a phantom release.
+// Offline fallback ONLY — the GitHub Releases fetch above is the live
+// source of truth. Used when GitHub is unreachable AND the in-memory cache
+// is cold (server just restarted). Override at deploy with LATEST_APP_VERSION
+// so it can't silently drift behind the shipped release: the previous
+// hardcoded 3.4.9 sat four releases behind shipped 4.0.8, which on a cold
+// start would tell every client "latest is 3.4.9" and show a misleading
+// downgrade prompt. Whatever value is used MUST point at a version that
+// actually has a GitHub release.
 const FALLBACK_VERSION = {
-  version: '3.4.9',
+  version: process.env.LATEST_APP_VERSION || '4.0.8',
   minVersion: '2.0.0',
-  releaseDate: '2026-05-05',
-  releaseNotes: 'Subscription management improvements: in-app cancel and reactivate, refund policy modal, and signed Windows installer (no more SmartScreen warnings).',
+  releaseDate: '2026-05-26',
+  releaseNotes: 'Latest stable release.',
   downloadUrl: {
     // Routed through get.minicaai.com → 302 → GitHub release CDN. Keeps the
     // codename out of any URL the client receives and surfaces in browser

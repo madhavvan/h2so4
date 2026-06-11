@@ -1930,10 +1930,17 @@ function getEngagement() {
   const q = (windowMs) => d.prepare(
     'SELECT COUNT(DISTINCT user_id) as c FROM login_logs WHERE success = 1 AND created_at >= ?'
   ).get(now - windowMs).c;
+  const dau = q(1 * DAY_MS_CONST);
+  const wau = q(7 * DAY_MS_CONST);
+  const mau = q(30 * DAY_MS_CONST);
   return {
-    dau: q(1 * DAY_MS_CONST),
-    wau: q(7 * DAY_MS_CONST),
-    mau: q(30 * DAY_MS_CONST),
+    dau, wau, mau,
+    // Stickiness ratios (0–1, 2dp). getStats() returns these to the admin
+    // dashboard but they were referenced without ever being computed here,
+    // so the Overview tab rendered `undefined`. Divide-by-zero guarded for a
+    // fresh/empty DB.
+    dau_wau_ratio: wau > 0 ? Math.round((dau / wau) * 100) / 100 : 0,
+    dau_mau_ratio: mau > 0 ? Math.round((dau / mau) * 100) / 100 : 0,
   };
 }
 
