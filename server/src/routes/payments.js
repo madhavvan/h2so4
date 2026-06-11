@@ -1600,10 +1600,10 @@ router.post('/portal', authMiddleware, async (req, res) => {
 // Razorpay has no Customer Portal equivalent, so Pro/Max Indian users
 // need a dedicated cancel endpoint. We look up the user's most recent
 // Razorpay subscription id from the payments table (we don't store it
-// on the user row) and call subscriptions.cancel(subId, false) — the
-// second arg tells Razorpay to honor the current billing cycle instead
-// of refunding the prorated remainder. Webhook `subscription.cancelled`
-// handles the actual tier downgrade when the period ends.
+// on the user row) and call subscriptions.cancel with
+// { cancel_at_cycle_end: true } so access continues to the cycle end.
+// Webhook `subscription.cancelled` handles the actual tier downgrade when
+// the period ends.
 router.post('/cancel-razorpay', authMiddleware, async (req, res) => {
   try {
     if (!razorpay) return res.status(503).json({ error: 'Razorpay not configured' });
@@ -1613,12 +1613,21 @@ router.post('/cancel-razorpay', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'No active Razorpay subscription found.' });
     }
 
-    // cancel_at_cycle_end = false tells Razorpay to cancel at the end of
-    // the current billing period (not immediately). Counter-intuitive
-    // naming — Razorpay's API treats `false` here as "cancel at next
-    // cycle boundary", `true` as "cancel immediately".
+    // Keep access until the END of the current billing cycle — matches the
+    // Stripe path's cancel_at_period_end:true and the "Pro until <date>" UI
+    // below. Razorpay's actual semantics (verified against the official docs
+    // + razorpay-node ^2.9.6): cancel_at_cycle_end:true = cancel at cycle
+    // end; false / 0 / omitted = cancel IMMEDIATELY. The prior code passed a
+    // bare positional `false` — wrong SHAPE (the SDK takes an options object,
+    // not a positional bool) AND wrong VALUE — so it cancelled immediately,
+    // and the subscription.cancelled webhook then flipped the user to free
+    // within minutes, contradicting the optimistic 'canceling' status set
+    // below ("you keep access until <date>").
     // See: https://razorpay.com/docs/api/payments/subscriptions/cancel-subscription/
-    await razorpay.subscriptions.cancel(subId, false);
+    // ⚠ VERIFY IN RAZORPAY SANDBOX before this serves live traffic — this
+    // path was unreachable until the country_code checkout fix, so it has
+    // never actually run against a real Razorpay subscription.
+    await razorpay.subscriptions.cancel(subId, { cancel_at_cycle_end: true });
 
     // Mirror Stripe's `cancel_at_period_end` behavior locally: keep the
     // tier active but pin expires_at to the actual cycle-end so the UI
@@ -1749,9 +1758,13 @@ router.post('/cancel-subscription', authMiddleware, async (req, res) => {
       if (!subscriptionId) {
         return res.status(404).json({ error: 'No active Razorpay subscription found.' });
       }
-      // cancel_at_cycle_end=false in Razorpay's API means "cancel at next
-      // cycle boundary" (counter-intuitive — true would cancel immediately).
-      await razorpay.subscriptions.cancel(subscriptionId, false);
+      // Keep access until cycle end — same as the Stripe branch's
+      // cancel_at_period_end:true. Razorpay: cancel_at_cycle_end:true =
+      // cycle end; false / omitted = cancel IMMEDIATELY. Prior code passed a
+      // bare positional `false` (wrong shape + wrong value) → immediate
+      // cancel, contradicting the 'canceling' status set below. The SDK
+      // takes an options object. ⚠ VERIFY IN RAZORPAY SANDBOX before live.
+      await razorpay.subscriptions.cancel(subscriptionId, { cancel_at_cycle_end: true });
       try {
         const sub = await razorpay.subscriptions.fetch(subscriptionId);
         if (sub && typeof sub.current_end === 'number' && sub.current_end > 0) {
