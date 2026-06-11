@@ -1354,8 +1354,30 @@ let _deepgramProjectIdWarned = false;
 let _deepgramMintDisabled = false;
 let _deepgramMintDisabledReason = null;
 let _deepgramMintFallbackWarned = false;
+let _deepgramStrictBlockWarned = false;
+
+// Opt-in hard lockdown. When DEEPGRAM_STRICT_NO_MASTER is set, the server
+// NEVER hands the master DEEPGRAM_API_KEY to a client — if per-user minting
+// can't be done, voice transcription degrades (503) instead of leaking a
+// long-lived, full-scope key that DevTools could extract for unlimited
+// transcription on our bill. Default OFF preserves the availability-first
+// fallback below; flip it to 'true' once you've confirmed minting works
+// (DEEPGRAM_PROJECT_ID set + the API key has keys:write scope).
+const DEEPGRAM_STRICT_NO_MASTER = ['1', 'true', 'yes'].includes(
+  String(process.env.DEEPGRAM_STRICT_NO_MASTER || '').toLowerCase()
+);
 
 function fallbackToMasterKey(res, masterKey, reason) {
+  // Strict mode: refuse to serve the master key. Voice degrades rather than
+  // exposing it. One loud error per process so the operator notices voice is
+  // down and fixes minting (scope / project id).
+  if (DEEPGRAM_STRICT_NO_MASTER) {
+    if (!_deepgramStrictBlockWarned) {
+      _deepgramStrictBlockWarned = true;
+      console.error(`[deepgram] STRICT mode (DEEPGRAM_STRICT_NO_MASTER) — refusing to serve the master key. Voice transcription is DEGRADED until per-user minting works. Mint-unavailable reason: ${reason}. Fix: grant keys:write to the Deepgram API key AND set DEEPGRAM_PROJECT_ID. Suppressing further strict-block warnings this process.`);
+    }
+    return res.status(503).json({ error: 'voice_unavailable', message: 'Voice transcription is temporarily unavailable.' });
+  }
   if (!_deepgramMintFallbackWarned) {
     _deepgramMintFallbackWarned = true;
     console.warn(`[deepgram] FALLING BACK TO MASTER KEY for the rest of this server process. Reason: ${reason}. Voice mode will keep working, but the master key is now reachable from the client (DevTools). Fix: grant keys:write scope to your Deepgram API key at https://console.deepgram.com/ → Settings → API Keys, OR set DEEPGRAM_PROJECT_ID to a project the key can mint into. Suppressing further fallback warnings this process.`);
@@ -1381,9 +1403,11 @@ const deepgramKeyHandler = async (req, res) => {
     // unguarded version flooded the log with the same message.
     if (!_deepgramProjectIdWarned) {
       _deepgramProjectIdWarned = true;
-      console.warn('[deepgram] DEEPGRAM_PROJECT_ID not set — serving master key (security fallback). Configure DEEPGRAM_PROJECT_ID to mint short-lived per-user keys. (suppressing further warnings this process)');
+      console.warn('[deepgram] DEEPGRAM_PROJECT_ID not set — cannot mint per-user keys. Configure DEEPGRAM_PROJECT_ID to mint short-lived per-user keys. (suppressing further warnings this process)');
     }
-    return res.json({ key: masterKey });
+    // Route through fallbackToMasterKey so DEEPGRAM_STRICT_NO_MASTER governs
+    // this path too (serve master when permissive, 503 when strict).
+    return fallbackToMasterKey(res, masterKey, 'DEEPGRAM_PROJECT_ID not set');
   }
 
   // Circuit-breaker fast path: a previous request hit a permanent mint
