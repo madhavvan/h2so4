@@ -859,7 +859,10 @@ const SupportBot: React.FC<SupportBotProps> = ({
     ws.onopen = () => {
       liveAttemptRef.current = 0;
       try {
-        ws.send(JSON.stringify({ type: 'join', role: 'customer', user: opts.email, name: opts.name }));
+        // Carry the JWT so the server binds this chat to the verified
+        // account (and replays prior history) instead of treating it as an
+        // anonymous, history-less session.
+        ws.send(JSON.stringify({ type: 'join', role: 'customer', user: opts.email, name: opts.name, token: readLiveToken() || undefined }));
       } catch { /* socket died between open and send */ }
       // Promote 'connecting' → 'waiting' on first open. On reconnect
       // we only change status if we were in a clearly-disconnected

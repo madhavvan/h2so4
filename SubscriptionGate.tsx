@@ -6806,7 +6806,9 @@ const SupportMobile: React.FC<SupportMobileProps> = ({
     try {
       const ws = new WebSocket(wsUrl);
       ws.onopen = () => {
-        ws.send(JSON.stringify({ type: 'join', user: currentUser.email, name: currentUser.name }));
+        // JWT binds the chat to the verified account so the server doesn't
+        // treat a logged-in user as anonymous (see /ws/support join auth).
+        ws.send(JSON.stringify({ type: 'join', user: currentUser.email, name: currentUser.name, token: licenseService.getToken() || undefined }));
       };
       ws.onmessage = (e) => {
         try {

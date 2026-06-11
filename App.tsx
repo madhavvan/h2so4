@@ -3568,6 +3568,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             role: 'agent',
             user: email,
             name: userProfile?.name || null,
+            // Admin JWT — the server rejects agent joins unless this token's
+            // email is in ADMIN_EMAILS (closes the open-inbox/impersonation
+            // hole). Omitted-if-null → server rejects, which is correct.
+            token: licenseService.getToken() || undefined,
           }));
           dispatchStatus('online');
         } catch (err) {

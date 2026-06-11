@@ -655,6 +655,14 @@ if (process.env.NODE_ENV !== 'test' && process.env.DATABASE_PATH !== ':memory:')
 //  LIVE SUPPORT CHAT (WebSocket)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const WebSocket = require('ws');
+// Support-WS join authentication. verifyToken uses the same JWT secret as
+// the REST middleware; SUPPORT_ADMIN_EMAILS (env list every other gate
+// reads) decides who may connect as a support agent. See the join handler:
+// agent role is admin-only and customer identity comes from the verified
+// token, never the frame.
+const { verifyToken } = require('./middleware/auth');
+const SUPPORT_ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 const wss = new WebSocket.Server({ server, path: '/ws/support' });
 
 // Track connected clients: customers and agents.
@@ -712,14 +720,70 @@ wss.on('connection', (ws, req) => {
 
       if (data.type === 'join') {
         const role = data.role || 'customer';
-        // Normalize email to lowercase. The DB stores customer_email
-        // lowercased in createSupportThread/getUserByEmail, and the
-        // REST inbox returns them lowercased. If we keep mixed-case
-        // here, the agent's `to` field (sourced from the inbox REST
-        // payload) won't match supportClients[c].email — and the
-        // agent's message silently drops. Reported 2026-05-13 as
-        // "messages not reflecting in user portal".
-        const email = String(data.user || `anon_${Date.now()}`).toLowerCase();
+
+        // ── AUTHENTICATE THE JOIN ──────────────────────────────────
+        // Until this hardening pass the handler trusted data.role and
+        // data.user outright, so anyone could:
+        //   • {role:'agent'}              → receive inbox_snapshot (every
+        //     open thread's email/name/tier/question) AND reply to
+        //     customers AS support;
+        //   • {role:'customer', user:<x>} → replay x's chat history.
+        // Identity now comes from a verified JWT carried IN THE JOIN FRAME
+        // (data.token — deliberately not the URL, so it never lands in
+        // access logs). Agents must present an admin token; customers may
+        // stay anonymous, but an unauthenticated socket can never bind to a
+        // registered account's email or read another thread's history.
+        let authedUser = null;
+        if (data.token && typeof data.token === 'string') {
+          try {
+            authedUser = verifyToken(data.token);
+            // Honor force-logout: password change/reset bumps
+            // tokens_revoked_after, killing pre-revocation tokens even when
+            // the signature is still valid. Same check as authMiddleware.
+            if (authedUser && authedUser.id) {
+              const revokedAfter = db.getTokensRevokedAfter(authedUser.id);
+              if (revokedAfter && authedUser.iat && authedUser.iat * 1000 < revokedAfter) {
+                authedUser = null;
+              }
+            }
+          } catch { authedUser = null; }
+        }
+        const authedEmail = authedUser ? String(authedUser.email || '').toLowerCase() : null;
+        const isAdminConn = !!authedEmail && SUPPORT_ADMIN_EMAILS.includes(authedEmail);
+
+        if (role === 'agent' && !isAdminConn) {
+          // Agent role gates the whole inbox + impersonation surface — admin
+          // token required, no exceptions. Close the socket so a rejected
+          // client can't sit idle holding a connection slot.
+          try { ws.send(JSON.stringify({ type: 'auth_error', scope: 'agent', message: 'Support agent access requires admin authentication.' })); } catch {}
+          try { ws.close(4401, 'agent auth required'); } catch {}
+          return;
+        }
+
+        // Resolve this socket's logical identity. Lowercased because the DB
+        // stores customer_email lowercased and the agent's `to` field (from
+        // the REST inbox) is matched case-insensitively against
+        // supportClients[c].email — a mixed-case mismatch silently drops the
+        // agent's reply (reported 2026-05-13 "messages not reflecting in
+        // user portal").
+        //   • agent           → verified admin email
+        //   • customer+token  → verified account email + bound user id
+        //   • customer (anon) → fresh anon_* id; a frame email belonging to
+        //                       a real account is NOT honored (replay vector)
+        let email;
+        let boundUserId = null;
+        let isAuthedCustomer = false;
+        if (role === 'agent') {
+          email = authedEmail;
+        } else if (authedUser) {
+          email = authedEmail;
+          boundUserId = authedUser.id;
+          isAuthedCustomer = true;
+        } else {
+          const claimed = String(data.user || '').trim().toLowerCase();
+          const claimsRegistered = !!claimed && !!db.getUserByEmail(claimed);
+          email = (claimed && !claimsRegistered) ? claimed : `anon_${Date.now()}`;
+        }
 
         // Per-role connection cap. Customers default to 1 — most-recent
         // click of Talk to a human wins. Agents default to 4 — admin can
@@ -757,13 +821,16 @@ wss.on('connection', (ws, req) => {
         // the 'message' handler — we don't double-insert on join.
         let threadId = null;
         if (role === 'customer') {
-          let thread = db.findResumableSupportThread(email);
+          // Only authenticated customers resume a prior thread by identity.
+          // Anonymous sockets always start fresh — otherwise a guessed email
+          // would resurface someone else's conversation.
+          let thread = isAuthedCustomer ? db.findResumableSupportThread(email) : null;
           if (!thread) {
             thread = db.createSupportThread({
               customer_email: email,
               customer_name: data.name || null,
               customer_tier: data.tier || null,
-              customer_user_id: data.userId || null,
+              customer_user_id: boundUserId || null,
               initial_question: data.initialQuestion || null,
               channel: 'bot',
               customer_ip: remoteIp,
@@ -842,8 +909,9 @@ wss.on('connection', (ws, req) => {
         if (role !== 'agent') {
           // 1. Send the customer their resumed conversation history so the
           //    bot panel doesn't open blank. The client renders these in
-          //    order before any new live message.
-          if (threadId) {
+          //    order before any new live message. Authed customers only —
+          //    an anonymous socket never replays stored history.
+          if (threadId && isAuthedCustomer) {
             try {
               const history = db.getSupportMessages(threadId, { limit: 200 });
               if (history.length > 0) {
