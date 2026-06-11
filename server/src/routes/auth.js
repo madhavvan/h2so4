@@ -838,7 +838,14 @@ router.put('/profile', authMiddleware, (req, res) => {
     const user = db.getUserById(req.user.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const { name, country_code } = req.body;
+    // country_code is intentionally NOT destructured/updatable here — it
+    // drives billing region (India = paid-only via regionGate) and the
+    // payment provider (Razorpay vs Stripe in routes/payments.js). A
+    // self-service edit would let a user flip regions to dodge the paywall
+    // or arbitrage INR pricing, so it's set once at signup and only an
+    // admin/support action can change it afterward. Any country_code in the
+    // request body is silently ignored.
+    const { name } = req.body;
     const d = db.getDB();
     const updates = [];
     const values = [];
@@ -846,10 +853,6 @@ router.put('/profile', authMiddleware, (req, res) => {
     if (name && name.trim().length > 0 && name.trim().length <= 100) {
       updates.push('name = ?');
       values.push(name.trim());
-    }
-    if (country_code && /^[A-Z]{2}$/.test(country_code)) {
-      updates.push('country_code = ?');
-      values.push(country_code);
     }
 
     if (updates.length === 0) {

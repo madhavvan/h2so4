@@ -223,11 +223,16 @@ router.post('/create-checkout', authMiddleware, async (req, res) => {
       return await grantAdminTier(req, res, tier);
     }
 
-    // SECURITY: country_code is server-controlled — read from the JWT
-    // (set at signup, mutable only via /profile with /^[A-Z]{2}$/ check).
-    // We deliberately ignore req.body.country_code so a malicious client
-    // cannot swap their billing region to whichever currency is cheapest.
-    const provider = getPaymentProvider(req.user.country_code || 'US');
+    // SECURITY: country_code is server-controlled — read from the user's
+    // DB row (set at signup; /profile can no longer change it). The JWT
+    // does NOT carry a country_code claim, so the old `req.user.country_code`
+    // was ALWAYS undefined and every user silently fell through to Stripe —
+    // making the Razorpay/UPI path unreachable for India (RBI e-mandate
+    // failures on USD recurring cards = "can't subscribe"). We deliberately
+    // ignore req.body.country_code so a malicious client cannot swap their
+    // billing region to whichever currency is cheapest.
+    const country = db.getUserById(req.user.id)?.country_code || 'US';
+    const provider = getPaymentProvider(country);
 
     if (provider === 'razorpay') {
       return await createRazorpayCheckout(req, res, tier);
@@ -363,7 +368,11 @@ router.post('/upgrade-tier', authMiddleware, async (req, res) => {
     // Once the webhook lands the user has a normal sub on file and future
     // upgrades use the in-place /upgrade-tier path.
     console.warn(`[upgrade-tier] no provider on file for ${req.user.email} (tier=${currentTier}); falling through to fresh checkout for ${targetTier}`);
-    const provider = getPaymentProvider(req.user.country_code || 'US');
+    // country from the user's DB row, not the JWT (which carries no
+    // country_code claim — see /create-checkout). Server-controlled and
+    // /profile can't edit it.
+    const country = db.getUserById(req.user.id)?.country_code || 'US';
+    const provider = getPaymentProvider(country);
     if (provider === 'razorpay') {
       return await createRazorpayCheckout(req, res, targetTier);
     }
@@ -640,10 +649,14 @@ router.post('/create-renewal', authMiddleware, async (req, res) => {
       });
     }
     // SECURITY: Same currency-injection mitigation as /create-checkout.
-    // country_code is server-controlled (JWT, set at signup) — body is
-    // ignored. Without this, a US user could POST country_code:"IN" and
-    // pay the INR renewal (~₹599) instead of USD (~$6.99).
-    const provider = getPaymentProvider(req.user.country_code || 'US');
+    // country_code is server-controlled — read from the user's DB row (set
+    // at signup; /profile can't change it). The JWT carries no country_code
+    // claim, so the old req.user.country_code was always undefined. Body is
+    // ignored. Without this a US user could pay the INR renewal (~₹599)
+    // instead of USD (~$6.99) — and, as happened, every IN user wrongly got
+    // Stripe USD because the claim never existed.
+    const country = db.getUserById(req.user.id)?.country_code || 'US';
+    const provider = getPaymentProvider(country);
     if (provider === 'razorpay') {
       return await createRazorpayRenewal(req, res);
     }
