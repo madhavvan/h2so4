@@ -21,6 +21,7 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const db = require('../database');
+const { hasAccess } = require('../services/subscriptionStates');
 
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
   .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
@@ -64,11 +65,33 @@ function requireTier(...allowedTiers) {
           message: `This feature requires ${allowedTiers.join(' or ')} tier.`,
         });
       }
-      // License row exists and tier matches. We don't gate on
-      // `license.status === 'active'` here because the tier itself
-      // already encodes "they've paid for the feature" — an expired
-      // Pro license already has tier=='free' (set by the cancel/refund
-      // webhook handlers). Status checks would double-count.
+      // Tier matches. The tier is meant to encode "paid for this feature" —
+      // webhooks reset tier→free on cancel/refund/expiry. But if a webhook
+      // is LOST (and the cycle-end sweeper only scans 'canceling'), a stale
+      // row can sit at tier='pro' past its expiry and keep serving paid AI
+      // to a DevTools user indefinitely. So we ALSO require an access status
+      // and a non-lapsed expiry — the same defense-in-depth regionGate.js
+      // already applies. hasAccess() (subscriptionStates) is the shared
+      // predicate: active / canceling / past_due.
+      if (!hasAccess(license.status)) {
+        return res.status(403).json({
+          error: 'tier_required',
+          required: allowedTiers,
+          current: license.tier,
+          current_status: license.status,
+          message: 'Your subscription is not active. Please renew to continue.',
+        });
+      }
+      // expires_at = -1 sentinel = "never expires" (recurring Pro/Max).
+      if (license.expires_at > 0 && Date.now() > license.expires_at) {
+        return res.status(403).json({
+          error: 'tier_required',
+          required: allowedTiers,
+          current: license.tier,
+          current_status: 'lapsed',
+          message: 'Your subscription has expired. Please renew to continue.',
+        });
+      }
       req.license = license;
       next();
     } catch (err) {

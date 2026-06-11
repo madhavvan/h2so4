@@ -276,7 +276,11 @@ app.use(async (req, res, next) => {
           const parts = token.split('.');
           if (parts.length === 3) {
             const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-            if (payload && payload.user_id) aiKey = `u:${payload.user_id}`;
+            // JWT payload carries `id` (see generateToken — {id,email,tier}).
+            // The old `payload.user_id` never existed, so every authenticated
+            // AI request silently fell back to the IP bucket and corporate-NAT
+            // users 429'd each other mid-interview.
+            if (payload && payload.id) aiKey = `u:${payload.id}`;
           }
         }
       } catch { /* fall back to IP */ }
