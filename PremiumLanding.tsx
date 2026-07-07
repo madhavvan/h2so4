@@ -401,6 +401,32 @@ const CSS = `
 }
 .pl-theater-gate::before{top:0;}
 .pl-theater-gate::after{bottom:0;}
+
+/* ── Target 3: Load choreography (first ~1.5s)
+   Stage lights up → card lands with premium settle → copy reveals →
+   then headline typing begins. Pure transform/opacity + both fill.
+   Orchestrated, expensive, no independent fades. */
+@keyframes pl-lightup{
+  from{opacity:0;transform:translateY(8px) scale(0.985);}
+  to{opacity:1;transform:none;}
+}
+@keyframes pl-cardland{
+  0%{opacity:0;transform:translateY(38px) scale(0.94);}
+  55%{transform:translateY(-5px) scale(1.015);}
+  78%{transform:translateY(1px) scale(0.998);}
+  100%{opacity:1;transform:none;}
+}
+@keyframes pl-loadup{
+  from{opacity:0;transform:translateY(16px);}
+  to{opacity:1;transform:none;}
+}
+.pl-stagelight{animation:pl-lightup 620ms 120ms cubic-bezier(.2,.7,.1,1) both;}
+.pl-beam{animation:pl-lightup 720ms 260ms cubic-bezier(.2,.7,.1,1) both;}
+.pl-reflectwrap{animation:pl-cardland 920ms 420ms cubic-bezier(.18,.82,.22,1) both;}
+.pl-hero-copy .pl-eyebrow{animation:pl-loadup 480ms 920ms cubic-bezier(.2,.8,.2,1) both;}
+.pl-hero-sub{animation:pl-loadup 520ms 1080ms cubic-bezier(.2,.8,.2,1) both;}
+.pl-hero-cta{animation:pl-loadup 520ms 1180ms cubic-bezier(.2,.8,.2,1) both;}
+.pl-hero-copy p:last-of-type{animation:pl-loadup 420ms 1280ms cubic-bezier(.2,.8,.2,1) both;}
 `;
 
 const Wordmark: React.FC<{ onClick?: () => void }> = ({ onClick }) => (
@@ -564,7 +590,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         setTyped(HERO_LINE.slice(0, i));
         if (i >= HERO_LINE.length) clearInterval(iv);
       }, 52);
-    }, 550);
+    }, 1450);
     return () => { clearTimeout(start); clearInterval(iv); };
   }, [reduce]);
 
@@ -954,7 +980,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             WebkitBackgroundClip: 'text',
             backgroundClip: 'text',
             color: 'transparent',
-            opacity: 0.042,
+            opacity: 0.065,
             whiteSpace: 'nowrap',
             pointerEvents: 'none',
             userSelect: 'none',
