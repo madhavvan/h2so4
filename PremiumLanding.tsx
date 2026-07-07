@@ -166,7 +166,15 @@ const CSS = `
   width:140%;height:132%;pointer-events:none;z-index:0;
   background:radial-gradient(56% 50% at 58% 34%,rgba(226,193,120,.14),rgba(211,172,99,.045) 46%,transparent 72%);}
 .pl-reflectwrap{position:relative;z-index:2;
-  -webkit-box-reflect:below 14px linear-gradient(rgba(0,0,0,.30),transparent 55%);
+  /* Glass reflection under the hero card. GOTCHA: for below-reflections
+     the mask gradient maps onto the FLIPPED copy - gradient 0% is the far
+     edge, 100% is the seam at the card's bottom. The previous
+     (rgba(.30) to transparent 55%) was therefore upside down: it faded the
+     reflection IN with distance, painting a readable inverted card ~300px
+     below the hero, behind the company-names strip. Correct form:
+     transparent for the far 68%, ramping to 22% only at the seam - the
+     sheen kisses the card bottom and is gone within ~a third of its height. */
+  -webkit-box-reflect:below 14px linear-gradient(transparent 68%, rgba(0,0,0,.22));
   animation:pl-heroin 1.15s cubic-bezier(.2,.8,.2,1) both;}
 @keyframes pl-heroin{from{opacity:0;transform:translateY(22px);}to{opacity:1;transform:none;}}
 @media (max-width:980px){
