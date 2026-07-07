@@ -495,16 +495,41 @@ function getDB() {
 }
 
 // ── Password hashing ──
+// Format: `v2:<iterations>:<salt>:<hash>` — the cost travels with the hash,
+// so it can be raised again later without breaking existing rows. Legacy
+// rows are bare `<salt>:<hash>` at a fixed 100k (the pre-2026-07 format);
+// they keep verifying until the next password change/reset re-hashes them
+// at the current cost. Bumping the constant below is therefore always safe.
+const PBKDF2_ITERATIONS = 210000; // OWASP-recommended floor for pbkdf2-sha512
+
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
-  return `${salt}:${hash}`;
+  const hash = crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS, 64, 'sha512').toString('hex');
+  return `v2:${PBKDF2_ITERATIONS}:${salt}:${hash}`;
 }
 
 function verifyPassword(password, storedHash) {
-  const [salt, hash] = storedHash.split(':');
-  const testHash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
-  return hash === testHash;
+  if (!storedHash || typeof storedHash !== 'string') return false;
+  const parts = storedHash.split(':');
+  let iterations, salt, hash;
+  if (parts.length === 4 && parts[0] === 'v2') {
+    iterations = parseInt(parts[1], 10);
+    salt = parts[2];
+    hash = parts[3];
+    if (!Number.isFinite(iterations) || iterations < 100000 || iterations > 10000000) return false;
+  } else if (parts.length === 2) {
+    iterations = 100000; // legacy format, fixed cost
+    [salt, hash] = parts;
+  } else {
+    return false;
+  }
+  const testHash = crypto.pbkdf2Sync(password, salt, iterations, 64, 'sha512').toString('hex');
+  // Constant-time compare; string === can short-circuit on the first
+  // differing char. Invalid hex in a corrupted row decodes short and fails
+  // the length check rather than throwing.
+  const a = Buffer.from(hash, 'hex');
+  const b = Buffer.from(testHash, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
