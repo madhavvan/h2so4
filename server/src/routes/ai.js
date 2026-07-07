@@ -291,7 +291,7 @@ router.post('/chat/gemini', geminiQuotaGate, async (req, res) => {
     parts.push({ text: prompt });
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
+      model: 'gemini-3.5-flash',
       contents: [{ role: 'user', parts }],
       config: {
         systemInstruction: enrichedSystem || '',
@@ -425,7 +425,7 @@ function resolveReasoningEffort(req, transcript) {
 // Provider hard caps as of 2026-05:
 //   OpenAI gpt-5.5            16,384 max_completion_tokens
 //   Anthropic Sonnet 4.6      64,000 max_tokens
-//   xAI grok-4-1-fast         8,000 max_tokens (model-specific)
+//   xAI grok-4.3              8,000 max_tokens (model-specific)
 //   Groq openai/gpt-oss-120b  8,192 max_tokens
 //   Gemini 3-flash-preview    8,192 maxOutputTokens (SDK default)
 // ─────────────────────────────────────────────────────────────
@@ -535,7 +535,7 @@ router.post('/chat/xai', requireTier(...PAID), async (req, res) => {
     const maxTokens = scaleTokensForInstructions(sysText, 8000, 8000);
 
     const completion = await client.chat.completions.create({
-      model: 'grok-4-1-fast-non-reasoning',
+      model: 'grok-4.3',
       messages: enrichedMessages,
       max_tokens: maxTokens,
       temperature: 0.7,
@@ -748,7 +748,7 @@ router.post('/stream/gemini', geminiQuotaGate, async (req, res) => {
     parts.push({ text: prompt });
 
     const stream = await ai.models.generateContentStream({
-      model: 'gemini-3-flash-preview',
+      model: 'gemini-3.5-flash',
       contents: [{ role: 'user', parts }],
       config: {
         systemInstruction: enrichedSystem || '',
@@ -861,7 +861,7 @@ router.post('/stream/xai', requireTier(...PAID), async (req, res) => {
 
     const stream = await client.chat.completions.create(
       {
-        model: 'grok-4-1-fast-non-reasoning',
+        model: 'grok-4.3',
         messages: enrichedMessages,
         max_tokens: maxTokens,
         temperature: 0.7,

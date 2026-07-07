@@ -1,8 +1,8 @@
 # Refund Policy
 
-**Effective: May 5, 2026** &nbsp; · &nbsp; **Last updated: May 5, 2026**
+**Effective: July 7, 2026** &nbsp; · &nbsp; **Last updated: July 7, 2026**
 
-This policy explains when and how minicaai ("the Service", "we", "us") issues refunds for purchases of our AI meeting assistant. By purchasing a plan you agree to the terms below.
+This policy explains when and how minicaai ("the Service", "we", "us") issues refunds for purchases of our AI interview copilot. By purchasing a plan you agree to the terms below.
 
 We aim to be fair: if you bought a plan you genuinely couldn't use, we'll refund it. If you've consumed the value, we won't.
 
@@ -12,22 +12,25 @@ We aim to be fair: if you bought a plan you genuinely couldn't use, we'll refund
 
 | Plan | Refund window | Usage condition |
 |---|---|---|
-| **Basic** ($25 / ₹1,999, one-time, 3 meeting credits) | 14 days from purchase | Zero of 3 meeting credits used |
-| **Pro** ($29/mo &nbsp;·&nbsp; ₹2,499/mo) | 7 days from the **first** charge | Less than 60 minutes of total session time across all meetings |
-| **Max** ($69/mo &nbsp;·&nbsp; ₹5,999/mo) | 7 days from the **first** charge | Less than 60 minutes of total session time across all meetings |
-| **+1 hour renewal** ($6.99 / ₹599) | Not refundable once delivered | — |
+| **Basic** ($30 / ₹2,499 · one-time · one 30-minute interview) | 14 days from purchase | Less than 2 hours of total session time |
+| **Pro** ($50 / ₹4,199 · one-time · one 1-hour interview) | 14 days from purchase | Less than 2 hours of total session time |
+| **Max** ($89 / ₹7,399 · one-time · three 1-hour interviews) | 14 days from purchase | Less than 2 hours of total session time |
+| **Ultra** ($159/mo &nbsp;·&nbsp; ₹12,999/mo) | 14 days from the **first** charge | Less than 2 hours of total session time |
+| **Interview extension** ($25 / ₹2,099 top-up) | Not refundable once delivered | — |
 
-A "session" is any active meeting-mode session, including ones ended early. Live transcription, screen-aware assistance, the always-on overlay, and chat usage during an active meeting all count toward session time.
+These windows apply to your **first** purchase of the Service. For repeat purchases, write to us anyway — we read every request and make fair exceptions.
+
+A "session" is any active interview session, including ones ended early. Live transcription, Auto-Solve captures, the pop-out overlay, and chat usage during an active interview all count toward session time.
 
 Refund eligibility is determined by our session logs, which are immutable and timestamped.
 
 ## 2. What is **not** refundable
 
-- Renewal credits ($6.99 / ₹599 top-up) once they've been added to your balance, even if unused
-- Subscription periods **after** the first billing cycle — cancel any time to stop the next renewal, but charges already made are not refunded
+- Interview extension top-ups ($25 / ₹2,099) once they've been added to your balance, even if unused
+- Ultra billing cycles **after** the first — cancel any time to stop the next renewal, but charges already made are not refunded
 - Any plan after the eligibility window above has elapsed
 - Any plan where the usage threshold has been exceeded
-- Accounts terminated for violation of our [Terms of Service](https://minicaai.com/terms) (sharing credentials, automated abuse, etc.)
+- Accounts terminated for violation of our Terms of Service (sharing credentials, automated abuse, etc.)
 - Currency conversion fees, bank wire fees, or foreign-exchange differences charged by your bank — only the amount we collected is refunded
 
 ## 3. How to request a refund
@@ -52,6 +55,8 @@ If your statement still doesn't show the refund after the expected window, reply
 
 ## 5. Cancellation is not the same as a refund
 
+This section applies to the **Ultra** subscription — one-time interview passes (Basic, Pro, Max) have nothing to cancel; they simply expire.
+
 Clicking **Cancel subscription** in-app stops the next renewal charge. You keep access to your paid tier until the end of the current billing cycle — that's the value you already paid for. No refund is issued for the current cycle on cancellation.
 
 If you want to stop renewing **and** be refunded for the current cycle, both must be requested — and the refund still depends on the eligibility window above.
@@ -60,7 +65,7 @@ You can also reactivate a scheduled cancellation any time before the cycle ends,
 
 ## 6. Service outages and downtime
 
-If a verified service outage on our side prevents you from using the Service for more than 48 consecutive hours during your billing period, we'll apply a pro-rated credit to your next renewal automatically. This applies to subscription plans (Pro, Max). Basic users in this situation are eligible for a refund or replacement credits.
+If a verified service outage on our side prevents you from using the Service for more than 48 consecutive hours during your billing period, we'll apply a pro-rated credit to your next renewal automatically. This applies to the **Ultra** subscription. One-time pass holders (Basic, Pro, Max) in this situation are eligible for a refund or replacement interview credits.
 
 Outages on third-party services we depend on (Stripe, Razorpay, Deepgram, AI model providers, your internet, your camera/mic drivers) are not covered.
 

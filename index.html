@@ -17,21 +17,54 @@
              but 'self' + no nonce blocks any injected script tag
          Google Sign-In (GSI) needs accounts.google.com in script-src,
          style-src, and frame-src for @react-oauth/google to work.
+         Razorpay (India checkout) needs checkout.razorpay.com in
+         script-src (SubscriptionGate injects its checkout.js on demand)
+         and api.razorpay.com + checkout.razorpay.com in frame-src for
+         the payment modal iframe — without these the SDK script is
+         refused and every INR payment dies with "Failed to load
+         Razorpay SDK" before the modal can open.
          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
     <meta http-equiv="Content-Security-Policy" content="
       default-src 'self';
-      script-src 'self' 'unsafe-eval' https://accounts.google.com;
+      script-src 'self' 'unsafe-eval' https://accounts.google.com https://checkout.razorpay.com;
       style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com;
       font-src 'self' https://fonts.gstatic.com data:;
       img-src 'self' data: blob: https:;
       media-src 'self' blob: data:;
       connect-src 'self' ws: wss: http://localhost:* https: data: blob:;
-      frame-src https://accounts.google.com;
+      frame-src https://accounts.google.com https://api.razorpay.com https://checkout.razorpay.com;
       object-src 'none';
       base-uri 'self';
       form-action 'self';
     ">
-    <title>Interview Copilot AI</title>
+    <!-- Deliberately just the wordmark: document.title overrides the
+         BrowserWindow title Electron sets in main.cjs, so whatever is
+         here is also what the desktop app shows in the taskbar mid-
+         interview. "minicaai" is brand-exact and says nothing about
+         interviews to a shoulder-surfer; the marketing sentence lives
+         in og:title / description below, which only crawlers read. -->
+    <title>minicaai</title>
+    <meta name="description" content="minicaai listens to your live interview call and streams a personalized answer to your screen — invisible to screen-share. Works with Zoom, Google Meet, and Microsoft Teams. Start free, no card." />
+    <link rel="canonical" href="https://minicaai.com/" />
+    <!-- Obsidian page ground — tints mobile browser chrome to match. -->
+    <meta name="theme-color" content="#070706" />
+    <!-- Social cards. og.png is a 1200×630 obsidian-and-gold render of
+         the hero line, generated at scripts/og/og.html → public/og.png
+         (headless-browser screenshot); regenerate there if the hero
+         copy or brand palette ever changes. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="minicaai" />
+    <meta property="og:title" content="Every interview question, answered the moment it’s asked." />
+    <meta property="og:description" content="minicaai listens to your live call and streams a personalized answer to your screen — invisible to everyone but you. Zoom · Google Meet · Teams. Start free." />
+    <meta property="og:url" content="https://minicaai.com/" />
+    <meta property="og:image" content="https://minicaai.com/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="minicaai — every interview question, answered the moment it’s asked." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Every interview question, answered the moment it’s asked." />
+    <meta name="twitter:description" content="minicaai listens to your live call and streams a personalized answer to your screen — invisible to everyone but you. Start free." />
+    <meta name="twitter:image" content="https://minicaai.com/og.png" />
     <!-- Branded favicon set. Generated from build/icon.svg by
          scripts/build-icons.mjs and copied into the build root by Vite from
          public/. Order matters: browsers scan link[rel=icon] entries and

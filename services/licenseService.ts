@@ -85,8 +85,9 @@ export interface UserProfile {
 }
 
 // Feature gates — what each tier can access.
-// Basic = Pro features minus Auto-Type, gated by credit time balance.
-// Max = Pro + Auto-Type.
+// 2026-07 gate map. Basic = the four base models (no Claude), time-gated.
+// Pro/Max = all five models incl. Claude; Max adds reasoning-effort control.
+// Auto-Type is Ultra-exclusive (the only recurring, unlimited tier).
 export const FEATURE_GATES = {
   free: {
     models: ['gemini'] as string[],
@@ -103,8 +104,8 @@ export const FEATURE_GATES = {
     reasoningEffortControl: false,
   },
   basic: {
-    // Claude is Max-only — its hosted web_search + the per-session "Train
-    // Model" pipeline are positioned as the premium differentiator.
+    // Basic is the only paid tier WITHOUT Claude — Claude (hosted web_search
+    // + the "Train Model" pipeline) unlocks at Pro as the premium step-up.
     models: ['gemini', 'groq', 'openai', 'xai'] as string[],
     screenCapture: true,
     autoSolve: true,
@@ -165,6 +166,7 @@ const REVALIDATION_INTERVAL = 30 * 60 * 1000; // 30 minutes
 // client-side credit-math knobs.
 export const TIME_CONSTANTS = {
   SECONDS_PER_CREDIT: 3600,         // 1 credit = 1 hour of session time
+  EXTENSION_SECONDS: 30 * 60,       // Basic "+30 min" extension top-up (2026-07)
   TRIAL_SECONDS: 30 * 60,           // Free signup = 30 minutes of Basic experience
   BASIC_EXPIRY_DAYS: 14,            // Credits void 14 days after purchase
   LOW_WARNING_SECONDS: 120,         // Fire "2 min left" warning here
@@ -508,9 +510,10 @@ class LicenseService {
     return updated;
   }
 
-  // ── Fresh Basic credit seed ──
-  // A new Basic grant = 3 credits (3 hours) valid until the server-set
-  // license.expires_at. Called on first-time Basic purchase, NOT on renewal.
+  // ── Fresh interview-time seed (2026-07 pricing) ──
+  // A new purchase seeds the tier's interview clock — Basic 30 min,
+  // Pro 1 hour, Max 3 hours — valid until the server-set license.expires_at.
+  // Called on first-time purchase, NOT on the +30-min extension.
   // Kept private because only normalizeLicenseCredits should decide when to
   // seed — direct callers would mis-overwrite an in-flight balance.
   private freshBasicCreditSeed(license: LicenseData): { credits_remaining_seconds: number; credits_expire_at: number } {
@@ -610,31 +613,31 @@ class LicenseService {
     return { ...license, ...this.freshBasicCreditSeed(license) };
   }
 
-  // Credit one additional hour (Basic renewal flow).
+  // Credit the +30-minute extension (Basic top-up flow, 2026-07).
   //
   // Base off effective balance, NOT the raw field: if the prior credits
   // already expired (credits_expire_at < now), effective balance is 0 and
   // stale seconds should not carry over. Otherwise a user whose credits
-  // expired with 1800s unused would pay for renewal and silently get
-  // 3600 + 1800 = 5400s — effectively a free half-credit.
+  // expired with time unused would pay for the extension and silently get
+  // the stale remainder back on top — a free partial credit.
   //
-  // Anchor the new expiry from max(now, license.expires_at) + 1h, mirroring
-  // the server's grantBasicRenewal in database.js. /create-renewal does NOT
-  // pre-bump expires_at — the payment.captured webhook does — so when this
-  // runs from the success URL, license.expires_at is still the pre-renewal
-  // value (often already past for a user who just hit the 14-day wall).
-  // Using it verbatim would place credits_expire_at in the past and void
-  // the credit the user just paid for. The next successful revalidation
-  // picks up the server-bumped expires_at and the two ledgers reconverge.
+  // Anchor the new expiry from max(now, license.expires_at) + 30 min,
+  // mirroring the server's grantBasicRenewal in database.js. /create-renewal
+  // does NOT pre-bump expires_at — the payment.captured webhook does — so
+  // when this runs from the success URL, license.expires_at is still the
+  // pre-extension value (often already past for a user who just hit the
+  // expiry wall). Using it verbatim would place credits_expire_at in the
+  // past and void the time the user just paid for. The next successful
+  // revalidation picks up the server-bumped expires_at and reconverges.
   grantRenewalCredit(license: LicenseData): LicenseData {
     const effectiveRemaining = this.getCreditsRemainingSeconds(license);
-    const ONE_HOUR_MS = TIME_CONSTANTS.SECONDS_PER_CREDIT * 1000;
+    const EXTENSION_MS = TIME_CONSTANTS.EXTENSION_SECONDS * 1000;
     const anchor = Math.max(Date.now(), license.expires_at > 0 ? license.expires_at : 0);
     const updated: LicenseData = {
       ...license,
       tier: 'basic', // grantBasicRenewal also reactivates from free/expired → basic
-      credits_remaining_seconds: effectiveRemaining + TIME_CONSTANTS.SECONDS_PER_CREDIT,
-      credits_expire_at: anchor + ONE_HOUR_MS,
+      credits_remaining_seconds: effectiveRemaining + TIME_CONSTANTS.EXTENSION_SECONDS,
+      credits_expire_at: anchor + EXTENSION_MS,
     };
     const user = this.loadAuth().user;
     if (user) this.saveAuth(user, updated);
@@ -838,14 +841,14 @@ class LicenseService {
           delete (updatedLicense as any).trial_remaining_seconds;
         }
       } else if (license.tier === 'basic' && serverData.tier === 'basic') {
-        // ── Cross-device renewal-credit propagation ──
+        // ── Cross-device extension-credit propagation ──
         // The server's grantBasicRenewal extends the license's expires_at
-        // by exactly 1h on each renewal payment. We use that delta as a
-        // change-detection signal: when the server's expires_at moves
-        // forward by ~1h since our last sync, a renewal payment landed
-        // somewhere (browser, another device, even the system browser
-        // launched from Electron). Apply +3600s to the local ledger so
-        // the renewal credits land regardless of which device/window
+        // by exactly 30 min on each extension payment. We use that delta
+        // as a change-detection signal: when the server's expires_at moves
+        // forward by ~30 min since our last sync, an extension payment
+        // landed somewhere (browser, another device, even the system
+        // browser launched from Electron). Apply +1800s to the local
+        // ledger so the time lands regardless of which device/window
         // handled the payment-success URL.
         //
         // Idempotent: after we apply the credit, we save the new
@@ -855,18 +858,17 @@ class LicenseService {
         // cleanest event-based propagation we can do.
         const oldExpires = license.expires_at || 0;
         const newExpires = serverData.expires_at || 0;
-        const ONE_HOUR_MS = 60 * 60 * 1000;
+        const EXTENSION_MS = TIME_CONSTANTS.EXTENSION_SECONDS * 1000;
         const deltaMs = newExpires - oldExpires;
-        if (deltaMs >= 0.5 * ONE_HOUR_MS && deltaMs <= 1.5 * ONE_HOUR_MS) {
-          // Renewal-shaped delta. Add 1h of credit time + extend the
-          // credit window. We only treat 30-90min deltas as renewals;
-          // bigger deltas are full Basic grants (handled by tierChanged
-          // when applicable) or unusual states we leave alone.
-          const ONE_HOUR_S = 3600;
+        if (deltaMs >= 0.5 * EXTENSION_MS && deltaMs <= 1.5 * EXTENSION_MS) {
+          // Extension-shaped delta (15–45 min). Add 30 min of credit time
+          // + extend the credit window. Bigger deltas are full grants
+          // (handled by tierChanged when applicable) or unusual states we
+          // leave alone.
           const existingCredits = updatedLicense.credits_remaining_seconds ?? 0;
           updatedLicense = {
             ...updatedLicense,
-            credits_remaining_seconds: existingCredits + ONE_HOUR_S,
+            credits_remaining_seconds: existingCredits + TIME_CONSTANTS.EXTENSION_SECONDS,
             credits_expire_at: newExpires,
           };
         }

@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { pricingService, PricingTier, RegionPricing } from './services/pricingService';
 import { UltraMark } from './UltraMark';
 import { BasicMark, ProMark, MaxMark } from './TierMarks';
+import { RefundPolicy } from './RefundPolicy';
 // Confirmed-present phosphor glyphs (same set SubscriptionGate imports).
 import {
   ArrowRight as PhArrowRight,
@@ -59,6 +60,14 @@ interface PremiumLandingProps {
   pricing: RegionPricing;
   handleTierSelect: (tier: PricingTier) => void;
   isSubmitting: boolean;
+  // Checkout feedback. A signed-in visitor clicking a paid tier goes
+  // straight into initiateCheckout — its failures (geo not resolved,
+  // server 4xx/5xx, timeout) land in the gate's paymentError, which
+  // every other purchase surface renders but the landing used to
+  // swallow: the click just silently did nothing. Optional so the
+  // component stays drop-in for previews/tests without the gate.
+  paymentError?: string | null;
+  onDismissPaymentError?: () => void;
 }
 
 const GRAIN =
@@ -133,8 +142,8 @@ const CSS = `
 @keyframes pl-pulse{0%{box-shadow:0 0 0 0 rgba(211,172,99,.55);}70%{box-shadow:0 0 0 8px rgba(211,172,99,0);}100%{box-shadow:0 0 0 0 rgba(211,172,99,0);}}
 .pl-obj{position:relative;background:linear-gradient(180deg,#100e0a,#0a0908);
   border:1px solid var(--gold-line);border-radius:20px;
-  box-shadow:0 60px 140px -50px #000, 0 0 0 1px rgba(255,255,255,.03), inset 0 1px 0 rgba(255,255,255,.05);}
-.pl-tilt{transition:transform .3s cubic-bezier(.2,.8,.25,1);will-change:transform;transform:perspective(950px);}
+  box-shadow:0 50px 120px -34px rgba(0,0,0,.92), 0 0 74px -26px rgba(211,172,99,.20), 0 0 0 1px rgba(255,255,255,.04), inset 0 1px 0 rgba(255,255,255,.06);}
+.pl-tilt{transition:transform .5s cubic-bezier(.2,.8,.25,1);will-change:transform;transform:perspective(1200px) rotateY(-6deg) rotateX(1.6deg);}
 .pl-rim{position:absolute;inset:0;border-radius:20px;pointer-events:none;
   background:radial-gradient(460px 260px at var(--rimx,50%) var(--rimy,16%), rgba(246,228,176,.09), transparent 62%);
   transition:background-position .3s;}
@@ -143,6 +152,29 @@ const CSS = `
   filter:blur(30px);pointer-events:none;z-index:0;}
 .pl-beam{position:absolute;left:50%;top:32%;width:680px;height:540px;max-width:92vw;
   transform:translate(-50%,-50%);pointer-events:none;z-index:1;}
+/* ── Hero: two-column cinematic stage. Left = the promise; right = the product,
+   lit like an object on black glass (still directional light + a real
+   reflection — an expensive product shot, NOT an ambient glow). ── */
+.pl-hero{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.06fr);
+  gap:clamp(30px,4.4vw,60px);align-items:center;min-height:min(80vh,720px);}
+.pl-hero-copy{max-width:560px;}
+.pl-hero-sub{max-width:470px;margin-top:26px;}
+.pl-hero-cta{display:flex;gap:24px;align-items:center;flex-wrap:wrap;justify-content:flex-start;margin:36px 0 16px;}
+.pl-hero-visual{position:relative;}
+.pl-stagelight{position:absolute;left:50%;top:47%;transform:translate(-50%,-50%);
+  width:140%;height:132%;pointer-events:none;z-index:0;
+  background:radial-gradient(56% 50% at 58% 34%,rgba(226,193,120,.14),rgba(211,172,99,.045) 46%,transparent 72%);}
+.pl-reflectwrap{position:relative;z-index:2;
+  -webkit-box-reflect:below 14px linear-gradient(rgba(0,0,0,.30),transparent 55%);
+  animation:pl-heroin 1.15s cubic-bezier(.2,.8,.2,1) both;}
+@keyframes pl-heroin{from{opacity:0;transform:translateY(22px);}to{opacity:1;transform:none;}}
+@media (max-width:980px){
+  .pl-hero{grid-template-columns:1fr;gap:44px;min-height:0;text-align:center;}
+  .pl-hero-copy{max-width:none;margin:0 auto;}
+  .pl-hero-sub{margin-left:auto;margin-right:auto;}
+  .pl-hero-cta{justify-content:center;}
+  .pl-reflectwrap{-webkit-box-reflect:none;}
+}
 .pl-mote{position:absolute;border-radius:50%;background:var(--gold-1);opacity:0;
   box-shadow:0 0 6px var(--gold-glow);filter:blur(.4px);
   animation-name:pl-drift;animation-timing-function:linear;animation-iteration-count:infinite;}
@@ -184,6 +216,20 @@ const CSS = `
 .pl-faq-a{max-width:700px;padding:0 2px 24px;color:var(--mut);font-size:15px;line-height:1.65;
   animation:pl-fadeup .45s cubic-bezier(.2,.8,.2,1);}
 @keyframes pl-fadeup{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
+.pl-toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:9;
+  display:flex;align-items:flex-start;gap:14px;max-width:min(92vw,560px);
+  background:linear-gradient(180deg,#14110b,#0c0a07);border:1px solid var(--gold-line);
+  border-left:2px solid var(--gold);border-radius:14px;padding:13px 16px;
+  box-shadow:0 24px 70px -22px rgba(0,0,0,.9), 0 0 40px -18px var(--gold-glow);
+  font-size:13.5px;line-height:1.55;color:var(--paper);
+  animation:pl-fadeup .45s cubic-bezier(.2,.8,.2,1);}
+.pl-toast-x{background:none;border:none;cursor:pointer;color:var(--mut);font-size:17px;
+  line-height:1;padding:2px 2px 0;flex-shrink:0;transition:color .2s;}
+.pl-toast-x:hover{color:var(--paper);}
+.pl-footnote-link{background:none;border:none;cursor:pointer;padding:0;color:var(--faint);
+  font-size:12.5px;letter-spacing:.02em;text-decoration:underline;text-underline-offset:3px;
+  text-decoration-color:var(--gold-line);transition:color .2s;}
+.pl-footnote-link:hover{color:var(--gold);}
 @media (max-width:860px){ .pl-wrap{padding:0 22px;} .pl-hide-sm{display:none !important;} .pl-lamp{display:none;} }
 @media (prefers-reduced-motion:reduce){
   .pl-root *{animation:none !important;}
@@ -225,7 +271,7 @@ const Magnetic: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 const HERO_LINE = 'answered the moment it’s asked.';
 const ANSWER = 'I’d anchor it on an event backbone — Kafka — with stateless scoring pulling features from Redis, and the model behind a feature cache so p99 holds under 50ms.';
 
-const MODELS = ['Claude Sonnet 5', 'GPT-5.5', 'Gemini 3', 'Grok', 'Groq'];
+const MODELS = ['Claude Sonnet 5', 'GPT-5.5', 'Gemini 3.5', 'Grok 4.3', 'Groq'];
 const CAPS = [
   { icon: PhHeadphones, t: 'Sub-second transcription' },
   { icon: PhMonitor, t: 'Solves coding & case rounds' },
@@ -283,10 +329,14 @@ const FAQS = [
   { q: 'What if it doesn’t work out?', a: 'There’s a 14-day window on your first purchase — under two hours of use gets a full refund. Cancel any time and keep access through the period you already paid for.' },
 ];
 
-const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handleTierSelect, isSubmitting }) => {
+const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handleTierSelect, isSubmitting, paymentError, onDismissPaymentError }) => {
   const reduce = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
   const [typed, setTyped] = useState(reduce ? HERO_LINE : '');
   const [scrolled, setScrolled] = useState(false);
+  // Refund policy modal — the pricing footnote promises a 14-day window,
+  // so the policy itself has to be readable BEFORE purchase, not only
+  // from the post-purchase billing sheet (ManageSubscription).
+  const [showRefund, setShowRefund] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const lampRef = useRef<HTMLDivElement>(null);
   const tiltRef = useRef<HTMLDivElement>(null);
@@ -370,12 +420,12 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
     const r = el.getBoundingClientRect();
     const nx = ((e.clientX - r.left) / r.width) * 2 - 1;
     const ny = ((e.clientY - r.top) / r.height) * 2 - 1;
-    el.style.transform = `perspective(950px) rotateX(${(-ny * 2.2).toFixed(2)}deg) rotateY(${(nx * 2.8).toFixed(2)}deg)`;
+    el.style.transform = `perspective(1200px) rotateX(${(1.6 - ny * 2.4).toFixed(2)}deg) rotateY(${(-6 + nx * 3.2).toFixed(2)}deg)`;
     rimRef.current?.style.setProperty('--rimx', `${(50 - nx * 34).toFixed(1)}%`);
     rimRef.current?.style.setProperty('--rimy', `${(16 - ny * 26).toFixed(1)}%`);
   };
   const onHeroLeave = () => {
-    if (tiltRef.current) tiltRef.current.style.transform = 'perspective(950px)';
+    if (tiltRef.current) tiltRef.current.style.transform = 'perspective(1200px) rotateY(-6deg) rotateX(1.6deg)';
     rimRef.current?.style.setProperty('--rimx', '50%');
     rimRef.current?.style.setProperty('--rimy', '16%');
   };
@@ -424,93 +474,101 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       </div>
 
       {/* ── Hero ────────────────────────────────────────────── */}
-      <header id="pl-top" className="pl-wrap" style={{ paddingTop: 96, paddingBottom: 40, textAlign: 'center' }}>
-        <div className="pl-eyebrow" style={{ marginBottom: 34 }}>Real-time interview copilot</div>
-
-        <h1 className="pl-serif" style={{ fontWeight: 500, fontSize: 'clamp(36px, 5vw, 72px)', lineHeight: 1.03, letterSpacing: '-0.028em', margin: '0 auto', maxWidth: 820 }} data-pl-hero>
-          <span style={{ color: 'var(--paper)' }}>Every interview question,</span>
-          <br />
-          <span style={{ display: 'inline-block', minHeight: '1.05em' }}>
-            <em className="pl-gold" style={{ fontStyle: 'italic' }}>{typed || ' '}</em>
-            <span className="pl-caret" />
-          </span>
-        </h1>
-
-        <p style={{ fontSize: 'clamp(15px, 1.6vw, 18px)', lineHeight: 1.6, color: 'var(--mut)', maxWidth: 520, margin: '30px auto 0' }}>
-          minicaai listens to your live call and streams a perfect, personalized answer to your screen —
-          <span style={{ color: 'var(--paper)' }}> invisible to everyone but you.</span>
-        </p>
-
-        <div style={{ display: 'flex', gap: 26, alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap', margin: '42px 0 18px' }}>
-          <Magnetic>
-            <button onClick={() => setView('signup')} className="pl-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 9, padding: '16px 32px', borderRadius: 999, fontSize: 16 }}>
-              Start free — 30 minutes <PhArrowRight size={17} weight="bold" />
-            </button>
-          </Magnetic>
-          <button onClick={() => scrollTo('why')} className="pl-textlink" style={{ fontSize: 16 }}>
-            See it live <PhArrowRight size={15} weight="bold" />
-          </button>
-        </div>
-        <p style={{ fontSize: 12.5, color: 'var(--faint)', letterSpacing: '.02em' }}>
-          No card to start · Works on Zoom · Google Meet · Microsoft Teams
-        </p>
-
-        {/* Signature hero object — one spotlit live answer, gold-rimmed on black.
-            Dust motes drift in the beam; the card tilts toward the pointer
-            while its rim light counters, like light on a lacquered surface. */}
-        <div style={{ position: 'relative', marginTop: 72 }}>
-          <div className="pl-spot" />
-          <div className="pl-beam" aria-hidden>
-            {MOTES.map((m, i) => (
-              <span
-                key={i}
-                className="pl-mote"
-                style={{
-                  left: `${m.left}%`, top: `${m.top}%`, width: m.size, height: m.size,
-                  animationDelay: `${m.delay}ms`, animationDuration: `${m.dur}ms`,
-                  '--dx': `${m.dx}px`, '--o': String(m.o),
-                } as React.CSSProperties}
-              />
-            ))}
+      <header id="pl-top" className="pl-wrap" style={{ paddingTop: 60, paddingBottom: 54, position: 'relative' }}>
+        <div className="pl-hero">
+          {/* LEFT — the promise */}
+          <div className="pl-hero-copy">
+            <div className="pl-eyebrow" style={{ marginBottom: 24 }}>Real-time interview copilot</div>
+            {/* aria-label carries the finished sentence; the visual children
+                are hidden from AT because the second line re-renders once
+                per typed character — a screen reader following the live DOM
+                would announce 40 partial fragments. */}
+            <h1 className="pl-serif" style={{ fontWeight: 500, fontSize: 'clamp(37px, 4.4vw, 62px)', lineHeight: 1.02, letterSpacing: '-0.03em', margin: 0 }} data-pl-hero aria-label={`Every interview question, ${HERO_LINE}`}>
+              <span aria-hidden="true">
+                <span style={{ color: 'var(--paper)' }}>Every interview question,</span>
+                <br />
+                <span style={{ display: 'inline-block', minHeight: '1.05em' }}>
+                  <em className="pl-gold" style={{ fontStyle: 'italic' }}>{typed || ' '}</em>
+                  <span className="pl-caret" />
+                </span>
+              </span>
+            </h1>
+            <p className="pl-hero-sub" style={{ fontSize: 'clamp(15px, 1.4vw, 17.5px)', lineHeight: 1.6, color: 'var(--mut)' }}>
+              minicaai listens to your live call and streams a perfect, personalized answer to your screen —
+              <span style={{ color: 'var(--paper)' }}> invisible to everyone but you.</span>
+            </p>
+            <div className="pl-hero-cta">
+              <Magnetic>
+                <button onClick={() => setView('signup')} className="pl-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 9, padding: '16px 32px', borderRadius: 999, fontSize: 16 }}>
+                  Start free — 30 minutes <PhArrowRight size={17} weight="bold" />
+                </button>
+              </Magnetic>
+              <button onClick={() => scrollTo('why')} className="pl-textlink" style={{ fontSize: 16 }}>
+                See it live <PhArrowRight size={15} weight="bold" />
+              </button>
+            </div>
+            <p style={{ fontSize: 12.5, color: 'var(--faint)', letterSpacing: '.02em' }}>
+              No card to start · Works on Zoom · Google Meet · Microsoft Teams
+            </p>
           </div>
-          <div className="pl-reveal" style={{ maxWidth: 760, margin: '0 auto', position: 'relative', zIndex: 2 }}>
-            <div className="pl-obj pl-tilt" ref={tiltRef} onPointerMove={onHeroMove} onPointerLeave={onHeroLeave} style={{ textAlign: 'left', padding: 0 }}>
-              <div className="pl-rim" ref={rimRef} aria-hidden />
-              <div style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '15px 20px', borderBottom: '1px solid var(--line)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <span className="pl-live" />
-                  <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--paper)' }}>Senior Data Engineer</span>
-                  <span style={{ fontSize: 11.5, color: 'var(--faint)' }}>· live round</span>
+
+          {/* RIGHT — the product, lit like glass. Still directional light (no
+              pulse), a floating live-answer panel, dust adrift in the beam, and
+              a real reflection beneath — an expensive product shot, not a glow. */}
+          <div className="pl-hero-visual">
+            <div className="pl-stagelight" aria-hidden />
+            <div className="pl-beam" aria-hidden>
+              {MOTES.map((m, i) => (
+                <span
+                  key={i}
+                  className="pl-mote"
+                  style={{
+                    left: `${m.left}%`, top: `${m.top}%`, width: m.size, height: m.size,
+                    animationDelay: `${m.delay}ms`, animationDuration: `${m.dur}ms`,
+                    '--dx': `${m.dx}px`, '--o': String(m.o),
+                  } as React.CSSProperties}
+                />
+              ))}
+            </div>
+            <div className="pl-reflectwrap">
+              <div className="pl-obj pl-tilt" ref={tiltRef} onPointerMove={onHeroMove} onPointerLeave={onHeroLeave} style={{ textAlign: 'left', padding: 0 }}>
+                <div className="pl-rim" ref={rimRef} aria-hidden />
+                <div style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '15px 20px', borderBottom: '1px solid var(--line)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <span className="pl-live" />
+                    <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--paper)' }}>Senior Data Engineer</span>
+                    <span style={{ fontSize: 11.5, color: 'var(--faint)' }}>· live round</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+                    <span className="pl-hide-sm" style={{ fontSize: 10, fontWeight: 600, letterSpacing: '.16em', textTransform: 'uppercase', color: 'var(--gold)', border: '1px solid var(--gold-line)', padding: '4px 9px', borderRadius: 999 }}>hidden on share</span>
+                    <span style={{ fontSize: 12, color: 'var(--faint)', fontVariantNumeric: 'tabular-nums' }}>12:04</span>
+                  </div>
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                  <span className="pl-hide-sm" style={{ fontSize: 10, fontWeight: 600, letterSpacing: '.16em', textTransform: 'uppercase', color: 'var(--gold)', border: '1px solid var(--gold-line)', padding: '4px 9px', borderRadius: 999 }}>hidden on share</span>
-                  <span style={{ fontSize: 12, color: 'var(--faint)', fontVariantNumeric: 'tabular-nums' }}>12:04</span>
-                </div>
-              </div>
 
-              <div style={{ position: 'relative', padding: '24px 22px' }}>
-                <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', color: 'var(--faint)', marginBottom: 8 }}>They ask</div>
-                <p style={{ fontSize: 15, lineHeight: 1.5, color: '#cfc9bd', marginBottom: 22 }}>
-                  “Design a fraud-detection pipeline that has to score every transaction in under 50&nbsp;milliseconds.”
-                </p>
+                <div style={{ position: 'relative', padding: '24px 22px' }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', color: 'var(--faint)', marginBottom: 8 }}>They ask</div>
+                  <p style={{ fontSize: 15, lineHeight: 1.5, color: '#cfc9bd', marginBottom: 22 }}>
+                    “Design a fraud-detection pipeline that has to score every transaction in under 50&nbsp;milliseconds.”
+                  </p>
 
-                <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', marginBottom: 8 }} className="pl-gold">You say</div>
-                <p className="pl-serif" style={{ fontSize: 18, lineHeight: 1.55, color: 'var(--paper)', letterSpacing: '-0.01em' }}>
-                  {ANSWER}<span className="pl-caret" />
-                </p>
+                  <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', marginBottom: 8 }} className="pl-gold">You say</div>
+                  <p className="pl-serif" style={{ fontSize: 18, lineHeight: 1.55, color: 'var(--paper)', letterSpacing: '-0.01em' }}>
+                    {ANSWER}<span className="pl-caret" />
+                  </p>
 
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 22 }}>
-                  <span className="pl-wave">
-                    {Array.from({ length: 26 }).map((_, i) => (
-                      <i key={i} style={{ animationDelay: `${(i % 13) * 0.08}s`, height: 3 + ((i * 5) % 16) }} />
-                    ))}
-                  </span>
-                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 11.5, color: 'var(--mut)' }}>
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--gold-line)', borderRadius: 999, padding: '4px 10px', color: 'var(--gold)', fontWeight: 600 }}>
-                      <PhSparkle size={13} weight="duotone" /> Claude Sonnet 5
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 22 }}>
+                    <span className="pl-wave">
+                      {Array.from({ length: 26 }).map((_, i) => (
+                        <i key={i} style={{ animationDelay: `${(i % 13) * 0.08}s`, height: 3 + ((i * 5) % 16) }} />
+                      ))}
                     </span>
-                    <span className="pl-hide-sm">0.8s</span>
-                  </span>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 11.5, color: 'var(--mut)' }}>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--gold-line)', borderRadius: 999, padding: '4px 10px', color: 'var(--gold)', fontWeight: 600 }}>
+                        <PhSparkle size={13} weight="duotone" /> Claude Sonnet 5
+                      </span>
+                      <span className="pl-hide-sm">0.8s</span>
+                    </span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -578,7 +636,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
               The right model<br />for <span className="pl-gold pl-foil">every question.</span>
             </h2>
             <p style={{ fontSize: 16.5, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 460 }}>
-              Claude Sonnet 5 for reasoning, GPT-5.5 for range, Gemini 3 for speed, Grok and Groq when you need instant. Switch minds mid-interview — no one will know.
+              Claude Sonnet 5 for reasoning, GPT-5.5 for range, Gemini 3.5 for speed, Grok and Groq when you need instant. Switch minds mid-interview — no one will know.
             </p>
           </div>
         </div>
@@ -751,8 +809,8 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
                   disabled={isSubmitting}
                   className={pop ? 'pl-cta' : undefined}
                   style={pop
-                    ? { width: '100%', padding: '11px', borderRadius: 999, fontSize: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, opacity: isSubmitting ? 0.6 : 1 }
-                    : { width: '100%', padding: '11px', borderRadius: 999, fontSize: 14, fontWeight: 600, cursor: 'pointer', color: 'var(--paper)', background: 'transparent', border: '1px solid rgba(255,255,255,.16)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, opacity: isSubmitting ? 0.6 : 1 }}
+                    ? { width: '100%', padding: '11px', borderRadius: 999, fontSize: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, opacity: isSubmitting ? 0.6 : 1, cursor: isSubmitting ? 'default' : 'pointer' }
+                    : { width: '100%', padding: '11px', borderRadius: 999, fontSize: 14, fontWeight: 600, cursor: isSubmitting ? 'default' : 'pointer', color: 'var(--paper)', background: 'transparent', border: '1px solid rgba(255,255,255,.16)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, opacity: isSubmitting ? 0.6 : 1 }}
                 >
                   {t.cta || 'Choose'} <PhArrowRight size={14} weight="bold" />
                 </button>
@@ -769,7 +827,8 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           })}
         </div>
         <p className="pl-reveal" style={{ textAlign: 'center', fontSize: 12.5, color: 'var(--faint)', letterSpacing: '.02em', marginTop: 28 }}>
-          Stripe or Razorpay at checkout · Apple Pay · Google Pay · UPI in India · 14-day first-purchase refund window
+          Stripe or Razorpay at checkout · Apple Pay · Google Pay · UPI in India ·{' '}
+          <button className="pl-footnote-link" onClick={() => setShowRefund(true)}>14-day first-purchase refund window</button>
         </p>
       </section>
 
@@ -824,12 +883,30 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             <button className="pl-navlink" onClick={() => setView('docs')}>Docs</button>
             <button className="pl-navlink" onClick={() => setView('tutorials')}>Tutorials</button>
             <button className="pl-navlink" onClick={() => scrollTo('privacy')}>Privacy</button>
+            <button className="pl-navlink" onClick={() => setShowRefund(true)}>Refund policy</button>
             <button className="pl-navlink" onClick={() => setView('support')}>Support</button>
             <button className="pl-navlink" onClick={() => setView('login')}>Sign in</button>
             <button className="pl-navlink" onClick={() => setView('signup')}>Get started</button>
           </div>
         </div>
       </footer>
+
+      {/* ── Checkout error toast ─────────────────────────────── */}
+      {/* Only reachable for signed-in visitors (anonymous tier clicks
+          detour to signup instead of checkout). Persistent until
+          dismissed — the messages carry instructions ("try again in a
+          moment", a fallback URL), so auto-hiding them would strand
+          the reader mid-sentence. */}
+      {paymentError && (
+        <div className="pl-toast" role="alert">
+          <span style={{ overflowWrap: 'anywhere' }}>{paymentError}</span>
+          {onDismissPaymentError && (
+            <button className="pl-toast-x" onClick={onDismissPaymentError} aria-label="Dismiss">×</button>
+          )}
+        </div>
+      )}
+
+      <RefundPolicy isOpen={showRefund} onClose={() => setShowRefund(false)} />
     </div>
   );
 };

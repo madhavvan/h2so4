@@ -57,10 +57,20 @@ class GeoService {
     // keys we use. Wrapped in try/catch so a server outage degrades
     // to the timezone-only fallback instead of a red console error.
     const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    // Hard timeout so a slow/unreachable geo proxy can NEVER stall first
+    // paint. Without this, `await fetch` has no timeout — if the endpoint
+    // accepts the connection but never responds, the whole app hangs on
+    // "Initializing secure session..." forever (isLoading stays true). The
+    // abort routes us straight into the timezone-only fallback below, which
+    // is exactly the graceful-degradation path we already handle.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4000);
     try {
       const response = await fetch(`${API_BASE}/api/v1/geo`, {
         headers: { 'Accept': 'application/json' },
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
 
       if (!response.ok) throw new Error(`Geo proxy returned ${response.status}`);
 
@@ -96,6 +106,7 @@ class GeoService {
       this.cacheExpiry = Date.now() + this.CACHE_TTL;
       return this.cachedGeo;
     } catch {
+      clearTimeout(timeoutId);
       // Silent timezone-only fallback. Intentionally swallowed —
       // geo is best-effort, and surfacing the error to console
       // would re-create the noise the proxy was supposed to remove.

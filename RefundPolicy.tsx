@@ -24,8 +24,8 @@ interface RefundPolicyProps {
   onClose: () => void;
 }
 
-const EFFECTIVE_DATE = 'May 5, 2026';
-const LAST_UPDATED = 'May 5, 2026';
+const EFFECTIVE_DATE = 'July 7, 2026';
+const LAST_UPDATED = 'July 7, 2026';
 
 export function RefundPolicy({ isOpen, onClose }: RefundPolicyProps) {
   // Same smooth-modal pattern as ManageSubscription. Backdrop fades,
@@ -86,7 +86,7 @@ export function RefundPolicy({ isOpen, onClose }: RefundPolicyProps) {
         </div>
 
         <p>
-          This policy explains when and how minicaai (&ldquo;the Service&rdquo;, &ldquo;we&rdquo;, &ldquo;us&rdquo;) issues refunds for purchases of our AI meeting assistant. By purchasing a plan you agree to the terms below.
+          This policy explains when and how minicaai (&ldquo;the Service&rdquo;, &ldquo;we&rdquo;, &ldquo;us&rdquo;) issues refunds for purchases of our AI interview copilot. By purchasing a plan you agree to the terms below.
         </p>
         <p className="text-white/70">
           We aim to be fair: if you bought a plan you genuinely couldn&rsquo;t use, we&rsquo;ll refund it. If you&rsquo;ve consumed the value, we won&rsquo;t.
@@ -105,36 +105,42 @@ export function RefundPolicy({ isOpen, onClose }: RefundPolicyProps) {
               </thead>
               <tbody className="text-white/75">
                 <tr className="border-t border-white/5">
-                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Basic</strong><br /><span className="text-white/50 text-[11px]">$25 / ₹1,999, one-time, 3 meeting credits</span></td>
+                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Basic</strong><br /><span className="text-white/50 text-[11px]">$30 / ₹2,499 · one-time · one 30-minute interview</span></td>
                   <td className="px-4 py-2.5 align-top">14 days from purchase</td>
-                  <td className="px-4 py-2.5 align-top">Zero of 3 meeting credits used</td>
+                  <td className="px-4 py-2.5 align-top">Less than 2 hours of total session time</td>
                 </tr>
                 <tr className="border-t border-white/5 bg-white/[0.015]">
-                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Pro</strong><br /><span className="text-white/50 text-[11px]">$29/mo · ₹2,499/mo</span></td>
-                  <td className="px-4 py-2.5 align-top">7 days from the <strong className="text-white">first</strong> charge</td>
-                  <td className="px-4 py-2.5 align-top">Less than 60 minutes of total session time across all meetings</td>
+                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Pro</strong><br /><span className="text-white/50 text-[11px]">$50 / ₹4,199 · one-time · one 1-hour interview</span></td>
+                  <td className="px-4 py-2.5 align-top">14 days from purchase</td>
+                  <td className="px-4 py-2.5 align-top">Less than 2 hours of total session time</td>
                 </tr>
                 <tr className="border-t border-white/5">
-                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Max</strong><br /><span className="text-white/50 text-[11px]">$69/mo · ₹5,999/mo</span></td>
-                  <td className="px-4 py-2.5 align-top">7 days from the <strong className="text-white">first</strong> charge</td>
-                  <td className="px-4 py-2.5 align-top">Less than 60 minutes of total session time across all meetings</td>
+                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Max</strong><br /><span className="text-white/50 text-[11px]">$89 / ₹7,399 · one-time · three 1-hour interviews</span></td>
+                  <td className="px-4 py-2.5 align-top">14 days from purchase</td>
+                  <td className="px-4 py-2.5 align-top">Less than 2 hours of total session time</td>
                 </tr>
                 <tr className="border-t border-white/5 bg-white/[0.015]">
-                  <td className="px-4 py-2.5 align-top"><strong className="text-white">+1 hour renewal</strong><br /><span className="text-white/50 text-[11px]">$6.99 / ₹599</span></td>
+                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Ultra</strong><br /><span className="text-white/50 text-[11px]">$159/mo · ₹12,999/mo</span></td>
+                  <td className="px-4 py-2.5 align-top">14 days from the <strong className="text-white">first</strong> charge</td>
+                  <td className="px-4 py-2.5 align-top">Less than 2 hours of total session time</td>
+                </tr>
+                <tr className="border-t border-white/5">
+                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Interview extension</strong><br /><span className="text-white/50 text-[11px]">$25 / ₹2,099 top-up</span></td>
                   <td className="px-4 py-2.5 align-top">Not refundable once delivered</td>
                   <td className="px-4 py-2.5 align-top">—</td>
                 </tr>
               </tbody>
             </table>
           </div>
-          <p>A &ldquo;session&rdquo; is any active meeting-mode session, including ones ended early. Live transcription, screen-aware assistance, the always-on overlay, and chat usage during an active meeting all count toward session time.</p>
+          <p>These windows apply to your <strong className="text-white">first</strong> purchase of the Service. For repeat purchases, write to us anyway — we read every request and make fair exceptions.</p>
+          <p>A &ldquo;session&rdquo; is any active interview session, including ones ended early. Live transcription, Auto-Solve captures, the pop-out overlay, and chat usage during an active interview all count toward session time.</p>
           <p>Refund eligibility is determined by our session logs, which are immutable and timestamped.</p>
         </Section>
 
         <Section title={<>2. What is <strong className="text-white">not</strong> refundable</>}>
           <ul className="list-disc pl-5 space-y-1.5">
-            <li>Renewal credits ($6.99 / ₹599 top-up) once they&rsquo;ve been added to your balance, even if unused</li>
-            <li>Subscription periods <strong className="text-white">after</strong> the first billing cycle &mdash; cancel any time to stop the next renewal, but charges already made are not refunded</li>
+            <li>Interview extension top-ups ($25 / ₹2,099) once they&rsquo;ve been added to your balance, even if unused</li>
+            <li>Ultra billing cycles <strong className="text-white">after</strong> the first &mdash; cancel any time to stop the next renewal, but charges already made are not refunded</li>
             <li>Any plan after the eligibility window above has elapsed</li>
             <li>Any plan where the usage threshold has been exceeded</li>
             <li>Accounts terminated for violation of our Terms of Service (sharing credentials, automated abuse, etc.)</li>
@@ -168,13 +174,14 @@ export function RefundPolicy({ isOpen, onClose }: RefundPolicyProps) {
         </Section>
 
         <Section title="5. Cancellation is not the same as a refund">
+          <p>This section applies to the <strong className="text-white">Ultra</strong> subscription &mdash; one-time interview passes (Basic, Pro, Max) have nothing to cancel; they simply expire.</p>
           <p>Clicking <strong className="text-white">Cancel subscription</strong> in-app stops the next renewal charge. You keep access to your paid tier until the end of the current billing cycle &mdash; that&rsquo;s the value you already paid for. No refund is issued for the current cycle on cancellation.</p>
           <p>If you want to stop renewing <strong className="text-white">and</strong> be refunded for the current cycle, both must be requested &mdash; and the refund still depends on the eligibility window above.</p>
           <p>You can also reactivate a scheduled cancellation any time before the cycle ends, directly from the <strong className="text-white">Manage subscription</strong> screen.</p>
         </Section>
 
         <Section title="6. Service outages and downtime">
-          <p>If a verified service outage on our side prevents you from using the Service for more than 48 consecutive hours during your billing period, we&rsquo;ll apply a pro-rated credit to your next renewal automatically. This applies to subscription plans (Pro, Max). Basic users in this situation are eligible for a refund or replacement credits.</p>
+          <p>If a verified service outage on our side prevents you from using the Service for more than 48 consecutive hours during your billing period, we&rsquo;ll apply a pro-rated credit to your next renewal automatically. This applies to the <strong className="text-white">Ultra</strong> subscription. One-time pass holders (Basic, Pro, Max) in this situation are eligible for a refund or replacement interview credits.</p>
           <p>Outages on third-party services we depend on (Stripe, Razorpay, Deepgram, AI model providers, your internet, your camera/mic drivers) are not covered.</p>
         </Section>
 

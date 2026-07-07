@@ -2012,21 +2012,21 @@ interface ModelMeta {
 const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
   gemini: {
     short: 'Gemini',
-    label: 'Gemini 3.1 Flash',
+    label: 'Gemini 3.5 Flash',
     monogram: 'G',
     Icon: GeminiIcon,
     tier: 'free',
     brand: { fg: '#60a5fa', chip: 'rgba(59, 130, 246, 0.18)', accent: '#3b82f6' },
-    tagline: 'Fast and free — included on every plan.',
+    tagline: 'Google’s frontier Flash — fast, free on every plan.',
   },
   groq: {
     short: 'Groq',
-    label: 'Groq Llama 3',
+    label: 'GPT-OSS 120B · Groq',
     monogram: 'Q',
     Icon: GroqIcon,
     tier: 'basic',
     brand: { fg: '#fb923c', chip: 'rgba(249, 115, 22, 0.18)', accent: '#f97316' },
-    tagline: 'Llama 3 on Groq — sub-second answers.',
+    tagline: 'OpenAI’s open model on Groq silicon — sub-second answers.',
   },
   openai: {
     short: 'GPT',
@@ -2040,24 +2040,27 @@ const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
   },
   xai: {
     short: 'Grok',
-    label: 'Grok (xAI)',
+    label: 'Grok 4.3',
     monogram: 'X',
     Icon: GrokIcon,
     tier: 'basic',
     brand: { fg: '#e4e4e7', chip: 'rgba(228, 228, 231, 0.16)', accent: '#a1a1aa' },
-    tagline: 'Real-time knowledge from xAI — Grok.',
+    tagline: 'xAI’s flagship — real-time knowledge, fastest Grok yet.',
   },
   claude: {
     short: 'Claude',
-    label: 'Claude Sonnet 4.6',
+    label: 'Claude Sonnet 5',
     monogram: 'C',
     Icon: ClaudeIcon,
-    tier: 'max',
-    // Max card uses CSS-driven gold/cream tokens (see .mp-card-max in
+    // 2026-07 pricing: Claude unlocks at Pro (Basic is the only paid tier
+    // without it). The flagship CARD treatment is keyed on the model key,
+    // not this tier — see isFlagship in ModelPickerCard.
+    tier: 'pro',
+    // Flagship card uses CSS-driven gold/cream tokens (see .mp-card-max in
     // index.html); these brand fields are kept for any non-card surface
     // that still references them inline.
     brand: { fg: '#e9c876', chip: 'rgba(201, 165, 92, 0.16)', accent: '#c9a55c' },
-    tagline: 'Web Search · Train Model · Auto-Type — Max flagship.',
+    tagline: 'Live web search mid-answer — the flagship, from Pro up.',
     badge: { text: 'Flagship', kind: 'flagship' },
   },
 };
@@ -2105,7 +2108,9 @@ function ModelPickerCard({
   onLockedClick?: () => void;
 }) {
   const meta = MODEL_REGISTRY[modelKey];
-  const isMax = meta.tier === 'max';
+  // Flagship (gold) card treatment is keyed on the MODEL, not its gate tier —
+  // Claude unlocks at Pro (2026-07 pricing) but stays the visual flagship.
+  const isMax = modelKey === 'claude';
   const lockBadge = !allowed ? lockBadgeFor(meta.tier) : null;
   const handleClick = () => {
     if (allowed) onSelect();
@@ -2179,7 +2184,7 @@ function ModelPickerCard({
         ) : !allowed ? (
           <span className={`mp-card-lock${isMax ? ' mp-card-lock-max' : ''}`}>
             {isMax ? <span aria-hidden="true">✦</span> : null}
-            {isMax ? 'MAX' : 'PRO'}
+            {lockBadge}
           </span>
         ) : null}
       </span>
@@ -2286,7 +2291,7 @@ const HourBoundaryModal = ({ remainingSeconds, onDecision }: { remainingSeconds:
         </div>
       </div>
       <p className="text-sm text-gray-400 mb-5 leading-relaxed">
-        You've been live for 60 minutes. You have <span className="text-emerald-400 font-semibold">{formatTimeRemaining(remainingSeconds)}</span> left on your Basic plan. Continuing will use your next credit.
+        You've been live for 60 minutes. You have <span className="text-emerald-400 font-semibold">{formatTimeRemaining(remainingSeconds)}</span> of interview time left on your plan. Continuing will start your next interview hour.
       </p>
       <div className="flex gap-3">
         <button onClick={() => onDecision('stop')} className="flex-1 px-4 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-gray-300 text-sm font-semibold hover:bg-white/[0.08] transition-all">
@@ -2315,12 +2320,14 @@ const LowWarningToast = ({ remainingSeconds, onDismiss }: { remainingSeconds: nu
   );
 };
 
-// ── Exhausted modal — blocking; offers renew CTA for Basic, upgrade for Free
+// ── Exhausted modal — blocking; offers the +30-min extension for Basic,
+// plan picker for everyone (2026-07 model: Basic/Pro/Max are one-time
+// interviews, Ultra is the unlimited monthly subscription).
 const ExhaustedModal = ({
   source, actualTier, countryCode, onRenew, onUpgrade, onDismiss,
 }: {
   source: 'trial' | 'credits' | 'unlimited' | 'none';
-  actualTier: 'free' | 'basic' | 'pro' | 'max';
+  actualTier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
   countryCode: string;
   onRenew: () => void;
   onUpgrade: () => void;
@@ -2337,23 +2344,25 @@ const ExhaustedModal = ({
           </div>
           <div>
             <h3 className="text-base font-bold text-white">{wasTrial ? 'Trial complete' : "You're out of interview time"}</h3>
-            <p className="text-xs text-gray-500">{wasTrial ? 'Your 30-minute trial just ended.' : 'All credits have been used.'}</p>
+            <p className="text-xs text-gray-500">{wasTrial ? 'Your 30-minute trial just ended.' : 'This interview\'s time has been used.'}</p>
           </div>
         </div>
         <p className="text-sm text-gray-400 mb-5 leading-relaxed">
           {wasTrial
-            ? 'Grab the Basic plan to keep using the full feature set — 3 interview credits (3 hours) valid for 14 days.'
-            : 'Add another hour for a single renewal, or upgrade to Pro for unlimited sessions.'}
+            ? 'Buy the interview that\'s ahead of you — a 30-minute Basic, a 1-hour Pro with all five models, or go unlimited with Ultra.'
+            : actualTier === 'basic'
+              ? 'Extend this interview by 30 minutes, or pick a bigger pass — Pro is a full hour with Claude, Ultra is unlimited.'
+              : 'Grab another interview pass, or go unlimited with Ultra.'}
         </p>
         <div className="flex flex-col gap-2">
           {!wasTrial && actualTier === 'basic' && (
             <button onClick={onRenew} className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-bold transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2">
               <Zap size={14} />
-              Renew +1 hour · {pricingService.formatPrice(renewal.price, renewal.currencySymbol, renewal.currency)}
+              Extend +30 min · {pricingService.formatPrice(renewal.price, renewal.currencySymbol, renewal.currency)}
             </button>
           )}
           <button onClick={onUpgrade} className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-400 hover:to-purple-400 text-white text-sm font-bold transition-all shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2">
-            <Crown size={14} /> {wasTrial ? 'See plans' : 'Upgrade to Pro (Unlimited)'}
+            <Crown size={14} /> See plans
           </button>
           <button onClick={onDismiss} className="px-4 py-2 rounded-xl text-gray-500 text-xs font-medium hover:text-gray-300 transition-all">
             Dismiss
@@ -2431,18 +2440,18 @@ async function pollForExternalUpgrade(
   }
 }
 
-// Renewals don't change `tier` — they extend `expires_at` by ~1h via
+// Extensions don't change `tier` — they extend `expires_at` by ~30 min via
 // grantBasicRenewal on the server. We watch for a forward delta on the
-// license's expires_at; validateWithServer's renewal-credit propagation
-// path lands the +3600s credit locally as soon as the matching delta is
-// detected. 30-min lower bound on the delta absorbs clock skew but stays
-// well above any non-renewal noise.
+// license's expires_at; validateWithServer's extension-credit propagation
+// path lands the +1800s credit locally as soon as the matching delta is
+// detected. 15-min lower bound on the delta absorbs clock skew but stays
+// well above any non-extension noise.
 async function pollForExternalRenewal(onSuccess?: () => void) {
   if (externalCheckoutPollActive) return;
   externalCheckoutPollActive = true;
   const POLL_INTERVAL_MS = 4000;
   const POLL_TIMEOUT_MS = 10 * 60 * 1000;
-  const RENEWAL_THRESHOLD_MS = 30 * 60 * 1000;
+  const RENEWAL_THRESHOLD_MS = 15 * 60 * 1000;
   const startedAt = Date.now();
   const baselineExpires = licenseService.loadAuth().license?.expires_at || 0;
   try {
@@ -2455,7 +2464,7 @@ async function pollForExternalRenewal(onSuccess?: () => void) {
           emitCheckoutStatus({
             kind: 'completed',
             mode: 'renewal',
-            message: 'Renewal credit added — +1 hour now available.',
+            message: 'Extension added — +30 minutes now available.',
           });
           return;
         }
@@ -2690,11 +2699,11 @@ async function openProUpgrade(
   }
 }
 
-// ── Basic +1h renewal — opens the renewal-specific checkout ──
+// ── Basic +30-min extension — opens the extension-specific checkout ──
 // Distinct from openProUpgrade because the server treats it differently:
-// /create-renewal grants +1 hour for the renewal price (~$6.99 / ₹599),
-// whereas /create-checkout would charge full Basic ($25 / ₹2099) and
-// reset to a fresh 3h/14d plan. Wiring the Basic out-of-credits "Renew"
+// /create-renewal grants +30 minutes for the extension price ($25 / ₹2099),
+// whereas /create-checkout would charge full Basic ($30 / ₹2499) and
+// reset to a fresh 30-min interview. Wiring the Basic out-of-time "Extend"
 // button to openProUpgrade silently double-billed users — the cure here
 // is a sibling function that hits the right endpoint.
 async function openProRenewal(onSuccess?: () => void) {
@@ -2702,15 +2711,15 @@ async function openProRenewal(onSuccess?: () => void) {
   const token = licenseService.getToken();
   if (!token) {
     console.warn('[openProRenewal] No auth token — aborting.');
-    emitCheckoutStatus({ kind: 'no-token', mode: 'renewal', message: 'Please sign in first to renew.' });
+    emitCheckoutStatus({ kind: 'no-token', mode: 'renewal', message: 'Please sign in first to extend.' });
     return;
   }
-  emitCheckoutStatus({ kind: 'connecting', mode: 'renewal', message: 'Connecting to renewal checkout…' });
+  emitCheckoutStatus({ kind: 'connecting', mode: 'renewal', message: 'Connecting to extension checkout…' });
   try {
     const saved = licenseService.loadAuth();
     const countryCode = saved.user?.country_code || 'US';
 
-    const response = await fetch('https://api.minicaai.com/api/v1/payments/create-renewal', {
+    const response = await fetch(`${licenseService.getApiBase()}/api/v1/payments/create-renewal`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
       body: JSON.stringify({ country_code: countryCode }),
@@ -5186,23 +5195,13 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   }, [refreshAuthFromStorage]);
 
   const handleOpenUpgrade = useCallback(async () => {
-    // The action must match the label the user actually saw:
-    //   • Free / trial → ExhaustedModal label is "See plans". Open the plan
-    //     picker (ManageSubscription) so they can compare and choose Basic
-    //     vs Pro vs Max — anything else would be picking for them.
-    //   • Basic out-of-credits → label is "Upgrade to Pro (Unlimited)".
-    //     Go straight to Pro checkout — that's exactly what the button
-    //     promises, and it's the most common upgrade path from Basic.
-    //   • Pro / Max → shouldn't happen (these tiers have unlimited time
-    //     and won't see the modal), but route to the plan picker anyway
-    //     as a defensive default in case the modal slips through.
-    const liveTier = userLicense?.tier;
-    if (liveTier === 'basic') {
-      try { await openProUpgrade('pro', refreshAuthFromStorage); } catch (e) { console.warn('upgrade failed:', e); }
-      return;
-    }
+    // The ExhaustedModal button reads "See plans" for every tier (2026-07
+    // model: Basic/Pro/Max are one-time interview passes, Ultra is the
+    // unlimited subscription — there's no single obvious "next tier" to
+    // pre-pick for the user). Open the plan picker so they can compare
+    // and choose; every row there routes through the same checkout flow.
     setManageSubOpen(true);
-  }, [userLicense?.tier, refreshAuthFromStorage]);
+  }, []);
 
   const handleManualSend = () => {
     if (isPopoutThinClient) {

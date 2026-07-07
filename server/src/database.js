@@ -1378,16 +1378,18 @@ function extendLicenseExpiry(userId, days) {
   return getLicenseByUserId(userId);
 }
 
-// Basic-tier renewal top-up: +1 session credit, +1 hour wall-clock. The
-// renewal button charges a fraction of the full Basic price and must
-// only add to what's already there — NEVER reset back to 3 sessions /
-// 14 days (that would be a full re-purchase, not a renewal).
+// Basic-tier extension top-up: +1 session credit, +30 minutes. This is
+// the 2026-07 "+30 min" extension ($25 / ₹2099 — RENEWAL_* constants in
+// payments.js); the grant MUST match the marketed amount. It only adds
+// to what's already there — NEVER reset back to a full Basic grant
+// (that would be a re-purchase, not an extension).
 //
-// For Pro/Max (sessions_limit === -1, expires_at === -1), the renewal
-// product isn't offered in the UI; if it somehow triggered server-side,
-// we leave the unlimited values intact and only flip status→active.
-// For Free or expired users, we reactivate Basic with sessions_limit=1
-// and expires_at=now+1h — paying for a 1-hour session is a valid path.
+// For unlimited licenses (sessions_limit === -1, expires_at === -1 —
+// Ultra or admin comps), the extension product isn't offered in the UI;
+// if it somehow triggered server-side, we leave the unlimited values
+// intact and only flip status→active. For Free or expired users, we
+// reactivate Basic with sessions_limit+1 and expires_at=now+30min —
+// paying for a 30-minute session is a valid path.
 function grantBasicRenewal(userId) {
   const license = getLicenseByUserId(userId);
   if (!license) return null;
@@ -1414,16 +1416,18 @@ function grantBasicRenewal(userId) {
   } else {
     newLimit = (license.sessions_limit || 0) + 1;
     // Anchor from whichever is later: now, or the existing expiry. Then
-    // add 1h. An already-expired license starts its new 1h from now; a
-    // still-valid one gets its expiry pushed out by 1h.
+    // add 30 min. An already-expired license starts its new 30 min from
+    // now; a still-valid one gets its expiry pushed out by 30 min.
+    const EXTENSION_MS = ONE_HOUR_MS / 2;
+    const EXTENSION_S = ONE_HOUR_S / 2;
     const base = Math.max(Date.now(), license.expires_at || 0);
-    newExpiresAt = base + ONE_HOUR_MS;
+    newExpiresAt = base + EXTENSION_MS;
     // Credit time top-up. If the previous credit window already expired,
     // start fresh from 0 (don't carry over stale time the user couldn't
     // have used anyway). Otherwise stack on top of the existing balance.
     const creditsValid = (license.credits_expire_at || 0) > Date.now();
     const existingCredits = creditsValid ? (license.credits_remaining_seconds || 0) : 0;
-    newCreditsRemaining = existingCredits + ONE_HOUR_S;
+    newCreditsRemaining = existingCredits + EXTENSION_S;
     newCreditsExpireAt = newExpiresAt;
   }
 

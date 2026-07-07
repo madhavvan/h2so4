@@ -114,14 +114,14 @@ const TIER_INFO: Record<string, {
     color: 'text-emerald-400',
     gradient: 'from-emerald-600/40 to-emerald-800/40',
     icon: Zap,
-    blurb: 'Time-credited access to four models. Renewable.',
+    blurb: 'One 30-min interview · Gemini, GPT-5.5, Grok, Groq (no Claude). Extendable +30 min.',
   },
   pro: {
     label: 'Pro',
     color: 'text-blue-400',
     gradient: 'from-blue-600/50 to-purple-700/50',
     icon: Crown,
-    blurb: 'Unlimited time on Gemini, GPT-5.5, Grok, and Groq. Pop-out + Auto-Solve.',
+    blurb: 'One 1-hour interview · all five models incl. Claude Sonnet 5. Pop-out + Auto-Solve.',
   },
   max: {
     // WizardHat is the dedicated Max-tier identity icon (custom SVG at
@@ -1124,7 +1124,7 @@ export function ManageSubscription({
                           )}
                         </div>
                         <div className="text-[10.5px] text-amber-200/70 leading-relaxed">
-                          Pro is half the price and still gives you every model except Claude.
+                          Pro is half the price and keeps all five models, Claude Sonnet 5 included — you'd just go from three interviews down to one.
                         </div>
                       </div>
                     )}
@@ -1137,13 +1137,16 @@ export function ManageSubscription({
                     <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3 space-y-1.5">
                       <div className="text-[11px] font-bold uppercase tracking-wider text-white/60">What you'll lose at {formatExpiry(expiresAt)}</div>
                       <ul className="text-[12px] text-white/80 space-y-1 ml-2 list-disc list-inside">
-                        {tier === 'max' && <li>Claude Sonnet 4.6 access</li>}
-                        {tier === 'max' && <li>Auto-Type (typing into the editor for you)</li>}
+                        {/* Gate-accurate under 2026-07 pricing (mirrors FEATURE_GATES).
+                            This cancel panel only renders for Pro/Max — both include
+                            Claude + the four base models; Max alone adds reasoning-effort
+                            control. Auto-Type is Ultra-only, so it's never lost here. */}
+                        <li>Claude Sonnet 5 access</li>
                         {tier === 'max' && <li>Reasoning effort control</li>}
-                        {(tier === 'max' || tier === 'pro' || tier === 'basic') && <li>Gemini, Groq, GPT, and Grok models</li>}
-                        {(tier === 'max' || tier === 'pro' || tier === 'basic') && <li>Auto-Solve (screen-capture problem solving)</li>}
-                        {(tier === 'max' || tier === 'pro' || tier === 'basic') && <li>Pop-out window (screen-share invisible)</li>}
-                        {(tier === 'max' || tier === 'pro' || tier === 'basic') && <li>Unlimited context files + export history</li>}
+                        <li>Gemini, Groq, GPT, and Grok models</li>
+                        <li>Auto-Solve (screen-capture problem solving)</li>
+                        <li>Pop-out window (screen-share invisible)</li>
+                        <li>Unlimited context files + export history</li>
                         <li>Five sessions/month limit (Free)</li>
                       </ul>
                     </div>

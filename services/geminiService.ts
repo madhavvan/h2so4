@@ -3,8 +3,8 @@ import { Message, ContextFile } from "../types";
 
 export class GeminiService {
   private ai: GoogleGenAI | null = null;
-  // Updated to Gemini 3 Flash Preview for fast responses
-  private modelName = "gemini-3-flash-preview"; 
+  // Gemini 3.5 Flash — Google's frontier Flash, fast and free on every plan.
+  private modelName = "gemini-3.5-flash";
   private currentKey: string | null = null;
 
   constructor(apiKey?: string) {

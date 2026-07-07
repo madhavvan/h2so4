@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, Suspense, lazy } from 'react';
 import SupportBot from './SupportBot';
 import PremiumLanding from './PremiumLanding';
+// Pre-purchase refund disclosure on the mobile landing footer — same
+// modal ManageSubscription opens post-purchase.
+import { RefundPolicy } from './RefundPolicy';
 import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search, Copy, ChevronUp, FileText } from 'lucide-react';
 import { WizardHat } from './WizardHat';
 // Phosphor duotone — used on the public landing + auth surfaces for the
@@ -3397,6 +3400,10 @@ interface LandingMobileProps {
   isSubmitting: boolean;
   currentUser: UserProfile | null;
   setAuthError: (err: string | null) => void;
+  // Checkout feedback for the signed-in tier-click path — same contract
+  // as PremiumLanding's paymentError props (see the comment there).
+  paymentError?: string | null;
+  onDismissPaymentError?: () => void;
 }
 
 // Static content. Lifted out of the component so the [data-rise]
@@ -3425,10 +3432,14 @@ const MOBILE_TRUST = [
 
 const LandingMobile: React.FC<LandingMobileProps> = ({
   setView, geo, pricing, handleTierSelect, isSubmitting, currentUser, setAuthError,
+  paymentError, onDismissPaymentError,
 }) => {
   const [sheetOpen, setSheetOpen] = useState(false);
   const [sheetClosing, setSheetClosing] = useState(false);
   const [showStickyCTA, setShowStickyCTA] = useState(false);
+  // Refund policy modal — purchases start from this surface, so the
+  // policy must be readable before checkout (mirrors PremiumLanding).
+  const [showRefund, setShowRefund] = useState(false);
   const heroSentinelRef = useRef<HTMLDivElement>(null);
 
   const stepsScrollRef = useRef<HTMLDivElement>(null);
@@ -3918,9 +3929,17 @@ const LandingMobile: React.FC<LandingMobileProps> = ({
         <div className="flex items-center gap-3">
           <span>© {new Date().getFullYear()} minicaai</span>
           <span aria-hidden>·</span>
-          <span>Privacy</span>
+          {/* Real links — these were inert <span>s that only looked like
+              links. Privacy lives in the docs surface (PRIVACY.md); there
+              is no Terms document, so the slot links the refund policy,
+              which is the legal text purchases actually depend on. */}
+          <button className="ios-press" style={{ color: 'var(--ink-muted)' }} onClick={() => setView('docs')}>
+            Privacy
+          </button>
           <span aria-hidden>·</span>
-          <span>Terms</span>
+          <button className="ios-press" style={{ color: 'var(--ink-muted)' }} onClick={() => setShowRefund(true)}>
+            Refund policy
+          </button>
         </div>
         <button
           onClick={handleSupport}
@@ -4053,6 +4072,41 @@ const LandingMobile: React.FC<LandingMobileProps> = ({
           </div>
         </>
       )}
+
+      {/* ── Checkout error toast — floats above the sticky CTA ── */}
+      {/* Signed-in tier clicks go straight to initiateCheckout; its
+          failures land here (they used to be swallowed on this surface).
+          Persistent until dismissed — the copy carries instructions. */}
+      {paymentError && (
+        <div
+          role="alert"
+          style={{
+            position: 'fixed', left: 16, right: 16, zIndex: 30,
+            bottom: 'calc(max(env(safe-area-inset-bottom), 16px) + 78px)',
+            display: 'flex', alignItems: 'flex-start', gap: 10,
+            background: 'var(--cream)',
+            border: '1px solid color-mix(in oklab, var(--accent) 40%, var(--cream-line))',
+            borderLeft: '3px solid var(--accent)',
+            borderRadius: 16, padding: '12px 14px',
+            boxShadow: '0 18px 44px rgba(20, 20, 19, 0.18)',
+            color: 'var(--ink)', fontSize: 13.5, lineHeight: 1.5,
+          }}
+        >
+          <span style={{ overflowWrap: 'anywhere' }}>{paymentError}</span>
+          {onDismissPaymentError && (
+            <button
+              className="ios-press"
+              onClick={onDismissPaymentError}
+              aria-label="Dismiss"
+              style={{ color: 'var(--ink-muted)', fontSize: 17, lineHeight: 1, flexShrink: 0, background: 'none', border: 'none', padding: '2px 2px 0' }}
+            >
+              ×
+            </button>
+          )}
+        </div>
+      )}
+
+      <RefundPolicy isOpen={showRefund} onClose={() => setShowRefund(false)} />
     </div>
   );
 };
@@ -4477,7 +4531,7 @@ const TUTORIAL_STEPS = [
   { step: '04', title: 'Start an Interview',  desc: 'Share system audio, enable auto-mode, and let minicaai listen.', duration: '2 min' },
   { step: '05', title: 'Pop-out Mode',        desc: 'Launch the invisible overlay that floats over Zoom, Meet, Teams. (Pro)', duration: '1 min' },
   { step: '06', title: 'Auto-Solve',          desc: 'Capture the editor and let AI solve coding problems on demand. (Pro)', duration: '2 min' },
-  { step: '07', title: 'Switch AI Models',    desc: 'Pick between Gemini, GPT, Claude, Grok, Llama for different strengths.', duration: '1 min' },
+  { step: '07', title: 'Switch AI Models',    desc: 'Pick between Gemini 3.5, GPT-5.5, Claude Sonnet 5, Grok 4.3, Groq for different strengths.', duration: '1 min' },
   { step: '08', title: 'Manage Subscription', desc: 'Upgrade, manage billing, and view usage stats.', duration: '1 min' },
 ] as const;
 
@@ -7217,13 +7271,17 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       case 'basic':
         return 'Payment successful — 3 interview credits unlocked (valid 14 days).';
       case 'pro':
-        // Pro does NOT include Claude (that's Max-exclusive). Saying "all
-        // models" was a long-running copy bug that promised something
-        // Pro doesn't deliver. The honest line lists what's actually new
-        // vs. Free / Basic without naming Claude.
-        return 'Payment successful — Pro activated. Unlimited sessions, GPT-5.5, Grok, and Llama unlocked.';
+        // 2026-07 pricing: Claude unlocks AT Pro (Basic is the only paid
+        // tier without it). Pro = one full-hour interview + the complete
+        // five-model lineup. Auto-Type stays Ultra-exclusive, so it's not
+        // named here.
+        return 'Payment successful — Pro activated. A full hour plus every model — Claude Sonnet 5, GPT-5.5, Grok 4.3, Gemini 3.5, and Groq — now unlocked.';
       case 'max':
-        return 'Payment successful — Max activated. Claude Sonnet 4.6, Auto-Type, and everything in Pro is now live.';
+        // Max = three full-hour interviews, same complete model lineup as
+        // Pro. No Auto-Type (Ultra only) — the value is the extra hours.
+        return 'Payment successful — Max activated. Three full-hour interviews with every model, including Claude Sonnet 5.';
+      case 'ultra':
+        return 'Payment successful — Ultra activated. Unlimited interviews, Auto-Type, and every model including Claude Sonnet 5 — all live.';
       default:
         return 'Payment successful — your plan is active.';
     }
@@ -8503,17 +8561,28 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
   // ── Loading ──
   if (isLoading) {
+    // First paint of minicaai.com (geo resolve, ≤4s) — and the desktop
+    // app's boot frame. Must speak the landing's obsidian-and-gold
+    // language, not the legacy blue-robot SaaS look, or the cut into
+    // PremiumLanding reads as two different products. Just the serif
+    // wordmark over obsidian with one breathing gold hairline — the
+    // same "single light in a dark theater" idea the hero opens on.
     return (
-      <div className="fixed inset-0 bg-[#050507] flex items-center justify-center">
-        <AnimatedBackground />
-        <div className="relative z-10 flex flex-col items-center gap-6">
-          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-blue-500 via-blue-600 to-purple-600 flex items-center justify-center shadow-2xl shadow-blue-500/30 animate-pulse">
-            <Bot size={32} className="text-white" strokeWidth={1.5} />
-          </div>
-          <div className="flex items-center gap-3">
-            <Loader2 size={16} className="text-blue-400 animate-spin" />
-            <span className="text-sm text-gray-500 font-medium">Initializing secure session...</span>
-          </div>
+      <div className="fixed inset-0 flex items-center justify-center" style={{ background: '#070706' }}>
+        <style>{`
+          @keyframes gate-breathe{0%,100%{opacity:.25;transform:scaleX(.45);}50%{opacity:1;transform:scaleX(1);}}
+          @media (prefers-reduced-motion: reduce){.gate-breathe{animation:none !important;opacity:.7 !important;}}
+        `}</style>
+        <div className="flex flex-col items-center gap-5" role="status" aria-live="polite">
+          <span style={{ fontFamily: 'var(--serif)', fontSize: 30, fontWeight: 600, letterSpacing: '-0.02em', color: 'var(--paper)' }}>
+            minicaai<span style={{ color: 'var(--gold)' }}>.</span>
+          </span>
+          <span
+            aria-hidden
+            className="gate-breathe"
+            style={{ width: 44, height: 2, borderRadius: 1, background: 'linear-gradient(90deg,transparent,var(--gold),transparent)', animation: 'gate-breathe 1.4s ease-in-out infinite', willChange: 'transform,opacity' }}
+          />
+          <span className="sr-only">Loading</span>
         </div>
       </div>
     );
@@ -9197,6 +9266,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   //  LANDING PAGE
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'landing') {
+    // isSubmitting covers the auth forms; paymentLoading covers the
+    // signed-in tier-click → initiateCheckout window. The landings take
+    // one merged busy flag so a click can't double-fire checkout while
+    // the first request is still in flight.
+    const landingBusy = isSubmitting || paymentLoading;
     if (isMobile) {
       return (
         <LandingMobile
@@ -9204,9 +9278,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           geo={geo}
           pricing={pricing}
           handleTierSelect={handleTierSelect}
-          isSubmitting={isSubmitting}
+          isSubmitting={landingBusy}
           currentUser={currentUser}
           setAuthError={setAuthError}
+          paymentError={paymentError}
+          onDismissPaymentError={() => setPaymentError(null)}
         />
       );
     }
@@ -9220,7 +9296,9 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         setView={setView}
         pricing={pricing}
         handleTierSelect={handleTierSelect}
-        isSubmitting={isSubmitting}
+        isSubmitting={landingBusy}
+        paymentError={paymentError}
+        onDismissPaymentError={() => setPaymentError(null)}
       />
     );
     // eslint-disable-next-line no-unreachable
@@ -9393,7 +9471,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               {
                 Icon: PhCpu,
                 title: 'Reasons in your voice',
-                body: 'Picks the model that fits the question — GPT, Claude Sonnet 4.6, Gemini, Grok, Llama — and shapes the answer to your résumé and the role.',
+                body: 'Picks the model that fits the question — GPT-5.5, Claude Sonnet 5, Gemini 3.5, Grok 4.3, Groq — and shapes the answer to your résumé and the role.',
               },
               {
                 Icon: PhShield,

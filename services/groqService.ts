@@ -3,8 +3,9 @@ import { Message, ContextFile } from "../types";
 
 export class GroqService {
   private groq: Groq | null = null;
-  // Using the requested Llama 4 Scout model
-  private modelName = "meta-llama/llama-4-scout-17b-16e-instruct";
+  // GPT-OSS-120B on Groq silicon — matches the server proxy (ai.js) and the
+  // "GPT-OSS 120B · Groq" label in the model picker. (Was Llama-4-Scout-17B.)
+  private modelName = "openai/gpt-oss-120b";
 
   public init(apiKey: string) {
     this.groq = new Groq({

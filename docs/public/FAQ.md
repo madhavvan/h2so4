@@ -33,10 +33,10 @@ The desktop app is where you do the actual interview. The website (minicaai.com)
 ## 2. Plans and billing
 
 **What plans are there?**
-Free, Basic, Pro, and Max. Free is genuinely free (no card required). Basic, Pro, and Max are paid subscriptions. See **[Tiers & Billing](./TIERS.md)** for the full feature breakdown.
+Free, Basic, Pro, Max, and Ultra. Free is genuinely free (no card required). Basic, Pro, and Max are **one-time interview purchases** — no recurring charge. Ultra is the only monthly subscription. See **[Tiers & Billing](./TIERS.md)** for the full feature breakdown.
 
 **How much do they cost?**
-Pricing varies by region. The website's **Pricing page** shows your local currency once we detect your region. In USD: Pro is $29/month, Max is $69/month, Basic is $25 for a 3-credit pack (one-time, no auto-renew on the pack itself).
+Pricing varies by region. The website's **Pricing page** shows your local currency once we detect your region. In USD: Basic is $30 (one 30-minute interview), Pro is $50 (one 1-hour interview), Max is $89 (three 1-hour interviews) — all one-time. Ultra is $159/month for unlimited interviews plus Auto-Type.
 
 **Can I try before I buy?**
 Yes. Free tier gives you 5 sessions of 30 minutes total trial time on Gemini, with one knowledge file. No card on file, no auto-conversion to paid.

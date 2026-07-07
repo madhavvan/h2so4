@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     OG CARD SOURCE — renders public/og.png (1200×630).
+
+     The card is the landing's thesis compressed to one frame: the
+     hero sentence caught mid-type on obsidian, gold reserved for
+     the answered half and the caret. Palette + faces must track
+     PremiumLanding.tsx (--gold* set, Newsreader/Inter).
+
+     Regenerate after changing hero copy or brand palette:
+       msedge --headless=new --disable-gpu ^
+         --user-data-dir=%TEMP%\og-profile ^
+         --window-size=1200,630 --hide-scrollbars ^
+         --virtual-time-budget=9000 ^
+         --screenshot=public/og.png scripts/og/og.html
+     (needs network for Google Fonts; virtual-time budget lets the
+     fonts land before capture)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,500&family=Inter:wght@400;500;600;700&display=block" />
+<style>
+  :root{
+    --ink:#070706; --paper:#f2efe6; --mut:#9d968a; --faint:#645e54;
+    --gold-1:#f6e4b0; --gold-2:#d9b874; --gold-3:#b58f45; --gold:#d3ac63;
+    --gold-line:rgba(211,172,99,.24); --gold-glow:rgba(211,172,99,.16);
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{width:1200px;height:630px;overflow:hidden;}
+  body{
+    background:var(--ink);
+    color:var(--paper);
+    font-family:'Inter',sans-serif;
+    position:relative;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* Stage light — one directional pool upper-left, where the words sit. */
+  .light{
+    position:absolute;left:-8%;top:-22%;width:78%;height:110%;
+    background:radial-gradient(56% 50% at 40% 40%, rgba(226,193,120,.13), rgba(211,172,99,.04) 48%, transparent 74%);
+  }
+  .vignette{
+    position:absolute;inset:0;
+    background:radial-gradient(115% 92% at 50% 10%, transparent 44%, rgba(0,0,0,.55) 100%);
+  }
+  .grain{
+    position:absolute;inset:0;opacity:.05;mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size:140px 140px;
+  }
+  .frame{
+    position:absolute;inset:0;padding:74px 84px;
+    display:flex;flex-direction:column;justify-content:space-between;
+  }
+  .eyebrow{
+    font-size:17px;font-weight:600;letter-spacing:.34em;text-transform:uppercase;
+    color:var(--gold);
+  }
+  h1{
+    font-family:'Newsreader',Georgia,serif;font-weight:500;
+    font-size:79px;line-height:1.06;letter-spacing:-0.028em;
+    max-width:1060px;
+  }
+  .gold{
+    font-style:italic;
+    background:linear-gradient(100deg,var(--gold-1),var(--gold-2) 52%,var(--gold-3));
+    -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  }
+  .caret{
+    display:inline-block;width:5px;height:.82em;margin-left:10px;vertical-align:-.06em;
+    background:var(--gold);border-radius:2px;box-shadow:0 0 22px var(--gold-glow);
+  }
+  .foot{
+    display:flex;align-items:baseline;justify-content:space-between;
+    border-top:1px solid var(--gold-line);padding-top:26px;
+  }
+  .wordmark{
+    font-family:'Newsreader',Georgia,serif;font-weight:600;font-size:34px;
+    letter-spacing:-0.02em;color:var(--paper);
+  }
+  .wordmark b{color:var(--gold);font-weight:600;}
+  .tag{font-size:17px;color:var(--faint);letter-spacing:.02em;}
+</style>
+</head>
+<body>
+  <div class="light"></div>
+  <div class="vignette"></div>
+  <div class="grain"></div>
+  <div class="frame">
+    <div class="eyebrow">Real-time interview copilot</div>
+    <h1>
+      <span>Every interview question,</span><br />
+      <span class="gold">answered the moment it&rsquo;s asked.</span><span class="caret"></span>
+    </h1>
+    <div class="foot">
+      <span class="wordmark">minicaai<b>.</b></span>
+      <span class="tag">Invisible on screen-share &nbsp;&middot;&nbsp; Zoom &middot; Meet &middot; Teams &nbsp;&middot;&nbsp; minicaai.com</span>
+    </div>
+  </div>
+</body>
+</html>
