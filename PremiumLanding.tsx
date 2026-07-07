@@ -40,7 +40,8 @@ const TIER_MARK: Partial<Record<PricingTier['id'], React.ComponentType<{ size?: 
 //  theater: a reading lamp that follows the cursor (brightens when you pause
 //  to read), dust motes drifting in the hero projector beam, a rim light that
 //  counters the hero card's tilt, gold foil catching light as headlines
-//  reveal, hairlines that draw themselves, and the step number you're on
+//  reveal, hairlines that draw themselves, a capture scan-line that reads
+//  the shared frame and finds nothing, and the step number you're on
 //  lighting up like the current teleprompter line. All transform/opacity
 //  only, all driven off refs (the typing hero re-renders 60×; effects must
 //  not ride the React render loop), all off under prefers-reduced-motion.
@@ -184,6 +185,50 @@ const CSS = `
   78%{opacity:calc(var(--o,.3)*.55);}
   100%{transform:translate3d(var(--dx,0px),-250px,0);opacity:0;}
 }
+/* ── The capture test (Invisible by design) ──
+   Two IDENTICAL mini screen-share frames, overlapped: the back frame is
+   what the interviewer's capture receives, the front is the same screen
+   on your glass — plus the gold answer card. The only difference between
+   the frames IS the card; a scan-line periodically reads the captured
+   frame and finds nothing. The one foreign color on the page is the
+   6px recording dot: recording lights are red in the physical world. */
+.pl-cap{position:relative;max-width:520px;margin-left:auto;}
+.pl-frame{border-radius:12px;overflow:hidden;background:linear-gradient(180deg,#0e0d0b,#090807);
+  border:1px solid var(--line);}
+.pl-frame--back{position:relative;opacity:.92;
+  box-shadow:0 24px 60px -30px rgba(0,0,0,.85);}
+.pl-frame--front{position:relative;margin-top:26px;
+  border-color:var(--gold-line);
+  box-shadow:0 34px 90px -34px rgba(0,0,0,.92), 0 0 60px -24px var(--gold-glow), inset 0 1px 0 rgba(255,255,255,.05);}
+.pl-chrome{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid var(--line);}
+.pl-dot3{display:flex;gap:5px;}
+.pl-dot3 i{width:7px;height:7px;border-radius:50%;background:rgba(255,255,255,.12);}
+.pl-addr{flex:1;min-width:0;font-size:10px;letter-spacing:.03em;color:var(--faint);
+  background:rgba(255,255,255,.035);border-radius:6px;padding:4px 9px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.pl-sharepill{display:inline-flex;align-items:center;gap:5px;flex-shrink:0;
+  font-size:8.5px;font-weight:700;letter-spacing:.14em;color:var(--mut);
+  border:1px solid var(--line);border-radius:999px;padding:3px 8px;}
+.pl-recdot{width:6px;height:6px;border-radius:50%;background:#b0524a;
+  box-shadow:0 0 6px rgba(176,82,74,.55);animation:pl-recblink 2.2s ease-in-out infinite;}
+@keyframes pl-recblink{0%,100%{opacity:1;}50%{opacity:.35;}}
+.pl-editor{position:relative;display:flex;gap:12px;padding:14px 14px 16px;overflow:hidden;}
+.pl-gutter{display:flex;flex-direction:column;gap:9px;font-size:9px;line-height:7px;
+  color:var(--faint);opacity:.55;font-variant-numeric:tabular-nums;text-align:right;}
+.pl-lines{flex:1;display:flex;flex-direction:column;gap:9px;}
+.pl-skl{height:7px;border-radius:4px;background:rgba(255,255,255,.075);}
+.pl-scan{position:absolute;top:0;bottom:0;width:1px;background:linear-gradient(180deg,transparent,var(--gold-line),transparent);
+  box-shadow:0 0 14px rgba(211,172,99,.25);opacity:0;animation:pl-scanmove 5.2s ease-in-out infinite;}
+@keyframes pl-scanmove{0%,54%{left:4%;opacity:0;}58%{opacity:.9;}88%{opacity:.9;}96%,100%{left:96%;opacity:0;}}
+.pl-captag{position:absolute;top:-9px;left:12px;z-index:3;font-size:9px;font-weight:700;
+  letter-spacing:.18em;text-transform:uppercase;padding:3px 9px;border-radius:999px;
+  background:#0b0a08;border:1px solid var(--line);color:var(--faint);}
+.pl-captag--you{border-color:var(--gold-line);color:var(--gold);}
+.pl-mini{position:absolute;right:10px;bottom:10px;width:min(66%,250px);z-index:2;
+  background:linear-gradient(180deg,#141109,#0c0a07);border:1px solid var(--gold-line);
+  border-radius:10px;padding:10px 12px;
+  box-shadow:0 18px 44px -18px rgba(0,0,0,.9), 0 0 30px -12px var(--gold-glow), inset 0 1px 0 rgba(255,255,255,.06);}
+@media (max-width:980px){ .pl-cap{margin-left:0;} }
 .pl-wave{display:flex;align-items:flex-end;gap:2.5px;height:22px;}
 .pl-wave i{display:block;width:2.5px;border-radius:999px;background:linear-gradient(to top,var(--gold-3),var(--gold-1));
   animation:pl-eq 1.15s ease-in-out infinite;}
@@ -267,6 +312,41 @@ const Magnetic: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     </div>
   );
 };
+
+// The capture test — one screen, rendered twice. Deterministic skeleton
+// [indent px, width %] so both frames are pixel-identical; the only
+// difference the reader can find is the gold answer card in the front one.
+const SKELINES: [number, number][] = [
+  [0, 62], [14, 46], [14, 74], [28, 38], [28, 58], [14, 30], [0, 52],
+];
+
+const ShareFrame: React.FC<{ overlay?: boolean; scan?: boolean }> = ({ overlay, scan }) => (
+  <div className={`pl-frame ${overlay ? 'pl-frame--front' : 'pl-frame--back'}`}>
+    <span className={`pl-captag${overlay ? ' pl-captag--you' : ''}`}>{overlay ? 'You see' : 'They see'}</span>
+    <div className="pl-chrome">
+      <span className="pl-dot3"><i /><i /><i /></span>
+      <span className="pl-addr">codesignal.com/assessment — final round</span>
+      <span className="pl-sharepill"><span className="pl-recdot" /> SHARING</span>
+    </div>
+    <div className="pl-editor">
+      <span className="pl-gutter">{SKELINES.map((_, i) => <span key={i}>{i + 1}</span>)}</span>
+      <span className="pl-lines">
+        {SKELINES.map(([ind, w], i) => (
+          <span key={i} className="pl-skl" style={{ marginLeft: ind, width: `${w}%` }} />
+        ))}
+      </span>
+      {scan && <span className="pl-scan" />}
+      {overlay && (
+        <div className="pl-mini">
+          <div className="pl-gold" style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', marginBottom: 5 }}>You say</div>
+          <p className="pl-serif" style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--paper)', margin: 0 }}>
+            Start with the trade-offs, then the design…<span className="pl-caret" style={{ height: '.8em' }} />
+          </p>
+        </div>
+      )}
+    </div>
+  </div>
+);
 
 const HERO_LINE = 'answered the moment it’s asked.';
 const ANSWER = 'I’d anchor it on an event backbone — Kafka — with stateless scoring pulling features from Redis, and the model behind a feature cache so p99 holds under 50ms.';
@@ -604,15 +684,19 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
               minicaai runs in a content-protected window the interviewer cannot capture — on Zoom, Meet, or Teams, even mid screen-share. Your edge stays yours.
             </p>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-            <div style={{ border: '1px solid var(--line)', borderRadius: 14, padding: 16, background: 'rgba(255,255,255,.01)' }}>
-              <div style={{ fontSize: 10, letterSpacing: '.16em', textTransform: 'uppercase', color: 'var(--faint)', marginBottom: 12 }}>They see</div>
-              <div style={{ height: 72, borderRadius: 8, border: '1px dashed rgba(255,255,255,.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--faint)', fontSize: 12 }}>your shared screen</div>
+          {/* The capture test. Two IDENTICAL frames — same chrome, same code
+              skeleton, same SHARING pill — so the one visible difference IS
+              the claim: the gold card exists only on your glass. The scan
+              line reads the captured frame and finds nothing. Decorative
+              (the copy on the left carries the claim), hence aria-hidden. */}
+          <div aria-hidden="true">
+            <div className="pl-cap">
+              <ShareFrame scan />
+              <ShareFrame overlay />
             </div>
-            <div style={{ border: '1px solid var(--gold-line)', borderRadius: 14, padding: 16, background: 'linear-gradient(180deg,rgba(211,172,99,.06),transparent)' }}>
-              <div className="pl-gold" style={{ fontSize: 10, letterSpacing: '.16em', textTransform: 'uppercase', marginBottom: 12 }}>You see</div>
-              <div style={{ height: 72, borderRadius: 8, border: '1px solid var(--gold-line)', padding: 10, fontSize: 11.5, lineHeight: 1.4, color: '#d9d3c6' }}>“Start with the trade-offs, then the design…”<span className="pl-caret" /></div>
-            </div>
+            <p style={{ maxWidth: 520, marginLeft: 'auto', marginTop: 16, fontSize: 12, color: 'var(--faint)', letterSpacing: '.02em', textAlign: 'right' }}>
+              One screen, mid share — the answer card never reaches the captured pixels.
+            </p>
           </div>
         </div>
 
