@@ -427,4 +427,55 @@ function renderAccessEndedEmail({ name, previousTier, buyBasicUrl, signInUrl }) 
   return { subject: `Your ${safeTier} access has ended — Free plan is active`, html, text };
 }
 
-module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail, renderTierChangeEmail, renderCancellationEmail, renderAccessEndedEmail };
+// ── Google Sign-In linked (security notice) ──────────────────
+// Sent when a Google sign-in is auto-linked to an EXISTING account that
+// already has a password (routes/auth.js, both /google and the browser
+// callback flow). This is the pre-hijack tripwire: if an attacker
+// registered this email+password before the real owner ever signed in,
+// the owner's first Google sign-in merges onto the attacker's account —
+// this email is what tells the real owner that a password they may never
+// have created exists, and resetting it is how they evict the attacker.
+// Deliberately loud about the "this wasn't you" path.
+function renderGoogleLinkedEmail({ name }) {
+  const safeName = (name || 'there').toString().replace(/</g, '&lt;');
+  const resetHint = 'https://minicaai.com';
+
+  const text = [
+    `Hi ${safeName},`,
+    '',
+    'Google Sign-In was just linked to your minicaai account. From now on you can sign in with Google or with your existing password — both work.',
+    '',
+    'As a precaution, every other signed-in session was logged out; only the device that just signed in with Google stays active.',
+    '',
+    "IMPORTANT: if you didn't do this — or you never set a password on this account — someone else may know that password. Open the app or minicaai.com, use \"Forgot password\", and choose a new one now. That locks out anyone else immediately.",
+    '',
+    '— The minicaai team',
+  ].join('\n');
+
+  const html = `<!doctype html>
+<html><body style="margin:0;padding:0;background:#050507;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e5e7eb">
+  <div style="max-width:560px;margin:0 auto;padding:40px 24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:32px">
+      <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:inline-block"></div>
+      <div style="font-weight:700;font-size:18px;color:#fff">minicaai</div>
+    </div>
+    <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 16px">Google Sign-In was linked to your account</h1>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 16px">
+      Hi ${safeName}, Google Sign-In was just linked to your minicaai account. From now on you can sign in with Google or with your existing password — both work.
+    </p>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 24px">
+      As a precaution, every other signed-in session was logged out; only the device that just signed in with Google stays active.
+    </p>
+    <p style="font-size:13px;line-height:1.6;color:#fca5a5;background:#1f1416;border:1px solid #4c1d24;border-radius:8px;padding:12px 14px;margin:0 0 24px">
+      <strong>Didn't do this — or never set a password on this account?</strong> Someone else may know that password. Use "Forgot password" in the app or on <a href="${resetHint}" style="color:#f87171">minicaai.com</a> to choose a new one now; that locks out anyone else immediately.
+    </p>
+    <div style="border-top:1px solid #1f2937;padding-top:16px;font-size:12px;color:#6b7280;line-height:1.6">
+      You're receiving this because a Google account with your email address signed in to minicaai.
+    </div>
+  </div>
+</body></html>`;
+
+  return { subject: 'Security notice: Google Sign-In was linked to your minicaai account', html, text };
+}
+
+module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail, renderTierChangeEmail, renderCancellationEmail, renderAccessEndedEmail, renderGoogleLinkedEmail };

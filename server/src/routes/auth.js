@@ -217,9 +217,30 @@ router.post('/google', async (req, res) => {
       // Check if email already exists (signed up with password before)
       user = db.getUserByEmail(email);
       if (user) {
-        // Link Google to existing account
+        // Link Google to existing account — two guards close the silent
+        // pre-hijack chain (attacker signs up with the victim's email + a
+        // password they know; victim later clicks "Sign in with Google" and
+        // silently merges onto the attacker's account, who keeps password
+        // access):
+        //  1. Only a VERIFIED Google email may absorb an existing account —
+        //     otherwise the same attack runs in reverse with an unverified
+        //     Google identity for the victim's address.
+        //  2. If the account already has a password, revoke every session
+        //     from before the link and notify the address owner. A password-
+        //     holding attacker loses their live sessions, and the real owner
+        //     learns a password exists that they may never have set (the
+        //     email tells them to reset it, which evicts the attacker).
+        if (payload.email_verified !== true) {
+          return res.status(403).json({ error: "This Google account's email address is unverified, so it can't be linked to an existing minicaai account. Verify the email with Google, or sign in with your password." });
+        }
+        const hadPassword = !!user.password_hash;
         db.linkGoogleAccount(user.id, googleId, picture);
         user = db.getUserById(user.id);
+        if (hadPassword) {
+          db.revokeOtherSessions(user.id);
+          const { subject, html, text } = renderGoogleLinkedEmail({ name: user.name });
+          sendMail({ to: user.email, subject, html, text }).catch(() => { /* mail outage non-fatal */ });
+        }
       } else {
         // Create new user via Google
         isNewUser = true;
@@ -332,6 +353,20 @@ router.get('/google/start', (req, res) => {
   const { session_id } = req.query;
   if (!session_id) return res.status(400).send('Missing session_id');
 
+  // session_id is CLIENT-generated and later redeems the signed-in user's
+  // JWT at /google/poll — so it must carry real entropy. The app has always
+  // sent crypto.randomUUID() (36 chars, since the flow shipped); enforce
+  // UUID-class shape so a hand-rolled short/guessable id (poll-hijack,
+  // device-flow-class weakness) is refused before a session is created.
+  // Cap the pending map so a scripted caller can't balloon server memory
+  // with junk ids inside the 5-minute TTL window.
+  if (typeof session_id !== 'string' || !/^[A-Za-z0-9_-]{21,64}$/.test(session_id)) {
+    return res.status(400).send('Invalid session_id');
+  }
+  if (pendingGoogleSessions.size >= 5000 && !pendingGoogleSessions.has(session_id)) {
+    return res.status(503).send('Sign-in is briefly unavailable. Please try again in a minute.');
+  }
+
   // Both vars are required for the server-side redirect flow used by Electron —
   // CLIENT_SECRET is consumed in /google/callback by oauth2Client.getToken(code).
   const googleClientId = process.env.GOOGLE_CLIENT_ID;
@@ -412,8 +447,21 @@ router.get('/google/callback', async (req, res) => {
     if (!user) {
       user = db.getUserByEmail(email);
       if (user) {
+        // Same link hardening as POST /google above: only a verified Google
+        // email may absorb an existing account, and a pre-existing password
+        // triggers revoke-all-prior-sessions + a security email to the owner.
+        if (payload.email_verified !== true) {
+          pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: "This Google account's email is unverified, so it can't be linked to an existing account. Sign in with your password instead." });
+          return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Email not verified</h2><p style="color:#9ca3af">This Google account&#39;s email is unverified, so it can&#39;t be linked to an existing minicaai account.</p></div></body></html>');
+        }
+        const hadPassword = !!user.password_hash;
         db.linkGoogleAccount(user.id, googleId, picture);
         user = db.getUserById(user.id);
+        if (hadPassword) {
+          db.revokeOtherSessions(user.id);
+          const { subject, html, text } = renderGoogleLinkedEmail({ name: user.name });
+          sendMail({ to: user.email, subject, html, text }).catch(() => { /* mail outage non-fatal */ });
+        }
       } else {
         isNewUser = true;
         const userId = uuidv4();
@@ -567,7 +615,7 @@ router.get('/google/poll', (req, res) => {
 //  3. POST /reset-password  → consume token, update password
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-const { sendMail, renderPasswordResetEmail } = require('../email');
+const { sendMail, renderPasswordResetEmail, renderGoogleLinkedEmail } = require('../email');
 
 router.post('/forgot-password', async (req, res) => {
   try {

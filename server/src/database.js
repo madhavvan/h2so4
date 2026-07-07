@@ -1337,6 +1337,20 @@ function forceLogoutUser(userId) {
     .run(Date.now(), Date.now(), userId);
 }
 
+// Same revocation, but with the cutoff floored to the second boundary so a
+// replacement token issued LATER IN THE SAME REQUEST survives. jwt `iat` is
+// whole seconds: a raw Date.now() cutoff sits a few hundred ms past the new
+// token's iat*1000 and would kill the fresh token too — the same race
+// applyPasswordReset documents above. Use this variant whenever the caller
+// hands the user a new token in the same response (e.g. the Google-link
+// hardening in routes/auth.js); forceLogoutUser stays raw-ms for admin
+// force-logout, where killing everything is the point.
+function revokeOtherSessions(userId) {
+  const cutoff = Math.floor(Date.now() / 1000) * 1000;
+  getDB().prepare('UPDATE users SET tokens_revoked_after = ?, updated_at = ? WHERE id = ?')
+    .run(cutoff, cutoff, userId);
+}
+
 // Hot path — called on every authenticated request. Returns 0 if never set.
 function getTokensRevokedAfter(userId) {
   const row = getDB().prepare('SELECT tokens_revoked_after FROM users WHERE id = ?').get(userId);
@@ -2564,7 +2578,7 @@ module.exports = {
   getStats,
   getTrends, getTopCustomers, getMRRBreakdown, getARPUBreakdown, getChurnRate, getEngagement, getSuspiciousActivity,
   // Admin actions / audit
-  logAdminAction, getAuditLog, forceLogoutUser, getTokensRevokedAfter,
+  logAdminAction, getAuditLog, forceLogoutUser, revokeOtherSessions, getTokensRevokedAfter,
   queryAuditLog, getAuditActions, getAuditAdmins,
   // Support bot — threads + messages
   createSupportThread, getSupportThread, findResumableSupportThread,

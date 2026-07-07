@@ -1,0 +1,47 @@
+# Repo-wide checks on every push/PR. Three gates:
+#   1. tsc --noEmit  — renderer type drift (root `npm run lint`)
+#   2. vitest run    — server suite (server/test, 431 tests as of 2026-07)
+#   3. node --check  — syntax over every server CJS file; the server has no
+#                      build step, so without this a typo ships silently
+#
+# The Electron binary is skipped at install (tsc doesn't need it) to keep
+# the job fast. Signing/notarization workflows live separately.
+name: CI
+
+on:
+  push:
+    branches: [master, main, 'fix/**']
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+
+      - name: Install (root)
+        run: npm ci
+
+      - name: Typecheck renderer
+        run: npm run lint
+
+      - name: Install (server)
+        run: npm ci
+        working-directory: server
+
+      - name: Server tests
+        run: npm test
+        working-directory: server
+
+      - name: Server syntax check
+        run: find server/src -name '*.js' -print0 | xargs -0 -n1 node --check
