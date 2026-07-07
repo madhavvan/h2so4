@@ -143,7 +143,7 @@ const CSS = `
 .pl-obj{position:relative;background:linear-gradient(180deg,#100e0a,#0a0908);
   border:1px solid var(--gold-line);border-radius:20px;
   box-shadow:0 50px 120px -34px rgba(0,0,0,.92), 0 0 74px -26px rgba(211,172,99,.20), 0 0 0 1px rgba(255,255,255,.04), inset 0 1px 0 rgba(255,255,255,.06);}
-.pl-tilt{transition:transform .5s cubic-bezier(.2,.8,.25,1);will-change:transform;transform:perspective(1200px) rotateY(-6deg) rotateX(1.6deg);}
+.pl-tilt{transition:transform .5s cubic-bezier(.2,.8,.25,1);will-change:transform;transform:perspective(1200px) rotateY(6deg) rotateX(1.6deg);}
 .pl-rim{position:absolute;inset:0;border-radius:20px;pointer-events:none;
   background:radial-gradient(460px 260px at var(--rimx,50%) var(--rimy,16%), rgba(246,228,176,.09), transparent 62%);
   transition:background-position .3s;}
@@ -420,12 +420,12 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
     const r = el.getBoundingClientRect();
     const nx = ((e.clientX - r.left) / r.width) * 2 - 1;
     const ny = ((e.clientY - r.top) / r.height) * 2 - 1;
-    el.style.transform = `perspective(1200px) rotateX(${(1.6 - ny * 2.4).toFixed(2)}deg) rotateY(${(-6 + nx * 3.2).toFixed(2)}deg)`;
+    el.style.transform = `perspective(1200px) rotateX(${(1.6 - ny * 2.4).toFixed(2)}deg) rotateY(${(6 + nx * 3.2).toFixed(2)}deg)`;
     rimRef.current?.style.setProperty('--rimx', `${(50 - nx * 34).toFixed(1)}%`);
     rimRef.current?.style.setProperty('--rimy', `${(16 - ny * 26).toFixed(1)}%`);
   };
   const onHeroLeave = () => {
-    if (tiltRef.current) tiltRef.current.style.transform = 'perspective(1200px) rotateY(-6deg) rotateX(1.6deg)';
+    if (tiltRef.current) tiltRef.current.style.transform = 'perspective(1200px) rotateY(6deg) rotateX(1.6deg)';
     rimRef.current?.style.setProperty('--rimx', '50%');
     rimRef.current?.style.setProperty('--rimy', '16%');
   };
