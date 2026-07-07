@@ -158,7 +158,7 @@ describe('runAutoTypeAgent — happy path', () => {
     });
     expect(calls.length).toBe(1);
     const callArg = calls[0];
-    expect(callArg.model).toBe('claude-sonnet-4-6');
+    expect(callArg.model).toBe('claude-sonnet-5');
     expect(callArg.system).toBe(SYSTEM_PROMPT);
     expect(callArg.tool_choice).toEqual({ type: 'tool', name: 'submit_plan' });
     expect(callArg.tools).toEqual([SUBMIT_PLAN_TOOL]);

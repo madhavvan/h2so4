@@ -256,3 +256,466 @@
 .minica-md th { font-weight: 700; background: rgba(127, 127, 127, 0.08); }
 .minica-md p { margin: 0; }
 .minica-md p + p { margin-top: 0.5em; }
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   OBSIDIAN & GOLD — in-app dark skin (2026-07)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   Brings the marketing landing's language (warm obsidian, one gold
+   accent, Newsreader serif, film-grain + vignette + gold spotlight)
+   into the logged-in tool. Same mechanism as the cream light layer
+   above: remap the utility classes the app already uses, so thousands
+   of elements re-skin without touching the 9k-line render.
+
+   Scope: everything is under `html.dark`. The atmosphere + serif are
+   ALSO gated on `:not(.popout-mode)` — the pop-out is a transparent
+   window (see pip-styles.css) and must stay see-through, so it gets
+   its own obsidian treatment there, never this opaque grain/vignette.
+   Light mode (`:root:not(.dark)`) is never touched. Gold tokens come
+   from index.html :root (--gold, --gold-1..3, --gold-line, --paper).
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+/* ── 1. Warm the hardcoded near-black panel surfaces ──
+   The cream layer remaps these in light; in dark they stayed cool.
+   Warm them to obsidian so panels/sidebars/modals sit in the same
+   material as the page ground. */
+html.dark .bg-\[\#09090b\] { background-color: #0b0a08; }
+html.dark .bg-\[\#0a0a0d\] { background-color: #100e0a; }
+html.dark .bg-\[\#0a0a0f\] { background-color: #100e0a; }
+html.dark .bg-\[\#111116\] { background-color: #15130d; }
+html.dark .bg-\[\#050507\] { background-color: #080706; }
+html.dark .bg-\[\#1a1a2e\] { background-color: #15130d; }   /* navy modal → obsidian */
+html.dark .bg-\[\#0a0a0d\]\/95 { background-color: rgba(16, 14, 10, 0.95); }
+
+/* ── 2. Accent remap: cool blue / primary → the single gold ──
+   Blue was the app's accent (popout button, active toggles, links,
+   badges, progress). Gold is the landing's accent; make them one. */
+html.dark .text-blue-300,
+html.dark .text-blue-400,
+html.dark .text-blue-500,
+html.dark .text-primary,
+html.dark .text-blue-300\/80 { color: var(--gold) !important; }
+html.dark .hover\:text-blue-300:hover { color: var(--gold-1) !important; }
+
+html.dark .bg-blue-500\/5  { background-color: rgba(211, 172, 99, 0.06) !important; }
+html.dark .bg-blue-500\/10 { background-color: rgba(211, 172, 99, 0.10) !important; }
+html.dark .bg-blue-500\/15 { background-color: rgba(211, 172, 99, 0.14) !important; }
+html.dark .bg-blue-500\/20 { background-color: rgba(211, 172, 99, 0.18) !important; }
+html.dark .hover\:bg-blue-500\/10:hover { background-color: rgba(211, 172, 99, 0.12) !important; }
+html.dark .hover\:bg-blue-500\/15:hover { background-color: rgba(211, 172, 99, 0.16) !important; }
+html.dark .hover\:bg-blue-500\/20:hover { background-color: rgba(211, 172, 99, 0.20) !important; }
+
+html.dark .border-blue-500\/15 { border-color: rgba(211, 172, 99, 0.20) !important; }
+html.dark .border-blue-500\/20 { border-color: rgba(211, 172, 99, 0.26) !important; }
+html.dark .border-blue-500\/30 { border-color: rgba(211, 172, 99, 0.34) !important; }
+html.dark .border-blue-500\/40 { border-color: rgba(211, 172, 99, 0.44) !important; }
+html.dark .hover\:border-blue-500\/40:hover { border-color: rgba(211, 172, 99, 0.48) !important; }
+
+/* Solid accent (buttons) → gold with dark ink text for contrast. */
+html.dark .bg-blue-500,
+html.dark .bg-primary { background-color: var(--gold) !important; color: #231c0c !important; }
+html.dark .hover\:bg-blue-600:hover,
+html.dark .hover\:bg-primary:hover { background-color: var(--gold-2) !important; }
+html.dark .fill-blue-500 { fill: var(--gold) !important; }
+html.dark .ring-blue-500 { --tw-ring-color: var(--gold-line) !important; }
+
+/* `primary` is the Tailwind custom color #3b82f6 (blue). It's used via
+   border/ring/focus variants the bg/text overrides above don't catch —
+   e.g. the model-picker button's `focus:ring-primary` (the blue ring
+   that was leaking through). Remap every primary + residual blue
+   variant to gold, dark-only. */
+html.dark .border-primary,
+html.dark .hover\:border-primary:hover { border-color: var(--gold) !important; }
+html.dark .focus\:border-primary\/40:focus,
+html.dark .focus\:border-primary:focus { border-color: var(--gold-line) !important; }
+html.dark .ring-primary { --tw-ring-color: var(--gold-line) !important; }
+html.dark .focus\:ring-primary:focus { --tw-ring-color: var(--gold-2) !important; }
+html.dark .border-blue-400 { border-color: var(--gold) !important; }
+html.dark .bg-blue-600\/95 { background-color: rgba(211, 172, 99, 0.92) !important; color: #231c0c !important; }
+html.dark .shadow-blue-500\/30 { --tw-shadow-color: var(--gold-glow) !important; }
+/* Gold-tint the selected model row (was a flat white overlay). */
+html.dark .mp-row.is-selected { background: rgba(211, 172, 99, 0.12) !important; }
+
+/* ── 7. Cool decorative families → the single gold (dark only) ──
+   Surfaced view-by-view (Manage Subscription tier cards, credit-timer
+   trial badge, download rows, upgrade toasts). These are chrome, not
+   meaning: provider brand marks use inline hex (untouched), and
+   semantic status (red = low time, emerald = plan active) is left
+   alone. cyan/purple/indigo collapse to gold; slate surfaces warm to
+   obsidian; the blue→purple gradient stops the first pass missed
+   resolve to a gold gradient. */
+
+/* cyan — trial indicators */
+html.dark .bg-cyan-500\/10 { background-color: rgba(211, 172, 99, 0.10) !important; }
+html.dark .bg-cyan-500\/15 { background-color: rgba(211, 172, 99, 0.14) !important; }
+html.dark .border-cyan-500\/30 { border-color: rgba(211, 172, 99, 0.32) !important; }
+html.dark .text-cyan-300, html.dark .text-cyan-400 { color: var(--gold) !important; }
+
+/* purple — decorative accents, badges, download rows, gradient tails */
+html.dark .bg-purple-500\/5  { background-color: rgba(211, 172, 99, 0.06) !important; }
+html.dark .bg-purple-500\/10 { background-color: rgba(211, 172, 99, 0.10) !important; }
+html.dark .bg-purple-500\/20 { background-color: rgba(211, 172, 99, 0.16) !important; }
+html.dark .bg-purple-500\/25 { background-color: rgba(211, 172, 99, 0.20) !important; }
+html.dark .hover\:bg-purple-500\/5:hover  { background-color: rgba(211, 172, 99, 0.08) !important; }
+html.dark .hover\:bg-purple-500\/20:hover { background-color: rgba(211, 172, 99, 0.18) !important; }
+html.dark .text-purple-300, html.dark .text-purple-400 { color: var(--gold) !important; }
+html.dark .border-purple-400\/40, html.dark .border-purple-500\/30 { border-color: var(--gold-line) !important; }
+html.dark .hover\:border-purple-500:hover { border-color: var(--gold) !important; }
+html.dark .group:hover .group-hover\:text-purple-400,
+html.dark .group:hover .group-hover\:text-purple-500 { color: var(--gold-1) !important; }
+html.dark .group:hover .group-hover\:bg-purple-500\/20 { background-color: rgba(211, 172, 99, 0.18) !important; }
+
+/* indigo — a Manage Subscription action button */
+html.dark .bg-indigo-500\/20 { background-color: rgba(211, 172, 99, 0.18) !important; }
+html.dark .hover\:bg-indigo-500\/30:hover { background-color: rgba(211, 172, 99, 0.24) !important; }
+html.dark .text-indigo-200 { color: var(--gold-1) !important; }
+html.dark .border-indigo-500\/40 { border-color: var(--gold-line) !important; }
+
+/* purple / blue gradient STOPS (Manage Sub tier cards, upgrade CTAs,
+   toasts) — resolve to gold; slate surfaces warm to obsidian. */
+html.dark .to-purple-600 { --tw-gradient-to: #b58f45 var(--tw-gradient-to-position) !important; }
+html.dark .to-purple-600\/20 { --tw-gradient-to: rgb(181 143 69 / 0.20) var(--tw-gradient-to-position) !important; }
+html.dark .to-purple-700\/50 { --tw-gradient-to: rgb(181 143 69 / 0.50) var(--tw-gradient-to-position) !important; }
+html.dark .to-purple-700\/40 { --tw-gradient-to: rgb(181 143 69 / 0.40) var(--tw-gradient-to-position) !important; }
+html.dark .from-blue-500\/20 { --tw-gradient-from: rgb(211 172 99 / 0.20) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(211 172 99 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .from-blue-600\/50 { --tw-gradient-from: rgb(217 184 116 / 0.50) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(217 184 116 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .hover\:from-blue-500\/15:hover { --tw-gradient-from: rgb(211 172 99 / 0.15) var(--tw-gradient-from-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .hover\:to-purple-500\/15:hover { --tw-gradient-to: rgb(181 143 69 / 0.15) var(--tw-gradient-to-position) !important; }
+html.dark .from-slate-900 { --tw-gradient-from: #100e0a var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(16 14 10 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .to-slate-800 { --tw-gradient-to: #15130d var(--tw-gradient-to-position) !important; }
+html.dark .from-slate-700 { --tw-gradient-from: #1c1a12 var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(28 26 18 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .shadow-blue-500\/10 { --tw-shadow-color: var(--gold-glow) !important; }
+html.dark .hover\:shadow-blue-400\/50:hover { --tw-shadow-color: rgba(211, 172, 99, 0.4) !important; }
+
+/* ── 8. Docs overlay (Documentation.tsx) ──
+   The docs viewer is built light-first with `dark:` VARIANT classes, so
+   its dark link color is `.dark:text-blue-400` (a different selector than
+   the base `.text-blue-400` remapped above) and it uses arbitrary-opacity
+   gradients. Catch both so doc links + the summary card read gold. */
+html.dark .dark\:text-blue-400 { color: var(--gold) !important; }
+
+/* Main-window streaming caret → gold, echoing the landing's signature
+   self-typing gold answer. (The pop-out caret is handled in
+   pip-styles.css under html.electron-transparent.) */
+html:not(.popout-mode).dark .stream-caret {
+  background: var(--gold) !important;
+  box-shadow: 0 0 8px var(--gold-glow);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   FUTURISTIC BORDERS — soften the hairlines (dark, 2026-07)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   The app's crisp 1px borders read as dated "outlined boxes". Fade them
+   toward whispers so grouping comes from the fills + elevation already
+   present, not drawn lines — the smooth, edgeless language of a premium
+   tool. Dark-only; light keeps its warm cream hairlines. */
+html.dark .border-white\/\[0\.04\] { border-color: rgba(255, 255, 255, 0.026) !important; }
+html.dark .border-white\/\[0\.06\] { border-color: rgba(255, 255, 255, 0.038) !important; }
+html.dark .border-white\/\[0\.08\] { border-color: rgba(255, 255, 255, 0.05) !important; }
+html.dark .border-white\/\[0\.1\]  { border-color: rgba(255, 255, 255, 0.06) !important; }
+html.dark .border-white\/\[0\.12\] { border-color: rgba(255, 255, 255, 0.07) !important; }
+html.dark .border-white\/10 { border-color: rgba(255, 255, 255, 0.06) !important; }
+html.dark .border-white\/15 { border-color: rgba(255, 255, 255, 0.08) !important; }
+html.dark .border-white\/20 { border-color: rgba(255, 255, 255, 0.10) !important; }
+/* Soften the hover-border escalations too so hovers glow rather than box. */
+html.dark .hover\:border-white\/10:hover { border-color: rgba(255, 255, 255, 0.08) !important; }
+html.dark .hover\:border-white\/20:hover { border-color: rgba(255, 255, 255, 0.12) !important; }
+/* Round the common card/pill radii up a touch for a softer, modern feel. */
+html.dark .rounded-lg  { border-radius: 0.65rem; }
+html.dark .rounded-xl  { border-radius: 0.9rem; }
+html.dark .rounded-2xl { border-radius: 1.15rem; }
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   AUTH SCREENS — Obsidian & Gold (login / signup / forgot)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   The sign-in / sign-up / reset views (SubscriptionGate) were built on
+   the warm CREAM marketing palette and read as a different product from
+   the obsidian landing + app. Rather than rewrite every inline
+   `var(--cream)`/`var(--ink)` in three ~170-line views, we SCOPE-OVERRIDE
+   those exact tokens to obsidian + gold on the `.pl-auth-dark` container,
+   so all their inline styles (card, inputs, borders, text, the `--accent`
+   focus ring) resolve to the new palette. Works in both light and dark
+   app themes — the auth screens are always obsidian now, matching the
+   landing. */
+.pl-auth-dark {
+  --cream:        #0b0a08;   /* page ground */
+  --cream-soft:   #14120d;   /* card surface */
+  --cream-line:   rgba(255, 255, 255, 0.09);
+  --ink:          #f2efe6;   /* primary text (also Logo/ring via var) */
+  --ink-soft:     #d9d3c6;
+  --ink-muted:    #9d968a;
+  --ink-faint:    #6a6355;
+  --accent:       #d3ac63;   /* gold — focus ring, links, error tint */
+  --accent-soft:  rgba(211, 172, 99, 0.14);
+  /* Obsidian ground with a single soft gold spotlight behind the card —
+     the landing's atmosphere, distilled. Overrides the inline solid bg. */
+  background:
+    radial-gradient(66% 52% at 50% 30%, rgba(211, 172, 99, 0.08), transparent 62%),
+    #0b0a08 !important;
+}
+/* Card: obsidian slab, gold-glow lift, faint top highlight. */
+.pl-auth-dark .auth-card {
+  box-shadow:
+    0 40px 110px -44px rgba(0, 0, 0, 0.9),
+    0 0 60px -30px rgba(211, 172, 99, 0.20),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+}
+/* Primary CTA (Sign in / Create account / Send reset link) → gold, like
+   the landing. Only the explicit type="submit" button; the Google button
+   (no type attr) stays the obsidian secondary. */
+.pl-auth-dark button[type="submit"].auth-submit:not(:disabled) {
+  background: linear-gradient(100deg, #f6e4b0, #d9b874 55%, #b58f45) !important;
+  color: #231c0c !important;
+  box-shadow:
+    0 14px 40px -16px rgba(211, 172, 99, 0.7),
+    inset 0 1px 0 rgba(255, 255, 255, 0.4) !important;
+}
+.pl-auth-dark button[type="submit"].auth-submit:not(:disabled):hover {
+  filter: brightness(1.05);
+  opacity: 1;
+}
+/* Gold text-selection inside the auth screens, matching the landing. */
+.pl-auth-dark ::selection { background: rgba(211, 172, 99, 0.3); color: #fff; }
+
+/* ── 10. Download-page platform cards (web download + in-app rows) ──
+   The Windows/macOS/Linux cards use per-platform blue/purple/orange
+   accents on the icon chip (at rest) + card hover + download arrow.
+   Collapse all three to one gold. Windows(blue)/macOS(purple) bases were
+   already remapped; this closes the gaps: Linux ORANGE entirely, plus the
+   /40 borders, arbitrary /[0.04] hover fills, and group-hover variants. */
+/* Linux — orange → gold */
+html.dark .bg-orange-500\/10 { background-color: rgba(211, 172, 99, 0.10) !important; }
+html.dark .text-orange-400 { color: var(--gold) !important; }
+html.dark .hover\:border-orange-500\/40:hover { border-color: rgba(211, 172, 99, 0.44) !important; }
+html.dark .hover\:bg-orange-500\/\[0\.04\]:hover { background-color: rgba(211, 172, 99, 0.06) !important; }
+html.dark .group:hover .group-hover\:bg-orange-500\/20 { background-color: rgba(211, 172, 99, 0.18) !important; }
+html.dark .group:hover .group-hover\:text-orange-400 { color: var(--gold) !important; }
+/* macOS — purple hover variants the earlier pass missed */
+html.dark .hover\:border-purple-500\/40:hover { border-color: rgba(211, 172, 99, 0.44) !important; }
+html.dark .hover\:bg-purple-500\/\[0\.04\]:hover { background-color: rgba(211, 172, 99, 0.06) !important; }
+html.dark .group:hover .group-hover\:bg-purple-500\/20 { background-color: rgba(211, 172, 99, 0.18) !important; }
+/* Windows — blue hover variants the earlier pass missed */
+html.dark .hover\:bg-blue-500\/\[0\.04\]:hover { background-color: rgba(211, 172, 99, 0.06) !important; }
+html.dark .group:hover .group-hover\:bg-blue-500\/20 { background-color: rgba(211, 172, 99, 0.18) !important; }
+html.dark .group:hover .group-hover\:text-blue-400 { color: var(--gold) !important; }
+
+/* ── 11. Settings model cards — simple & modern (2026-07) ──
+   Was busy: a brand-colour left RAIL on every card + the selected card
+   glowing its brand colour (green GPT, etc.). Simplify to uniform glass
+   with ONE gold selected/hover state — the brand ICON chips stay for
+   recognition. Max card keeps its amber-gold flagship rim. */
+html.dark .mp-card:not(.mp-card-max)::before { opacity: 0 !important; }  /* kill brand rail */
+html.dark .mp-card:not(.mp-card-max):hover {
+  border-color: var(--gold-line) !important;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0)),
+    rgba(21,19,13,0.82) !important;
+}
+html.dark .mp-card.is-selected:not(.mp-card-max) {
+  border-color: rgba(211,172,99,0.5) !important;
+  box-shadow:
+    inset 0 0 0 1px rgba(211,172,99,0.28),
+    inset 0 0 40px -12px rgba(211,172,99,0.10),
+    0 10px 30px -14px rgba(211,172,99,0.30) !important;
+}
+/* RECOMMENDED badge: green → gold. (ACTIVE check tints via text-emerald
+   elsewhere — that stays as the semantic "on" tick.) */
+html.dark .mp-card-badge-recommended {
+  background: rgba(211,172,99,0.15) !important;
+  color: var(--gold-1) !important;
+  border-color: rgba(211,172,99,0.38) !important;
+}
+/* "ACTIVE" pill on the selected card pulls the model's brand colour
+   (green for GPT); make it gold to match the gold-selected card. */
+html.dark .mp-card-active:not(.mp-card-active-max) {
+  background: rgba(211,172,99,0.15) !important;
+  color: var(--gold-1) !important;
+}
+html.dark .bg-blue-500\/\[0\.08\] { background-color: rgba(211, 172, 99, 0.08) !important; }
+html.dark .from-blue-500\/\[0\.08\] { --tw-gradient-from: rgb(211 172 99 / 0.08) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(211 172 99 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .to-purple-500\/\[0\.04\] { --tw-gradient-to: rgb(181 143 69 / 0.05) var(--tw-gradient-to-position) !important; }
+html.dark .shadow-blue-500\/20 { --tw-shadow-color: var(--gold-glow) !important; box-shadow: var(--tw-ring-offset-shadow,0 0 #0000), var(--tw-ring-shadow,0 0 #0000), var(--tw-shadow) !important; }
+
+/* Blue→purple gradients (upgrade CTAs) → gold gradient. */
+html.dark .from-blue-500 { --tw-gradient-from: #d9b874 var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(217 184 116 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .to-purple-500 { --tw-gradient-to: #b58f45 var(--tw-gradient-to-position) !important; }
+html.dark .from-blue-500\/10 { --tw-gradient-from: rgb(211 172 99 / 0.12) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(211 172 99 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .to-purple-500\/10 { --tw-gradient-to: rgb(181 143 69 / 0.12) var(--tw-gradient-to-position) !important; }
+html.dark .hover\:from-blue-400:hover { --tw-gradient-from: #f6e4b0 var(--tw-gradient-from-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .hover\:to-purple-400:hover { --tw-gradient-to: #d9b874 var(--tw-gradient-to-position) !important; }
+html.dark .hover\:from-blue-500\/20:hover { --tw-gradient-from: rgb(211 172 99 / 0.20) var(--tw-gradient-from-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+html.dark .hover\:to-purple-500\/20:hover { --tw-gradient-to: rgb(181 143 69 / 0.20) var(--tw-gradient-to-position) !important; }
+
+/* ── 3. Serif for headings (the landing's display voice) ── */
+html:not(.popout-mode).dark :is(h1, h2, h3) {
+  font-family: var(--serif);
+  letter-spacing: -0.02em;
+}
+
+/* ── 4. Gold keyboard focus (matches the landing) ── */
+html.dark :focus-visible {
+  outline: 2px solid var(--gold-2);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+/* …but NOT on multi-line text fields. The composer + the Settings
+   custom-instructions / paste boxes carry their OWN inner-gold focus glow
+   (focus:shadow-[inset … gold]). The offset-2px, 4px-radius gold OUTLINE
+   above therefore reads as a mismatched box spilling PAST their rounded
+   corners the moment you click in — the "text throwing out of the box" bug.
+   Suppress the outline on textareas so the inset glow is the sole, clean
+   focus affordance (mirrors the pop-out's own fix in pip-styles.css).
+   Buttons/links keep the outline for keyboard accessibility. */
+html.dark textarea:focus,
+html.dark textarea:focus-visible { outline: none; }
+
+/* ── 5. Warm the scrollbar thumb toward gold in dark ── */
+html.dark ::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--gold) 20%, transparent);
+}
+html.dark ::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklab, var(--gold) 42%, transparent);
+}
+
+/* ── 6. Atmosphere — film grain + vignette + a single gold spotlight.
+   Fixed, pointer-events:none, painted behind #root. Deliberately far
+   more restrained than the landing (this is a tool used for long
+   sessions, not a hero): grain ~2%, a gentle edge vignette, one faint
+   warm glow at the top. NEVER in the pop-out (transparent window). */
+html:not(.popout-mode).dark body::before {
+  content: '';
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  opacity: 0.022; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 140px 140px;
+}
+html:not(.popout-mode).dark body::after {
+  content: '';
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(120% 70% at 50% -6%, var(--gold-glow), transparent 40%),
+    radial-gradient(120% 92% at 50% 8%, transparent 58%, rgba(0, 0, 0, 0.42) 100%);
+}
+/* Keep app content above the atmosphere. */
+html:not(.popout-mode).dark #root { position: relative; z-index: 1; }
+
+/* Respect reduced motion isn't needed here (static layers), but honor
+   it for the serif swap? No — typography is not motion. Nothing to gate. */
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   BRAND MARK — motion states (2026-07)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Drives BrandMark.tsx (the gold-on-obsidian identity medallion). One
+   class per app state on the <svg> root: .bm--idle / .bm--listening /
+   .bm--thinking / .bm--answering. The story: sound arrives from the
+   LEFT (listening), light races the bezel + the m glows from within
+   (thinking = the loading action), wavefronts emit to the RIGHT
+   (answering). All keyframes are transform/opacity ONLY — safe for
+   the transparent pop-out (no backdrop-filter, no live blurs) and
+   cheap on the GPU. Loaded here (not index.html) because index.css is
+   linked by BOTH the main window and the pop-out.
+
+   Element transforms use transform-box: view-box so origins are in
+   viewBox units (the medallion's center is 48px 48px). The always-on
+   .bm-sweep translates in the m's own 1024-space (its parent group
+   carries the scale), hence the large px values.
+
+   Both global prefers-reduced-motion kill-switches (index.html `*`
+   rule + pip-styles .pip-body rule) already neutralize these. */
+
+.bm { display: block; flex-shrink: 0; }
+
+/* Cross-fade between states: when a state class drops its animation,
+   the layer eases back to its resting opacity instead of popping. */
+.bm .bm-bloom,
+.bm .bm-waves,
+.bm .bm-orbit,
+.bm .bm-mglow {
+  transition: opacity 0.45s var(--ease-ios);
+}
+
+/* Resting layer visibilities (idle shows only bloom + sweep). */
+.bm .bm-bloom { opacity: 0.28; }
+.bm .bm-waves { opacity: 0; }
+.bm .bm-orbit { opacity: 0; }
+.bm .bm-mglow { opacity: 0; }
+
+/* The idle signature: a specular band gliding across the gold m every
+   ~6.4s — polished metal catching light. Runs in every state. */
+.bm .bm-sweep { animation: bm-sweep 6.4s infinite; }
+@keyframes bm-sweep {
+  0%   { transform: translateX(-380px); animation-timing-function: cubic-bezier(0.45, 0.05, 0.35, 0.95); }
+  16%  { transform: translateX(680px); }
+  100% { transform: translateX(680px); }
+}
+
+/* ── LISTENING — sound arrives; the coin breathes ── */
+.bm--listening .bm-bloom { animation: bm-bloom-breathe 3.6s ease-in-out infinite; }
+.bm--listening .bm-body {
+  transform-box: view-box;
+  transform-origin: 48px 48px;
+  animation: bm-breathe 3.6s ease-in-out infinite;
+}
+.bm--listening .bm-waves-in { animation: bm-wave-in 1.8s cubic-bezier(0.33, 0, 0.35, 1) infinite; }
+.bm--listening .bm-mglow { animation: bm-mglow-soft 3.6s ease-in-out infinite; }
+
+/* ── THINKING — the loading action: comets race the bezel, the m
+      pulses with inner light ── */
+.bm--thinking .bm-orbit {
+  transform-box: view-box;
+  transform-origin: 48px 48px;
+  animation: bm-orbit 1.4s linear infinite;
+  opacity: 1;
+}
+.bm--thinking .bm-mglow { animation: bm-mglow-think 1.4s ease-in-out infinite; }
+.bm--thinking .bm-bloom { animation: bm-bloom-think 1.4s ease-in-out infinite; }
+
+/* ── ANSWERING — the mark speaks: wavefronts emit rightward ── */
+.bm--answering .bm-waves-out { animation: bm-wave-out 1.5s cubic-bezier(0.3, 0, 0.4, 1) infinite; }
+.bm--answering .bm-mglow { animation: bm-mglow-answer 2.2s ease-in-out infinite; }
+.bm--answering .bm-bloom { opacity: 0.62; }
+.bm--answering .bm-orbit {
+  transform-box: view-box;
+  transform-origin: 48px 48px;
+  animation: bm-orbit 3.4s linear infinite;
+  opacity: 0.5;
+}
+
+@keyframes bm-orbit { to { transform: rotate(360deg); } }
+@keyframes bm-breathe {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.014); }
+}
+@keyframes bm-bloom-breathe {
+  0%, 100% { opacity: 0.22; }
+  50%      { opacity: 0.55; }
+}
+@keyframes bm-bloom-think {
+  0%, 100% { opacity: 0.3; }
+  50%      { opacity: 0.6; }
+}
+/* Wavefront travelling INTO the mark (left side, moving right). */
+@keyframes bm-wave-in {
+  0%   { transform: translateX(-5px); opacity: 0; }
+  30%  { opacity: 1; }
+  78%  { opacity: 0.2; }
+  100% { transform: translateX(3.5px); opacity: 0; }
+}
+/* Wavefront emitted AWAY from the mark (right side, moving right). */
+@keyframes bm-wave-out {
+  0%   { transform: translateX(-4px); opacity: 0; }
+  25%  { opacity: 1; }
+  100% { transform: translateX(6px); opacity: 0; }
+}
+@keyframes bm-mglow-soft {
+  0%, 100% { opacity: 0; }
+  50%      { opacity: 0.22; }
+}
+@keyframes bm-mglow-think {
+  0%, 100% { opacity: 0.08; }
+  50%      { opacity: 0.5; }
+}
+@keyframes bm-mglow-answer {
+  0%, 100% { opacity: 0.3; }
+  50%      { opacity: 0.48; }
+}

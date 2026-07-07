@@ -56,12 +56,13 @@ const CLIENT_MODELS_BY_TIER = {
   anonymous: ['gemini'],
   free: ['gemini'],
   basic: ['gemini', 'groq', 'openai', 'xai'],
-  pro: ['gemini', 'groq', 'openai', 'xai'],
+  pro: ['gemini', 'groq', 'openai', 'xai', 'claude'],
   max: ['gemini', 'groq', 'openai', 'xai', 'claude'],
+  ultra: ['gemini', 'groq', 'openai', 'xai', 'claude'],
 };
 
 const REASONING_EFFORT_VALUES = ['none', 'low', 'medium', 'high'];
-const VALID_TIERS = ['free', 'basic', 'pro', 'max'];
+const VALID_TIERS = ['free', 'basic', 'pro', 'max', 'ultra'];
 
 // Lazy provider clients — only loaded when an admin actually calls a
 // refund / cancel / etc. Mirrors the lazy pattern in routes/admin.js.
@@ -88,11 +89,13 @@ function getRazorpay() {
 // rather than imported because admin.js doesn't export it — extracting
 // is a follow-up refactor.
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Admin bot grants are UNLIMITED-until-revoked, same as routes/admin.js.
 const TIER_LICENSE_DEFAULTS = {
   free:  { expires_at: () => Date.now() + 30 * DAY_MS, sessions_limit: 5 },
-  basic: { expires_at: () => Date.now() + 14 * DAY_MS, sessions_limit: 3 },
+  basic: { expires_at: () => -1, sessions_limit: -1 },
   pro:   { expires_at: () => -1, sessions_limit: -1 },
   max:   { expires_at: () => -1, sessions_limit: -1 },
+  ultra: { expires_at: () => -1, sessions_limit: -1 },
 };
 
 // ─── Step-up gate helper ──────────────────────────────────────────

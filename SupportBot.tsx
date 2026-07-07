@@ -200,9 +200,9 @@ const PALETTE_APP: Palette = {
   inkSoft: 'var(--text-color)',
   inkMuted: '#6b7280',
   inkFaint: '#9ca3af',
-  accent: '#3b82f6',
-  accentSoft: 'rgba(59,130,246,0.12)',
-  invertBg: '#1f2937',
+  accent: '#d3ac63',
+  accentSoft: 'rgba(211,172,99,0.14)',
+  invertBg: '#15130d',
   invertText: '#ffffff',
   font: 'inherit',
 };
@@ -2931,8 +2931,8 @@ const SupportBot: React.FC<SupportBotProps> = ({
                                   className="text-[10px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded transition-colors"
                                   style={{
                                     background: 'transparent',
-                                    color: '#3b82f6',
-                                    border: `1px solid #3b82f6`,
+                                    color: '#d3ac63',
+                                    border: `1px solid #d3ac63`,
                                   }}
                                   title="Mark this conversation as assigned to you"
                                 >

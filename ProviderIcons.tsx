@@ -9,12 +9,13 @@
 //  no @lobehub/ui transitive (which is what blew up the v4.0.0
 //  build with electron-builder + npm-ls).
 //
-//  We use the monochrome marks (`gemini.svg`, `openai.svg`, etc.,
-//  not the `*-color.svg` variants) so each icon picks up the
-//  chip's `color` via `currentColor` — preserving the per-model
-//  accent theming the existing CSS already wires (blue for
-//  Gemini, orange for Groq, emerald for OpenAI, zinc for Grok,
-//  gold for Claude).
+//  Gemini and Claude use their OFFICIAL FULL-COLOR marks
+//  (`gemini-color.svg` = the blue→violet spark, `claude-color.svg`
+//  = Anthropic's rust asterisk) — these carry the brand's real
+//  gradient/hue and read as authentic next to the model name,
+//  which flat monochrome versions do not. OpenAI, Grok, and Groq
+//  are genuinely monochrome brands, so they stay on the mono mark
+//  and pick up a clean brand hue via `currentColor` from the chip.
 //
 //  Trademark / nominative-use note: each provider's logo is
 //  their trademark. Displaying it next to the provider's name
@@ -30,9 +31,9 @@ import React from 'react';
 // SVGR converts each SVG file into a React component at build
 // time. Per @lobehub/icons-static-svg's package layout the icons
 // live under /icons/<name>.svg.
-import GeminiSvg from '@lobehub/icons-static-svg/icons/gemini.svg?react';
+import GeminiSvg from '@lobehub/icons-static-svg/icons/gemini-color.svg?react';
 import OpenAISvg from '@lobehub/icons-static-svg/icons/openai.svg?react';
-import AnthropicSvg from '@lobehub/icons-static-svg/icons/anthropic.svg?react';
+import AnthropicSvg from '@lobehub/icons-static-svg/icons/claude-color.svg?react';
 import GrokSvg from '@lobehub/icons-static-svg/icons/grok.svg?react';
 import GroqSvg from '@lobehub/icons-static-svg/icons/groq.svg?react';
 

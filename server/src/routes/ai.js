@@ -175,13 +175,16 @@ function rateLimitedJson(provider) {
 }
 
 // ── Tier gate aliases ──
-// Mirrors services/licenseService.ts FEATURE_GATES.models, in shorthand:
-//   - PAID  → basic + pro + max  (GPT-5.5, Grok, Groq GPT-OSS-120B)
-//   - MAX   → max only           (Claude Sonnet 4.6, Auto-Type planner)
+// Mirrors services/licenseService.ts FEATURE_GATES.models, in shorthand.
+// The 2026-07 pricing overhaul re-laddered model access:
+//   - PAID        → basic + pro + max + ultra  (GPT-5.5, Grok, Groq GPT-OSS-120B)
+//   - CLAUDE_TIERS→ pro + max + ultra          (Claude Sonnet 5 — Basic excludes Claude)
+//   - ULTRA_ONLY  → ultra only                 (Auto-Type — the Ultra-exclusive feature)
 // Free tier: only Gemini, ungated. Defined here so adding a new model
 // route only requires picking the right gate, not hand-listing tiers.
-const PAID = ['basic', 'pro', 'max'];
-const MAX_ONLY = ['max'];
+const PAID = ['basic', 'pro', 'max', 'ultra'];
+const CLAUDE_TIERS = ['pro', 'max', 'ultra'];
+const ULTRA_ONLY = ['ultra'];
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  /prefetch-context — speculative cache warming during transcription
@@ -619,7 +622,7 @@ const _AnthropicMod = (() => {
 })();
 const Anthropic = _AnthropicMod && (_AnthropicMod.default || _AnthropicMod);
 
-router.post('/chat/claude', requireTier(...MAX_ONLY), async (req, res) => {
+router.post('/chat/claude', requireTier(...CLAUDE_TIERS), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
 
@@ -640,18 +643,22 @@ router.post('/chat/claude', requireTier(...MAX_ONLY), async (req, res) => {
       : undefined;
 
     // Match the stream route — non-streaming chat path also needs
-    // custom-instruction-aware token scaling. Sonnet 4.6 supports
+    // custom-instruction-aware token scaling. Sonnet 5 supports
     // up to 64,000 max_tokens, so STAR / detailed responses can scale
     // up to 32,000 here without truncation.
     const maxTokens = scaleTokensForInstructions(enrichedSystem || '', 16000, 64000);
 
     const completion = await client.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-5',
       max_tokens: maxTokens,
       system,
       messages,
       tools: tools.length ? tools : undefined,
-      temperature: 0.7,
+      // Sonnet 5 defaults effort to 'high' (more thinking → slower + pricier).
+      // For live-interview answers we want speed, so pin it low. Sonnet 5 is a
+      // new-generation model and rejects sampling params (temperature/top_p),
+      // so temperature is intentionally omitted (was 0.7 on Sonnet 4.6).
+      output_config: { effort: 'low' },
     });
 
     // Anthropic returns a content array of blocks. server_tool_use and
@@ -944,7 +951,7 @@ router.post('/stream/groq', requireTier(...PAID), async (req, res) => {
 // out by the helper, so the candidate sees only the final answer text.
 // Web search runs server-side on Anthropic's infra during a single API
 // call — no extra round-trip on our end.
-router.post('/stream/claude', requireTier(...MAX_ONLY), async (req, res) => {
+router.post('/stream/claude', requireTier(...CLAUDE_TIERS), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
 
@@ -974,12 +981,14 @@ router.post('/stream/claude', requireTier(...MAX_ONLY), async (req, res) => {
     const maxTokens = scaleTokensForInstructions(enrichedSystem || '', 16000, 64000);
 
     const stream = client.messages.stream({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-5',
       max_tokens: maxTokens,
       system,
       messages,
       tools: tools.length ? tools : undefined,
-      temperature: 0.7,
+      // See /chat/claude: pin effort low for latency, omit temperature (Sonnet 5
+      // rejects sampling params).
+      output_config: { effort: 'low' },
     }, { signal: sse.signal });
 
     stream.on('text', (textDelta) => {
@@ -1038,7 +1047,7 @@ router.post('/stream/claude', requireTier(...MAX_ONLY), async (req, res) => {
 // vendors so an Anthropic outage doesn't sink Tier 2 entirely. The caller
 // (electron/main.cjs) treats the response as opaque — `planner_used` in
 // the body identifies which vendor served the plan.
-router.post('/autotype-agent', requireTier(...MAX_ONLY), async (req, res) => {
+router.post('/autotype-agent', requireTier(...ULTRA_ONLY), async (req, res) => {
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   const groqKey = process.env.GROQ_API_KEY;
 
@@ -1129,7 +1138,7 @@ router.post('/autotype-agent', requireTier(...MAX_ONLY), async (req, res) => {
 // `move_relative` / `lines_delta` fields for invisible counted-arrow
 // cursor repositioning). Falls through (caller's responsibility) to the
 // text agent / Haiku / deterministic chain on any non-2xx.
-router.post('/autotype-vision', requireTier(...MAX_ONLY), async (req, res) => {
+router.post('/autotype-vision', requireTier(...ULTRA_ONLY), async (req, res) => {
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   if (!anthropicKey) {
     return res.status(503).json({ error: 'Claude not configured (need ANTHROPIC_API_KEY)' });
@@ -1172,7 +1181,7 @@ router.post('/autotype-vision', requireTier(...MAX_ONLY), async (req, res) => {
   }
 });
 
-router.post('/autotype-plan', requireTier(...MAX_ONLY), async (req, res) => {
+router.post('/autotype-plan', requireTier(...ULTRA_ONLY), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) {
     return res.status(503).json({ error: 'Claude not configured' });

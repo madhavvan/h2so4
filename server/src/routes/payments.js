@@ -44,21 +44,38 @@ function getPaymentProvider(countryCode) {
   return 'stripe';
 }
 
-// ── Tier → license grant config ─────────────────────────────────────
-// Basic is a one-time purchase: 3 credits, 14-day expiry. Pro/Max are
-// recurring and unlimited (lifecycle managed by provider webhooks).
+// ── Tier → license grant config (CUSTOMER purchase) ─────────────────
+// 2026-07 pricing: Basic/Pro/Max are ONE-TIME, time-limited interviews;
+// Ultra is the monthly unlimited subscription. Each customer grant seeds the
+// interview clock (credits_remaining_seconds) with a 30-day window to use it:
+//   Basic  = one 30-minute interview      (1 session, 1800s)
+//   Pro    = one 1-hour interview          (1 session, 3600s)
+//   Max    = three 1-hour interviews       (3 sessions, 10800s; per-session
+//            60-min cap enforced by the client/server timer)
+//   Ultra  = unlimited                     (-1 sentinels; subscription)
+// NOTE: this is the CUSTOMER config. Admin grants are unlimited-until-revoked
+// and use grantAdminTier() / recordCompPayment() instead (never this).
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+const INTERVIEW_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 function grantConfigForTier(tier) {
+  const now = Date.now();
   if (tier === 'free') {
-    // Free tier: rolling 30-day window, 5 practice sessions/month.
-    // Mirrors db.transitionLicenseToFree() so the admin-grant path
-    // produces identical state to the cycle-end downgrade path.
-    return { tier: 'free', sessions_limit: 5, expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000 };
+    return { tier: 'free', sessions_limit: 5, expires_at: now + INTERVIEW_WINDOW_MS, credits_remaining_seconds: 0, credits_expire_at: 0 };
   }
   if (tier === 'basic') {
-    return { tier: 'basic', sessions_limit: 3, expires_at: Date.now() + FOURTEEN_DAYS_MS };
+    const exp = now + INTERVIEW_WINDOW_MS;
+    return { tier: 'basic', sessions_limit: 1, expires_at: exp, credits_remaining_seconds: 30 * 60, credits_expire_at: exp };
   }
-  return { tier, sessions_limit: -1, expires_at: -1 };
+  if (tier === 'pro') {
+    const exp = now + INTERVIEW_WINDOW_MS;
+    return { tier: 'pro', sessions_limit: 1, expires_at: exp, credits_remaining_seconds: 60 * 60, credits_expire_at: exp };
+  }
+  if (tier === 'max') {
+    const exp = now + INTERVIEW_WINDOW_MS;
+    return { tier: 'max', sessions_limit: 3, expires_at: exp, credits_remaining_seconds: 3 * 60 * 60, credits_expire_at: exp };
+  }
+  // ultra — monthly subscription, unlimited.
+  return { tier: 'ultra', sessions_limit: -1, expires_at: -1, credits_remaining_seconds: -1, credits_expire_at: -1 };
 }
 
 // ── Normalize/validate the tier coming in from the client ──
@@ -67,7 +84,7 @@ function grantConfigForTier(tier) {
 // non-admin callers, /upgrade-tier rejects `free` (they should cancel
 // the subscription instead — that triggers the proper webhook + email
 // chain at cycle end).
-const VALID_TIERS = ['free', 'basic', 'pro', 'max'];
+const VALID_TIERS = ['free', 'basic', 'pro', 'max', 'ultra'];
 function normalizeTier(t) {
   return VALID_TIERS.includes(t) ? t : 'pro';
 }
@@ -76,8 +93,11 @@ function normalizeTier(t) {
 //    for a Basic user who ran out mid-interview. Must match the per-region
 //    amounts returned by pricingService.getBasicRenewalPrice() on the
 //    client so the amount shown on the checkout modal matches the pill.
-const RENEWAL_USD_CENTS = 699;   // $6.99
-const RENEWAL_INR_PAISE = 59900; // ₹599
+// Basic 30-min interview EXTENSION (+30 min). Repriced 2026-07 ($25 / ₹2099).
+// (Constant names kept as RENEWAL_* for call-site compatibility; semantically
+// this is now the "+30 minutes" extension top-up, not a Basic credit renewal.)
+const RENEWAL_USD_CENTS = 2500;   // $25
+const RENEWAL_INR_PAISE = 209900; // ₹2099
 
 // ── Pricing validation ──────────────────────────────────────────────
 // Rooted bug: the client hardcoded $29/$69 in pricingService.ts but the
@@ -99,14 +119,16 @@ const RENEWAL_INR_PAISE = 59900; // ₹599
 // EXPECTED_*_AMOUNTS must stay in sync with pricingService.ts on the
 // client. If you change a price, update both sides.
 const EXPECTED_USD_CENTS = {
-  basic: 2500, // $25 one-time (mode=payment)
-  pro:   2900, // $29/month
-  max:   6900, // $69/month
+  basic: 3000,  // $30 one-time · 30-min interview
+  pro:   5000,  // $50 one-time · 1-hour interview
+  max:   8900,  // $89 one-time · 3× 1-hour interviews
+  ultra: 15900, // $159/month · unlimited + Auto-Type
 };
 const EXPECTED_INR_PAISE = {
-  basic: 199900, // ₹1999 one-time
-  pro:   249900, // ₹2499/month
-  max:   599900, // ₹5999/month
+  basic: 249900,  // ₹2499 one-time
+  pro:   419900,  // ₹4199 one-time
+  max:   739900,  // ₹7399 one-time
+  ultra: 1299900, // ₹12999/month
 };
 const PRICE_VALIDATION_TTL_MS = 10 * 60 * 1000;
 const stripePriceCache = new Map(); // priceId → { amount, currency, recurring, interval, validated_at }
@@ -115,7 +137,11 @@ const razorpayPlanCache = new Map(); // planId  → { amount, currency, period, 
 async function assertStripePriceMatches(stripeClient, priceId, tier) {
   const expected = EXPECTED_USD_CENTS[tier];
   if (!expected) return; // unknown tier — let it through (caller already validated)
-  const expectedRecurring = tier !== 'basic';
+  // 2026-07 model: ONLY Ultra is a recurring subscription. Basic/Pro/Max are
+  // one-time interview purchases. (Pre-2026-07 this was `tier !== 'basic'`,
+  // which wrongly expected Pro/Max to be monthly recurring and would reject a
+  // correctly-configured one-time Pro/Max Price ID.)
+  const expectedRecurring = tier === 'ultra';
 
   const now = Date.now();
   let entry = stripePriceCache.get(priceId);
@@ -698,27 +724,36 @@ const STRIPE_PRICE_DATA = {
     currency: 'usd',
     product_data: {
       name: 'minicaai Basic',
-      description: '3 interview credits · 14-day expiry · GPT-5.5 · Grok · Llama',
+      description: 'One 30-minute interview · Gemini · GPT-5.5 · Grok · Groq',
     },
-    unit_amount: 2500,
-    // No `recurring` — Basic is a one-time payment.
+    unit_amount: 3000,
+    // No `recurring` — one-time interview.
   },
   pro: {
     currency: 'usd',
     product_data: {
       name: 'minicaai Pro',
-      description: 'Unlimited sessions · 4 AI models · Pop-out · Auto-Solve',
+      description: 'One 1-hour interview · all 5 models incl. Claude Sonnet 5',
     },
-    unit_amount: 2900,
-    recurring: { interval: 'month' },
+    unit_amount: 5000,
+    // No `recurring` — one-time interview.
   },
   max: {
     currency: 'usd',
     product_data: {
       name: 'minicaai Max',
-      description: 'Pro + Claude Sonnet 4.6 + Auto-Type + Train Model',
+      description: 'Three 1-hour interviews · all 5 models incl. Claude Sonnet 5',
     },
-    unit_amount: 6900,
+    unit_amount: 8900,
+    // No `recurring` — one-time 3-interview pack.
+  },
+  ultra: {
+    currency: 'usd',
+    product_data: {
+      name: 'minicaai Ultra',
+      description: 'Unlimited interviews · all models · Auto-Type · Train Model',
+    },
+    unit_amount: 15900,
     recurring: { interval: 'month' },
   },
 };
@@ -800,9 +835,9 @@ async function createStripeCheckout(req, res, tier) {
   }
 
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3005';
-  // Basic is a one-time purchase (3 credits, 14-day expiry). Pro/Max are
-  // recurring subscriptions with provider-managed lifecycle.
-  const mode = tier === 'basic' ? 'payment' : 'subscription';
+  // 2026-07 pricing: Basic/Pro/Max are ONE-TIME interview purchases; only Ultra
+  // is a recurring subscription with provider-managed lifecycle.
+  const mode = tier === 'ultra' ? 'subscription' : 'payment';
 
   // Reuse the existing Stripe customer when we have one. Stripe creates a
   // brand-new cus_* if you pass `customer_email` instead of `customer`,
@@ -885,26 +920,36 @@ async function createStripeCheckout(req, res, tier) {
 // INR amounts & copy per tier. Must match the pricingService table on the
 // client for the amount shown on the Razorpay checkout modal to match
 // what the user clicked. Amount is in paise.
+// 2026-07 INR pricing — must match pricingService.ts (IN block) and
+// EXPECTED_INR_PAISE above. Basic/Pro/Max are ONE-TIME interview orders; Ultra
+// is the monthly subscription. Amount is in paise.
 const RAZORPAY_TIER_CONFIG = {
   basic: {
-    amountPaise: 199900, // ₹1999 one-time
+    amountPaise: 249900, // ₹2499 one-time · one 30-min interview
     name: 'minicaai Basic',
-    description: '3 interview credits · 14-day expiry',
+    description: 'One 30-minute interview · Gemini · GPT-5.5 · Grok · Groq',
   },
   pro: {
-    amountPaise: 249900, // ₹2499/month
+    amountPaise: 419900, // ₹4199 one-time · one 1-hour interview
     name: 'minicaai Pro',
-    description: 'Pro Plan — ₹2499/month · unlimited sessions',
+    description: 'One 1-hour interview · all 5 models incl. Claude Sonnet 5',
   },
   max: {
-    amountPaise: 599900, // ₹5999/month
+    amountPaise: 739900, // ₹7399 one-time · three 1-hour interviews
     name: 'minicaai Max',
-    description: 'Max Plan — ₹5999/month · Auto-Type unlocked',
+    description: 'Three 1-hour interviews · all 5 models incl. Claude Sonnet 5',
+  },
+  ultra: {
+    amountPaise: 1299900, // ₹12999/month · unlimited + Auto-Type
+    name: 'minicaai Ultra',
+    description: 'Unlimited interviews · all models · Auto-Type · Train Model',
   },
 };
-// Plan-ID env per tier. Legacy RAZORPAY_PLAN_ID stays valid for Pro so
-// existing deployments don't break while Max is being set up.
+// Plan-ID env per tier. Only Ultra recurs in the 2026-07 model. Legacy Pro/Max
+// plan envs are still recognized so any historical subscriptions keep resolving,
+// but new Pro/Max checkouts are one-time orders (no plan needed).
 const RAZORPAY_PLAN_ENV = {
+  ultra: 'RAZORPAY_PLAN_ID_ULTRA',
   pro: 'RAZORPAY_PLAN_ID_PRO',
   max: 'RAZORPAY_PLAN_ID_MAX',
 };
@@ -919,13 +964,21 @@ async function createRazorpayCheckout(req, res, tier) {
     return res.status(400).json({ error: `Unknown tier: ${tier}` });
   }
 
-  // Pro/Max → recurring subscription (if a plan is configured).
-  // Basic → always one-time order (no recurring semantics).
-  if (tier !== 'basic') {
-    const planId = process.env[RAZORPAY_PLAN_ENV[tier]]
-      || (tier === 'pro' ? process.env.RAZORPAY_PLAN_ID : null);
+  // 2026-07 model: ONLY Ultra is a recurring subscription. Basic/Pro/Max are
+  // one-time interview orders (they fall through to razorpay.orders.create below).
+  if (tier === 'ultra') {
+    const planId = process.env[RAZORPAY_PLAN_ENV.ultra];
+    if (!planId) {
+      // No recurring Ultra plan configured for India yet. Refuse rather than
+      // sell Ultra as a one-time order — the webhook grants Ultra as
+      // unlimited-forever (expires_at:-1), so a single ₹12,999 charge that
+      // never recurs would hand out permanent unlimited access.
+      return res.status(503).json({
+        error: 'Ultra isn\'t available as a subscription in your region yet. Please choose Basic, Pro, or Max, or contact support.',
+      });
+    }
 
-    if (planId) {
+    {
       // Verify the plan's amount/currency/period match the published in-app
       // amount before creating the subscription. The Razorpay equivalent of
       // the Stripe price-mismatch check — see assertStripePriceMatches for
@@ -985,11 +1038,9 @@ async function createRazorpayCheckout(req, res, tier) {
         tier,
       });
     }
-    // Falls through to one-time order when the plan isn't configured yet
-    // — lets Max be exercised in test mode before creating the recurring
-    // plan in the Razorpay dashboard.
   }
 
+  // Basic/Pro/Max → one-time order at the tier's INR price.
   const order = await razorpay.orders.create({
     amount: cfg.amountPaise,
     currency: 'INR',

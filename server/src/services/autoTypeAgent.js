@@ -228,7 +228,7 @@ async function runAutoTypeAgent({ editorText, cursorOffset, code, language, apiK
   const client = factory(apiKey);
 
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 1500,
     system: SYSTEM_PROMPT,
     tools: [SUBMIT_PLAN_TOOL],
@@ -280,7 +280,7 @@ async function runAutoTypeAgent({ editorText, cursorOffset, code, language, apiK
     // Telemetry / debugging — not consumed by the typer
     pre_tool_reasoning: reasoningText,
     request_id: requestId || null,
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     usage: response.usage || null,
   };
 

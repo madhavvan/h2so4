@@ -36,7 +36,7 @@ const _AnthropicMod = (() => {
 })();
 const Anthropic = _AnthropicMod && (_AnthropicMod.default || _AnthropicMod);
 
-const MODEL = process.env.SUPPORT_ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+const MODEL = process.env.SUPPORT_ANTHROPIC_MODEL || 'claude-sonnet-5';
 const MAX_TOOL_ITERATIONS = 8;
 const MAX_TOKENS_PER_TURN = 16000;
 

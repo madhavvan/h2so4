@@ -646,7 +646,9 @@ function createMainWindow() {
     // Normal opaque window with frame
     frame: true,
     transparent: false,
-    backgroundColor: '#09090b', // Dark zinc background
+    backgroundColor: '#0b0a08', // Warm obsidian — matches the in-app dark
+                                // theme (index.html .dark --bg-color) so the
+                                // pre-paint frame doesn't flash cool zinc.
     skipTaskbar: true,  // Hidden from taskbar — access via system tray
     webPreferences: {
       // Sandboxed renderer: no Node.js access, no shared context with the

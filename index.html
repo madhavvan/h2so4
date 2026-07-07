@@ -86,6 +86,28 @@
         --ink-faint:    #9b988e;
         --accent:       #c96342;  /* Anthropic terracotta */
         --accent-soft:  #f4ddd2;
+
+        /* ── Obsidian & Gold (shared with the marketing landing) ──
+           The premium landing (PremiumLanding.tsx) is built on warm
+           obsidian + a single precious gold accent + Newsreader serif.
+           These tokens bring that exact language into the in-app dark
+           theme and the transparent pop-out so the logged-in tool
+           feels like a continuation of the landing, not a different
+           product. Defined globally (harmless in light mode); consumed
+           by the `.dark` obsidian skin layer in index.css and by the
+           pop-out overrides in pip-styles.css. Keep in sync with the
+           `--gold*` values inside PremiumLanding.tsx's scoped CSS. */
+        --paper:        #f2efe6;   /* warm off-white — the landing's text */
+        --obsidian:     #0b0a08;   /* warm near-black page ground */
+        --obsidian-2:   #15130d;   /* elevated warm surface */
+        --gold-1:       #e6d29c;   /* bright highlight end of the gold (toned ~8% for less glare) */
+        --gold-2:       #cba966;   /* mid gold */
+        --gold-3:       #aa863f;   /* deep gold / shadow end */
+        --gold:         #c39d58;   /* the single accent (toned down from #d3ac63 per brightness feedback) */
+        --gold-line:    rgba(195, 157, 88, 0.20);  /* hairlines, borders (softer) */
+        --gold-glow:    rgba(195, 157, 88, 0.12);  /* spotlights, focus (dimmer glow) */
+        --gold-grad:    linear-gradient(100deg, #e6d29c, #cba966 55%, #aa863f);
+
         --serif: 'Newsreader', 'Tiempos Headline', 'Source Serif 4',
                  ui-serif, Georgia, serif;
         --sans:  'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
@@ -135,17 +157,22 @@
       }
 
       .dark {
-        /* Dark Mode Defaults */
-        --bg-color: #09090b; /* Zinc 950 */
-        --surface-color: #18181b; /* Zinc 900 */
-        --border-color: #27272a; /* Zinc 800 */
-        --text-color: #e4e4e7; /* Zinc 200 */
+        /* Dark Mode Defaults — WARM OBSIDIAN (2026-07).
+           Was cool Zinc (#09090b / #18181b / #27272a / #e4e4e7). Shifted
+           to the landing's warm obsidian + paper so the logged-in tool
+           shares the marketing surface's material. Kept a hair above pure
+           black for long-session eye comfort. */
+        --bg-color: #0b0a08;      /* warm obsidian ground (was zinc-950) */
+        --surface-color: #15130d; /* warm elevated surface (was zinc-900) */
+        --border-color: #221f17;  /* faint warm hairline — softer, less "boxed" */
+        --text-color: #ece7dc;    /* warm paper text (was zinc-200) */
 
-        /* Dark-mode popover surfaces — match the original popout
-           design (deep navy, 94% opacity, strong drop shadow). */
-        --model-menu-bg:     rgba(10, 10, 30, 0.94);
-        --model-menu-border: rgba(255, 255, 255, 0.18);
-        --model-menu-shadow: 0 10px 32px rgba(0, 0, 0, 0.60);
+        /* Dark-mode popover surfaces — warm obsidian glass with a gold
+           hairline (was deep navy + white border), so the model picker /
+           dropdowns match the pop-out and landing. */
+        --model-menu-bg:     rgba(16, 14, 10, 0.95);
+        --model-menu-border: rgba(211, 172, 99, 0.28);
+        --model-menu-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 26px 64px -22px rgba(0, 0, 0, 0.88), 0 2px 10px -4px rgba(0, 0, 0, 0.5);
       }
 
       /* ── Typography: SF-family, -webkit-font-smoothing for iOS feel ── */
@@ -254,19 +281,86 @@
          used flat Tailwind utility colors (bg-primary, bg-purple-600)
          that visually disconnected from the rest of the iOS-aesthetic
          app. */
+      /* Composer shell — 2026-07 PREMIUM GLASS. A frosted obsidian slab
+         with a real light-catching glass edge (gradient hairline via the
+         padding-box mask trick, not a flat border), layered depth
+         shadows, and a gold FOCUS BLOOM — inner gold haze + an outer gold
+         glow — the moment the textarea is engaged. Radius comes from the
+         element's rounded-[1.5rem] utility so nothing here fights the
+         global radius remap. */
       .composer-shell {
-        /* Outer shell: subtle background + 1px hairline. Stays inert on
-           focus — user feedback (2026-05-08) was that the prior
-           focus-within blue glow felt like a highlighted/active state
-           and competed with the chat content for attention. The shell
-           is now purely structural: the rounded container exists to
-           group the textarea with the Send / Auto-Solve gradient
-           buttons as one visual unit, but typing into it doesn't
-           change the shell's appearance. */
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+        position: relative;
+        border-radius: 1.5rem;  /* guaranteed even if the rounded-[1.5rem] utility JIT-misses */
+        background: linear-gradient(180deg, rgba(20,20,19,0.045) 0%, rgba(20,20,19,0.02) 45%, rgba(20,20,19,0.01) 100%);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.55),
+          inset 0 0 0 1px rgba(20,20,19,0.06),
+          0 10px 30px -16px rgba(20,20,19,0.16);
+        transition: box-shadow var(--dur-ios) var(--ease-ios),
+                    background var(--dur-ios) var(--ease-ios);
+      }
+      .composer-shell:focus-within {
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.55),
+          inset 0 0 36px -12px rgba(201,99,66,0.06),       /* faint ambient warmth */
+          0 14px 34px -16px rgba(20,20,19,0.18);
       }
       .dark .composer-shell {
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+        background: linear-gradient(180deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.022) 42%, rgba(255,255,255,0.012) 100%);
+        -webkit-backdrop-filter: blur(16px) saturate(1.25);
+        backdrop-filter: blur(16px) saturate(1.25);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.12),        /* glass top light-catch */
+          inset 0 0 0 1px rgba(255,255,255,0.04),        /* whisper ring */
+          inset 0 -18px 34px -22px rgba(0,0,0,0.55),     /* inner floor depth */
+          0 2px 6px -3px rgba(0,0,0,0.5),                /* tight key */
+          0 22px 54px -26px rgba(0,0,0,0.9);             /* soft ambient */
+      }
+      .dark .composer-shell:focus-within {
+        /* Ambient, rich, MINUTE. Focus barely warms the glass — a soft gold
+           light felt from inside, not a bright bloom around it. */
+        background: linear-gradient(180deg, rgba(255,255,255,0.062) 0%, rgba(255,255,255,0.024) 45%, rgba(211,172,99,0.011) 100%);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.11),            /* glass top highlight */
+          inset 0 0 0 1px rgba(255,255,255,0.04),           /* whisper ring (as at rest) */
+          inset 0 0 48px -14px rgba(211,172,99,0.07),       /* ambient inner warmth — soft, diffuse */
+          inset 0 -18px 34px -22px rgba(0,0,0,0.5),         /* inner floor depth */
+          0 2px 6px -3px rgba(0,0,0,0.5),
+          0 22px 54px -26px rgba(0,0,0,0.9),                /* the float */
+          0 0 20px -16px rgba(211,172,99,0.06);             /* barely-there outer whisper */
+      }
+      /* The glass edge: a gradient hairline that catches light at the
+         top-left and fades to nothing, drawn as a masked 1px border so
+         only the ring shows. Blooms gold on focus. */
+      .composer-shell::after {
+        content: '';
+        position: absolute; inset: 0;
+        border-radius: inherit;
+        padding: 1px;
+        background: linear-gradient(135deg, rgba(255,255,255,0.16), rgba(255,255,255,0.02) 38%, transparent 62%);
+        -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+        -webkit-mask-composite: xor;
+                mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+                mask-composite: exclude;
+        pointer-events: none;
+        transition: background var(--dur-ios) var(--ease-ios), opacity var(--dur-ios) var(--ease-ios);
+      }
+      .composer-shell:focus-within::after {
+        background: linear-gradient(135deg, rgba(246,228,176,0.11), rgba(211,172,99,0.03) 40%, transparent 60%);
+      }
+      /* Gold caret in the composer — a small premium signature. */
+      .composer-shell textarea { caret-color: var(--gold, #d3ac63); }
+      /* The focus affordance lives on the SHELL (its gold glow blooms on
+         :focus-within). The inner textarea must draw NO outline of its own,
+         or a bright rectangle appears inside the glass. Kill both :focus and
+         the global `html.dark :focus-visible` gold outline for it. */
+      .composer-shell textarea:focus,
+      .composer-shell textarea:focus-visible {
+        outline: none !important;
+        box-shadow: none !important;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .composer-shell, .composer-shell::after { transition: none; }
       }
 
       /* ── Composer buttons (Send / Auto-Solve) ──
@@ -304,6 +398,29 @@
         opacity: 0.45;
         cursor: not-allowed;
       }
+
+      /* Send = the primary action → gold gradient (the landing CTA), the
+         composer's focal "go". Auto-Solve stays neutral glass so there's
+         one clear gold action, not two competing chips. Disabled send is a
+         faded gold, not gray, so the affordance stays on-theme. */
+      .dark .btn-ios-send:not(:disabled) {
+        background: linear-gradient(145deg, #f6e4b0 0%, #d9b874 55%, #b58f45 100%);
+        color: #231c0c;
+        box-shadow: 0 6px 18px -6px rgba(211,172,99,0.55), inset 0 1px 0 rgba(255,255,255,0.45);
+        transition: background 150ms ease, box-shadow 200ms ease, transform 160ms var(--ease-ios);
+      }
+      .dark .btn-ios-send:not(:disabled) svg { color: #231c0c; }
+      .dark .btn-ios-send:hover:not(:disabled) {
+        background: linear-gradient(145deg, #fbeecb 0%, #e2c684 55%, #c69c4e 100%);
+        transform: translateY(-1px);
+        box-shadow: 0 11px 26px -8px rgba(211,172,99,0.68), inset 0 1px 0 rgba(255,255,255,0.5);
+      }
+      .dark .btn-ios-send:active:not(:disabled) { transform: translateY(0) scale(0.94); }
+      .dark .btn-ios-send:disabled {
+        background-color: rgba(211,172,99,0.10);
+        opacity: 0.55;
+      }
+      .dark .btn-ios-send:disabled svg { color: rgba(211,172,99,0.55); }
 
       /* PiP textarea focus glow upgrade — was a 4px white box-shadow at 6%
          opacity (too subtle to read). Bump to a slightly more visible focus

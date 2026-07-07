@@ -345,6 +345,7 @@ function getDB() {
   setDefault.run('max_devices_basic', '2', Date.now());
   setDefault.run('max_devices_pro', '3', Date.now());
   setDefault.run('max_devices_max', '5', Date.now());
+  setDefault.run('max_devices_ultra', '10', Date.now());
 
   // ── Idempotent migrations ──
   // SQLite has no "ADD COLUMN IF NOT EXISTS", so we check PRAGMA table_info.
@@ -896,6 +897,7 @@ function registerDevice(userId, deviceId, deviceName, platform) {
     basic: getConfig('max_devices_basic', 2),
     pro: getConfig('max_devices_pro', 3),
     max: getConfig('max_devices_max', 5),
+    ultra: getConfig('max_devices_ultra', 10),
   };
   const maxDevices = tierDeviceLimits[user.tier] ?? tierDeviceLimits.free;
   const activeDevices = d.prepare('SELECT * FROM devices WHERE user_id = ? AND is_active = 1 ORDER BY last_seen_at ASC').all(userId);
@@ -1618,10 +1620,12 @@ function recordCompPayment(userId, tier, note) {
   const d = getDB();
   const user = d.prepare('SELECT * FROM users WHERE id = ?').get(userId);
   if (!user) return null;
+  // Comp grants are unlimited-until-revoked across every paid tier (2026-07).
   const grantConfig = {
-    basic: { sessions_limit: 3, expires_at: Date.now() + 14 * DAY_MS_CONST },
+    basic: { sessions_limit: -1, expires_at: -1 },
     pro:   { sessions_limit: -1, expires_at: -1 },
     max:   { sessions_limit: -1, expires_at: -1 },
+    ultra: { sessions_limit: -1, expires_at: -1 },
   }[tier];
   if (!grantConfig) return null;
   // Capture the inserted payment row id so the admin audit entry can
@@ -1631,7 +1635,7 @@ function recordCompPayment(userId, tier, note) {
   let paymentId = null;
   const tx = d.transaction(() => {
     d.prepare('UPDATE users SET tier = ?, updated_at = ? WHERE id = ?').run(tier, Date.now(), userId);
-    d.prepare('UPDATE licenses SET tier = ?, status = ?, expires_at = ?, sessions_limit = ? WHERE user_id = ?')
+    d.prepare('UPDATE licenses SET tier = ?, status = ?, expires_at = ?, sessions_limit = ?, credits_remaining_seconds = -1, credits_expire_at = -1 WHERE user_id = ?')
       .run(tier, 'active', grantConfig.expires_at, grantConfig.sessions_limit, userId);
     const info = d.prepare(`
       INSERT INTO payments (user_id, email, provider, provider_payment_id, provider_subscription_id, amount, currency, status, tier_granted, metadata, created_at)
@@ -1987,7 +1991,7 @@ function getStats() {
 
   // Full per-tier user count — single GROUP BY scan instead of four COUNTs.
   const tierRows = d.prepare('SELECT tier, COUNT(*) as c FROM users GROUP BY tier').all();
-  const tiers = { free: 0, basic: 0, pro: 0, max: 0 };
+  const tiers = { free: 0, basic: 0, pro: 0, max: 0, ultra: 0 };
   for (const row of tierRows) {
     if (row.tier in tiers) tiers[row.tier] = row.c;
   }

@@ -25,6 +25,12 @@ import {
   Cpu, ChevronRight, Info, ShieldCheck, UploadCloud,
 } from 'lucide-react';
 import { WizardHat } from './WizardHat';
+import { UltraMark } from './UltraMark';
+// Precious-material marks for the pricing rows: Basic→bronze, Pro→platinum,
+// Max→gold — a value ladder that tops out at Ultra's amethyst gem. See
+// TierMarks.tsx. (The identity chips above keep their semantic Zap/Crown/
+// WizardHat marks on currentColor.)
+import { BasicMark, ProMark, MaxMark } from './TierMarks';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
 import { backfillAllConversations, BackfillProgress } from './services/aiProxyService';
 import { RefundPolicy } from './RefundPolicy';
@@ -39,7 +45,7 @@ const API_BASE = (import.meta as any).env?.PROD
 
 interface SubscriptionStatus {
   status: 'active' | 'canceling' | 'trial' | 'expired' | 'revoked' | 'paused' | 'refunded' | 'disputed' | 'none';
-  tier: 'free' | 'basic' | 'pro' | 'max';
+  tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
   provider: 'stripe' | 'razorpay' | null;
   expires_at: number;
   sessions_used: number;
@@ -60,7 +66,7 @@ interface ManageSubscriptionProps {
   userLicense: LicenseData | null;
   // Triggers the existing upgrade flow (re-uses SubscriptionGate's checkout
   // path so we don't duplicate Razorpay/Stripe SDK plumbing).
-  onUpgradeRequested: (targetTier: 'basic' | 'pro' | 'max') => void;
+  onUpgradeRequested: (targetTier: 'basic' | 'pro' | 'max' | 'ultra') => void;
   // Optional callback fired after the user successfully edits their
   // profile here (display name) so MainApp can keep its userProfile state
   // in sync without a separate fetch. licenseService already mirrors the
@@ -83,7 +89,7 @@ interface ManageSubscriptionProps {
   // browser to open. Without this, the button click felt unresponsive
   // — modal closed instantly with no feedback. Now button shows spinner
   // until the parent decides to close us, smoothly.
-  upgradePending?: 'basic' | 'pro' | 'max' | null;
+  upgradePending?: 'basic' | 'pro' | 'max' | 'ultra' | null;
   // Same pattern but for the +1h Basic top-up — separate flag so the
   // renewal spinner doesn't accidentally light up the upgrade rows.
   renewPending?: boolean;
@@ -100,7 +106,7 @@ const TIER_INFO: Record<string, {
     label: 'Free',
     color: 'text-gray-300',
     gradient: 'from-slate-700 to-slate-800',
-    icon: Cpu,
+    icon: Sparkles,
     blurb: '5 sessions/month, Gemini only.',
   },
   basic: {
@@ -129,7 +135,15 @@ const TIER_INFO: Record<string, {
     color: 'text-amber-400',
     gradient: 'from-amber-600/40 via-orange-600/40 to-purple-700/40',
     icon: WizardHat,
-    blurb: 'Everything in Pro · plus Claude Sonnet 4.6, Auto-Type, and Train Model.',
+    blurb: 'Three 1-hour interviews · all five models incl. Claude Sonnet 5 · Train Model.',
+  },
+  ultra: {
+    // Amethyst flagship — the only unlimited, monthly-subscription tier.
+    label: 'Ultra',
+    color: 'text-violet-300',
+    gradient: 'from-violet-600/45 to-fuchsia-700/40',
+    icon: UltraMark,
+    blurb: 'Unlimited interviews · Auto-Type · all five models. The monthly flagship.',
   },
 };
 
@@ -185,18 +199,85 @@ function formatTrialTime(seconds: number | undefined): string {
 
 // Plan comparison rows. Keep this short — long tables intimidate users
 // scanning for the right plan at decision time.
+// 2026-07 model. Basic/Pro/Max are one-time interviews (time-gated); Ultra is
+// the unlimited monthly subscription. Auto-Type is Ultra-only; Claude unlocks
+// at Pro.
 const FEATURE_ROWS: Array<{ label: string; values: Record<string, string | boolean> }> = [
-  { label: 'AI models',           values: { free: 'Gemini',       basic: 'Gemini · GPT-5.5 · Grok · Groq',  pro: 'Gemini · GPT-5.5 · Grok · Groq',          max: 'All four · plus Claude Sonnet 4.6' } },
-  { label: 'Sessions per month',  values: { free: '5',            basic: 'Unlimited', pro: 'Unlimited',         max: 'Unlimited' } },
-  { label: 'Time per session',    values: { free: 'Credit-gated', basic: 'Credit-gated (renewable)', pro: 'Unlimited', max: 'Unlimited' } },
-  { label: 'Pop-out window',      values: { free: false,          basic: true,        pro: true,                max: true } },
-  { label: 'Auto-Solve (camera)', values: { free: false,          basic: true,        pro: true,                max: true } },
-  { label: 'Auto-Type (typing)',  values: { free: false,          basic: false,       pro: false,               max: true } },
-  { label: 'Train Model (Claude)', values: { free: false,         basic: false,       pro: false,               max: true } },
-  { label: 'Context files',       values: { free: '1',            basic: 'Unlimited', pro: 'Unlimited',         max: 'Unlimited' } },
+  { label: 'Interview time',      values: { free: '30-min trial', basic: 'One 30-min',  pro: 'One 1-hour', max: 'Three 1-hour', ultra: 'Unlimited' } },
+  { label: 'AI models',           values: { free: 'Gemini',       basic: '4 (no Claude)', pro: 'All 5',    max: 'All 5',        ultra: 'All 5' } },
+  { label: 'Pop-out window',      values: { free: false,          basic: true,          pro: true,         max: true,           ultra: true } },
+  { label: 'Auto-Solve (screen)', values: { free: false,          basic: true,          pro: true,         max: true,           ultra: true } },
+  { label: 'Train Model',         values: { free: false,          basic: false,         pro: false,        max: true,           ultra: true } },
+  { label: 'Auto-Type (typing)',  values: { free: false,          basic: false,         pro: false,        max: false,          ultra: true } },
+  { label: 'Context files',       values: { free: '1',            basic: 'Unlimited',   pro: 'Unlimited',  max: 'Unlimited',    ultra: 'Unlimited' } },
 ];
 
-const TIER_ORDER = ['free', 'basic', 'pro', 'max'] as const;
+const TIER_ORDER = ['free', 'basic', 'pro', 'max', 'ultra'] as const;
+
+// ── Purchasable plans (2026-07 model) ──
+// Basic/Pro/Max are one-time interview buys; Ultra is the monthly subscription.
+// EVERY option is a fresh checkout via onUpgradeRequested → /create-checkout —
+// there's no in-place sub swap anymore (the old /upgrade-tier Pro↔Max path 404s
+// without a live subscription). Each row wears its tier's precious material:
+// Basic bronze → Pro platinum → Max gold → Ultra amethyst-gold gem. The marks
+// self-colour (they ignore the span tint below); `accent` now only drives the
+// row chrome — gold hairline for the metals, violet glow for the Ultra jewel.
+type BuyTier = 'basic' | 'pro' | 'max' | 'ultra';
+const PLAN_ROW_META: Record<BuyTier, { title: string; blurb: string; Icon: React.ComponentType<{ size?: number }>; accent: 'gold' | 'violet' }> = {
+  basic: { title: 'Get Basic', Icon: BasicMark, accent: 'gold',   blurb: 'One 30-min interview · Gemini, GPT-5.5, Grok, Groq (no Claude)' },
+  pro:   { title: 'Get Pro',   Icon: ProMark,   accent: 'gold',   blurb: 'One 1-hour interview · all 5 models incl. Claude Sonnet 5' },
+  max:   { title: 'Get Max',   Icon: MaxMark,   accent: 'gold',   blurb: 'Three 1-hour interviews · all 5 models · Train Model' },
+  ultra: { title: 'Go Ultra',  Icon: UltraMark,  accent: 'violet', blurb: 'Unlimited interviews · Auto-Type · all 5 models · billed monthly' },
+};
+const UPGRADE_TARGETS: Record<string, BuyTier[]> = {
+  free:  ['basic', 'pro', 'max', 'ultra'],
+  basic: ['pro', 'max', 'ultra'],
+  pro:   ['max', 'ultra'],
+  max:   ['ultra'],
+  ultra: [],
+};
+
+// Themed purchase row — dark with a SLIGHT gold hairline; Basic is the plainest.
+// Ultra stays in the core dark+gold theme but a rich purple glow bleeds in from
+// the RIGHT edge — a hint, not a violet row. Colors are inline hex so they
+// survive the html.dark blue/purple→gold remap in index.css and read on both
+// the light and dark surfaces. Icon color rides on the span's `color`.
+const UpgradeRow: React.FC<{ target: BuyTier; pending: boolean; disabled: boolean; onClick: () => void }> = ({ target, pending, disabled, onClick }) => {
+  const m = PLAN_ROW_META[target];
+  const Icon = m.Icon;
+  const isUltra = m.accent === 'violet';
+  const goldLine = target === 'basic' ? 0.14 : 0.22; // Basic = plainest hairline
+  const fg = isUltra ? '#c4b5fd' : '#d3ac63';
+  const style: React.CSSProperties = {
+    border: `1px solid rgba(211,172,99,${goldLine})`,
+    backgroundColor: 'rgba(255,255,255,0.015)',
+    ...(isUltra ? {
+      // background-image clips to the rounded border-box, so the purple stays
+      // inside the row's radius.
+      backgroundImage: 'radial-gradient(55% 130% at 100% 50%, rgba(139,92,246,0.20) 0%, rgba(124,58,237,0.06) 30%, transparent 62%)',
+      boxShadow: 'inset -1px 0 0 rgba(167,139,250,0.35)',
+    } : {}),
+  };
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="w-full flex items-center justify-between gap-3 p-4 rounded-xl transition-all hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+      style={style}
+    >
+      <div className="flex items-center gap-3">
+        <span style={{ color: fg, display: 'inline-flex' }}><Icon size={18} /></span>
+        <div className="text-left">
+          <div className="font-semibold text-zinc-900 dark:text-white text-sm">{pending ? 'Preparing checkout…' : m.title}</div>
+          <div className="text-xs text-zinc-600 dark:text-white/60">{m.blurb}</div>
+        </div>
+      </div>
+      {pending
+        ? <Loader2 size={16} className="animate-spin" style={{ color: fg }} />
+        : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
+    </button>
+  );
+};
 
 export function ManageSubscription({
   isOpen,
@@ -768,147 +849,41 @@ export function ManageSubscription({
         <div className="space-y-3">
           <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500 dark:text-white/50">Available plans</h4>
 
-          {/* === Free tier → all paid options === */}
-          {tier === 'free' && (
-            <>
-              <button
-                onClick={() => onUpgradeRequested('pro')}
-                disabled={upgradePending != null}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <div className="flex items-center gap-3">
-                  <Crown size={18} className="text-blue-400" />
-                  <div className="text-left">
-                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
-                      {upgradePending === 'pro' ? 'Preparing checkout…' : 'Upgrade to Pro'}
-                    </div>
-                    <div className="text-xs text-zinc-600 dark:text-white/60">Unlimited time · GPT-5.5, Grok, Llama · Pop-out · Auto-Solve</div>
-                  </div>
-                </div>
-                {upgradePending === 'pro'
-                  ? <Loader2 size={16} className="animate-spin text-blue-400" />
-                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
-              </button>
-              <button
-                onClick={() => onUpgradeRequested('max')}
-                disabled={upgradePending != null}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <div className="flex items-center gap-3">
-                  <WizardHat size={18} className="text-amber-400" />
-                  <div className="text-left">
-                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
-                      {upgradePending === 'max' ? 'Preparing checkout…' : 'Upgrade to Max'}
-                    </div>
-                    <div className="text-xs text-zinc-600 dark:text-white/60">Pro + Claude Sonnet 4.6 + Auto-Type + Train Model</div>
-                  </div>
-                </div>
-                {upgradePending === 'max'
-                  ? <Loader2 size={16} className="animate-spin text-amber-400" />
-                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
-              </button>
-              <button
-                onClick={() => onUpgradeRequested('basic')}
-                disabled={upgradePending != null}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <div className="flex items-center gap-3">
-                  <Zap size={18} className="text-emerald-400" />
-                  <div className="text-left">
-                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
-                      {upgradePending === 'basic' ? 'Preparing checkout…' : 'Get Basic'}
-                    </div>
-                    <div className="text-xs text-zinc-600 dark:text-white/60">3 hours · 14-day window · GPT, Grok, Llama (no Claude)</div>
-                  </div>
-                </div>
-                {upgradePending === 'basic'
-                  ? <Loader2 size={16} className="animate-spin text-emerald-400" />
-                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
-              </button>
-            </>
-          )}
-
-          {/* === Basic tier → renew or upgrade === */}
-          {tier === 'basic' && (
-            <>
-              {onRenewRequested && (
-                <button
-                  onClick={onRenewRequested}
-                  disabled={renewPending || upgradePending != null}
-                  className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <div className="flex items-center gap-3">
-                    <Zap size={18} className="text-emerald-400" />
-                    <div className="text-left">
-                      <div className="font-semibold text-zinc-900 dark:text-white text-sm">
-                        {renewPending ? 'Preparing checkout…' : 'Renew · +1 hour'}
-                      </div>
-                      <div className="text-xs text-zinc-600 dark:text-white/60">Adds another hour of session time to your Basic plan.</div>
-                    </div>
-                  </div>
-                  {renewPending
-                    ? <Loader2 size={16} className="animate-spin text-emerald-400" />
-                    : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
-                </button>
-              )}
-              <button
-                onClick={() => onUpgradeRequested('pro')}
-                disabled={upgradePending != null}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <div className="flex items-center gap-3">
-                  <Crown size={18} className="text-blue-400" />
-                  <div className="text-left">
-                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
-                      {upgradePending === 'pro' ? 'Preparing checkout…' : 'Upgrade to Pro'}
-                    </div>
-                    <div className="text-xs text-zinc-600 dark:text-white/60">Unlimited time, no expiry · keep your remaining Basic hours.</div>
-                  </div>
-                </div>
-                {upgradePending === 'pro'
-                  ? <Loader2 size={16} className="animate-spin text-blue-400" />
-                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
-              </button>
-              <button
-                onClick={() => onUpgradeRequested('max')}
-                disabled={upgradePending != null}
-                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <div className="flex items-center gap-3">
-                  <WizardHat size={18} className="text-amber-400" />
-                  <div className="text-left">
-                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
-                      {upgradePending === 'max' ? 'Preparing checkout…' : 'Upgrade to Max'}
-                    </div>
-                    <div className="text-xs text-zinc-600 dark:text-white/60">Adds Claude + Auto-Type + Train Model.</div>
-                  </div>
-                </div>
-                {upgradePending === 'max'
-                  ? <Loader2 size={16} className="animate-spin text-amber-400" />
-                  : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
-              </button>
-            </>
-          )}
-
-          {/* === Pro tier → upgrade to Max (in-place via /upgrade-tier) ===
-              Server's upgradeStripeSubscription / upgradeRazorpaySubscription
-              both update the existing sub instead of creating a duplicate. */}
-          {tier === 'pro' && (
+          {/* Basic-tier renewal top-up (+30 min) — Basic only */}
+          {tier === 'basic' && onRenewRequested && (
             <button
-              onClick={() => handleUpgradeTier('max')}
-              disabled={actionLoading === 'upgrade-max'}
-              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15 transition-colors disabled:opacity-50"
+              onClick={onRenewRequested}
+              disabled={renewPending || upgradePending != null}
+              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl transition-all hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{ border: '1px solid rgba(211,172,99,0.38)', background: 'rgba(211,172,99,0.09)' }}
             >
               <div className="flex items-center gap-3">
-                <WizardHat size={18} className="text-amber-400" />
+                <span style={{ color: '#d3ac63', display: 'inline-flex' }}><Zap size={18} /></span>
                 <div className="text-left">
-                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">Upgrade to Max</div>
-                  <div className="text-xs text-zinc-600 dark:text-white/60">Adds Claude Sonnet 4.6 + Auto-Type + Train Model. Effective immediately, prorated diff next invoice.</div>
+                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">{renewPending ? 'Preparing checkout…' : 'Renew · +30 min'}</div>
+                  <div className="text-xs text-zinc-600 dark:text-white/60">Add another 30 minutes of interview time to your Basic plan.</div>
                 </div>
               </div>
-              {actionLoading === 'upgrade-max' ? <Loader2 size={16} className="animate-spin text-amber-400" /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
+              {renewPending ? <Loader2 size={16} className="animate-spin" style={{ color: '#d3ac63' }} /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
             </button>
           )}
+          {/* Purchase / upgrade — every option is a fresh checkout (2026-07 model):
+              Basic/Pro/Max are one-time, Ultra is the monthly subscription.
+              Ultra renders in amethyst; the rest in gold (see UpgradeRow). */}
+          {(UPGRADE_TARGETS[tier] || []).map(t => (
+            <UpgradeRow
+              key={t}
+              target={t}
+              pending={upgradePending === t}
+              disabled={upgradePending != null}
+              onClick={() => onUpgradeRequested(t)}
+            />
+          ))}
+
+          {/* Basic renew + Pro/Max/Ultra purchase options are all handled by the
+              tier-driven block above (UPGRADE_TARGETS). The old per-tier branches
+              here assumed the pre-2026-07 subscription model (in-place Pro↔Max
+              swap via /upgrade-tier, which 404s now that Pro/Max are one-time). */}
 
           {/* === Max tier → switch back to Pro (downgrade in-place) ===
               On Razorpay this schedules at cycle_end (server keeps Max

@@ -294,7 +294,7 @@ async function runAutoTypeVisionAgent({ screenshotBase64, screenshotMediaType, c
   const client = factory(apiKey);
 
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 4000,   // multi-op plans with full chunk bodies need headroom
     system: SYSTEM_PROMPT,
     tools: [SUBMIT_PLAN_TOOL],
@@ -340,7 +340,7 @@ async function runAutoTypeVisionAgent({ screenshotBase64, screenshotMediaType, c
       : 0,
     pre_tool_reasoning: reasoningText,
     request_id: requestId || null,
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     usage: response.usage || null,
   };
 

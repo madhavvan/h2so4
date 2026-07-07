@@ -7,28 +7,31 @@
 //  - Periodic revalidation every 30 minutes
 //  - No offline grace period for Pro — forces server check
 //
-//  TIERS:
-//  - Free: 5 sessions, Gemini only, no stealth. NEW: 30-minute
-//    full-experience trial on first signup (acts as Basic-level features
-//    for that window) — time-gated by trial_remaining_seconds.
-//  - Basic: $25 for 3 credits (3 hours of live-session time),
-//    14-day expiry, four models (Gemini, GPT, Grok, Llama — NO Claude),
-//    stealth, Auto-Solve. No Auto-Type. Renewal $6.99/credit.
-//    Time-gated by credits_remaining_seconds.
-//  - Pro: unlimited time, four models (same set as Basic — NO Claude),
-//    all features except Auto-Type and Claude.
-//  - Max: Pro + Claude Sonnet 4.6 + Auto-Type + Train Model — the only
-//    tier with all five models.
+//  TIERS (2026-07 pricing — dollar/rupee amounts live in services/pricingService.ts):
+//  - Free: 5 sessions, Gemini only, no stealth. 30-minute full-experience trial
+//    on first signup (acts as Basic-level features for that window) — time-gated
+//    by trial_remaining_seconds.
+//  - Basic ($30 one-time): ONE 30-min interview, four models (Gemini, GPT-5.5,
+//    Grok, Groq — NO Claude), stealth, Auto-Solve. No Auto-Type. Extend +30 min
+//    anytime. Time-gated by credits_remaining_seconds.
+//  - Pro ($50 one-time): ONE 1-hour interview, all five models incl. Claude
+//    Sonnet 5. No Auto-Type.
+//  - Max ($89 one-time): THREE 1-hour interviews, all five models, full
+//    reasoning control + Train Model. No Auto-Type.
+//  - Ultra ($159/month): UNLIMITED interviews, all five models, Auto-Type +
+//    Train Model — the only recurring subscription.
+//  Admins bypass every gate (see isAdmin / getEffectiveTier) — full access,
+//  unlimited everything, no purchase required.
 //
 //  CREDITS vs TIME:
 //  Credits are a display abstraction — internally we track seconds.
-//  3600s = "1 credit". 5400s = "1 credit + 30 min".
+//  3600s = "1 credit" (1 hour). Basic=1800s, Pro=3600s, Max=3×3600s.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 export interface LicenseData {
   key: string;
   email: string;
-  tier: 'free' | 'basic' | 'pro' | 'max';
+  tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
   // Status values mirror what the server's webhook handlers + license
   // routes write into the licenses table. Keep this union exhaustive — a
   // missing value here would render as 'Unknown' in the billing UI's
@@ -74,7 +77,7 @@ export interface UserProfile {
   name: string;
   avatar?: string;
   avatar_url?: string;
-  tier: 'free' | 'basic' | 'pro' | 'max';
+  tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
   country_code: string;
   created_at: number;
   is_admin?: boolean;
@@ -113,30 +116,41 @@ export const FEATURE_GATES = {
     reasoningEffortControl: false,
   },
   pro: {
-    // Claude is Max-only — see comment in `basic`.
-    models: ['gemini', 'groq', 'openai', 'xai'] as string[],
+    // Pro unlocks Claude Sonnet 5 (all five models). Basic is the only paid
+    // tier without Claude. Pro = one 1-hour interview (time-gated).
+    models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
     screenCapture: true,
     autoSolve: true,
-    autoType: false,     // Auto-Type is Max-exclusive
+    autoType: false,     // Auto-Type is Ultra-exclusive
     popout: true,
     contextFiles: -1,    // unlimited
-    sessionsPerMonth: -1, // unlimited
+    sessionsPerMonth: -1, // session count isn't the gate — credit time is
     exportHistory: true,
     reasoningEffortControl: false,
   },
   max: {
+    // Max = three 1-hour interviews, all five models. No Auto-Type (Ultra-only).
     models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
     screenCapture: true,
     autoSolve: true,
-    autoType: true,      // Max tier unlocks Auto-Type
+    autoType: false,     // Auto-Type moved to Ultra (2026-07 pricing)
+    popout: true,
+    contextFiles: -1,    // unlimited
+    sessionsPerMonth: -1, // 3 interviews enforced via sessions_limit + per-session cap
+    exportHistory: true,
+    // Full reasoning bar (none/low/medium/high) on Max and Ultra.
+    reasoningEffortControl: true,
+  },
+  ultra: {
+    // Ultra = unlimited interviews, all five models, + Auto-Type. Monthly sub.
+    models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
+    screenCapture: true,
+    autoSolve: true,
+    autoType: true,      // Ultra unlocks Auto-Type
     popout: true,
     contextFiles: -1,    // unlimited
     sessionsPerMonth: -1, // unlimited
     exportHistory: true,
-    // Max users get the full reasoning bar (none/low/medium/high). Pairs
-    // with Train Model: a trained Max user on 'none' answers in 1-3s
-    // because the cached tech-state card already supplies depth that
-    // reasoning would otherwise compute live.
     reasoningEffortControl: true,
   },
 } as const;
@@ -261,13 +275,12 @@ class LicenseService {
   // trial are treated as Basic for this window so they can experience the
   // full product before the wall comes up.
   //
-  // Tier gating is STRICT — including for admins. Previously this method
-  // returned true unconditionally for admin email matches, which meant an
-  // admin who downgraded their own license to "pro" still had max features
-  // (Auto-Type, Claude) — a loophole that made tier testing impossible and
-  // hid real bugs. The admin-tools surface (admin dashboard, admin bot
-  // tools) is gated separately on the server-side ADMIN_EMAILS check;
-  // personal feature usage honors the license tier exactly.
+  // Admins resolve to Ultra (see getEffectiveTier) so every feature + model is
+  // unlocked — the owner's policy that an admin account has unlimited everything.
+  // An admin who wants to test a lower tier's gating can set the
+  // 'minicaai_admin_test_tier' localStorage override; clearing it restores full
+  // access. The admin-tools surface (dashboard, bot tools) remains gated
+  // independently on the server-side ADMIN_EMAILS check.
   canUseFeature(license: LicenseData | null, feature: keyof typeof FEATURE_GATES.free): boolean {
     if (!license) return false;
     const tier = this.getEffectiveTier(license);
@@ -284,27 +297,39 @@ class LicenseService {
     return FEATURE_GATES[tier].models.includes(model);
   }
 
-  // ── Effective tier resolution (4-way) ──
+  // ── Effective tier resolution ──
+  // Admins resolve to Ultra (full access) unless they opt into a lower tier via
+  // the 'minicaai_admin_test_tier' localStorage override.
   // Free user inside their 30-min trial window gets Basic features.
-  // Basic user with expired credits falls back to Free features.
-  //
-  // Admins are NOT auto-promoted to max here. Strict tier gating means
-  // an admin who downgrades their own license to "pro" sees pro features
-  // (no Claude, no Auto-Type), matching what every other pro user sees.
-  // Admin-tool surfaces (admin dashboard, admin bot tools) are gated
-  // independently on the server-side ADMIN_EMAILS check. To test max
-  // features as an admin, set your own license tier to max via the
-  // change_user_tier admin tool or the ManageSubscription UI.
-  getEffectiveTier(license: LicenseData | null): 'free' | 'basic' | 'pro' | 'max' {
+  // Basic/Pro/Max whose interview clock is exhausted or expired fall back to Free.
+  getEffectiveTier(license: LicenseData | null): 'free' | 'basic' | 'pro' | 'max' | 'ultra' {
+    // ── Admin full access ──
+    // Admins resolve to the top tier (Ultra) for EVERY feature + model gate,
+    // matching the server-side ADMIN_EMAILS bypass in middleware/tier.js. This is
+    // the owner's explicit policy: an admin account has unlimited everything with
+    // no purchase and no license row required. To deliberately test a LOWER tier's
+    // gating as an admin, set localStorage 'minicaai_admin_test_tier' to one of
+    // free|basic|pro|max|ultra (clear it to restore full access).
+    if (this.isAdmin()) {
+      try {
+        const t = typeof localStorage !== 'undefined'
+          ? localStorage.getItem('minicaai_admin_test_tier')
+          : null;
+        if (t === 'free' || t === 'basic' || t === 'pro' || t === 'max' || t === 'ultra') return t;
+      } catch { /* localStorage unavailable — fall through to full access */ }
+      return 'ultra';
+    }
     if (!license) return 'free';
-    if (license.tier === 'max') return 'max';
-    if (license.tier === 'pro') return 'pro';
-    if (license.tier === 'basic') {
-      // Basic with zero balance = locked out of Basic-only features
-      if (this.getCreditsRemainingSeconds(license) > 0) return 'basic';
+    // Ultra is unlimited — no time gate.
+    if (license.tier === 'ultra') return 'ultra';
+    // Basic (30m) / Pro (1h) / Max (3×1h) are time-gated interviews. Once the
+    // live balance hits zero the interview is used up, so features fall back
+    // to Free until the user buys another interview.
+    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
+      if (this.getCreditsRemainingSeconds(license) > 0) return license.tier;
       return 'free';
     }
-    // Free tier: check trial
+    // Free tier: the 30-min signup trial grants Basic-level features for its window.
     if (this.isTrialActive(license)) return 'basic';
     return 'free';
   }
@@ -399,7 +424,7 @@ class LicenseService {
   needsRevalidation(license: LicenseData | null): boolean {
     if (!license) return true;
     // All paid tiers MUST revalidate with server (Basic/Pro/Max)
-    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
+    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max' || license.tier === 'ultra') {
       return Date.now() - license.last_validated > REVALIDATION_INTERVAL;
     }
     // Free users can work offline for longer
@@ -410,7 +435,17 @@ class LicenseService {
   // Returns 0 if credits are expired or absent. Basic users only.
   getCreditsRemainingSeconds(license: LicenseData | null): number {
     if (!license) return 0;
-    if (license.tier !== 'basic') return 0;
+    // Basic/Pro/Max all draw from the credit-seconds bucket now (time-limited
+    // interviews). Ultra is unlimited; Free uses the trial bucket instead.
+    if (!['basic', 'pro', 'max'].includes(license.tier)) return 0;
+    // Admin-granted / comp licenses are unlimited-until-revoked: the grant path
+    // seeds -1 credits and a -1 (never-expires) window. Treat that as Infinity
+    // so an admin-comped user never hits the interview time cap.
+    if ((license.credits_remaining_seconds ?? 0) === -1
+        || license.expires_at === -1
+        || license.credits_expire_at === -1) {
+      return Infinity;
+    }
     const expireAt = license.credits_expire_at ?? 0;
     if (expireAt > 0 && Date.now() > expireAt) return 0;
     return Math.max(0, license.credits_remaining_seconds ?? 0);
@@ -436,11 +471,17 @@ class LicenseService {
     // stored tier hasn't been upgraded yet.
     if (this.isAdmin()) return { seconds: Infinity, source: 'unlimited' };
     if (!license) return { seconds: 0, source: 'none' };
-    if (license.tier === 'pro' || license.tier === 'max') {
+    // Ultra is the only unlimited paid tier now.
+    if (license.tier === 'ultra') {
       return { seconds: Infinity, source: 'unlimited' };
     }
-    if (license.tier === 'basic') {
-      return { seconds: this.getCreditsRemainingSeconds(license), source: 'credits' };
+    // Basic (30m) / Pro (1h) / Max (3×1h) all draw from the credit-seconds bucket.
+    // An admin-granted unlimited license reports Infinity here → 'unlimited'.
+    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
+      const secs = this.getCreditsRemainingSeconds(license);
+      return secs === Infinity
+        ? { seconds: Infinity, source: 'unlimited' }
+        : { seconds: secs, source: 'credits' };
     }
     // Free
     const trial = this.getTrialRemainingSeconds(license);
@@ -451,9 +492,11 @@ class LicenseService {
   // Saves to storage. No-op for unlimited tiers.
   consumeTime(license: LicenseData, seconds: number): LicenseData {
     if (seconds <= 0) return license;
-    if (license.tier === 'pro' || license.tier === 'max') return license;
+    if (license.tier === 'ultra') return license; // unlimited — nothing to deduct
+    // Admin-granted unlimited (-1 sentinel) — never deduct, never expire.
+    if ((license.credits_remaining_seconds ?? 0) === -1 || license.expires_at === -1) return license;
     let updated = { ...license };
-    if (license.tier === 'basic') {
+    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
       const remaining = Math.max(0, (license.credits_remaining_seconds ?? 0) - seconds);
       updated.credits_remaining_seconds = remaining;
     } else if (license.tier === 'free') {
@@ -472,8 +515,14 @@ class LicenseService {
   // seed — direct callers would mis-overwrite an in-flight balance.
   private freshBasicCreditSeed(license: LicenseData): { credits_remaining_seconds: number; credits_expire_at: number } {
     const fallback = Date.now() + TIME_CONSTANTS.BASIC_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+    // Per-tier interview time (2026-07 pricing):
+    //   Basic = one 30-min interview · Pro = one 1-hour · Max = three 1-hour.
+    const seconds =
+      license.tier === 'pro' ? 60 * 60 :
+      license.tier === 'max' ? 3 * 60 * 60 :
+      /* basic */              30 * 60;
     return {
-      credits_remaining_seconds: 3 * TIME_CONSTANTS.SECONDS_PER_CREDIT,
+      credits_remaining_seconds: seconds,
       credits_expire_at: license.expires_at > 0 ? license.expires_at : fallback,
     };
   }
@@ -534,13 +583,18 @@ class LicenseService {
   // undefined, which getEffectiveTier treats as 0 and silently downgrades
   // the paying user back to 'free' features.
   private normalizeLicenseCredits(license: LicenseData, priorLicense: LicenseData | null): LicenseData {
-    if (license.tier !== 'basic') {
+    // Only the time-limited tiers carry a credit bucket. Free (trial) and
+    // Ultra (unlimited) strip the fields for cleanliness.
+    if (!['basic', 'pro', 'max'].includes(license.tier)) {
       const clean: any = { ...license };
       delete clean.credits_remaining_seconds;
       delete clean.credits_expire_at;
       return clean as LicenseData;
     }
-    const prior = priorLicense && priorLicense.tier === 'basic' ? priorLicense : null;
+    // Carry the running balance only when the prior state is the SAME
+    // time-limited tier (a Pro→Pro tab refresh keeps its clock; a tier change
+    // re-seeds from the new tier's grant).
+    const prior = priorLicense && priorLicense.tier === license.tier ? priorLicense : null;
     const hasCoherentPrior =
       !!prior &&
       typeof prior.credits_remaining_seconds === 'number' &&

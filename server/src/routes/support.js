@@ -1456,7 +1456,7 @@ function safeParse(s) {
 // chatbot, which matters more for the FIRST-draft surface than for an
 // edit pass. Both can be overridden via env if we ever swap providers.
 const AI_ASSIST_POLISH_MODEL = process.env.SUPPORT_AI_ASSIST_POLISH_MODEL || 'gpt-5.5';
-const AI_ASSIST_DRAFT_MODEL = process.env.SUPPORT_AI_ASSIST_DRAFT_MODEL || 'claude-sonnet-4-6';
+const AI_ASSIST_DRAFT_MODEL = process.env.SUPPORT_AI_ASSIST_DRAFT_MODEL || 'claude-sonnet-5';
 const AI_ASSIST_MAX_TOKENS = 600;
 const AI_ASSIST_MAX_HISTORY = 25;   // recent turns sent to the model
 

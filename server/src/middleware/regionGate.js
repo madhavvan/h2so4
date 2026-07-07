@@ -37,7 +37,7 @@ const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
 
 // Tiers that count as "paid". Anything else (free, trial-as-tier) is
 // blocked. We don't list 'admin' here — admins bypass via email check.
-const PAID_TIERS = new Set(['basic', 'pro', 'max']);
+const PAID_TIERS = new Set(['basic', 'pro', 'max', 'ultra']);
 
 // Statuses that retain access. 'canceling' = paid through cycle end.
 // 'past_due' = Razorpay retry window (~7 days). 'active' = nominal.

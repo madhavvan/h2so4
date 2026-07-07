@@ -19,36 +19,41 @@ For the customer-facing **[Refund Policy](https://minicaai.com/refund-policy)** 
 
 ---
 
-## 1. The four tiers
+## 1. The five tiers
 
-We offer four plans: **Free**, **Basic**, **Pro**, and **Max**. Free lets you try the app without payment; Basic, Pro, and Max are paid subscriptions.
+We offer five plans: **Free**, **Basic**, **Pro**, **Max**, and **Ultra**. Free lets you try the app without payment. Basic, Pro, and Max are **one-time interview purchases** — you buy a set amount of live-interview time and use it within 30 days. **Ultra** is the only monthly subscription: unlimited interviews plus Auto-Type.
 
-You can upgrade or downgrade at any time. Pro-rated charges and credits are handled automatically by Stripe (or Razorpay in India) on tier change.
+- **Basic** — one 30-minute interview
+- **Pro** — one 1-hour interview
+- **Max** — three 1-hour interviews
+- **Ultra** — unlimited interviews, billed monthly
+
+Because Basic/Pro/Max are one-time buys, there's nothing recurring on them to "downgrade" — you simply purchase the tier that fits the interview ahead of you. Ultra you can cancel any time from **Manage Subscription**.
 
 ## 2. What each tier unlocks
 
-| Feature | Free | Basic | Pro | Max |
-|---|---|---|---|---|
-| AI models | Gemini | + GPT-5.5, Grok, Groq | Same four | + Claude Sonnet 4.6 |
-| Sessions per month | 5 | Unlimited (credit-gated time) | Unlimited | Unlimited |
-| Time per session | 30-min trial total | Credit-gated (3-hour starting bank) | Unlimited | Unlimited |
-| Context files | 1 | Unlimited | Unlimited | Unlimited |
-| Pop-out window | — | ✓ | ✓ | ✓ |
-| Screen capture (Auto-Solve) | — | ✓ | ✓ | ✓ |
-| Auto-Type into editor | — | — | — | ✓ |
-| Train Model (résumé + JD pre-research) | — | — | — | ✓ |
-| Reasoning-effort knob | — | — | — | ✓ |
-| Custom Instructions | ✓ | ✓ | ✓ | ✓ |
-| Web search inside Claude answers | — | — | — | ✓ |
-| Export conversation history | — | ✓ | ✓ | ✓ |
-| Minica support chatbot | Scripted FAQ + handoff | Full AI chat with Minica | Full AI chat with Minica | Full AI chat with Minica |
-| Talk to a human handoff | ✓ | ✓ | ✓ | ✓ |
+| Feature | Free | Basic | Pro | Max | Ultra |
+|---|---|---|---|---|---|
+| Interview time | 30-min trial total | One 30-min interview | One 1-hour interview | Three 1-hour interviews | Unlimited |
+| AI models | Gemini | + GPT-5.5, Grok, Groq | + Claude Sonnet 5 (all 5) | All 5 | All 5 |
+| Context files | 1 | Unlimited | Unlimited | Unlimited | Unlimited |
+| Pop-out window | — | ✓ | ✓ | ✓ | ✓ |
+| Screen capture (Auto-Solve) | — | ✓ | ✓ | ✓ | ✓ |
+| Auto-Type into editor | — | — | — | — | ✓ |
+| Train Model (résumé + JD pre-research) | — | — | — | ✓ | ✓ |
+| Reasoning-effort knob | — | — | — | ✓ | ✓ |
+| Custom Instructions | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Web search inside Claude answers | — | — | ✓ | ✓ | ✓ |
+| Export conversation history | — | ✓ | ✓ | ✓ | ✓ |
+| Minica support chatbot | Scripted FAQ + handoff | Full AI chat | Full AI chat | Full AI chat | Full AI chat |
+| Talk to a human handoff | ✓ | ✓ | ✓ | ✓ | ✓ |
 
-Two notes on the more premium features:
+Notes on the more premium features:
 
-- **Auto-Type** is a Max-only feature. It types an AI-drafted answer directly into your code editor, with realistic timing. It's positioned at Max because it's the most-developed feature and the most useful in technical interviews.
-- **Claude (Anthropic Sonnet 4.6 with web_search)** is Max-only because it's our most expensive model per call and the differentiator for the premium tier.
-- **Minica (the AI support chatbot)** is full-featured AI from Basic upward. Free tier uses a scripted FAQ — pick a topic from a list, get a curated answer. Both tiers can hand off to a human at any time. The reasoning: AI support calls are billed inference, and the cost per support session is similar to a regular interview call; reserving the AI chat for paid tiers keeps the Free plan genuinely free at our expense.
+- **Auto-Type** is an **Ultra-only** feature. It types an AI-drafted answer directly into your code editor, with realistic timing. It's the differentiator for the unlimited subscription tier.
+- **Claude (Anthropic Sonnet 5 with web_search)** unlocks at **Pro** and above. Basic is the only paid tier without Claude.
+- **Train Model** and the **reasoning-effort knob** unlock at **Max** and above.
+- **Minica (the AI support chatbot)** is full-featured AI from Basic upward. Free tier uses a scripted FAQ — pick a topic from a list, get a curated answer. Every tier can hand off to a human at any time. The reasoning: AI support calls are billed inference, and the cost per support session is similar to a regular interview call; reserving the AI chat for paid tiers keeps the Free plan genuinely free at our expense.
 
 ## 3. Trial mechanics
 
@@ -62,8 +67,8 @@ Pricing depends on your country. We use IP-based geolocation to detect your regi
 
 The current price list is shown on the **[Pricing page](https://minicaai.com/#pricing)**. The two main regional bands:
 
-- **United States and most countries**: USD pricing, billed monthly via Stripe
-- **India**: INR pricing, billed monthly via Razorpay (subscriptions) or as one-time charges
+- **United States and most countries**: USD pricing via Stripe — Basic/Pro/Max as one-time charges, Ultra as a monthly subscription
+- **India**: INR pricing via Razorpay — Basic/Pro/Max as one-time charges, Ultra as a monthly subscription
 
 Indian customers must have an active paid subscription to access the AI features. The Free tier is not available in India due to regional licensing constraints; this is enforced server-side and applies regardless of the app you install.
 

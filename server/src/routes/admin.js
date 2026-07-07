@@ -38,12 +38,17 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
 }
 
 // ── Tier definitions ──
+// Admin-granted licenses are UNLIMITED-until-revoked. Customer purchases are
+// time-limited interviews (see payments.js/webhooks.js grantConfigForTier),
+// but an admin bumping someone to a paid tier is a comp: never-expires,
+// unlimited sessions, and -1 credit sentinel (seeded in handleChangeTier).
 const DAY_MS = 24 * 60 * 60 * 1000;
 const TIER_LICENSE_DEFAULTS = {
   free:  { expires_at: () => Date.now() + 30 * DAY_MS, sessions_limit: 5 },
-  basic: { expires_at: () => Date.now() + 14 * DAY_MS, sessions_limit: 3 },
+  basic: { expires_at: () => -1, sessions_limit: -1 },
   pro:   { expires_at: () => -1, sessions_limit: -1 },
   max:   { expires_at: () => -1, sessions_limit: -1 },
+  ultra: { expires_at: () => -1, sessions_limit: -1 },
 };
 const VALID_TIERS = Object.keys(TIER_LICENSE_DEFAULTS);
 
@@ -365,11 +370,17 @@ function handleChangeTier(req, res) {
     const defaults = TIER_LICENSE_DEFAULTS[tier];
 
     db.updateUserTier(user.id, tier);
+    // Admin grant of a paid tier = unlimited-until-revoked: seed the -1 credit
+    // sentinel so the client's interview-time gate treats it as unlimited
+    // (not a time-limited customer purchase). Downgrade to free clears it.
+    const paidGrant = tier !== 'free';
     db.updateLicenseOnPayment(user.id, {
       tier,
       status: 'active',
       expires_at: defaults.expires_at(),
       sessions_limit: defaults.sessions_limit,
+      credits_remaining_seconds: paidGrant ? -1 : 0,
+      credits_expire_at: paidGrant ? -1 : 0,
     });
 
     writeAudit(req, 'change-tier', user, { from: previousTier, to: tier });

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, Suspense, lazy } from 'react';
 import SupportBot from './SupportBot';
+import PremiumLanding from './PremiumLanding';
 import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search, Copy, ChevronUp, FileText } from 'lucide-react';
 import { WizardHat } from './WizardHat';
 // Phosphor duotone — used on the public landing + auth surfaces for the
@@ -218,37 +219,62 @@ const FeaturePill = ({ icon: Icon, text }: { icon: any; text: string }) => (
   </div>
 );
 
-// ── Pricing Card (Free / Basic / Pro / Max) ──
-// Editorial cream-theme card. The "popular" tier is signalled by an
-// inverted ink-on-cream tile rather than a saturated gradient — louder
-// in restraint than in ornament. Period label is set in tabular numerals
-// so the price row aligns optically across cards.
+// ── Pricing Card ──
+// Every card is dark obsidian (theme-aware via --cream-soft/--ink; light = cream)
+// with a SLIGHT gold hairline. Free/Basic are the plainest (faintest line); Pro
+// is the gold "Most chosen"; Ultra stays in the core dark+gold theme but a rich
+// purple glow bleeds in from the top-right corner — a hint, not a full violet
+// card. Accent hex is fixed so it reads on both surfaces AND survives the
+// html.dark blue/purple→gold remap in index.css.
 const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelect: (tier: PricingTier) => void; isLoading: boolean }) => {
-  const isPopular = !!tier.popular;
+  const isPopular = !!tier.popular;                        // Pro
+  const isUltra = tier.id === 'ultra';                     // flagship — purple corner hint
+  const isPlain = tier.price === 0 || tier.id === 'basic'; // Free/Basic — plainest, darkest
   const periodLabel = tier.period === 'month' ? '/mo' : tier.period === 'year' ? '/yr' : '';
 
-  const frameStyle: React.CSSProperties = isPopular
-    ? { background: 'var(--ink)', color: 'var(--cream)', border: '1px solid var(--ink)' }
-    : { background: 'transparent', color: 'var(--ink)', border: '1px solid var(--cream-line)' };
+  const GOLD_CTA = 'linear-gradient(180deg, #f6e4b0 0%, #d9b874 48%, #b58f45 100%)';
+  const hair = isPopular ? 0.26 : (isPlain ? 0.10 : 0.16); // gold-hairline strength
+  const iconColor = isUltra ? '#c4b5fd' : (isPlain ? '#b89a5a' : '#d3ac63');
+  const goldCta = isPopular || isUltra;                    // filled gold CTA on the two flagships
 
-  const subColor = isPopular ? 'rgba(245,244,239,0.65)' : 'var(--ink-muted)';
-  const featureColor = isPopular ? 'rgba(245,244,239,0.85)' : 'var(--ink-soft)';
+  const frameStyle: React.CSSProperties = {
+    backgroundColor: 'var(--cream-soft)',
+    color: 'var(--ink)',
+    // background-image is clipped to the rounded border-box, so the purple
+    // corner never spills past the radius — no overflow:hidden (which would
+    // clip the floating badge) required.
+    ...(isUltra
+      ? {
+          backgroundImage: 'radial-gradient(60% 55% at 100% 0%, rgba(139,92,246,0.30) 0%, rgba(124,58,237,0.10) 26%, transparent 52%)',
+          boxShadow: `inset 0 0 0 1px rgba(211,172,99,${hair}), inset 0 1px 0 rgba(255,255,255,0.05), inset -1px 1px 0 rgba(167,139,250,0.30), 0 20px 44px -30px rgba(139,92,246,0.45)`,
+        }
+      : isPopular
+      ? {
+          backgroundImage: 'radial-gradient(120% 70% at 50% -12%, rgba(211,172,99,0.10), transparent 60%)',
+          boxShadow: `inset 0 0 0 1px rgba(211,172,99,${hair}), inset 0 1px 0 rgba(255,255,255,0.05), 0 18px 40px -30px rgba(211,172,99,0.30)`,
+        }
+      : {
+          boxShadow: `inset 0 0 0 1px rgba(211,172,99,${hair}), inset 0 1px 0 rgba(255,255,255,0.05)`,
+        }),
+  };
 
-  const ctaStyle: React.CSSProperties = isPopular
-    ? { background: 'var(--cream)', color: 'var(--ink)' }
-    : { background: 'var(--ink)', color: 'var(--cream)' };
+  const ctaStyle: React.CSSProperties = goldCta
+    ? { background: GOLD_CTA, color: '#2a1f08', boxShadow: `0 8px 20px -10px ${isUltra ? 'rgba(139,92,246,0.40)' : 'rgba(211,172,99,0.38)'}` }
+    : { background: 'rgba(211,172,99,0.08)', color: 'var(--ink)', boxShadow: 'inset 0 0 0 1px rgba(211,172,99,0.24)' };
 
   return (
     <div
-      className="relative rounded-2xl flex flex-col p-7 transition-all duration-300"
+      className="relative rounded-2xl flex flex-col p-7 transition-all duration-300 hover:-translate-y-0.5"
       style={frameStyle}
     >
-      {isPopular && (
+      {(isPopular || isUltra) && (
         <div
-          className="absolute -top-2.5 left-7 px-2.5 py-1 rounded-full text-[10px] font-medium uppercase tracking-[0.16em]"
-          style={{ background: 'var(--accent)', color: 'var(--cream)' }}
+          className="absolute -top-2.5 left-7 px-2.5 py-1 rounded-full text-[10px] font-semibold uppercase tracking-[0.16em]"
+          style={isUltra
+            ? { background: '#171326', color: '#c4b5fd', boxShadow: 'inset 0 0 0 1px rgba(167,139,250,0.55)' }
+            : { background: GOLD_CTA, color: '#2a1f08' }}
         >
-          Most chosen
+          {isUltra ? 'Unlimited' : 'Most chosen'}
         </div>
       )}
 
@@ -259,7 +285,7 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
         {tier.name}
       </h3>
       {tier.subtitle && (
-        <p className="mt-1 text-[12.5px]" style={{ color: subColor }}>
+        <p className="mt-1 text-[12.5px]" style={{ color: 'var(--ink-muted)' }}>
           {tier.subtitle}
         </p>
       )}
@@ -281,7 +307,7 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
               {pricingService.formatPrice(tier.price, tier.currencySymbol, tier.currency)}
             </span>
             {periodLabel && (
-              <span className="text-[14px]" style={{ color: subColor }}>
+              <span className="text-[14px]" style={{ color: 'var(--ink-muted)' }}>
                 {periodLabel}
               </span>
             )}
@@ -292,7 +318,7 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
       <button
         onClick={() => onSelect(tier)}
         disabled={isLoading}
-        className="w-full py-3 px-4 rounded-full text-[14px] font-medium transition-all duration-200 inline-flex items-center justify-center gap-2 hover:opacity-90"
+        className="w-full py-3 px-4 rounded-full text-[14px] font-semibold transition-all duration-200 inline-flex items-center justify-center gap-2 hover:brightness-[1.06] disabled:opacity-60"
         style={ctaStyle}
       >
         {isLoading ? <Loader2 size={14} className="animate-spin" /> : null}
@@ -302,11 +328,11 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
 
       <ul className="mt-7 space-y-3.5">
         {tier.features.map((feature, i) => (
-          <li key={i} className="flex items-start gap-2.5 text-[13.5px]" style={{ color: featureColor }}>
+          <li key={i} className="flex items-start gap-2.5 text-[13.5px]" style={{ color: 'var(--ink-soft)' }}>
             <PhCheck
               size={16}
-              weight="duotone"
-              style={{ color: isPopular ? 'var(--accent-soft)' : 'var(--accent)', flexShrink: 0, marginTop: 1 }}
+              weight="bold"
+              style={{ color: iconColor, flexShrink: 0, marginTop: 1 }}
             />
             <span style={{ lineHeight: 1.5 }}>{feature}</span>
           </li>
@@ -6238,7 +6264,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
       key: 'upgrade-pro',
       Icon: Crown, iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb',
       title: 'Upgrade to Pro',
-      subtitle: 'Unlimited time · 4 AI models · Pop-out · Auto-Solve',
+      subtitle: 'One 1-hour interview · all 5 models incl. Claude · Auto-Solve',
       price: proPrice || undefined,
       variant: 'primary',
       onClick: wrapAction('upgrade-pro', () => initiateCheckout('pro')),
@@ -6247,7 +6273,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
       key: 'upgrade-max',
       Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
       title: 'Upgrade to Max',
-      subtitle: 'Pro + Claude Sonnet 4.6 + Auto-Type + Train Model',
+      subtitle: 'Three 1-hour interviews · all 5 models · Train Model',
       price: maxPrice || undefined,
       onClick: wrapAction('upgrade-max', () => initiateCheckout('max')),
     });
@@ -6256,7 +6282,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
         key: 'upgrade-basic',
         Icon: Zap, iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857',
         title: 'Get Basic',
-        subtitle: '3 hours · 14-day window · GPT, Grok, Llama (no Claude)',
+        subtitle: 'One 30-min interview · Gemini, GPT-5.5, Grok, Groq (no Claude)',
         price: basicPrice || undefined,
         onClick: wrapAction('upgrade-basic', () => initiateCheckout('basic')),
       });
@@ -6277,7 +6303,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
       key: 'upgrade-pro',
       Icon: Crown, iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb',
       title: 'Upgrade to Pro',
-      subtitle: 'Unlimited time, no expiry · keep your remaining Basic hours',
+      subtitle: 'One 1-hour interview · adds Claude Sonnet 5',
       price: findTierPrice('pro') || undefined,
       onClick: wrapAction('upgrade-pro', () => initiateCheckout('pro')),
     });
@@ -6285,7 +6311,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
       key: 'upgrade-max',
       Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
       title: 'Upgrade to Max',
-      subtitle: 'Adds Claude, Auto-Type, Train Model',
+      subtitle: 'Three 1-hour interviews · adds Claude + Train Model',
       price: findTierPrice('max') || undefined,
       onClick: wrapAction('upgrade-max', () => initiateCheckout('max')),
     });
@@ -7130,7 +7156,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // Which tier the user clicked on the pricing card. Persisted across
   // signup → checkout transitions (otherwise a non-authenticated user
   // clicking Max would sign up and then get routed through a Pro checkout).
-  const [pendingCheckoutTier, setPendingCheckoutTier] = useState<'basic' | 'pro' | 'max'>('pro');
+  const [pendingCheckoutTier, setPendingCheckoutTier] = useState<'basic' | 'pro' | 'max' | 'ultra'>('pro');
   // What the user just paid for / was just granted. Survives webhook lag:
   // when the Stripe webhook hasn't landed by the time we render /download,
   // currentLicense.tier may still be 'free' — we'd otherwise drop the user
@@ -7551,7 +7577,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // a routing mismatch (rare). We surface a clear "still waiting" message
   // instead of spinning forever — relaunching the app picks up the new
   // license on the next validateWithServer tick regardless.
-  const pollForUpgrade = async (targetTier: 'basic' | 'pro' | 'max'): Promise<void> => {
+  const pollForUpgrade = async (targetTier: 'basic' | 'pro' | 'max' | 'ultra'): Promise<void> => {
     const POLL_INTERVAL_MS = 4000;
     const POLL_TIMEOUT_MS = 10 * 60 * 1000;
     const startedAt = Date.now();
@@ -7625,7 +7651,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   };
 
   // ── Initiate payment checkout (Stripe or Razorpay based on geo) ──
-  const initiateCheckout = async (tier: 'basic' | 'pro' | 'max' = pendingCheckoutTier) => {
+  const initiateCheckout = async (tier: 'basic' | 'pro' | 'max' | 'ultra' = pendingCheckoutTier) => {
     setPaymentLoading(true);
     setPaymentError(null);
 
@@ -7659,8 +7685,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       // falls through to /create-checkout's normal new-subscription flow.
       const liveTier = currentLicense?.tier;
       const isLiveActive = currentLicense?.status === 'active';
+      // 2026-07 model: only Ultra is a recurring subscription that can be
+      // swapped in-place. Basic/Pro/Max are one-time purchases — picking a
+      // different one is a fresh /create-checkout, never an /upgrade-tier swap
+      // (which would 404 hunting for a Stripe sub that one-time buyers never had).
       const isRecurringTier = (t: string | undefined | null): boolean =>
-        t === 'pro' || t === 'max';
+        t === 'ultra';
       const isInPlaceUpgrade =
         isLiveActive &&
         isRecurringTier(liveTier) &&
@@ -7685,7 +7715,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       const timeoutId = window.setTimeout(() => controller.abort(), 30000);
       let response: Response;
       try {
-        response = await fetch(`https://api.minicaai.com${endpointPath}`, {
+        response = await fetch(`${API_BASE}${endpointPath}`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -9180,6 +9210,20 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         />
       );
     }
+    // ── PREMIUM DARK LANDING (2026-07) ─────────────────────────────
+    // New default marketing surface. The old cream/serif landing below is
+    // intentionally kept as an instant A/B fallback (dead code after this
+    // return); delete from the next `return (` through its matching close
+    // once the premium landing is signed off.
+    return (
+      <PremiumLanding
+        setView={setView}
+        pricing={pricing}
+        handleTierSelect={handleTierSelect}
+        isSubmitting={isSubmitting}
+      />
+    );
+    // eslint-disable-next-line no-unreachable
     return (
       <div
         className="fixed inset-0 overflow-y-auto"
@@ -9492,7 +9536,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             )}
           </div>
           {pricing && (
-            <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6">
+            <div className="grid sm:grid-cols-2 lg:grid-cols-5 gap-4 max-w-7xl mx-auto">
               {pricing.tiers.map((tier) => (
                 <PricingCard key={tier.id} tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
               ))}
@@ -9584,7 +9628,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     if (isMobile) return renderAuthMobile('login');
     return (
       <div
-        className="fixed inset-0 overflow-y-auto"
+        className="fixed inset-0 overflow-y-auto pl-auth-dark"
         style={{ background: 'var(--cream)', color: 'var(--ink)', fontFamily: 'var(--sans)' }}
       >
         <div className="min-h-full flex items-center justify-center px-4 py-8">
@@ -9756,7 +9800,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     if (isMobile) return renderAuthMobile('forgot_password');
     return (
       <div
-        className="fixed inset-0 overflow-y-auto"
+        className="fixed inset-0 overflow-y-auto pl-auth-dark"
         style={{ background: 'var(--cream)', color: 'var(--ink)', fontFamily: 'var(--sans)' }}
       >
         <div className="min-h-full flex items-center justify-center px-4 py-8">
@@ -9872,7 +9916,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     if (isMobile) return renderAuthMobile('signup');
     return (
       <div
-        className="fixed inset-0 overflow-y-auto"
+        className="fixed inset-0 overflow-y-auto pl-auth-dark"
         style={{ background: 'var(--cream)', color: 'var(--ink)', fontFamily: 'var(--sans)' }}
       >
         <div className="min-h-full flex items-center justify-center px-4 py-8">
@@ -10100,7 +10144,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           </div>
 
           {pricing && (
-            <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6 max-w-6xl mx-auto">
+            <div className="grid sm:grid-cols-2 lg:grid-cols-5 gap-4 max-w-7xl mx-auto">
               {pricing.tiers.map((tier) => (
                 <PricingCard key={tier.id} tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
               ))}

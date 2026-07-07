@@ -3,7 +3,7 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 export interface PricingTier {
-  id: 'free' | 'basic' | 'pro' | 'max';
+  id: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
   name: string;
   price: number;
   currency: string;
@@ -69,44 +69,47 @@ const EUROZONE = ['AT', 'BE', 'CY', 'EE', 'FI', 'FR', 'DE', 'GR', 'IE', 'IT', 'L
 
 const BASE_FEATURES_FREE = [
   '30-minute full-experience trial on signup',
-  'Gemini Flash model only (after trial)',
-  'Basic transcript capture',
+  'Gemini Flash model after the trial',
+  'Screen & transcript capture',
   'Community support',
 ];
 
-// Model lists per tier — single source of truth so feature strings stay
-// in sync with services/licenseService.ts FEATURE_GATES.models. Saying
-// "All AI models" + listing 4 was the long-running copy bug ("for all
-// models" appeared on Pro CTAs/badges even though Claude is Max-only).
-// Spelling out the actual model count keeps marketing copy honest.
+// Feature copy mirrors services/licenseService.ts FEATURE_GATES.models.
+// 2026-07 pricing: Basic is the only paid tier without Claude; Auto-Type is
+// the Ultra-exclusive feature. Basic/Pro/Max are one-time interview buys;
+// Ultra is the monthly unlimited subscription.
 const BASE_FEATURES_BASIC = [
-  '3 interview credits (3 hours total)',
-  'Four AI models — Gemini, GPT-5.5, Grok, Llama',
+  'One 30-minute interview',
+  'Extend +30 min anytime',
+  'Four AI models (Gemini · GPT-5.5 · Grok · Groq)',
   'Pop-out stealth mode',
   'Auto-solve with screen analysis',
   'Resume & JD context upload',
   'Session history & export',
-  'Renewable: +1h for $6.99',
-  '14-day credit expiry',
 ];
 
 const BASE_FEATURES_PRO = [
-  'Unlimited interview sessions',
-  'Four AI models — Gemini, GPT-5.5, Grok, Llama',
-  'System audio capture',
+  'One 1-hour interview',
+  'All five AI models — incl. Claude Sonnet 5',
+  'Pop-out stealth mode',
   'Auto-solve with screen analysis',
   'Resume & JD context upload',
-  'Pop-out stealth mode',
   'Session history & export',
-  'Priority support',
 ];
 
 const BASE_FEATURES_MAX = [
+  'Three 1-hour interviews',
+  'All five AI models — incl. Claude Sonnet 5',
+  'Full reasoning-effort control',
+  'Train Model — pre-research the role',
   'Everything in Pro',
-  'Claude Sonnet 4.6 with hosted web search — Max-only',
+];
+
+const BASE_FEATURES_ULTRA = [
+  'Unlimited interviews, all five models',
   'Auto-Type into any editor (HackerRank, CoderPad, LeetCode)',
   'Human-like typing rhythm & indent handling',
-  'Train Model — pre-research the role before your interview',
+  'Train Model + full reasoning control',
   'No copy-paste detection',
   'Priority support',
 ];
@@ -124,12 +127,19 @@ function roundPrice(price: number, code: string): number {
   return Math.floor(price) + 0.99;
 }
 
-// USD base prices — single source of truth. Non-USD regions scale via exchange rate.
+// USD base prices (2026-07 pricing overhaul). Basic/Pro/Max are ONE-TIME
+// interview purchases; Ultra is the only monthly subscription. India prices are
+// the same value converted to INR (see the IN block below), not a discount.
 const USD_PRICES = {
-  basic: 25,     // one-time, 3 credits, 14-day expiry
-  pro: 29,       // monthly subscription
-  max: 69,       // monthly subscription
+  basic: 30,     // one-time · one 30-min interview
+  pro: 50,       // one-time · one 1-hour interview
+  max: 89,       // one-time · three 1-hour interviews
+  ultra: 159,    // per month · unlimited + Auto-Type
 } as const;
+
+// Basic 30-min interview extension (+30 min). One-time top-up.
+const EXTENSION_USD = 25;
+const EXTENSION_INR = 2099;
 
 class PricingService {
   getPricing(countryCode: string): RegionPricing {
@@ -149,20 +159,28 @@ class PricingService {
             features: BASE_FEATURES_FREE, cta: 'Get Started Free',
           },
           {
-            id: 'basic', name: 'Basic', price: 1999,
+            id: 'basic', name: 'Basic', price: 2499,
             currency: 'INR', currencySymbol: '₹', period: 'one-time',
-            features: BASE_FEATURES_BASIC, popular: true, cta: 'Get 3 Interviews',
-            subtitle: '3 credits · 14-day expiry',
+            features: BASE_FEATURES_BASIC, cta: 'Start a 30-min interview',
+            subtitle: '30-min interview · extend anytime',
           },
           {
-            id: 'pro', name: 'Pro', price: 2499,
-            currency: 'INR', currencySymbol: '₹', period: 'month',
-            features: BASE_FEATURES_PRO, cta: 'Start Pro',
+            id: 'pro', name: 'Pro', price: 4199,
+            currency: 'INR', currencySymbol: '₹', period: 'one-time',
+            features: BASE_FEATURES_PRO, popular: true, cta: 'Start a 1-hour interview',
+            subtitle: '1-hour interview · all models',
           },
           {
-            id: 'max', name: 'Max', price: 5999,
+            id: 'max', name: 'Max', price: 7399,
+            currency: 'INR', currencySymbol: '₹', period: 'one-time',
+            features: BASE_FEATURES_MAX, cta: 'Get 3 interviews',
+            subtitle: '3 × 1-hour interviews',
+          },
+          {
+            id: 'ultra', name: 'Ultra', price: 12999,
             currency: 'INR', currencySymbol: '₹', period: 'month',
-            features: BASE_FEATURES_MAX, cta: 'Start Max',
+            features: BASE_FEATURES_ULTRA, cta: 'Go Ultra',
+            subtitle: 'Unlimited + Auto-Type',
           },
         ],
       };
@@ -184,18 +202,26 @@ class PricingService {
           {
             id: 'basic', name: 'Basic', price: USD_PRICES.basic,
             currency: 'USD', currencySymbol: '$', period: 'one-time',
-            features: BASE_FEATURES_BASIC, popular: true, cta: 'Get 3 Interviews',
-            subtitle: '3 credits · 14-day expiry',
+            features: BASE_FEATURES_BASIC, cta: 'Start a 30-min interview',
+            subtitle: '30-min interview · extend anytime',
           },
           {
             id: 'pro', name: 'Pro', price: USD_PRICES.pro,
-            currency: 'USD', currencySymbol: '$', period: 'month',
-            features: BASE_FEATURES_PRO, cta: 'Start Pro',
+            currency: 'USD', currencySymbol: '$', period: 'one-time',
+            features: BASE_FEATURES_PRO, popular: true, cta: 'Start a 1-hour interview',
+            subtitle: '1-hour interview · all models',
           },
           {
             id: 'max', name: 'Max', price: USD_PRICES.max,
+            currency: 'USD', currencySymbol: '$', period: 'one-time',
+            features: BASE_FEATURES_MAX, cta: 'Get 3 interviews',
+            subtitle: '3 × 1-hour interviews',
+          },
+          {
+            id: 'ultra', name: 'Ultra', price: USD_PRICES.ultra,
             currency: 'USD', currencySymbol: '$', period: 'month',
-            features: BASE_FEATURES_MAX, cta: 'Start Max',
+            features: BASE_FEATURES_ULTRA, cta: 'Go Ultra',
+            subtitle: 'Unlimited + Auto-Type',
           },
         ],
       };
@@ -222,18 +248,26 @@ class PricingService {
         {
           id: 'basic', name: 'Basic', price: USD_PRICES.basic,
           currency: 'USD', currencySymbol: '$', period: 'one-time',
-          features: BASE_FEATURES_BASIC, popular: true, cta: 'Get 3 Interviews',
-          subtitle: '3 credits · 14-day expiry',
+          features: BASE_FEATURES_BASIC, cta: 'Start a 30-min interview',
+          subtitle: '30-min interview · extend anytime',
         },
         {
           id: 'pro', name: 'Pro', price: USD_PRICES.pro,
-          currency: 'USD', currencySymbol: '$', period: 'month',
-          features: BASE_FEATURES_PRO, cta: 'Start Pro',
+          currency: 'USD', currencySymbol: '$', period: 'one-time',
+          features: BASE_FEATURES_PRO, popular: true, cta: 'Start a 1-hour interview',
+          subtitle: '1-hour interview · all models',
         },
         {
           id: 'max', name: 'Max', price: USD_PRICES.max,
+          currency: 'USD', currencySymbol: '$', period: 'one-time',
+          features: BASE_FEATURES_MAX, cta: 'Get 3 interviews',
+          subtitle: '3 × 1-hour interviews',
+        },
+        {
+          id: 'ultra', name: 'Ultra', price: USD_PRICES.ultra,
           currency: 'USD', currencySymbol: '$', period: 'month',
-          features: BASE_FEATURES_MAX, cta: 'Start Max',
+          features: BASE_FEATURES_ULTRA, cta: 'Go Ultra',
+          subtitle: 'Unlimited + Auto-Type',
         },
       ],
     };
@@ -248,16 +282,17 @@ class PricingService {
     return `${symbol}${price.toFixed(2)}`;
   }
 
-  // Basic-tier renewal: +1 credit (1 hour). Only offered to Basic users.
+  // Basic 30-min interview extension (+30 min). Only offered to Basic users.
   // Returns { price, currency, currencySymbol } in the actual charge currency.
   //
-  // India goes through Razorpay in INR. Everywhere else the server creates
-  // a Stripe checkout with hardcoded `currency:'usd'` + RENEWAL_USD_CENTS
+  // India goes through Razorpay in INR. Everywhere else the server creates a
+  // Stripe checkout with hardcoded `currency:'usd'` + RENEWAL_USD_CENTS
   // (see payments.js createStripeRenewal), so the UI must show USD to match.
+  // (Method name kept for call-site compatibility; it now prices the extension.)
   getBasicRenewalPrice(countryCode: string): { price: number; currency: string; currencySymbol: string } {
     const cc = countryCode.toUpperCase();
-    if (cc === 'IN') return { price: 599, currency: 'INR', currencySymbol: '₹' };
-    return { price: 6.99, currency: 'USD', currencySymbol: '$' };
+    if (cc === 'IN') return { price: EXTENSION_INR, currency: 'INR', currencySymbol: '₹' };
+    return { price: EXTENSION_USD, currency: 'USD', currencySymbol: '$' };
   }
 }
 

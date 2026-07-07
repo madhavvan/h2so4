@@ -332,12 +332,65 @@
    beat its inline `fill="currentColor"`. */
 .send-btn svg { width: 18px; height: 18px; color: var(--text-main); stroke-width: 1.5px; filter: drop-shadow(0 1px 3px rgba(0,0,0,0.5)); }
 
+/* Footer AUTO/MIC toggles — BOXLESS at rest (transparent, no fill), fill only
+   when active, glass on hover. Mirrors the main-app input pills so the pop-out
+   footer reads identically. */
+.pip-toggle {
+  background: transparent; border: none;
+  padding: 3px 9px; border-radius: 8px;
+  font-size: 10px; font-weight: 700;
+  display: flex; align-items: center; gap: 4px;
+  color: var(--text-muted); cursor: default;
+  transition: background var(--dur-ios) var(--ease-ios), color var(--dur-ios) var(--ease-ios);
+}
+.pip-toggle:hover { background: rgba(255,255,255,0.06); }
+.pip-toggle.active-gold { background: rgba(211,172,99,0.20); color: var(--gold, #d3ac63); }
+.pip-toggle.active-red  { background: rgba(239,68,68,0.20); color: #ef4444; }
+html.electron-transparent:not(.dark) .pip-toggle:hover { background: rgba(20,20,19,0.06); }
+
 /* Typing indicator */
 .typing-bubble { display: flex; gap: 4px; align-items: center; padding: 16px !important; }
 .typing-dot { width: 6px; height: 6px; background: var(--text-main); border-radius: 50%; animation: typing 1.4s infinite ease-in-out both; opacity: 0.6; }
 .typing-dot:nth-child(1) { animation-delay: -0.32s; }
 .typing-dot:nth-child(2) { animation-delay: -0.16s; }
 @keyframes typing { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
+
+/* Regenerate pill — floats under the last answer. Uses an INSET ring
+   instead of a hard 1px border (the "smooth, no-lining" language), so it
+   reads as a soft glass chip rather than an old outlined box. */
+.pip-regen-row {
+  display: flex; justify-content: center;
+  padding: 2px 0 8px;
+  animation: pip-bubble-in var(--dur-ios) var(--ease-ios-out) both;
+}
+.pip-regen {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12px; font-weight: 600; letter-spacing: -0.01em;
+  color: #d6c396;
+  padding: 7px 15px; border-radius: 999px; border: none;
+  cursor: default;
+  background: rgba(211, 172, 99, 0.13);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  transition:
+    transform var(--dur-ios-fast) var(--ease-ios),
+    background var(--dur-ios) var(--ease-ios),
+    box-shadow var(--dur-ios) var(--ease-ios);
+}
+.pip-regen svg { color: #d6c396; filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5)); }
+.pip-regen:hover {
+  background: rgba(211, 172, 99, 0.15);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 4px 12px rgba(211, 172, 99, 0.10);
+  transform: translateY(-1px);
+}
+.pip-regen:active { transform: translateY(0) scale(0.97); }
+html.electron-transparent:not(.dark) .pip-regen {
+  color: #7c5c1f;
+  background: rgba(211, 172, 99, 0.18);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  text-shadow: 0 1px 3px rgba(255, 255, 255, 0.5);
+}
+html.electron-transparent:not(.dark) .pip-regen svg { color: #7c5c1f; filter: drop-shadow(0 1px 3px rgba(255, 255, 255, 0.5)); }
 
 /* ═══════════════════════════════════════════════════
    ELECTRON TRANSPARENCY OVERRIDES
@@ -364,43 +417,222 @@ html.electron-transparent *::after {
 
 html.electron-transparent .popup {
   background: transparent !important;
-  border-radius: 16px;
+  border-radius: 18px;
+  overflow: hidden;
 }
+
+/* The pop-out reads as HEAD (header band) + transparent middle + TAIL (footer
+   band). Each band is a fully-rounded card: the OUTER corners (18px) match the
+   window's rounded edges; the INNER corners (12px) that face the transparent
+   middle are also rounded so NO corner is sharp. A small side inset makes them
+   read as clean floating bands rather than square slabs. */
+html.electron-transparent .popup-header {
+  border-radius: 18px 18px 12px 12px;
+  margin: 5px 5px 0;
+}
+html.electron-transparent .input-area {
+  border-radius: 20px;
+  margin: 6px 7px 7px;
+}
+
+/* The "bright border on click" = the global `html.dark :focus-visible`
+   gold outline (index.css) landing on the pop-out textarea. Kill it — the
+   inner gold glow (below) is the real focus affordance. */
+html.electron-transparent .pip-textarea:focus,
+html.electron-transparent .pip-textarea:focus-visible,
+html.electron-transparent .pip-textarea:focus-within { outline: none !important; }
 
 html.electron-transparent .bg-layer {
   background: transparent !important;
 }
 
+/* Dark pop-out surfaces — OBSIDIAN & GOLD (2026-07).
+   Was deep navy (rgba(10,10,30,...)) + white hairlines. Shifted to the
+   landing's warm obsidian glass + gold hairlines so the transparent
+   pop-out reads as the same product as the marketing surface and the
+   in-app dark theme. Still fully see-through (low alpha), still NO
+   backdrop-filter (crashes transparent windows), still text-shadowed
+   so text lifts off any wallpaper. */
+/* ══════════════════════════════════════════════════════════════
+   POP-OUT — SUPER PREMIUM OBSIDIAN GLASS (2026-07)
+   Transparent window ⇒ no backdrop-filter (crashes it). So the glass
+   depth comes from layered GRADIENT fills + inset light-catch sheens +
+   soft float shadows + gold glows — not frosting. Hard 1px borders
+   replaced by inset gold rings (the app's borderless language).
+   ══════════════════════════════════════════════════════════════ */
 html.electron-transparent .popup-header {
-  background: rgba(10, 10, 30, 0.75) !important;
+  background: linear-gradient(180deg, rgba(20, 18, 12, 0.82) 0%, rgba(12, 11, 8, 0.66) 100%) !important;
   -webkit-app-region: drag;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+  border-bottom: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 10px 26px -16px rgba(0, 0, 0, 0.7);
+  position: relative;
 }
+/* Gold gradient divider that fades at the ends — richer than a flat line. */
+html.electron-transparent .popup-header::after {
+  content: '';
+  position: absolute; left: 14px; right: 14px; bottom: 0; height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(211, 172, 99, 0.40), transparent);
+  pointer-events: none;
+}
+/* Gold metallic avatar (was a flat white disc) + gold status dot. */
+html.electron-transparent .avatar {
+  background: linear-gradient(145deg, #f6e4b0, #d9b874 52%, #b58f45) !important;
+  color: #231c0c !important;
+  font-weight: 700;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 4px 12px -4px rgba(211, 172, 99, 0.5);
+}
+html.electron-transparent .dot { background: #d3ac63 !important; opacity: 1; box-shadow: 0 0 8px rgba(211, 172, 99, 0.6); }
 
 html.electron-transparent .messages {
   background: transparent !important;
 }
 
+/* BORDERLESS: no ring/outline anywhere — depth is fill + top-edge sheen +
+   float shadow only (iMessage-style glass). */
 html.electron-transparent .bubble {
-  background: rgba(10, 10, 30, 0.65) !important;
-  border: 1px solid rgba(255, 255, 255, 0.15) !important;
+  background: linear-gradient(180deg, rgba(27, 24, 17, 0.74) 0%, rgba(13, 12, 9, 0.68) 100%) !important;
+  border: none !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),          /* top-edge light catch (1-sided, not a border) */
+    0 12px 30px -12px rgba(0, 0, 0, 0.64) !important;  /* float shadow */
 }
 
 html.electron-transparent .msg.user .bubble {
-  background: rgba(255, 255, 255, 0.1) !important;
+  /* Your turn — a SOLID gold plate with DARK text. A translucent gold bubble
+     with white text vanished over bright wallpapers (the transparent window
+     lets the desktop through). The AI's obsidian plate carries white text;
+     yours is the gold counterpart with dark text — readable over ANY desktop,
+     and visually distinct. */
+  background: linear-gradient(180deg, rgba(212, 176, 110, 0.94) 0%, rgba(186, 148, 83, 0.92) 100%) !important;
+  color: #2a1f08 !important;
+  text-shadow: none !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.45),
+    0 12px 30px -12px rgba(0, 0, 0, 0.5),
+    0 0 22px -10px rgba(211, 172, 99, 0.40) !important;
 }
 
+/* PREMIUM INPUT SHELL — the footer is now one frosted-glass composer slab
+   (mirrors the main-app .composer-shell, minus the backdrop-blur the
+   transparent window can't run). Depth = gradient fill + inset top light-catch
+   + inner floor + float shadow; a masked ::after gives the 1px light-catch
+   edge; :focus-within lights the whole shell gold while you type. */
 html.electron-transparent .input-area {
-  background: rgba(10, 10, 30, 0.75) !important;
-  border-top: 1px solid rgba(255, 255, 255, 0.15);
+  background: linear-gradient(180deg, rgba(32, 29, 20, 0.80) 0%, rgba(15, 13, 9, 0.82) 100%) !important;
+  border-top: none;
+  padding: 8px !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.13),
+    inset 0 -16px 30px -20px rgba(0, 0, 0, 0.5),
+    0 2px 6px -3px rgba(0, 0, 0, 0.5),
+    0 18px 44px -24px rgba(0, 0, 0, 0.9);
+  position: relative;
+  transition: box-shadow var(--dur-ios) var(--ease-ios), background var(--dur-ios) var(--ease-ios);
+}
+html.electron-transparent .input-area::after {
+  content: '';
+  position: absolute; inset: 0; border-radius: inherit; padding: 1px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.18), rgba(211, 172, 99, 0.06) 42%, transparent 68%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+  transition: background var(--dur-ios) var(--ease-ios);
+}
+html.electron-transparent .input-area:focus-within {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.17),
+    inset 0 0 26px -6px rgba(211, 172, 99, 0.14),
+    0 2px 6px -3px rgba(0, 0, 0, 0.5),
+    0 20px 48px -24px rgba(0, 0, 0, 0.92),
+    0 0 34px -12px rgba(211, 172, 99, 0.24);
+}
+html.electron-transparent .input-area:focus-within::after {
+  background: linear-gradient(135deg, rgba(246, 228, 176, 0.52), rgba(211, 172, 99, 0.18) 45%, rgba(211, 172, 99, 0.04) 100%);
 }
 
+/* Textarea — borderless glass, soft gold ring, ambient gold focus glow. */
+/* Textarea is now bare inside the shell — the .input-area shell provides the
+   glass, the edge, and the gold focus glow. It spans the FULL width of the
+   shell, auto-grows to a tall cap, then scrolls with a slim gold scrollbar. */
 html.electron-transparent .pip-textarea {
-  background: rgba(255, 255, 255, 0.05) !important;
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  width: 100% !important;
+  padding: 8px 10px !important;
+  max-height: 80px !important;   /* ≈3 lines, then scroll (was 140px ≈6 lines) */
+  overflow-y: auto !important;
+  scroll-behavior: smooth;
+}
+html.electron-transparent .pip-textarea:focus {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+/* Slim gold scrollbar — appears only once the text overflows the grow cap;
+   scrolls all the way up through the accumulated text. */
+html.electron-transparent .pip-textarea::-webkit-scrollbar { width: 7px; }
+html.electron-transparent .pip-textarea::-webkit-scrollbar-track { background: transparent; margin: 6px 0; }
+html.electron-transparent .pip-textarea::-webkit-scrollbar-thumb {
+  background: rgba(211, 172, 99, 0.45);
+  border-radius: 999px;
+  transition: background var(--dur-ios) var(--ease-ios);
+}
+html.electron-transparent .pip-textarea:hover::-webkit-scrollbar-thumb { background: rgba(211, 172, 99, 0.48); }
+html.electron-transparent .pip-textarea::-webkit-scrollbar-thumb:active { background: rgba(211, 172, 99, 0.65); }
+
+/* Send (primary) = gold gradient, the focal action. Auto-Solve (.ml-2) =
+   soft gold glass, so there's one clear gold "go" not two. */
+html.electron-transparent .send-btn { border: none !important; }
+html.electron-transparent .send-btn:not(.ml-2) {
+  background: linear-gradient(145deg, #f6e4b0 0%, #d9b874 55%, #b58f45 100%) !important;
+  box-shadow: 0 6px 16px -6px rgba(211, 172, 99, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.4) !important;
+}
+html.electron-transparent .send-btn:not(.ml-2) svg { color: #231c0c !important; filter: drop-shadow(0 1px 1px rgba(255, 255, 255, 0.3)) !important; }
+html.electron-transparent .send-btn:not(.ml-2):hover {
+  transform: scale(1.05) translateY(-1px);
+  box-shadow: 0 11px 26px -8px rgba(211, 172, 99, 0.66), inset 0 1px 0 rgba(255, 255, 255, 0.5) !important;
+}
+html.electron-transparent .send-btn.ml-2 {
+  background: rgba(211, 172, 99, 0.13) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12) !important;
+}
+html.electron-transparent .send-btn.ml-2 svg { color: #ecdcb2 !important; }
+html.electron-transparent .send-btn.ml-2:hover {
+  background: rgba(211, 172, 99, 0.20) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), 0 5px 16px -6px rgba(211, 172, 99, 0.3) !important;
 }
 
-html.electron-transparent .send-btn {
-  background: rgba(255, 255, 255, 0.08) !important;
+/* Serif name + gold speaker labels + gold streaming caret — the
+   pop-out's small echo of the landing's "You say" gold eyebrow and
+   the self-typing gold answer. */
+html.electron-transparent .header-info h4 {
+  font-family: 'Newsreader', 'Tiempos Headline', ui-serif, Georgia, serif;
+  letter-spacing: -0.01em;
+}
+html.electron-transparent .msg-name { color: rgba(214, 178, 108, 0.9) !important; }
+html.electron-transparent .stream-caret {
+  background: #d3ac63 !important;
+  box-shadow: 0 0 10px rgba(211, 172, 99, 0.5);
+}
+html.electron-transparent .msg.streaming .bubble {
+  animation: pip-stream-pulse-gold 2.1s var(--ease-ios) infinite;
+}
+@keyframes pip-stream-pulse-gold {
+  0%, 100% {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      0 12px 30px -12px rgba(0, 0, 0, 0.64),
+      0 0 0 0 rgba(211, 172, 99, 0.0);
+  }
+  50% {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      0 12px 30px -12px rgba(0, 0, 0, 0.64),
+      0 0 18px 1px rgba(211, 172, 99, 0.18);
+  }
 }
 
 /* ═══════════════════════════════════════════════════
@@ -425,7 +657,10 @@ html.electron-transparent:not(.dark) .bubble {
   text-shadow: 0 1px 4px rgba(255, 255, 255, 0.55) !important;
 }
 html.electron-transparent:not(.dark) .msg.user .bubble {
-  background: rgba(20, 20, 19, 0.08) !important;
+  /* Light theme: a readable gold tint with dark text — distinct from the
+     cream AI bubble, legible over a light desktop. */
+  background: linear-gradient(180deg, rgba(211, 172, 99, 0.34) 0%, rgba(181, 143, 69, 0.26) 100%) !important;
+  color: #2a1f08 !important;
 }
 html.electron-transparent:not(.dark) .input-area {
   background: rgba(250, 247, 240, 0.78) !important;

@@ -27,8 +27,13 @@ function makeFakeRazorpay(planResponse) {
 }
 
 describe('EXPECTED_INR_PAISE canonical amounts', () => {
-  it('Pro is ₹2499 (Razorpay paise)', () => {
-    expect(EXPECTED_INR_PAISE.pro).toBe(249900);
+  // 2026-07 INR pricing (must match pricingService.ts IN block):
+  // Basic ₹2499 · Pro ₹4199 · Max ₹7399 (one-time) · Ultra ₹12999/mo.
+  it('Pro is ₹4199 (Razorpay paise)', () => {
+    expect(EXPECTED_INR_PAISE.pro).toBe(419900);
+  });
+  it('Ultra is ₹12999 (the monthly subscription)', () => {
+    expect(EXPECTED_INR_PAISE.ultra).toBe(1299900);
   });
   it('Max is set and integer paise', () => {
     expect(EXPECTED_INR_PAISE.max).toBeGreaterThan(0);

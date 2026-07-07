@@ -41,9 +41,17 @@ if (process.env.STRIPE_SECRET_KEY) {
 
 // ── Tier helpers (mirror of payments.js — kept local to avoid a cross-file
 //    dependency; webhooks may run in a separate worker in the future). ──
-const VALID_TIERS = ['basic', 'pro', 'max'];
-const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
-const BASIC_INITIAL_CREDIT_SECONDS = 3 * 3600; // 3 hours, matches "3 credits"
+//
+// 2026-07 PRICING MODEL. Basic/Pro/Max are ONE-TIME, time-limited interviews
+// with a 30-day window to use them; Ultra is the monthly UNLIMITED subscription.
+// This MUST stay byte-for-byte in step with payments.js grantConfigForTier (the
+// customer-purchase config) — the two were duplicated deliberately, and drift
+// between them silently grants paying customers the WRONG plan. The pre-2026-07
+// version of this file still granted Pro/Max as `expires_at:-1` (unlimited) and
+// omitted 'ultra' entirely, so a real Ultra purchase recorded as "failed / no
+// tier" and Pro/Max buyers got unlimited time for a one-time price.
+const VALID_TIERS = ['basic', 'pro', 'max', 'ultra'];
+const INTERVIEW_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // window to USE a one-time interview
 
 // Strict: returns null for unknown/missing. Every money-granting path uses
 // this — the prior version defaulted to 'pro', which silently upgraded a
@@ -52,31 +60,29 @@ function resolveTier(t) {
   return VALID_TIERS.includes(t) ? t : null;
 }
 
-// Initial license values for a fresh tier grant. Includes the credits
-// fields so a Basic checkout seeds 3 hours of session time server-side
-// (was client-only in the legacy ledger; see the database.js migration
-// comment for why that didn't propagate across devices).
+// Initial license values for a fresh tier grant. Includes the credits fields so
+// the server row is coherent even before the client re-seeds its ledger:
+//   Basic = one 30-min interview  (1 session, 1800s, 30-day window)
+//   Pro   = one 1-hour interview  (1 session, 3600s, 30-day window)
+//   Max   = three 1-hour interviews (3 sessions, 10800s, 30-day window)
+//   Ultra = unlimited monthly subscription (-1 sentinels; lifecycle managed by
+//           customer.subscription.updated/.deleted).
 function grantConfigForTier(tier) {
+  const now = Date.now();
   if (tier === 'basic') {
-    const expires_at = Date.now() + FOURTEEN_DAYS_MS;
-    return {
-      tier: 'basic',
-      sessions_limit: 3,
-      expires_at,
-      credits_remaining_seconds: BASIC_INITIAL_CREDIT_SECONDS,
-      credits_expire_at: expires_at,
-    };
+    const exp = now + INTERVIEW_WINDOW_MS;
+    return { tier: 'basic', sessions_limit: 1, expires_at: exp, credits_remaining_seconds: 30 * 60, credits_expire_at: exp };
   }
-  // Pro/Max: -1 sentinels mirror sessions_limit / expires_at convention
-  // ("unlimited"). The client's getCreditsRemainingSeconds reads tier===basic
-  // anyway and short-circuits Pro/Max to "unlimited time".
-  return {
-    tier,
-    sessions_limit: -1,
-    expires_at: -1,
-    credits_remaining_seconds: -1,
-    credits_expire_at: -1,
-  };
+  if (tier === 'pro') {
+    const exp = now + INTERVIEW_WINDOW_MS;
+    return { tier: 'pro', sessions_limit: 1, expires_at: exp, credits_remaining_seconds: 60 * 60, credits_expire_at: exp };
+  }
+  if (tier === 'max') {
+    const exp = now + INTERVIEW_WINDOW_MS;
+    return { tier: 'max', sessions_limit: 3, expires_at: exp, credits_remaining_seconds: 3 * 60 * 60, credits_expire_at: exp };
+  }
+  // ultra — monthly subscription, unlimited.
+  return { tier: 'ultra', sessions_limit: -1, expires_at: -1, credits_remaining_seconds: -1, credits_expire_at: -1 };
 }
 
 // Reverse-lookup: given a Razorpay plan_id, return the tier it represents.
@@ -226,8 +232,13 @@ async function handleStripeEvent(event) {
           db.updateLicenseOnPayment(user.id, {
             tier: grant.tier,
             status: 'active',
-            expires_at: grant.expires_at,  // Basic: now+14d, Pro/Max: -1 (Stripe-managed)
-            sessions_limit: grant.sessions_limit, // Basic: 3, Pro/Max: -1
+            // Basic/Pro/Max: now+30d one-time interview window. Ultra: -1 (unlimited,
+            // Stripe-managed). Passing credits keeps the server row coherent with
+            // the client ledger for the time-limited tiers.
+            expires_at: grant.expires_at,
+            sessions_limit: grant.sessions_limit,
+            credits_remaining_seconds: grant.credits_remaining_seconds,
+            credits_expire_at: grant.credits_expire_at,
           });
         }
         // Save Stripe customer ID (even on renewal — may be the first

@@ -8,6 +8,7 @@ import { Settings, Mic, MicOff, FileText, Upload, Trash2, Cpu, FileCheck, Refres
 // to fill the modal body and inherit the user's light/dark theme.
 import SupportBot from './SupportBot';
 import { WizardHat } from './WizardHat';
+import { BrandMark, type BrandMarkState } from './BrandMark';
 import { PaperAirplane } from './GitHubIcons';
 import { GeminiIcon, OpenAIIcon, ClaudeIcon, GrokIcon, GroqIcon } from './ProviderIcons';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -839,11 +840,17 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
 
   if (!isOpen) return null;
   const inElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
+  // In the transparent pop-out, a full-bleed opaque-black backdrop turns the
+  // rounded floating window into a hard black square. Use a themed obsidian
+  // tint rounded to the window's radius so the pop-out keeps its shape and the
+  // overlay reads as part of the same premium surface.
+  const inPopout = typeof document !== 'undefined' && document.documentElement.classList.contains('electron-transparent');
   return (
     <div
       className="fixed inset-0 flex items-center justify-center p-4"
       style={{
-        background: inElectron ? 'rgba(0,0,0,0.92)' : 'rgba(0,0,0,0.5)',
+        background: inPopout ? 'rgba(11,10,8,0.82)' : (inElectron ? 'rgba(0,0,0,0.92)' : 'rgba(0,0,0,0.5)'),
+        borderRadius: inPopout ? '18px' : undefined,
         zIndex: 99999,
         WebkitAppRegion: 'no-drag',
       } as any}
@@ -855,7 +862,7 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
       <div
         ref={dialogRef}
         className="border border-border rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col shadow-2xl overflow-hidden text-text"
-        style={{ background: inElectron ? '#1a1a2e' : 'var(--surface-color)' }}
+        style={{ background: 'var(--surface-color)' }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-4 border-b border-border flex justify-between items-center bg-gray-500/5">
@@ -918,6 +925,20 @@ const ChatInterface = ({
     effectiveTier,
     markPendingPopoutModel,
 }: any) => {
+
+    // ── Brand-mark state — the identity medallion's motion story ──
+    // One derivation shared by the header jewel and both empty states:
+    // answering (tokens streaming) > thinking (request in flight) >
+    // listening (audio capture live) > idle. streamingMsg/isProcessing/
+    // isListening are already popout-synced upstream, so the pop-out's
+    // mark mirrors the main window with no extra IPC.
+    const brandState: BrandMarkState = streamingMsg
+        ? 'answering'
+        : isProcessing
+            ? 'thinking'
+            : isListening
+                ? 'listening'
+                : 'idle';
 
     const setSelectedModel = (newModel: 'gemini' | 'groq' | 'openai' | 'xai' | 'claude') => {
         // ── Feature Gate: Block model switch for free users ──
@@ -1035,9 +1056,12 @@ const ChatInterface = ({
         };
 
         // Shared button style for glass look
+        // Header controls: transparent at rest, glass on hover (via each
+        // button's hover:bg-* class) — matches the main-app header. No fill
+        // box, no border.
         const glassBtn = {
             background: 'transparent',
-            border: '1px solid var(--glass-border)',
+            border: 'none',
             color: 'var(--text-main)',
         };
 
@@ -1051,11 +1075,9 @@ const ChatInterface = ({
                     id="dragHandle"
                     style={inElectron ? { WebkitAppRegion: 'drag', padding: '10px 12px' } as any : undefined}
                 >
-                    {/* Left: Name (avatar removed — name is the only identity element) */}
-                    <div className="header-info" style={{ minWidth: 0 }}>
-                        <h4>minicaai</h4>
-                        <span><span className="dot"></span> Online</span>
-                    </div>
+                    {/* Left: empty draggable region — identity wordmark removed
+                        for a clean, minimal futuristic header (controls only). */}
+                    <div style={{ flex: 1, minWidth: 0 }} />
 
                     {/* Right: Controls row */}
                     <div
@@ -1065,28 +1087,28 @@ const ChatInterface = ({
                         {/* Tier & credit chips — only at M/L sizes so the S preset
                             (340px) doesn't wrap the controls onto two rows. */}
                         {sizeIndex >= 1 && effectiveTier === 'max' && (
-                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400">
+                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-gradient-to-r from-amber-500/15 to-purple-500/10 text-amber-400">
                             <WizardHat size={9} /> MAX
                           </div>
                         )}
                         {sizeIndex >= 1 && effectiveTier === 'pro' && (
-                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold border bg-blue-500/10 border-blue-500/30 text-blue-400">
+                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-blue-500/10 text-blue-400">
                             <Crown size={9} /> PRO
                           </div>
                         )}
                         {sizeIndex >= 1 && effectiveTier === 'basic' && (
-                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold border bg-emerald-500/10 border-emerald-500/30 text-emerald-400">
+                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-emerald-500/10 text-emerald-400">
                             <Zap size={9} /> BASIC
                           </div>
                         )}
                         {sizeIndex >= 1 && creditTimer && (creditTimer.source === 'credits' || creditTimer.source === 'trial') && creditTimer.remaining > 0 && (
                           <div
-                            className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-semibold border ${
+                            className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-semibold ${
                               creditTimer.remaining <= TIME_CONSTANTS.LOW_WARNING_SECONDS
-                                ? 'bg-red-500/10 border-red-500/40 text-red-400'
+                                ? 'bg-red-500/15 text-red-400'
                                 : creditTimer.source === 'trial'
-                                  ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                                  : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                                  ? 'bg-cyan-500/15 text-cyan-400'
+                                  : 'bg-emerald-500/15 text-emerald-300'
                             }`}
                             aria-label={creditTimer.source === 'trial' ? 'Free trial time remaining' : 'Plan time remaining'}
                           >
@@ -1101,7 +1123,7 @@ const ChatInterface = ({
                               ref={modelButtonRef}
                               type="button"
                               onClick={toggleModelMenu}
-                              className="appearance-none text-[10px] rounded pl-1.5 pr-5 py-0.5 outline-none cursor-pointer"
+                              className="appearance-none text-[10px] rounded-md pl-1.5 pr-5 py-0.5 outline-none cursor-pointer hover:bg-white/[0.07] transition-colors"
                               style={glassBtn}
                               aria-haspopup="listbox"
                               aria-expanded={isModelMenuOpen}
@@ -1113,16 +1135,16 @@ const ChatInterface = ({
                             <div
                               ref={modelMenuRef}
                               role="listbox"
-                              className="fixed z-[9999] py-1.5 px-1 rounded-lg border min-w-[160px] overflow-y-auto custom-scrollbar"
+                              className="fixed z-[9999] py-2 px-1.5 rounded-2xl min-w-[160px] overflow-y-auto custom-scrollbar"
                               style={{
                                   top: modelMenuPos.top,
                                   bottom: modelMenuPos.bottom,
                                   right: modelMenuPos.right,
                                   maxHeight: 'calc(100vh - 24px)',
-                                  background: 'rgba(10, 10, 30, 0.94)',
-                                  borderColor: 'var(--glass-border)',
-                                  boxShadow: '0 10px 32px rgba(0, 0, 0, 0.60)',
-                                  backdropFilter: 'blur(8px)',
+                                  background: 'var(--model-menu-bg)',
+                                  borderColor: 'var(--model-menu-border)',
+                                  boxShadow: 'var(--model-menu-shadow)',
+                                  backdropFilter: 'blur(20px) saturate(1.2)',
                                   WebkitAppRegion: 'no-drag',
                               } as any}
                             >
@@ -1157,7 +1179,7 @@ const ChatInterface = ({
                         {inElectron && (
                             <>
                                 {/* Divider */}
-                                <div style={{ width: 1, height: 16, background: 'var(--glass-border)', margin: '0 2px' }} />
+                                <div style={{ width: 1, height: 16, background: 'rgba(211,172,99,0.20)', margin: '0 2px' }} />
 
                                 {/* Size cycle: S → M → L */}
                                 <button
@@ -1201,12 +1223,17 @@ const ChatInterface = ({
                     onScroll={handleScroll}
                 >
                     {messages.length === 0 && (
-                        <div className="flex flex-col items-center justify-center h-full space-y-4 opacity-80 mt-10" style={{ color: 'var(--text-muted)' }}>
-                            <div className="w-16 h-16 rounded-full flex items-center justify-center relative border border-current" style={{ background: 'var(--bubble-user)' }}>
-                                {isListening ? <Mic size={24} strokeWidth={1.5} className="animate-pulse" style={{ color: 'var(--text-main)' }} /> : <MicOff size={24} strokeWidth={1.5} />}
-                                {settings.autoSend && <div className="absolute top-0 right-0 w-3 h-3 rounded-full border-2" style={{ background: 'var(--text-main)', borderColor: 'var(--glass-bg)' }}></div>}
+                        <div className="flex flex-col items-center justify-center h-full space-y-4 mt-10" style={{ color: 'var(--text-muted)' }}>
+                            {/* The identity medallion (BrandMark) replaces the old flat
+                                Mic-in-a-circle. Its state carries the whole story —
+                                idle / listening / thinking / answering — so no separate
+                                mic glyph is needed. Self-grounded obsidian coin: reads
+                                on any wallpaper behind this transparent window. */}
+                            <div className="relative">
+                                <BrandMark size={76} state={brandState} />
+                                {settings.autoSend && <div className="absolute top-1.5 right-1.5 w-3 h-3 rounded-full border-2" style={{ background: 'var(--text-main)', borderColor: 'var(--glass-bg)' }}></div>}
                             </div>
-                            <div className="text-center px-4">
+                            <div className="text-center px-4 opacity-80">
                                 <p className="font-medium mb-1 text-sm" style={{ color: 'var(--text-main)' }}>System Audio Copilot</p>
                                 <p className="text-xs leading-relaxed max-w-xs mx-auto">
                                     {isListening ? 'Listening to system audio — speak or wait for the interviewer.' : 'Press Mic to start capturing system audio.'}
@@ -1224,6 +1251,18 @@ const ChatInterface = ({
                             <span className="msg-time">{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                         </div>
                     ))}
+
+                    {/* Regenerate — surfaced in the transparent pop-out too, not
+                        just the main composer. Shows under the last answer when
+                        idle; reuses the same handleRegenerate the main window uses. */}
+                    {messages.length > 0 && !isProcessing && !streamingMsg && messages[messages.length - 1].role !== 'user' && (
+                        <div className="pip-regen-row">
+                            <button className="pip-regen" onClick={handleRegenerate} aria-label="Regenerate answer">
+                                <RefreshCw size={13} strokeWidth={2} />
+                                <span>Regenerate</span>
+                            </button>
+                        </div>
+                    )}
 
                     {streamingMsg && (
                         <div key={streamingMsg.id} className="msg ai streaming">
@@ -1270,7 +1309,7 @@ const ChatInterface = ({
                             // (pip-styles.css line 312 — would crash the window),
                             // so the pill needs higher opacity to read against any
                             // desktop background behind it.
-                            background: 'rgba(20,20,28,0.92)',
+                            background: 'rgba(18,16,11,0.92)',
                             border: '1px solid var(--glass-border, rgba(255,255,255,0.14))',
                             boxShadow: '0 4px 14px rgba(0,0,0,0.28)',
                             cursor: 'pointer',
@@ -1284,92 +1323,81 @@ const ChatInterface = ({
                 </div>
 
                 <div className="input-area" style={{ flexDirection: 'column', gap: '0' }}>
-                    {/* ── Control strip: AUTO, MIC, LIVE status ── */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 8px', borderBottom: '1px solid var(--glass-border)' }}>
+                    {/* ── Textarea — spans the FULL width of the shell so there's
+                         maximum room to type; auto-grows then scrolls (see the
+                         styled scrollbar + max-height in pip-styles.css). ── */}
+                    <textarea
+                        id="inputBox"
+                        className="pip-textarea"
+                        placeholder={settings.autoSend ? "Listening for interviewer..." : "Type a message…"}
+                        rows={1}
+                        value={inputText}
+                        // `field-sizing: content` delegates auto-grow to the browser and
+                        // avoids the JS-triggered layout recomputation that caused
+                        // per-keystroke typing lag. max-height in pip-styles.css caps the
+                        // grow region, with the styled scrollbar taking over past it.
+                        style={{ fieldSizing: 'content', maxHeight: 80 } as React.CSSProperties}
+                        onChange={(e) => setInputText(e.target.value)}
+                        onKeyDown={(e) => {
+                            if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                handleManualSend();
+                            }
+                        }}
+                    />
+
+                    {/* ── Controls row: AUTO / MIC on the left, Send + Auto-Solve
+                         on the right — sits BELOW the full-width textarea. ── */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', paddingTop: '6px' }}>
                         <button
                             onClick={toggleAutoSend}
-                            style={{
-                                background: settings.autoSend ? 'rgba(59,130,246,0.2)' : 'transparent',
-                                border: `1px solid ${settings.autoSend ? 'rgba(59,130,246,0.4)' : 'var(--glass-border)'}`,
-                                color: settings.autoSend ? '#3b82f6' : 'var(--text-muted)',
-                                padding: '3px 8px', borderRadius: '6px', fontSize: '10px', fontWeight: 700,
-                                display: 'flex', alignItems: 'center', gap: '4px'
-                            }}
+                            className={`pip-toggle ${settings.autoSend ? 'active-gold' : ''}`}
                         >
                             <Zap size={10} /> {settings.autoSend ? 'AUTO' : 'MANUAL'}
                         </button>
 
                         <button
                             onClick={isListening ? stopListening : startListening}
-                            style={{
-                                background: isListening ? 'rgba(239,68,68,0.2)' : 'transparent',
-                                border: `1px solid ${isListening ? 'rgba(239,68,68,0.4)' : 'var(--glass-border)'}`,
-                                color: isListening ? '#ef4444' : 'var(--text-muted)',
-                                padding: '3px 8px', borderRadius: '6px', fontSize: '10px', fontWeight: 700,
-                                display: 'flex', alignItems: 'center', gap: '4px'
-                            }}
+                            className={`pip-toggle ${isListening ? 'active-red' : ''}`}
                         >
                             {isListening ? <Mic size={10} /> : <MicOff size={10} />}
                             {isListening ? 'LIVE' : 'MIC OFF'}
                         </button>
 
                         {speechError && (
-                            <span style={{ fontSize: '9px', color: '#ef4444', marginLeft: 'auto', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            <span style={{ fontSize: '9px', color: '#ef4444', maxWidth: '90px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                 {speechError}
                             </span>
                         )}
-                    </div>
 
-                    {/* ── Input row ── */}
-                    <div style={{ display: 'flex', alignItems: 'flex-end', gap: '8px', padding: '8px' }}>
-                    <div className="input-wrap">
-                        <textarea
-                            id="inputBox"
-                            className="pip-textarea"
-                            placeholder={settings.autoSend ? "Listening for interviewer..." : "Type a message…"}
-                            rows={1}
-                            value={inputText}
-                            // `field-sizing: content` delegates auto-grow to the browser and
-                            // avoids the JS-triggered layout recomputation that caused
-                            // per-keystroke typing lag. max-height (110px) in pip-styles.css
-                            // continues to cap the grow region, with overflow scrolling past.
-                            style={{ fieldSizing: 'content', maxHeight: 110 } as React.CSSProperties}
-                            onChange={(e) => setInputText(e.target.value)}
-                            onKeyDown={(e) => {
-                                if (e.key === 'Enter' && !e.shiftKey) {
-                                    e.preventDefault();
-                                    handleManualSend();
-                                }
-                            }}
-                        />
-                    </div>
-                    
-                    <button
-                        className="send-btn"
-                        id="sendBtn"
-                        aria-label="Send message"
-                        onClick={handleManualSend}
-                        disabled={!inputText.trim() || isProcessing}
-                        style={{ opacity: (!inputText.trim() || isProcessing) ? 0.5 : 1 }}
-                    >
-                        <PaperAirplane size={18} />
-                    </button>
+                        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
+                            <button
+                                className="send-btn"
+                                id="sendBtn"
+                                aria-label="Send message"
+                                onClick={handleManualSend}
+                                disabled={!inputText.trim() || isProcessing}
+                                style={{ opacity: (!inputText.trim() || isProcessing) ? 0.5 : 1 }}
+                            >
+                                <PaperAirplane size={18} />
+                            </button>
 
-                    <button
-                        className="send-btn ml-2"
-                        aria-label={gate.canAutoSolve ? "Auto-Solve" : "Auto-Solve — Pro only"}
-                        onClick={handleAutoSolve}
-                        disabled={isProcessing || !gate.canAutoSolve}
-                        style={{ opacity: (isProcessing || !gate.canAutoSolve) ? 0.4 : 1, position: 'relative' }}
-                    >
-                        <ScanSearch size={18} strokeWidth={1.5} />
-                        {!gate.canAutoSolve && (
-                            <span
-                                className="absolute -top-1 -right-1 text-[7px] font-bold tracking-wider bg-amber-400/15 text-amber-300 px-1 py-px rounded border border-amber-400/40"
-                                style={{ letterSpacing: '0.05em', lineHeight: 1 }}
-                            >PRO</span>
-                        )}
-                    </button>
+                            <button
+                                className="send-btn ml-2"
+                                aria-label={gate.canAutoSolve ? "Auto-Solve" : "Auto-Solve — Pro only"}
+                                onClick={handleAutoSolve}
+                                disabled={isProcessing || !gate.canAutoSolve}
+                                style={{ opacity: (isProcessing || !gate.canAutoSolve) ? 0.4 : 1, position: 'relative' }}
+                            >
+                                <ScanSearch size={18} strokeWidth={1.5} />
+                                {!gate.canAutoSolve && (
+                                    <span
+                                        className="absolute -top-1 -right-1 text-[7px] font-bold tracking-wider bg-amber-400/15 text-amber-300 px-1 py-px rounded border border-amber-400/40"
+                                        style={{ letterSpacing: '0.05em', lineHeight: 1 }}
+                                    >PRO</span>
+                                )}
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1379,8 +1407,13 @@ const ChatInterface = ({
     return (
         <div className={`flex-1 flex flex-col h-full overflow-hidden relative bg-transparent text-text transition-colors duration-300 ${settings.theme === 'dark' ? 'dark' : ''}`}>
              {/* --- RESPONSIVE HEADER --- */}
-            <header className={`h-14 md:h-16 border-b border-white/15 bg-transparent flex items-center justify-between px-4 shrink-0 z-20 sticky top-0`}>
+            <header className={`h-14 md:h-16 bg-transparent flex items-center justify-between px-4 shrink-0 z-20 sticky top-0`}>
                 <div className="flex items-center gap-2 md:gap-3">
+                {/* Living identity jewel — the BrandMark doubles as an ambient
+                    status light: it breathes while listening, races light around
+                    its bezel while the model thinks, and emits while answering.
+                    Always visible (the text wordmark still hides below xs). */}
+                <BrandMark size={26} state={brandState} />
                 <h1 className="font-bold text-base md:text-lg tracking-tight hidden xs:block">minica<span className="text-blue-500">ai</span></h1>
                 {/* Hide button — replaces the previous always-visible kbd chip.
                     Three improvements over the old approach:
@@ -1402,12 +1435,12 @@ const ChatInterface = ({
                 <div className="relative group hidden md:block md:ml-12">
                     <button
                         onClick={() => electronIPC.send('close-window')}
-                        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/[0.04] hover:bg-blue-500/15 border border-white/10 hover:border-blue-500/40 transition-all text-[11px] font-medium text-gray-400 hover:text-blue-300"
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] transition-all text-[11px] font-medium text-gray-400 hover:text-[#d3ac63]"
                         aria-label="Hide app for screen-share safety. Also available via Ctrl+Alt+Space."
                     >
                         <EyeOff size={12} />
                         <span>Hide</span>
-                        <kbd className="hidden lg:inline-flex px-1 py-0.5 rounded bg-white/[0.06] border border-white/10 font-mono text-[9px] text-white/50">
+                        <kbd className="hidden lg:inline-flex px-1 py-0.5 rounded bg-white/[0.06] font-mono text-[9px] text-white/50">
                             {/(Mac|iPhone|iPad)/i.test(typeof navigator !== 'undefined' ? navigator.platform : '') ? '⌘' : 'Ctrl'}+Alt+Space
                         </kbd>
                     </button>
@@ -1416,7 +1449,7 @@ const ChatInterface = ({
                         the tooltip itself doesn't intercept the mouse. z-60
                         sits above the sticky header (z-20) but below modals
                         (z-99999). */}
-                    <div className="absolute top-full left-0 mt-2 w-80 p-3.5 rounded-xl bg-zinc-900/95 backdrop-blur-md border border-white/10 shadow-2xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 z-[60] pointer-events-none">
+                    <div className="absolute top-full left-0 mt-2 w-80 p-3.5 rounded-xl bg-zinc-900/95 backdrop-blur-md shadow-2xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 z-[60] pointer-events-none" style={{ boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.06), 0 24px 60px -20px rgba(0,0,0,0.85)' }}>
                         <div className="flex items-center gap-2 mb-2">
                             <ShieldCheck size={14} className="text-emerald-400" />
                             <div className="text-xs font-bold text-white">Quick hide for screen-share safety</div>
@@ -1447,19 +1480,19 @@ const ChatInterface = ({
                         regardless of breakpoint so users on narrow widths
                         still see and can click it. */}
                     {userLicense && userLicense.tier === 'max' ? (
-                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-amber-500/10 to-purple-500/10 border-amber-500/40 text-amber-400 hover:from-amber-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-gradient-to-r from-amber-500/15 to-purple-500/10 text-amber-400 hover:from-amber-500/25 hover:to-purple-500/20 transition-all cursor-pointer">
                         <WizardHat size={10} /> MAX
                       </button>
                     ) : userLicense && userLicense.tier === 'pro' ? (
-                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-blue-500/10 border-blue-500/30 text-blue-400 hover:bg-blue-500/20 transition-all cursor-pointer">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-all cursor-pointer">
                         <Crown size={10} /> PRO
                       </button>
                     ) : userLicense && userLicense.tier === 'basic' ? (
-                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20 transition-all cursor-pointer">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25 transition-all cursor-pointer">
                         <Zap size={10} /> BASIC
                       </button>
                     ) : userLicense ? (
-                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-3 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 border bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/30 text-blue-400 hover:from-blue-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-3 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-gradient-to-r from-blue-500/10 to-purple-500/10 text-blue-400 hover:from-blue-500/20 hover:to-purple-500/20 transition-all cursor-pointer">
                         <Crown size={10} /> Upgrade
                       </button>
                     ) : null}
@@ -1467,19 +1500,19 @@ const ChatInterface = ({
                     {/* Live credit / trial countdown chip (Basic users + Free on trial) */}
                     {creditTimer && (creditTimer.source === 'credits' || creditTimer.source === 'trial') && creditTimer.remaining > 0 && (
                       <div
-                        className={`hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-semibold items-center gap-1.5 border transition-all duration-300 ${
+                        className={`hidden md:flex px-2.5 py-1 rounded-full text-[10px] font-semibold items-center gap-1.5 transition-all duration-300 ${
                           creditTimer.remaining <= TIME_CONSTANTS.LOW_WARNING_SECONDS
-                            ? 'bg-red-500/10 border-red-500/40 text-red-400'
+                            ? 'bg-red-500/15 text-red-400'
                             : creditTimer.source === 'trial'
-                              ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                              : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                              ? 'bg-cyan-500/15 text-cyan-400'
+                              : 'bg-emerald-500/15 text-emerald-300'
                         }`}
                         aria-label={creditTimer.source === 'trial' ? 'Free trial time remaining' : 'Basic plan time remaining'}
                       >
                         {creditTimer.source === 'trial' ? 'TRIAL' : ''} {formatTimeRemaining(creditTimer.remaining)}
                       </div>
                     )}
-                    <div className={`hidden md:flex px-3 py-1 rounded-full text-xs font-medium items-center gap-2 border transition-all duration-300 ${isListening ? 'bg-red-500/10 border-red-500/50 text-red-500' : 'bg-surface border-border text-gray-500'}`}>
+                    <div className={`hidden md:flex px-3 py-1 rounded-full text-xs font-medium items-center gap-2 transition-all duration-300 ${isListening ? 'bg-red-500/15 text-red-500' : 'bg-white/[0.04] text-gray-400'}`}>
                         <div className={`w-2 h-2 rounded-full ${isListening ? 'bg-red-500 animate-pulse' : 'bg-gray-500'}`}></div>
                         {isListening ? 'LIVE' : 'OFF'}
                     </div>
@@ -1487,10 +1520,10 @@ const ChatInterface = ({
                     {!isPipMode && (
                         <button
                             onClick={togglePip}
-                            className={`p-2 rounded-lg transition-all border relative ${
+                            className={`p-2 rounded-lg transition-all relative ${
                               gate.canPopout
-                                ? 'text-primary hover:bg-blue-500/10 border-blue-500/20'
-                                : 'text-gray-500 border-gray-500/20 cursor-not-allowed opacity-60'
+                                ? 'text-[#d3ac63] hover:bg-white/[0.06]'
+                                : 'text-gray-500 cursor-not-allowed opacity-60'
                             }`}
                             aria-label={gate.canPopout ? "Pop Out (Hide from Screen Share)" : "Pop-out Mode — Pro only"}
                         >
@@ -1500,15 +1533,14 @@ const ChatInterface = ({
                     )}
 
                     {onNewSession && (
-                        <button onClick={onNewSession} className="p-2 text-gray-400 hover:text-green-400 hover:bg-green-500/10 border border-transparent hover:border-green-500/20 rounded-lg transition-all" aria-label="New Interview Session"><Plus size={20} /></button>
+                        <button onClick={onNewSession} className="p-2 rounded-lg text-gray-400 hover:text-[#d3ac63] hover:bg-white/[0.06] transition-all" aria-label="New Interview Session"><Plus size={20} /></button>
                     )}
-                    <button onClick={onOpenHelp} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Audio Help"><HelpCircle size={20} /></button>
                     {onOpenSupport && (
-                        <button onClick={onOpenSupport} className="p-2 text-gray-400 hover:text-emerald-400 hover:bg-emerald-500/10 border border-transparent hover:border-emerald-500/20 rounded-lg transition-all" aria-label="Chat with Minica (Support)"><Headphones size={20} /></button>
+                        <button onClick={onOpenSupport} className="p-2 rounded-lg text-gray-400 hover:text-[#d3ac63] hover:bg-white/[0.06] transition-all" aria-label="Chat with Minica (Support)"><Headphones size={20} /></button>
                     )}
-                    <button onClick={onOpenContext} className="p-2 text-gray-400 hover:text-text hover:bg-surface border border-transparent hover:border-border rounded-lg transition-all" aria-label="Files (Knowledge Base)"><FileText size={20} /></button>
-                    <button onClick={onOpenSettings} className={`p-2 rounded-lg transition-all border border-transparent hover:border-border text-gray-400 hover:text-text hover:bg-surface`} aria-label="Settings"><Settings size={20} /></button>
-                    <button onClick={onLogout} className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 rounded-lg transition-all" aria-label="Logout"><LogOut size={20} /></button>
+                    <button onClick={onOpenContext} className="p-2 rounded-lg text-gray-400 hover:text-[#d3ac63] hover:bg-white/[0.06] transition-all" aria-label="Files (Knowledge Base)"><FileText size={20} /></button>
+                    <button onClick={onOpenSettings} className="p-2 rounded-lg transition-all text-gray-400 hover:text-[#d3ac63] hover:bg-white/[0.06]" aria-label="Settings"><Settings size={20} /></button>
+                    <button onClick={onLogout} className="p-2 rounded-lg text-gray-400 hover:text-red-400 hover:bg-red-500/10 transition-all" aria-label="Logout"><LogOut size={20} /></button>
                 </div>
             </header>
 
@@ -1521,16 +1553,22 @@ const ChatInterface = ({
                     className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 md:space-y-6 pb-40 md:pb-48 custom-scrollbar"
                 >
                     {messages.length === 0 && (
-                        <div className="flex flex-col items-center justify-center h-[60%] text-gray-400 space-y-6 opacity-60 mt-10">
-                            <div className="w-24 h-24 rounded-full bg-surface flex items-center justify-center relative ring-1 ring-border">
-                                {isListening ? <ScreenShare size={40} className="text-red-500 animate-pulse" /> : <ScreenShareOff size={40} className="text-gray-500" />}
-                                {settings.autoSend && <div className="absolute top-1 right-1 w-4 h-4 bg-green-500 rounded-full border-2 border-background shadow-[0_0_10px_rgba(34,197,94,0.5)]"></div>}
+                        <div className="flex flex-col items-center justify-center h-[60%] space-y-6 mt-10">
+                            {/* The identity medallion (BrandMark) replaces the old
+                                ScreenShare-icon-in-a-circle. Idle = polished gold at
+                                rest; listening = sound arcs arrive + the coin breathes;
+                                thinking = comets race the bezel; answering = arcs emit.
+                                The LIVE red pill in the header still carries the
+                                explicit capture-state signal. */}
+                            <div className="relative">
+                                <BrandMark size={104} state={brandState} />
+                                {settings.autoSend && <div className="absolute top-2 right-2 w-3.5 h-3.5 rounded-full" style={{ background: '#d3ac63', boxShadow: '0 0 10px rgba(211,172,99,0.6)' }}></div>}
                             </div>
                             <div className="text-center px-6">
-                                <p className="font-medium text-text mb-2 text-lg">System Audio Copilot</p>
+                                <p className="mb-2 text-xl" style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em', color: 'var(--text-color)' }}>System Audio Copilot</p>
                                 <p className="text-sm leading-relaxed max-w-xs mx-auto text-gray-500">
                                     Click the Mic button to share your screen tab.<br/>
-                                    <strong>Remember to check "Share tab audio"</strong>.
+                                    <strong style={{ color: 'rgba(211,172,99,0.78)' }}>Remember to check "Share tab audio"</strong>.
                                 </p>
                             </div>
                         </div>
@@ -1616,16 +1654,16 @@ const ChatInterface = ({
                             </div>
                         )}
 
-                        <div className={`bg-transparent border rounded-2xl shadow-lg transition-all duration-300 flex flex-col ${isListening ? 'border-white/30' : 'border-white/15'}`}>
-                            
-                            <div className="flex items-center justify-between px-3 py-1.5 border-b border-gray-500/10">
+                        <div className="composer-shell relative flex flex-col mx-2 rounded-[1.5rem] transition-all duration-300">
+
+                            <div className="flex items-center justify-between px-3 pt-2 pb-1">
                                 <div className="flex items-center gap-2">
                                     <button
                                         onClick={toggleAutoSend}
-                                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] md:text-xs font-bold transition-all border ${
-                                            settings.autoSend 
-                                            ? 'bg-blue-500/20 text-blue-500 border-blue-500/30' 
-                                            : 'bg-gray-500/10 text-gray-500 border-transparent'
+                                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] md:text-xs font-bold transition-all ${
+                                            settings.autoSend
+                                            ? 'bg-blue-500/20 text-blue-500'
+                                            : 'bg-white/[0.04] text-gray-400 hover:bg-white/[0.07]'
                                         }`}
                                     >
                                         <Zap size={12} className={settings.autoSend ? "fill-blue-500" : ""} />
@@ -1634,10 +1672,10 @@ const ChatInterface = ({
 
                                     <button
                                         onClick={isListening ? stopListening : startListening}
-                                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] md:text-xs font-bold transition-all border ${
-                                            isListening 
-                                            ? 'bg-red-500/20 text-red-500 border-red-500/30' 
-                                            : 'bg-gray-500/10 text-gray-500 border-transparent'
+                                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] md:text-xs font-bold transition-all ${
+                                            isListening
+                                            ? 'bg-red-500/20 text-red-500'
+                                            : 'bg-white/[0.04] text-gray-400 hover:bg-white/[0.07]'
                                         }`}
                                     >
                                         {isListening ? <Mic size={12} /> : <MicOff size={12} />}
@@ -1654,13 +1692,13 @@ const ChatInterface = ({
                                         same compositor surface as the rest of
                                         the renderer and inherits content
                                         protection. */}
-                                    <div className="h-5 w-[1px] bg-gray-500/20 mx-1"></div>
+                                    <div className="h-4 w-[1px] bg-white/[0.06] mx-1"></div>
                                     <div className="relative">
                                         <button
                                             ref={modelButtonRef}
                                             type="button"
                                             onClick={toggleModelMenu}
-                                            className="appearance-none bg-surface text-text text-[10px] md:text-xs font-bold px-2.5 py-1 pr-6 rounded-md border border-border hover:border-primary focus:outline-none focus:ring-1 focus:ring-primary transition-all cursor-pointer"
+                                            className="appearance-none bg-white/[0.04] text-text text-[10px] md:text-xs font-bold px-2.5 py-1 pr-6 rounded-lg hover:bg-white/[0.07] focus:outline-none transition-all cursor-pointer"
                                             aria-haspopup="listbox"
                                             aria-expanded={isModelMenuOpen}
                                         >
@@ -1671,16 +1709,16 @@ const ChatInterface = ({
                                             <div
                                                 ref={modelMenuRef}
                                                 role="listbox"
-                                                className="fixed z-[9999] py-1.5 px-1 rounded-lg border min-w-[200px] overflow-y-auto custom-scrollbar"
+                                                className="fixed z-[9999] py-2 px-1.5 rounded-2xl min-w-[200px] overflow-y-auto custom-scrollbar"
                                                 style={{
                                                     top: modelMenuPos.top,
                                                     bottom: modelMenuPos.bottom,
                                                     right: modelMenuPos.right,
                                                     maxHeight: 'calc(100vh - 24px)',
-                                                    background: 'rgba(10, 10, 30, 0.94)',
-                                                    borderColor: 'var(--border-color)',
-                                                    boxShadow: '0 10px 32px rgba(0, 0, 0, 0.40)',
-                                                    backdropFilter: 'blur(8px)',
+                                                    background: 'var(--model-menu-bg)',
+                                                    borderColor: 'var(--model-menu-border)',
+                                                    boxShadow: 'var(--model-menu-shadow)',
+                                                    backdropFilter: 'blur(20px) saturate(1.2)',
                                                 } as React.CSSProperties}
                                             >
                                                 {MODEL_ORDER.map(key => (
@@ -1717,7 +1755,7 @@ const ChatInterface = ({
                                 `.btn-ios-send` / `.btn-ios-violet` rules for the visual
                                 language. focus-within lifts the whole row when the user
                                 engages the textarea (parent container glows, not the box). */}
-                            <div className="composer-shell relative flex items-end gap-2.5 mx-2 mb-2 px-2 py-2 rounded-2xl border border-border/60 bg-white/[0.02] dark:bg-white/[0.025] transition-all">
+                            <div className="relative flex items-end gap-2.5 px-2 pb-2 pt-0.5">
                                 <div className="relative flex-1 min-w-0">
                                     {interimText && (
                                         <div className="absolute top-2.5 left-3 text-gray-400 pointer-events-none text-sm md:text-base whitespace-pre-wrap truncate w-full opacity-60 italic z-0">
@@ -1847,7 +1885,7 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
                               surface: 'var(--surface-color)',
                               border: 'var(--border-color)',
                               text: 'var(--text-color)',
-                              primary: '#3b82f6',
+                              primary: '#d3ac63',
                               accent: '#f59e0b',
                             },
                           },
@@ -2350,7 +2388,7 @@ let externalCheckoutPollActive = false;
 // modals immediately; the tier badge in the chat header flips when the
 // poll detects the upgrade.
 async function pollForExternalUpgrade(
-  targetTier: 'basic' | 'pro' | 'max',
+  targetTier: 'basic' | 'pro' | 'max' | 'ultra',
   onSuccess?: (info: { tier: string }) => void,
 ) {
   if (externalCheckoutPollActive) return;
@@ -2522,7 +2560,7 @@ async function tryOpenCheckoutUrl(url: string): Promise<{
 }
 
 async function openProUpgrade(
-  targetTier: 'basic' | 'pro' | 'max' = 'pro',
+  targetTier: 'basic' | 'pro' | 'max' | 'ultra' = 'pro',
   onSuccess?: (info: { tier: string; message?: string }) => void,
 ) {
   const { licenseService } = await import('./services/licenseService');
@@ -2541,11 +2579,12 @@ async function openProUpgrade(
     const countryCode = saved.user?.country_code || 'US';
 
     // In-place tier swap detection — mirror SubscriptionGate.initiateCheckout.
-    // Only Pro↔Max qualifies: Basic isn't recurring (one-time), Free has no
-    // sub to update.
+    // 2026-07 model: only Ultra is a recurring subscription. Basic/Pro/Max are
+    // one-time purchases, so they never qualify for an in-place /upgrade-tier
+    // swap — picking a different one is always a fresh /create-checkout.
     const liveTier = saved.license?.tier;
     const isLiveActive = saved.license?.status === 'active';
-    const isRecurringTier = (t: string | undefined): boolean => t === 'pro' || t === 'max';
+    const isRecurringTier = (t: string | undefined): boolean => t === 'ultra';
     const isInPlaceUpgrade =
       isLiveActive &&
       isRecurringTier(liveTier) &&
@@ -2559,7 +2598,7 @@ async function openProUpgrade(
       ? { tier: targetTier }
       : { country_code: countryCode, tier: targetTier };
 
-    const response = await fetch(`https://api.minicaai.com${endpointPath}`, {
+    const response = await fetch(`${licenseService.getApiBase()}${endpointPath}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
       body: JSON.stringify(requestBody),
@@ -3355,10 +3394,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   // modal closed instantly on click and the user was thrown into a
   // dim app waiting for a toast that hadn't surfaced yet — the exact
   // "thrown to chat interface" symptom.
-  const [upgradePending, setUpgradePending] = useState<'basic' | 'pro' | 'max' | null>(null);
+  const [upgradePending, setUpgradePending] = useState<'basic' | 'pro' | 'max' | 'ultra' | null>(null);
   const [renewPending, setRenewPending] = useState(false);
 
-  const handleSubscriptionUpgrade = useCallback(async (targetTier: 'basic' | 'pro' | 'max') => {
+  const handleSubscriptionUpgrade = useCallback(async (targetTier: 'basic' | 'pro' | 'max' | 'ultra') => {
       // Reuse the checkout flow in openProUpgrade. The checkout happens in
       // the browser via openExternal for /create-checkout, or completes
       // server-side and updates local state for /upgrade-tier. The
@@ -5876,7 +5915,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         {!isPopoutElectron && !isPipMode && !sidebarOpen && (
           <button
             onClick={() => setSidebarOpen(true)}
-            className="fixed top-3 left-3 z-40 w-9 h-9 rounded-lg bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] flex items-center justify-center text-gray-400 hover:text-white transition-all backdrop-blur-sm"
+            className="fixed top-3 left-3 z-40 w-9 h-9 rounded-lg bg-white/[0.05] hover:bg-white/[0.09] flex items-center justify-center text-gray-400 hover:text-[#d3ac63] transition-all backdrop-blur-md"
             aria-label="Open conversations"
           >
             <Menu size={16} />
@@ -5995,10 +6034,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
          <div className="space-y-6">
             
             {/* Model Selection */}
-            <div className="bg-surface/50 border border-border p-3 rounded-lg space-y-3">
+            <div className="bg-black/[0.04] dark:bg-white/[0.025] p-4 rounded-2xl space-y-3.5">
                 <div className="flex items-center justify-between gap-3 flex-wrap">
                     <label className="text-sm font-bold text-text flex items-center gap-2">
-                        <Cpu size={16} /> AI Model Selection
+                        <Sparkles size={16} /> AI Model Selection
                     </label>
                     {/* Tier-aware upgrade prompt. Max → "Full access" pill (no
                         nag, just confirmation). Pro → Claude path. Basic → both
@@ -6068,32 +6107,34 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
 
             <button
                 onClick={saveSettings}
-                className={`w-full px-4 py-2 rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-all ${
+                className={`w-full px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all ${
                     saveStatus === 'saved'
-                    ? 'bg-green-500 text-white'
-                    : 'bg-primary text-white hover:bg-blue-600'
+                    ? 'bg-emerald-500/90 text-white'
+                    : 'bg-gradient-to-b from-[#e8cf8f] to-[#c9a655] text-[#2a2109] hover:from-[#f0d99a] hover:to-[#d3ac63] shadow-[0_6px_18px_-8px_rgba(211,172,99,0.55)]'
                 }`}
             >
                 {saveStatus === 'saved' ? <Check size={16} /> : <Save size={16} />}
                 {saveStatus === 'saved' ? 'Settings Saved' : 'Save Settings'}
             </button>
 
-            <div className="border-t border-border pt-4 space-y-4">
+            <div className="bg-black/[0.04] dark:bg-white/[0.025] p-4 rounded-2xl space-y-4">
+                <p className="text-[10px] font-bold tracking-[0.18em] uppercase text-[#8a6d2f] dark:text-[#c9a86a]/80">Preferences</p>
+
                 {/* Theme Toggle */}
                 <div className="flex items-center justify-between">
                     <span className="text-sm font-medium text-text">App Theme</span>
-                    <div className="flex items-center bg-background border border-border rounded-lg p-1">
-                        <button 
+                    <div className="flex items-center gap-0.5 bg-black/25 rounded-lg p-0.5">
+                        <button
                             onClick={() => setSettings(s => ({...s, theme: 'light'}))}
-                            className={`p-2 rounded-md transition-all ${settings.theme === 'light' ? 'bg-white shadow text-black' : 'text-gray-400 hover:text-gray-200'}`}
+                            className={`p-1.5 rounded-md transition-all ${settings.theme === 'light' ? 'bg-[#d3ac63] text-[#241b08]' : 'text-gray-400 hover:text-gray-200'}`}
                         >
-                            <Sun size={16} />
+                            <Sun size={15} />
                         </button>
-                        <button 
+                        <button
                             onClick={() => setSettings(s => ({...s, theme: 'dark'}))}
-                            className={`p-2 rounded-md transition-all ${settings.theme === 'dark' ? 'bg-gray-700 shadow text-white' : 'text-gray-400 hover:text-gray-600'}`}
+                            className={`p-1.5 rounded-md transition-all ${settings.theme === 'dark' ? 'bg-[#d3ac63] text-[#241b08]' : 'text-gray-400 hover:text-gray-200'}`}
                         >
-                            <Moon size={16} />
+                            <Moon size={15} />
                         </button>
                     </div>
                 </div>
@@ -6101,15 +6142,15 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                 {/* Font Size Toggle */}
                 <div className="flex items-center justify-between">
                     <span className="text-sm font-medium text-text">Text Size</span>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-0.5 bg-black/25 rounded-lg p-0.5">
                         {(['small', 'medium', 'large'] as const).map((size) => (
                             <button
                                 key={size}
                                 onClick={() => setSettings(s => ({...s, fontSize: size}))}
-                                className={`px-3 py-1.5 rounded-md text-xs font-medium border transition-all ${
+                                className={`px-3 py-1 rounded-md text-xs font-semibold transition-all ${
                                     settings.fontSize === size
-                                    ? 'bg-primary text-white border-primary'
-                                    : 'bg-transparent text-gray-500 border-border hover:border-gray-400'
+                                    ? 'bg-[#d3ac63] text-[#241b08]'
+                                    : 'text-gray-400 hover:text-gray-200'
                                 }`}
                             >
                                 {size.charAt(0).toUpperCase() + size.slice(1)}
@@ -6134,7 +6175,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                           aria-checked={settings.localOnlyAutoType}
                           onClick={() => setSettings(s => ({ ...s, localOnlyAutoType: !s.localOnlyAutoType }))}
                           className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
-                              settings.localOnlyAutoType ? 'bg-primary' : 'bg-gray-600'
+                              settings.localOnlyAutoType ? 'bg-[#d3ac63]' : 'bg-white/15'
                           }`}
                       >
                           <span
@@ -6164,7 +6205,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                             </span>
                         )}
                     </div>
-                    <div className="grid grid-cols-4 gap-1.5">
+                    <div className="grid grid-cols-4 gap-0.5 bg-black/25 rounded-lg p-0.5">
                         {(['none', 'low', 'medium', 'high'] as const).map((level) => {
                             const isActive = settings.reasoningEffort === level;
                             const isLockedForTier = !gate.canChooseReasoningEffort && level !== 'none';
@@ -6182,12 +6223,12 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                                         level === 'medium' ? 'Balanced reasoning · ~5-10s answers' :
                                         'Deep reasoning · ~10-25s answers'
                                     }
-                                    className={`relative px-2 py-1.5 rounded-md text-xs font-medium border transition-all ${
+                                    className={`relative px-2 py-1.5 rounded-md text-xs font-semibold transition-all ${
                                         isLockedForTier
-                                            ? 'bg-transparent text-gray-700 border-border cursor-not-allowed opacity-60'
+                                            ? 'text-gray-600 cursor-not-allowed opacity-70'
                                             : isActive
-                                                ? 'bg-primary text-white border-primary shadow-sm'
-                                                : 'bg-transparent text-gray-500 border-border hover:border-gray-400 hover:text-gray-300'
+                                                ? 'bg-[#d3ac63] text-[#241b08]'
+                                                : 'text-gray-400 hover:text-gray-200'
                                     }`}
                                 >
                                     {level.charAt(0).toUpperCase() + level.slice(1)}
@@ -6199,14 +6240,14 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                         })}
                     </div>
                     {/* Contextual help — adapts to tier + training status */}
-                    <div className={`text-[10px] leading-relaxed mt-0.5 px-2 py-1.5 rounded-md ${
+                    <div className={`text-[10px] leading-relaxed mt-0.5 px-2.5 py-2 rounded-lg ${
                         !gate.canChooseReasoningEffort
-                            ? 'bg-amber-400/5 text-amber-200/70 border border-amber-400/15'
+                            ? 'bg-amber-400/[0.12] text-amber-800 dark:bg-amber-400/[0.07] dark:text-amber-200/75'
                             : hasTrainedCache && settings.reasoningEffort === 'none'
-                                ? 'bg-emerald-500/10 text-emerald-300/90 border border-emerald-500/20'
+                                ? 'bg-emerald-500/[0.12] text-emerald-800 dark:bg-emerald-500/[0.09] dark:text-emerald-300/90'
                                 : !hasTrainedCache && settings.reasoningEffort === 'none'
-                                    ? 'bg-orange-500/10 text-orange-300/80 border border-orange-500/20'
-                                    : 'bg-blue-500/5 text-blue-300/80 border border-blue-500/15'
+                                    ? 'bg-orange-500/[0.12] text-orange-800 dark:bg-orange-500/[0.09] dark:text-orange-300/80'
+                                    : 'bg-blue-500/[0.12] text-blue-800 dark:bg-blue-500/[0.07] dark:text-blue-300/80'
                     }`}>
                         {!gate.canChooseReasoningEffort ? (
                             <>
@@ -6240,7 +6281,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
 
             {/* ── App Updates (Electron only) ── */}
             {isElectron && (
-              <div className="border-t border-border pt-4">
+              <div className="bg-black/[0.04] dark:bg-white/[0.025] p-4 rounded-2xl">
                 <div className="flex items-center justify-between">
                   <div>
                     <span className="text-sm font-medium text-text">App Updates</span>
@@ -6250,7 +6291,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                     {updateStatus.status === 'idle' || updateStatus.status === 'up-to-date' || updateStatus.status === 'error' ? (
                       <button
                         onClick={() => electronIPC.send('check-for-updates')}
-                        className="px-3 py-1.5 rounded-lg text-xs font-medium border border-border hover:border-primary text-gray-400 hover:text-primary transition-all flex items-center gap-1.5"
+                        className="px-3 py-1.5 rounded-lg text-xs font-medium bg-black/[0.05] hover:bg-black/[0.09] text-gray-600 hover:text-[#a07d2f] dark:bg-white/[0.05] dark:hover:bg-white/[0.09] dark:text-gray-300 dark:hover:text-[#d3ac63] transition-all flex items-center gap-1.5"
                       >
                         <RefreshCw size={12} /> Check for Updates
                       </button>
@@ -6555,7 +6596,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                    value={settings.customInstructions}
                    onChange={(e) => setSettings(s => ({ ...s, customInstructions: e.target.value }))}
                    placeholder='e.g. "Use the STAR method for behavioral questions. Cite tool versions in code answers. Keep responses under 200 words unless I ask for more detail."'
-                   className="w-full h-28 bg-background border border-border rounded-xl p-3 text-xs focus:ring-1 focus:ring-primary outline-none resize-y custom-scrollbar leading-relaxed"
+                   className="w-full h-28 bg-black/[0.04] dark:bg-white/[0.03] rounded-xl p-3 text-xs outline-none resize-y custom-scrollbar leading-relaxed transition-all focus:bg-black/[0.055] dark:focus:bg-white/[0.05] focus:shadow-[inset_0_0_20px_-6px_rgba(211,172,99,0.28)]"
                />
                <div className="flex items-center justify-between text-[10px]">
                    <span className={settings.customInstructions.length > 3000 ? 'text-orange-400 font-medium' : 'text-gray-500'}>
@@ -6707,16 +6748,19 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                      onDragOver={!disabled ? handleDragOver : undefined}
                      onDragLeave={!disabled ? handleDragLeave : undefined}
                      onDrop={!disabled ? handleFilesDrop : undefined}
-                     className={`relative flex flex-col items-center justify-center gap-2 px-6 py-7 rounded-xl border-2 border-dashed transition-all ${
+                     className={`group/drop relative flex flex-col items-center justify-center gap-2.5 px-6 py-9 rounded-2xl transition-all overflow-hidden ${
                        disabled
-                         ? 'border-border/50 bg-surface/20 cursor-not-allowed'
+                         ? 'bg-black/[0.02] dark:bg-white/[0.01] cursor-not-allowed'
                          : dragActive
-                           ? 'border-primary/60 bg-primary/5 cursor-copy'
-                           : 'border-border hover:border-primary/40 hover:bg-surface/40 cursor-pointer'
+                           ? 'bg-[#d3ac63]/[0.12] cursor-copy'
+                           : 'bg-black/[0.03] dark:bg-white/[0.03] hover:bg-[#d3ac63]/[0.06] cursor-pointer'
                      }`}
+                     style={{ boxShadow: dragActive ? 'inset 0 0 0 1.5px rgba(211,172,99,0.5), inset 0 0 40px -8px rgba(211,172,99,0.22)' : 'inset 0 0 0 1px rgba(211,172,99,0.16), inset 0 1px 0 rgba(255,255,255,0.05)' }}
                      title={blockedForSession ? 'File picker is paused during a live interview to keep filenames off your screen-share. Stop the mic to add files.' : undefined}
                    >
-                     <Upload size={26} className={dragActive ? 'text-primary' : disabled ? 'text-gray-600' : 'text-gray-500'} />
+                     <div className="w-12 h-12 rounded-2xl flex items-center justify-center transition-all" style={{ background: dragActive ? 'rgba(211,172,99,0.16)' : 'rgba(211,172,99,0.08)', boxShadow: 'inset 0 0 0 1px rgba(211,172,99,0.15)' }}>
+                       <Upload size={22} strokeWidth={1.6} className="transition-all" style={{ color: dragActive ? '#f6e4b0' : disabled ? '#6a6355' : 'rgba(211,172,99,0.7)' }} />
+                     </div>
                      <div className="text-center">
                        <p className="text-sm font-medium text-text">
                          {blockedForSession ? 'Paused — stop the mic to add files' :
@@ -6741,6 +6785,30 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                    accept=".pdf,.docx,.txt,.md,.json,.js,.ts,.py,.html,.css,.csv,.png,.jpg,.jpeg"
                    multiple={gate.maxContextFiles === -1}
                />
+
+               {/* Uploaded files + pasted snippets — sit DIRECTLY under the drop
+                   zone so an added file appears exactly where you dropped it,
+                   not buried below the paste box. Borderless glass rows. */}
+               {db.contextFiles.length > 0 && (
+                   <div className="space-y-2 max-h-[200px] overflow-y-auto custom-scrollbar pr-1">
+                       {db.contextFiles.map(file => (
+                           <div key={file.id} className="flex items-center justify-between p-2.5 bg-black/[0.04] dark:bg-white/[0.03] rounded-xl group hover:bg-black/[0.06] dark:hover:bg-white/[0.05] transition-colors">
+                               <div className="flex items-center gap-3 overflow-hidden">
+                                   <div className="w-8 h-8 rounded-lg bg-[#d3ac63]/12 flex items-center justify-center shrink-0">
+                                       <FileText size={14} className="text-[#c9a86a]" />
+                                   </div>
+                                   <div className="min-w-0">
+                                       <p className="text-xs font-medium text-text truncate max-w-[220px]">{file.name}</p>
+                                       <p className="text-[10px] text-gray-500 uppercase tracking-wider">{file.type}</p>
+                                   </div>
+                               </div>
+                               <button onClick={() => removeFile(file.id)} className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors opacity-0 group-hover:opacity-100">
+                                   <Trash2 size={14} />
+                               </button>
+                           </div>
+                       ))}
+                   </div>
+               )}
 
                {/* ── Paste text directly — parallel input method ──
                    Always-visible section (replaces the prior collapsed
@@ -6773,13 +6841,13 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                            value={pasteContent}
                            onChange={(e) => setPasteContent(e.target.value)}
                            placeholder="Paste resume, job description, or interview notes here…"
-                           className="w-full h-28 bg-background border border-border rounded-xl p-3 pr-12 text-xs focus:ring-1 focus:ring-primary focus:border-primary/40 outline-none resize-none custom-scrollbar leading-relaxed"
+                           className="w-full h-28 bg-black/[0.04] dark:bg-white/[0.03] rounded-xl p-3 pr-12 text-xs outline-none resize-none custom-scrollbar leading-relaxed transition-all focus:bg-black/[0.055] dark:focus:bg-white/[0.05] focus:shadow-[inset_0_0_20px_-6px_rgba(211,172,99,0.28)]"
                        />
                        <div className="absolute bottom-2 right-2">
                            <button
                                onClick={handleAddPasteText}
                                disabled={!pasteContent.trim() || (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles)}
-                               className={`p-2 rounded-lg transition-all ${pasteContent.trim() && !(gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) ? 'bg-primary text-white shadow-lg hover:bg-blue-600' : 'bg-surface text-gray-500 cursor-not-allowed border border-border'}`}
+                               className={`p-2 rounded-lg transition-all ${pasteContent.trim() && !(gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) ? 'bg-gradient-to-b from-[#e8cf8f] to-[#c9a655] text-[#2a2109] shadow-[0_4px_12px_-4px_rgba(211,172,99,0.5)] hover:from-[#f0d99a] hover:to-[#d3ac63]' : 'bg-black/[0.05] dark:bg-white/[0.04] text-gray-500 cursor-not-allowed'}`}
                                aria-label="Add pasted text as context"
                                title="Add as context"
                            >
@@ -6789,31 +6857,6 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                    </div>
                </div>
 
-               {/* Unified files list — uploads + pasted snippets together.
-                   Placed AFTER both input methods so it reads as the
-                   "result" of either drop or paste. Hidden when empty
-                   since the drop-zone + paste-section above already
-                   serve as the empty-state CTAs. */}
-               {db.contextFiles.length > 0 && (
-                   <div className="space-y-2 max-h-[180px] overflow-y-auto custom-scrollbar pr-1 pt-1">
-                       {db.contextFiles.map(file => (
-                           <div key={file.id} className="flex items-center justify-between p-2.5 bg-background border border-border rounded-lg group hover:border-primary/30 transition-colors">
-                               <div className="flex items-center gap-3 overflow-hidden">
-                                   <div className="w-8 h-8 rounded bg-gray-500/10 flex items-center justify-center shrink-0">
-                                       <FileText size={14} className="text-gray-400" />
-                                   </div>
-                                   <div className="min-w-0">
-                                       <p className="text-xs font-medium text-text truncate max-w-[220px]">{file.name}</p>
-                                       <p className="text-[10px] text-gray-500 uppercase tracking-wider">{file.type}</p>
-                                   </div>
-                               </div>
-                               <button onClick={() => removeFile(file.id)} className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors opacity-0 group-hover:opacity-100">
-                                   <Trash2 size={14} />
-                               </button>
-                           </div>
-                       ))}
-                   </div>
-               )}
            </div>
 
            {/* General Mode Toggle within Context */}
