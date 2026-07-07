@@ -57,6 +57,12 @@ const TIER_MARK: Partial<Record<PricingTier['id'], React.ComponentType<{ size?: 
 //  One-time passes rendered as compact supporting grid (4-col). Ultra is a
 //  distinct cinematic band — spotlight material, two-column features, larger
 //  presence, gold-lifted treatment. All data + handlers untouched.
+//
+//  Target 2 complete: Full-bleed cinematic theater intermission between Why
+//  and Kit. Slow breathing projector beams, traveling gold slit (the light
+//  in the dark theater), breathing aperture, 28 delicate motes, proscenium
+//  gate. At center: enormous, almost-invisible foil echo of the hero line
+//  that the slit dramatically illuminates as it passes — a quiet miracle.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 interface PremiumLandingProps {
@@ -313,6 +319,88 @@ const CSS = `
   .pl-foil{background-position:0 0 !important;}
   .pl-lamp,.pl-mote{display:none !important;}
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   TARGET 2 — Full-bleed cinematic theater intermission
+   A deliberate breath between the big claims and the quiet details.
+   "Light in a dark theater" taken to its purest form: slow projector
+   beams, living dust, a traveling slit of light, and a breathing
+   aperture at center. The light occasionally "finds" something.
+   All motion is expensive, slow, and quiet. 10-trillion-company
+   restraint and poetry.
+   ═══════════════════════════════════════════════════════════════════ */
+.pl-theater{
+  position:relative;
+  height:420px;
+  background:#030302;
+  overflow:hidden;
+  border-top:1px solid var(--line);
+  border-bottom:1px solid var(--line);
+}
+.pl-theater-inner{
+  position:absolute;inset:0;
+  background:
+    radial-gradient(120% 70% at 18% 38%, rgba(246,228,176,.065), transparent 58%),
+    radial-gradient(90% 80% at 78% 52%, rgba(211,172,99,.055), transparent 62%),
+    radial-gradient(140% 55% at 52% 72%, rgba(217,184,116,.035), transparent 68%);
+  animation:pl-theaterbreathe 22s ease-in-out infinite;
+}
+@keyframes pl-theaterbreathe{
+  0%,100%{transform:translate3d(0,0,0) scale(1);}
+  50%{transform:translate3d(0,1px,0) scale(1.006);}
+}
+.pl-theater-slit{
+  position:absolute;top:0;bottom:0;width:3px;
+  background:linear-gradient(180deg,transparent,rgba(246,228,176,.75) 8%,#f6e4b0 46%,rgba(246,228,176,.75) 90%,transparent);
+  box-shadow:0 0 52px rgba(211,172,99,.65), 0 0 110px rgba(211,172,99,.28);
+  animation:pl-slittravel 24s cubic-bezier(.22,.6,.22,1) infinite;
+  mix-blend-mode:screen;
+}
+@keyframes pl-slittravel{
+  0%{left:-3%;} 47%{left:97%;} 53%{left:97%;} 100%{left:-3%;}
+}
+.pl-theater-aperture{
+  position:absolute;left:50%;top:50%;width:320px;height:320px;
+  transform:translate(-50%,-50%);
+  border:1px solid rgba(211,172,99,.16);
+  border-radius:999px;
+  box-shadow:0 0 0 1px rgba(211,172,99,.07) inset, 0 0 70px rgba(211,172,99,.12);
+  animation:pl-aperturebreathe 15s ease-in-out infinite;
+}
+.pl-theater-aperture::before,
+.pl-theater-aperture::after{
+  content:'';position:absolute;inset:-16%;border:1px solid rgba(211,172,99,.09);border-radius:999px;
+}
+.pl-theater-aperture::after{inset:-30%;border-color:rgba(211,172,99,.05);}
+@keyframes pl-aperturebreathe{
+  0%,100%{transform:translate(-50%,-50%) scale(1); opacity:.75;}
+  50%{transform:translate(-50%,-50%) scale(1.18); opacity:1;}
+}
+.pl-theater-mote{
+  position:absolute;border-radius:50%;background:var(--gold-1);
+  opacity:0;filter:blur(.3px);
+  animation:pl-theaterdrift 19s linear infinite;
+  box-shadow:0 0 5px var(--gold-glow);
+}
+@keyframes pl-theaterdrift{
+  0%{transform:translate3d(0,38px,0);opacity:0;}
+  7%{opacity:var(--o,.22);}
+  78%{opacity:calc(var(--o,.22)*.55);}
+  100%{transform:translate3d(var(--dx,0),-195px,0);opacity:0;}
+}
+.pl-theater-gate{
+  position:absolute;left:5%;right:5%;top:16%;bottom:16%;
+  border:1px solid rgba(211,172,99,.09);
+  pointer-events:none;
+}
+.pl-theater-gate::before,
+.pl-theater-gate::after{
+  content:'';position:absolute;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--gold-line),transparent);
+  opacity:.48;
+}
+.pl-theater-gate::before{top:0;}
+.pl-theater-gate::after{bottom:0;}
 `;
 
 const Wordmark: React.FC<{ onClick?: () => void }> = ({ onClick }) => (
@@ -404,6 +492,18 @@ const MOTES = Array.from({ length: 16 }, (_, i) => ({
   dur: 9000 + ((i * 397) % 9000),
   dx: ((i * 89) % 44) - 22,
   o: 0.22 + (i % 4) * 0.09,
+}));
+
+// Theater dust — slower, more delicate, different rhythm.
+// Deterministic so it never reshuffles on the typing hero re-renders.
+const THEATER_MOTES = Array.from({ length: 28 }, (_, i) => ({
+  left: 4 + ((i * 137) % 92),
+  top: 12 + ((i * 211) % 76),
+  size: 0.9 + (i % 5) * 0.35,
+  delay: (i * 173) % 14000,
+  dur: 16000 + ((i * 281) % 11000),
+  dx: ((i * 67) % 38) - 19,
+  o: 0.07 + (i % 5) * 0.035,
 }));
 
 // ── App-grounded content (docs/public/*.md; tiers per 2026-07 pricing) ──
@@ -792,6 +892,77 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           ))}
         </div>
       </section>
+
+      {/* ── Theater intermission (full-bleed cinematic breath) ─────────
+          Pure light and material. The scroll-depth equivalent of the
+          lights dimming in a real theater before something important.
+          One of the few places the page is allowed to feel truly quiet
+          and slightly miraculous. */}
+      <div className="pl-theater pl-reveal" aria-hidden="true">
+        <div className="pl-theater-inner" />
+        <div className="pl-theater-gate" />
+        {/* Slow traveling projector slit — the "light in the dark theater" */}
+        <div className="pl-theater-slit" style={{ animationDelay: '-4s' }} />
+        {/* Breathing aperture at center — the lens finding focus */}
+        <div className="pl-theater-aperture" />
+        {/* Delicate projector dust — 28 motes, slower and more precious */}
+        {THEATER_MOTES.map((m, i) => (
+          <span
+            key={i}
+            className="pl-theater-mote"
+            style={{
+              left: `${m.left}%`,
+              top: `${m.top}%`,
+              width: m.size,
+              height: m.size,
+              animationDelay: `${m.delay}ms`,
+              animationDuration: `${m.dur}ms`,
+              '--dx': `${m.dx}px`,
+              '--o': String(m.o),
+            } as React.CSSProperties}
+          />
+        ))}
+        {/* One extra slow, wider beam for depth */}
+        <div
+          style={{
+            position: 'absolute',
+            left: '12%',
+            right: '12%',
+            top: '28%',
+            height: '1px',
+            background: 'linear-gradient(90deg,transparent,rgba(246,228,176,.12),transparent)',
+            boxShadow: '0 0 60px rgba(211,172,99,.1)',
+            animation: 'pl-theaterbreathe 32s ease-in-out infinite',
+            animationDelay: '-11s',
+            pointerEvents: 'none',
+          }}
+        />
+        {/* The miracle: enormous, almost-invisible gold-foil echo of the
+            hero line. The traveling slit dramatically "lights" it as it
+            passes — a quiet, $10T-company moment of recognition. */}
+        <div
+          style={{
+            position: 'absolute',
+            left: '50%',
+            top: '50%',
+            transform: 'translate(-50%, -50%)',
+            fontSize: 'clamp(36px, 5.8vw, 74px)',
+            fontFamily: "'Newsreader', serif",
+            fontStyle: 'italic',
+            letterSpacing: '-0.048em',
+            background: 'linear-gradient(100deg, var(--gold-1), var(--gold-2) 46%, var(--gold-3))',
+            WebkitBackgroundClip: 'text',
+            backgroundClip: 'text',
+            color: 'transparent',
+            opacity: 0.042,
+            whiteSpace: 'nowrap',
+            pointerEvents: 'none',
+            userSelect: 'none',
+          }}
+        >
+          answered the moment it’s asked.
+        </div>
+      </div>
 
       {/* ── Capability ledger — the rest of the kit, spec-sheet style ── */}
       <section id="kit" className="pl-wrap" style={{ paddingTop: 72, paddingBottom: 24 }}>
