@@ -52,6 +52,11 @@ const TIER_MARK: Partial<Record<PricingTier['id'], React.ComponentType<{ size?: 
 //
 //  Self-contained (all selectors scoped under .pl-root). Renders the real
 //  region-aware pricing and drives the real funnel via setView / handleTierSelect.
+//
+//  Target 1 complete: Pricing composition elevated to flagship staging.
+//  One-time passes rendered as compact supporting grid (4-col). Ultra is a
+//  distinct cinematic band — spotlight material, two-column features, larger
+//  presence, gold-lifted treatment. All data + handlers untouched.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 interface PremiumLandingProps {
@@ -250,6 +255,23 @@ const CSS = `
   background:linear-gradient(180deg, rgba(211,172,99,.08), rgba(211,172,99,.01));
   box-shadow:0 40px 90px -46px rgba(211,172,99,.5), inset 0 1px 0 rgba(255,255,255,.06);}
 .pl-price-pop:hover{border-color:rgba(211,172,99,.5);transform:translateY(-4px);}
+
+/* Target 1: Pricing composition — flagship staging.
+   Passes are compact supporting players. Ultra is the distinct cinematic band:
+   a spotlighted object with its own material depth and hierarchy. */
+.pl-passes{display:grid;grid-template-columns:repeat(auto-fit,minmax(186px,1fr));gap:14px;align-items:stretch;}
+.pl-ultra-band{
+  margin-top:18px;
+  background:linear-gradient(145deg,rgba(211,172,99,.065),rgba(10,9,8,.75));
+  border:1px solid var(--gold-line);
+  border-radius:22px;
+  padding:28px 32px;
+  box-shadow:0 60px 140px -50px rgba(0,0,0,.92), 0 0 90px -30px var(--gold-glow), inset 0 1px 0 rgba(255,255,255,.04);
+  display:grid;grid-template-columns:310px 1fr;gap:34px;align-items:start;
+}
+@media (max-width:980px){
+  .pl-ultra-band{grid-template-columns:1fr;gap:22px;padding:22px 24px;}
+}
 .pl-num{font-size:64px;line-height:1;color:rgba(211,172,99,.16);font-weight:500;
   transition:color 1.2s ease .2s, text-shadow 1.2s ease .2s;}
 .pl-reveal.pl-in .pl-num{color:rgba(211,172,99,.42);text-shadow:0 0 26px rgba(211,172,99,.18);}
@@ -879,45 +901,84 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             One-time passes for the interviews that matter — or go unlimited with Ultra.{pricing?.currency ? ` Prices in ${pricing.currency}.` : ''}
           </p>
         </div>
-        <div className="pl-reveal" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(206px,1fr))', gap: 16, alignItems: 'stretch' }}>
-          {tiers.map((t) => {
-            const pop = !!t.popular;
-            const Mark = TIER_MARK[t.id];
-            return (
-              <div key={t.id} className={pop ? 'pl-price-pop' : 'pl-price'} style={{ borderRadius: 18, padding: 24, display: 'flex', flexDirection: 'column', position: 'relative' }}>
-                {pop && (
-                  <span style={{ position: 'absolute', top: -10, left: 24, fontSize: 10, fontWeight: 700, letterSpacing: '.14em', textTransform: 'uppercase', color: '#231c0c', background: 'linear-gradient(100deg,var(--gold-1),var(--gold-3))', padding: '4px 11px', borderRadius: 999 }}>Most chosen</span>
-                )}
-                {Mark && (
-                  <div style={{ marginBottom: 12, height: 30, display: 'flex', alignItems: 'center' }}>
-                    <Mark size={30} />
-                  </div>
-                )}
-                <h3 className="pl-serif" style={{ fontSize: 21, fontWeight: 500 }}>{t.name}</h3>
-                {t.subtitle && <p style={{ fontSize: 12.5, color: 'var(--faint)', marginTop: 4 }}>{t.subtitle}</p>}
-                <div style={{ margin: '18px 0 16px' }}>{priceBlock(t)}</div>
-                <button
-                  onClick={() => handleTierSelect(t)}
-                  disabled={isSubmitting}
-                  className={pop ? 'pl-cta' : undefined}
-                  style={pop
-                    ? { width: '100%', padding: '11px', borderRadius: 999, fontSize: 14, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, opacity: isSubmitting ? 0.6 : 1, cursor: isSubmitting ? 'default' : 'pointer' }
-                    : { width: '100%', padding: '11px', borderRadius: 999, fontSize: 14, fontWeight: 600, cursor: isSubmitting ? 'default' : 'pointer', color: 'var(--paper)', background: 'transparent', border: '1px solid rgba(255,255,255,.16)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, opacity: isSubmitting ? 0.6 : 1 }}
-                >
-                  {t.cta || 'Choose'} <PhArrowRight size={14} weight="bold" />
-                </button>
-                <ul style={{ marginTop: 20, display: 'flex', flexDirection: 'column', gap: 10 }}>
-                  {(t.features || []).map((f, i) => (
-                    <li key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, fontSize: 13, color: '#cbc5b9' }}>
-                      <PhCheck size={15} weight="fill" color="var(--gold)" style={{ flexShrink: 0, marginTop: 1 }} />
-                      <span style={{ lineHeight: 1.45 }}>{f}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            );
-          })}
+        <div className="pl-reveal" style={{ marginBottom: 6 }}>
+          <div style={{ fontSize: 10, letterSpacing: '.18em', textTransform: 'uppercase', color: 'var(--gold)', marginBottom: 8 }}>One-time passes</div>
+          <div className="pl-passes">
+            {tiers.filter(t => t.id !== 'ultra').map((t) => {
+              const pop = !!t.popular;
+              const Mark = TIER_MARK[t.id];
+              return (
+                <div key={t.id} className={pop ? 'pl-price-pop' : 'pl-price'} style={{ borderRadius: 18, padding: 20, display: 'flex', flexDirection: 'column', position: 'relative' }}>
+                  {pop && (
+                    <span style={{ position: 'absolute', top: -9, left: 20, fontSize: 9, fontWeight: 700, letterSpacing: '.14em', textTransform: 'uppercase', color: '#231c0c', background: 'linear-gradient(100deg,var(--gold-1),var(--gold-3))', padding: '2px 8px', borderRadius: 999 }}>Most chosen</span>
+                  )}
+                  {Mark && (
+                    <div style={{ marginBottom: 8, height: 24, display: 'flex', alignItems: 'center' }}>
+                      <Mark size={24} />
+                    </div>
+                  )}
+                  <h3 className="pl-serif" style={{ fontSize: 18, fontWeight: 500 }}>{t.name}</h3>
+                  {t.subtitle && <p style={{ fontSize: 11, color: 'var(--faint)', marginTop: 1 }}>{t.subtitle}</p>}
+                  <div style={{ margin: '12px 0 10px' }}>{priceBlock(t)}</div>
+                  <button
+                    onClick={() => handleTierSelect(t)}
+                    disabled={isSubmitting}
+                    className={pop ? 'pl-cta' : undefined}
+                    style={pop
+                      ? { width: '100%', padding: '8px 12px', borderRadius: 999, fontSize: 12.5, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6, opacity: isSubmitting ? 0.6 : 1, cursor: isSubmitting ? 'default' : 'pointer' }
+                      : { width: '100%', padding: '8px 12px', borderRadius: 999, fontSize: 12.5, fontWeight: 600, cursor: isSubmitting ? 'default' : 'pointer', color: 'var(--paper)', background: 'transparent', border: '1px solid rgba(255,255,255,.16)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6, opacity: isSubmitting ? 0.6 : 1 }}
+                  >
+                    {t.cta || 'Choose'} <PhArrowRight size={13} weight="bold" />
+                  </button>
+                  <ul style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {(t.features || []).map((f, i) => (
+                      <li key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 7, fontSize: 11.5, color: '#cbc5b9' }}>
+                        <PhCheck size={13} weight="fill" color="var(--gold)" style={{ flexShrink: 0, marginTop: 1 }} />
+                        <span style={{ lineHeight: 1.4 }}>{f}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              );
+            })}
+          </div>
         </div>
+        {(() => {
+          const ultra = tiers.find(t => t.id === 'ultra');
+          if (!ultra) return null;
+          const Mark = TIER_MARK[ultra.id];
+          return (
+            <div className="pl-reveal">
+              <div style={{ fontSize: 10, letterSpacing: '.18em', textTransform: 'uppercase', color: 'var(--gold)', margin: '2px 0 6px' }}>Flagship — unlimited</div>
+              <div className="pl-ultra-band">
+                <div>
+                  {Mark && <div style={{ marginBottom: 6 }}><Mark size={38} /></div>}
+                  <h3 className="pl-serif" style={{ fontSize: 23, fontWeight: 500, letterSpacing: '-0.01em' }}>{ultra.name}</h3>
+                  {ultra.subtitle && <p style={{ fontSize: 11.5, color: 'var(--faint)', marginTop: 1 }}>{ultra.subtitle}</p>}
+                  <div style={{ margin: '12px 0 14px' }}>{priceBlock(ultra)}</div>
+                  <button
+                    onClick={() => handleTierSelect(ultra)}
+                    disabled={isSubmitting}
+                    className="pl-cta"
+                    style={{ padding: '10px 24px', borderRadius: 999, fontSize: 13.5, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, opacity: isSubmitting ? 0.6 : 1 }}
+                  >
+                    {ultra.cta || 'Choose Ultra'} <PhArrowRight size={14} weight="bold" />
+                  </button>
+                </div>
+                <div style={{ paddingTop: 2 }}>
+                  <ul style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '5px 14px', margin: 0, padding: 0, listStyle: 'none' }}>
+                    {(ultra.features || []).map((f, i) => (
+                      <li key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 7, fontSize: 12.5, color: '#d2ccbf' }}>
+                        <PhCheck size={13} weight="fill" color="var(--gold)" style={{ flexShrink: 0, marginTop: 1 }} />
+                        <span style={{ lineHeight: 1.4 }}>{f}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
         <p className="pl-reveal" style={{ textAlign: 'center', fontSize: 12.5, color: 'var(--faint)', letterSpacing: '.02em', marginTop: 28 }}>
           Stripe or Razorpay at checkout · Apple Pay · Google Pay · UPI in India ·{' '}
           <button className="pl-footnote-link" onClick={() => setShowRefund(true)}>14-day first-purchase refund window</button>
