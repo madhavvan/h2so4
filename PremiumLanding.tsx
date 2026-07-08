@@ -427,6 +427,30 @@ const CSS = `
 .pl-hero-sub{animation:pl-loadup 520ms 1080ms cubic-bezier(.2,.8,.2,1) both;}
 .pl-hero-cta{animation:pl-loadup 520ms 1180ms cubic-bezier(.2,.8,.2,1) both;}
 .pl-hero-copy p:last-of-type{animation:pl-loadup 420ms 1280ms cubic-bezier(.2,.8,.2,1) both;}
+
+/* How-it-works vignettes — tiny live scenes in the capture-test language,
+   one per step. Own keyframes (pl-stepeq): reusing pl-eq here would
+   redefine the hero waveform's amplitude (last definition wins). */
+.pl-step-vignette{
+  width:128px;height:78px;border-radius:8px;overflow:hidden;
+  background:linear-gradient(180deg,#0e0d0b,#090807);
+  border:1px solid var(--line);position:relative;font-size:7px;
+  box-shadow:0 8px 20px -10px rgba(0,0,0,.7);
+}
+.pl-step-chrome{display:flex;align-items:center;gap:3px;padding:3px 5px;border-bottom:1px solid var(--line);}
+.pl-step-dot{width:3px;height:3px;border-radius:50%;background:rgba(255,255,255,.2);}
+.pl-step-addr{flex:1;color:var(--faint);font-size:5.5px;opacity:.6;}
+.pl-step-content{padding:4px 5px;}
+.pl-step-skl{height:3px;border-radius:2px;background:rgba(255,255,255,.12);margin-bottom:2px;}
+.pl-step-wave{display:flex;gap:1.5px;height:9px;align-items:flex-end;}
+.pl-step-wave i{width:1.5px;background:linear-gradient(to top,var(--gold-3),var(--gold-1));border-radius:999px;animation:pl-stepeq 900ms ease-in-out infinite;}
+@keyframes pl-stepeq{0%,100%{height:2px;}50%{height:9px;}}
+.pl-step-mini{
+  position:absolute;bottom:4px;right:4px;width:58px;background:linear-gradient(180deg,#141109,#0c0a07);
+  border:1px solid var(--gold-line);border-radius:4px;padding:3px 4px;font-size:5.5px;line-height:1.2;
+}
+.pl-step-caret{display:inline-block;width:1px;height:5px;background:var(--gold);margin-left:1px;animation:pl-blink 1s steps(2) infinite;}
+.pl-step-live{width:3px;height:3px;border-radius:50%;background:var(--gold);box-shadow:0 0 3px var(--gold-glow);animation:pl-pulse 1.6s infinite;}
 `;
 
 const Wordmark: React.FC<{ onClick?: () => void }> = ({ onClick }) => (
@@ -1022,14 +1046,66 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             Live help, three quiet steps.
           </h2>
         </div>
-        {STEPS.map((s) => (
+        {STEPS.map((s, idx) => (
           <div key={s.n} className="pl-reveal">
             <div className="pl-goldline" style={{ margin: '0 0 30px' }} />
-            <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 'clamp(20px,4vw,60px)', alignItems: 'baseline', paddingBottom: 30 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 'clamp(20px,4vw,60px)', alignItems: 'center', paddingBottom: 30 }}>
               <span className="pl-serif pl-num">{s.n}</span>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(240px,1fr))', gap: 20, alignItems: 'baseline' }}>
                 <h3 className="pl-serif" style={{ fontSize: 'clamp(22px,3vw,32px)', fontWeight: 500, letterSpacing: '-0.02em' }}>{s.t}</h3>
                 <p style={{ fontSize: 16, lineHeight: 1.6, color: 'var(--mut)' }}>{s.b}</p>
+              </div>
+              {/* Tiny live vignette per step — same mini-UI language as the
+                  capture-test frames. Decorative; the copy carries the steps. */}
+              <div aria-hidden="true" className="pl-hide-sm">
+                {idx === 0 && (
+                  <div className="pl-step-vignette">
+                    <div className="pl-step-chrome">
+                      <span style={{ display: 'flex', gap: 2 }}><i className="pl-step-dot" /><i className="pl-step-dot" /><i className="pl-step-dot" /></span>
+                      <span className="pl-step-addr">zoom — interview</span>
+                    </div>
+                    <div className="pl-step-content" style={{ textAlign: 'center', paddingTop: 6 }}>
+                      <div style={{ fontSize: 6, color: 'var(--gold)', marginBottom: 2 }}>press</div>
+                      <div style={{ border: '1px solid var(--gold-line)', borderRadius: 3, padding: '1px 5px', display: 'inline-block', fontSize: 7, letterSpacing: '.5px' }}>Ctrl K</div>
+                      <div style={{ marginTop: 4, color: 'var(--faint)', fontSize: 5.5 }}>to open over window</div>
+                    </div>
+                    <div style={{ position: 'absolute', bottom: 5, right: 5, width: 18, height: 10, border: '1px solid var(--gold-line)', borderRadius: 2, background: 'rgba(211,172,99,.08)' }} />
+                  </div>
+                )}
+                {idx === 1 && (
+                  <div className="pl-step-vignette">
+                    <div className="pl-step-chrome">
+                      <span style={{ display: 'flex', gap: 2 }}><i className="pl-step-dot" /><i className="pl-step-dot" /><i className="pl-step-dot" /></span>
+                      <span className="pl-step-addr">listening…</span>
+                      <span className="pl-step-live" style={{ marginLeft: 'auto' }} />
+                    </div>
+                    <div className="pl-step-content">
+                      <div className="pl-step-skl" style={{ width: '72%' }} />
+                      <div className="pl-step-skl" style={{ width: '54%' }} />
+                      <div className="pl-step-skl" style={{ width: '81%' }} />
+                      <div className="pl-step-wave" style={{ marginTop: 3 }}>
+                        {[3, 6, 4, 8, 5].map((h, i) => <i key={i} style={{ height: h }} />)}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {idx === 2 && (
+                  <div className="pl-step-vignette">
+                    <div className="pl-step-chrome">
+                      <span style={{ display: 'flex', gap: 2 }}><i className="pl-step-dot" /><i className="pl-step-dot" /><i className="pl-step-dot" /></span>
+                      <span className="pl-step-addr">you see</span>
+                    </div>
+                    <div className="pl-step-content">
+                      <div style={{ fontSize: 5.5, color: 'var(--gold)', marginBottom: 1 }}>You say</div>
+                      <div style={{ color: 'var(--paper)', lineHeight: 1.15 }}>
+                        Use a feature cache…<span className="pl-step-caret" />
+                      </div>
+                      <div className="pl-step-mini" style={{ fontSize: 5 }}>
+                        Claude Sonnet 5
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
