@@ -7166,9 +7166,9 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     }
   }, [view]);
 
-  // iPhone-feel landing on phones; desktop landing unchanged. Flips live on
-  // window resize / orientation change so DevTools mobile-emulation toggles
-  // and tablet rotations Just Work.
+  // Drives mobile-only surfaces (auth sheets, download, pricing, tutorials).
+  // Public landing is unified on PremiumLanding for all widths — isMobile no
+  // longer forks the marketing homepage. Flips live on resize / orientation.
   const isMobile = useIsMobile();
   // Desktop profile sheet — opened from the /download nav's email click.
   // Mobile uses its own copy inside DownloadMobile; desktop drives this
@@ -9336,21 +9336,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     // one merged busy flag so a click can't double-fire checkout while
     // the first request is still in flight.
     const landingBusy = isSubmitting || paymentLoading;
-    if (isMobile) {
-      return (
-        <LandingMobile
-          setView={setView}
-          geo={geo}
-          pricing={pricing}
-          handleTierSelect={handleTierSelect}
-          isSubmitting={landingBusy}
-          currentUser={currentUser}
-          setAuthError={setAuthError}
-          paymentError={paymentError}
-          onDismissPaymentError={() => setPaymentError(null)}
-        />
-      );
-    }
+    // One marketing surface for every viewport. PremiumLanding already has
+    // responsive breakpoints (≤980 / ≤860) plus phone polish. The old
+    // LandingMobile fork left phones on a parallel pre-redesign UI while
+    // desktop got the cinematic landing. Auth / download / pricing mobile
+    // sheets are unchanged — only this public landing unifies.
     // ── PREMIUM DARK LANDING (2026-07) ─────────────────────────────
     // New default marketing surface. The old cream/serif landing below is
     // intentionally kept as an instant A/B fallback (dead code after this
