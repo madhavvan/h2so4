@@ -895,7 +895,10 @@ function downloadCsv(filename: string, csv: string) {
   URL.revokeObjectURL(url);
 }
 
-const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUser: UserProfile }) => {
+// Exported so MainApp can render the same admin dashboard after the
+// authenticated → MainApp routing split. Still used by SubscriptionGate
+// itself when view === 'admin' (download surface / payment-return edge).
+export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; currentUser: UserProfile }) => {
   const [stats, setStats] = useState<any>(null);
   const [users, setUsers] = useState<any[]>([]);
   const [logins, setLogins] = useState<any[]>([]);
