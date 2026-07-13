@@ -39,6 +39,7 @@
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
+const fs = require('fs');
 const cheerio = require('cheerio');
 
 let cacheDb = null;
@@ -89,6 +90,11 @@ function initSchema(db) {
 function getCacheDB() {
   if (cacheDb) return cacheDb;
   const cachePath = resolveCachePath();
+  // better-sqlite3 refuses to open a DB in a directory that doesn't exist,
+  // which crashes on a clean CI runner or a fresh Railway container where the
+  // data dir hasn't been created yet. Create it first — this is the retrieval
+  // path and must never throw into a live interview (fail-open contract above).
+  fs.mkdirSync(path.dirname(cachePath), { recursive: true });
   cacheDb = new Database(cachePath);
   initSchema(cacheDb);
   return cacheDb;
