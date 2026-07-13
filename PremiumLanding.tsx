@@ -69,7 +69,8 @@ interface PremiumLandingProps {
   // Exact views the landing navigates to — a subset of SubscriptionGate's
   // View union, spelled out so passing its setState dispatcher type-checks.
   setView: (v: 'login' | 'signup' | 'docs' | 'support' | 'tutorials') => void;
-  pricing: RegionPricing;
+  // Null while geo/pricing is still resolving — tiers render empty until then.
+  pricing: RegionPricing | null;
   handleTierSelect: (tier: PricingTier) => void;
   isSubmitting: boolean;
   // Checkout feedback. A signed-in visitor clicking a paid tier goes
@@ -411,6 +412,27 @@ const CSS = `
   text-decoration-color:var(--gold-line);transition:color .2s;}
 .pl-footnote-link:hover{color:var(--gold);}
 @media (max-width:860px){ .pl-wrap{padding:0 22px;} .pl-hide-sm{display:none !important;} .pl-lamp{display:none;} }
+/* Phone polish — same cinematic landing as desktop, scaled for thumb reach,
+   notched safe-areas, and one-column pricing. Keeps mobile on PremiumLanding
+   instead of a parallel older surface. */
+@media (max-width:767px){
+  .pl-root{padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right);}
+  .pl-navbar{padding-top:env(safe-area-inset-top);}
+  .pl-navbar .pl-wrap{height:60px !important;padding-left:16px;padding-right:16px;}
+  .pl-wrap{padding-left:18px;padding-right:18px;}
+  .pl-hero{min-height:0;gap:28px;padding-bottom:8px;}
+  .pl-hero-cta{justify-content:center;gap:16px;margin:28px 0 14px;}
+  .pl-hero-cta .pl-cta{width:100%;justify-content:center;}
+  .pl-passes{grid-template-columns:1fr;gap:12px;}
+  .pl-ultra-band{padding:20px 18px;border-radius:18px;}
+  .pl-ultra-band ul{grid-template-columns:1fr !important;}
+  .pl-theater{height:280px;}
+  .pl-theater-aperture{width:200px;height:200px;}
+  .pl-theater-echo{font-size:clamp(28px,11vw,48px) !important;}
+  .pl-ledger{grid-template-columns:1fr;column-gap:0;}
+  .pl-toast{left:12px;right:12px;bottom:calc(16px + env(safe-area-inset-bottom));transform:none;max-width:none;}
+  #pricing{padding:56px 18px 32px !important;}
+}
 @media (prefers-reduced-motion:reduce){
   .pl-root *{animation:none !important;}
   .pl-reveal{opacity:1 !important;transform:none !important;}
@@ -1914,9 +1936,11 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             <button className="pl-navlink" onClick={() => scrollTo('faq')}>FAQ</button>
             <button className="pl-navlink" onClick={() => setView('docs')}>Docs</button>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
-            <button className="pl-navlink pl-hide-sm" onClick={() => setView('login')}>Sign in</button>
-            <button onClick={() => setView('signup')} className="pl-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '10px 20px', borderRadius: 999, fontSize: 13.5 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            {/* Sign in stays visible on phones — mid-nav links hide via pl-hide-sm,
+                but returning users still need a one-tap path into auth. */}
+            <button className="pl-navlink" onClick={() => setView('login')}>Sign in</button>
+            <button onClick={() => setView('signup')} className="pl-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '10px 16px', borderRadius: 999, fontSize: 13 }}>
               Get started <PhArrowRight size={14} weight="bold" />
             </button>
           </div>
