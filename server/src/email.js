@@ -478,4 +478,51 @@ function renderGoogleLinkedEmail({ name }) {
   return { subject: 'Security notice: Google Sign-In was linked to your minicaai account', html, text };
 }
 
-module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail, renderTierChangeEmail, renderCancellationEmail, renderAccessEndedEmail, renderGoogleLinkedEmail };
+// ── Pass expiring with unused time (lifecycle reminder) ──────
+// Sent by the pass-expiry sweep (server/src/index.js) when a Basic/Pro/Max
+// license still holds >1 min of paid interview time and its window closes
+// within 3 days. Dedup is handled by lifecycle_emails — one send per
+// (user, expiry window), no matter how often the sweep runs.
+function renderPassExpiryEmail({ name, tier, minutesLeft, expiresDate, signInUrl }) {
+  const safeName = (name || 'there').toString().replace(/</g, '&lt;');
+  const safeTier = (tier || 'interview').toString().toUpperCase().replace(/</g, '&lt;');
+  const mins = Math.max(1, Math.round(minutesLeft || 0));
+  const dateStr = (expiresDate || '').toString().replace(/</g, '&lt;');
+  const inUrl = signInUrl || 'https://minicaai.com';
+
+  const text = [
+    `Hi ${safeName},`,
+    '',
+    `Heads-up: your ${safeTier} pass still has ${mins} minute${mins === 1 ? '' : 's'} of interview time left,`,
+    `and it expires on ${dateStr}.`,
+    '',
+    `Open minicaai before then to use it — unused time doesn't carry over.`,
+    inUrl,
+    '',
+    '— The minicaai team',
+  ].join('\n');
+
+  const html = `<!doctype html>
+<html><body style="margin:0;padding:0;background:#050507;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e5e7eb">
+  <div style="max-width:560px;margin:0 auto;padding:40px 24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:32px">
+      <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6)"></div>
+      <div style="font-weight:700;font-size:18px;color:#fff">minicaai</div>
+    </div>
+    <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 12px">You still have ${mins} minute${mins === 1 ? '' : 's'} on your ${safeTier} pass</h1>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 16px">Hi ${safeName}, your pass expires on <strong style="color:#e5e7eb">${dateStr}</strong> and unused time doesn't carry over. If there's an interview (or a practice round) ahead of you, this is the moment to use it.</p>
+    <div style="margin:18px 0">
+      <a href="${inUrl}" style="display:inline-block;padding:12px 24px;border-radius:10px;background:linear-gradient(135deg,#10b981,#3b82f6);color:#fff;font-weight:700;font-size:14px;text-decoration:none">
+        Open minicaai
+      </a>
+    </div>
+    <div style="border-top:1px solid #1f2937;padding-top:16px;font-size:12px;color:#6b7280;line-height:1.6">
+      Running long on interview day? You can add 30 minutes any time with one click from inside the app.
+    </div>
+  </div>
+</body></html>`;
+
+  return { subject: `${mins} minute${mins === 1 ? '' : 's'} of interview time expires ${dateStr}`, html, text };
+}
+
+module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail, renderTierChangeEmail, renderCancellationEmail, renderAccessEndedEmail, renderGoogleLinkedEmail, renderPassExpiryEmail };

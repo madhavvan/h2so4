@@ -51,7 +51,7 @@ The first time you open the app you'll be asked to sign in. Use email + password
 
 After sign-in you'll see a tier picker:
 
-- **Free** — 5 sessions, 30-minute trial total, Gemini model, one context file
+- **Free** — one-time 10-minute trial (every model except Claude), one context file
 - **Basic** — Unlimited sessions, credit-gated time (3-hour starting bank, renewable), four models (Gemini, GPT, Grok, Groq), unlimited context files, pop-out, screen capture, Auto-Solve
 - **Pro** — Same as Basic plus unlimited time, no credit gating
 - **Max** — Adds Claude with web search, Auto-Type, Train Model, reasoning-effort knob

@@ -110,6 +110,19 @@ export const useSpeechRecognition = ({
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intentionalStopRef = useRef(false); // true when user clicks stop
   const deepgramKeyRef = useRef<string | null>(null); // Cache key for reconnects
+  // ── Recovery state (mid-interview resilience) ──
+  // reacquiring: a fresh-stream re-acquire is in flight (dedupe).
+  // fastFailStreak: consecutive connects that closed without ever
+  //   delivering data — the signal for an auth/config problem, which we
+  //   use to break an otherwise-infinite reconnect storm.
+  // gotData: this socket delivered at least one message (so a later close
+  //   is a normal drop, not a fast-fail).
+  // recover: late-bound pointer to reacquireStream so connectDeepgram's
+  //   onclose can reach it without a declaration cycle.
+  const reacquiringRef = useRef(false);
+  const fastFailStreakRef = useRef(0);
+  const gotDataRef = useRef(false);
+  const recoverRef = useRef<(() => void) | null>(null);
 
   const stopListening = useCallback(() => {
     intentionalStopRef.current = true;
@@ -128,6 +141,10 @@ export const useSpeechRecognition = ({
     }
     reconnectAttemptsRef.current = 0;
     deepgramKeyRef.current = null; // Clear cached key so next start gets fresh one
+    // Reset recovery state so a later start() isn't blocked or biased by a
+    // previous session's fast-fail streak / in-flight re-acquire flag.
+    reacquiringRef.current = false;
+    fastFailStreakRef.current = 0;
 
     // Stop and clear mediaRecorder
     if (mediaRecorderRef.current) {
@@ -179,6 +196,7 @@ export const useSpeechRecognition = ({
 
     // Store socket ref immediately so event handlers can check if they're stale
     socketRef.current = socket;
+    gotDataRef.current = false; // reset per-socket; set true on first message
 
     socket.onopen = () => {
       // Ignore if this socket is no longer current (user stopped/restarted)
@@ -216,6 +234,19 @@ export const useSpeechRecognition = ({
           }
         });
 
+        // Recorder failure = audio pipeline broken while the socket looks
+        // fine. Without this the mic would appear "on" but send nothing.
+        // Bounce the socket (its onclose reconnect recreates the recorder);
+        // if the underlying audio track is dead, the reconnect path
+        // re-acquires a fresh stream. Only act on the CURRENT socket.
+        mediaRecorder.addEventListener('error', (ev: any) => {
+          if (socketRef.current !== socket) return;
+          console.warn('[mic] MediaRecorder error — bouncing capture:', ev?.error?.message || ev);
+          if (!intentionalStopRef.current) {
+            try { socket.close(); } catch {} // triggers onclose → reconnect/re-acquire
+          }
+        });
+
         mediaRecorder.start(250);
       } catch (recErr: any) {
         console.error("MediaRecorder Start Error:", recErr);
@@ -227,6 +258,11 @@ export const useSpeechRecognition = ({
     socket.onmessage = (message) => {
       // Ignore if this socket is no longer current
       if (socketRef.current !== socket) return;
+
+      // This connection is delivering — a later close is a normal drop,
+      // not a fast-fail, and the auth/config storm-breaker resets.
+      gotDataRef.current = true;
+      fastFailStreakRef.current = 0;
 
       try {
         const received = JSON.parse(message.data);
@@ -254,34 +290,64 @@ export const useSpeechRecognition = ({
         keepaliveIntervalRef.current = null;
       }
 
-      // Auto-reconnect if not intentionally stopped and audio stream is still alive
-      // No limit on reconnect attempts - keep trying until user stops
-      if (
-        !intentionalStopRef.current &&
-        audioStreamRef.current &&
-        audioStreamRef.current.getAudioTracks().some(t => t.readyState === 'live')
-      ) {
-        reconnectAttemptsRef.current += 1;
-        // Quick reconnect: 1s, then 2s, then cap at 5s for fast recovery
-        const delay = Math.min(1000 * Math.pow(2, Math.min(reconnectAttemptsRef.current - 1, 2)), 5000);
-        console.log(`Deepgram auto-reconnect #${reconnectAttemptsRef.current} in ${delay}ms`);
-        setError(`Reconnecting...`);
+      if (intentionalStopRef.current) return; // user stopped — nothing to recover
 
-        reconnectTimerRef.current = setTimeout(async () => {
-          if (!intentionalStopRef.current && audioStreamRef.current) {
-            // Get fresh Deepgram key for reconnect (keys may expire)
-            let keyToUse = cleanKey;
-            try {
-              keyToUse = await getDeepgramKey();
-              deepgramKeyRef.current = keyToUse;
-            } catch (e) {
-              console.error('Failed to refresh Deepgram key:', e);
-              // Continue with old key
-            }
-            connectDeepgram(audioStreamRef.current, keyToUse);
-          }
-        }, delay);
+      // ── Auth/config storm-breaker (#7) ──
+      // A socket that closes WITHOUT ever delivering data is a "fast-fail":
+      // almost always a bad/expired key, quota, or a policy close (1008 /
+      // Deepgram 4xxx). A few in a row means reconnecting won't help — stop
+      // and surface a clear error instead of hammering every ≤5s forever.
+      if (gotDataRef.current) {
+        fastFailStreakRef.current = 0;
+      } else {
+        fastFailStreakRef.current += 1;
       }
+      if (fastFailStreakRef.current >= 5) {
+        console.error('[mic] giving up after repeated fast-fail closes (auth/config?) code=', event.code);
+        setError('Voice service could not stay connected. Please stop and start the mic again.');
+        return;
+      }
+
+      // ── Dead audio track → re-acquire a fresh stream (#4) ──
+      // The old code simply GAVE UP when the audio track wasn't live —
+      // the silent-death path (a device change ended the track). Now we
+      // recover: on desktop the system-audio loopback re-acquires with no
+      // prompt; in the browser a dead audio track means the user ended the
+      // screen-share, so we stop cleanly (their intent).
+      const audioLive = !!audioStreamRef.current &&
+        audioStreamRef.current.getAudioTracks().some(t => t.readyState === 'live');
+      if (!audioLive) {
+        if (isElectron && recoverRef.current) {
+          console.warn('[mic] audio track dead on close — re-acquiring stream');
+          recoverRef.current();
+        } else {
+          console.warn('[mic] capture ended (share stopped) — stopping');
+          stopListening();
+        }
+        return;
+      }
+
+      // ── Normal reconnect with the still-live stream ──
+      reconnectAttemptsRef.current += 1;
+      // Quick reconnect: 1s, then 2s, then cap at 5s for fast recovery
+      const delay = Math.min(1000 * Math.pow(2, Math.min(reconnectAttemptsRef.current - 1, 2)), 5000);
+      console.log(`Deepgram auto-reconnect #${reconnectAttemptsRef.current} in ${delay}ms`);
+      setError(`Reconnecting...`);
+
+      reconnectTimerRef.current = setTimeout(async () => {
+        if (!intentionalStopRef.current && audioStreamRef.current) {
+          // Get fresh Deepgram key for reconnect (keys may expire)
+          let keyToUse = cleanKey;
+          try {
+            keyToUse = await getDeepgramKey();
+            deepgramKeyRef.current = keyToUse;
+          } catch (e) {
+            console.error('Failed to refresh Deepgram key:', e);
+            // Continue with old key
+          }
+          connectDeepgram(audioStreamRef.current, keyToUse);
+        }
+      }, delay);
     };
 
     socket.onerror = (e) => {
@@ -295,6 +361,80 @@ export const useSpeechRecognition = ({
       }
     };
   }, [onResult, stopListening]);
+
+  // Wire failure handlers onto a freshly-acquired stream.
+  // Video loss is DECOUPLED from audio (#3): the video track exists only
+  // for Auto-Solve screenshots, so losing it must NOT kill the mic.
+  // Audio-track loss triggers recovery (#4).
+  const wireTracks = useCallback((stream: MediaStream, audioStream: MediaStream) => {
+    const vTracks = stream.getVideoTracks();
+    if (vTracks.length > 0) {
+      vTracks[0].onended = () => {
+        // Keep the mic alive. captureScreenshot re-acquires its own
+        // one-shot video in Electron, so no persistent video track is
+        // required for screenshots.
+        console.warn('[mic] video track ended — screenshot capture paused; mic stays live');
+      };
+    }
+    audioStream.getAudioTracks().forEach(track => {
+      track.onended = () => {
+        if (intentionalStopRef.current) return;
+        if (isElectron && recoverRef.current) {
+          // System-audio loopback re-acquires with no prompt on desktop.
+          console.warn('[mic] audio track ended — re-acquiring stream');
+          recoverRef.current();
+        } else {
+          // Browser: no separate mic — a dead audio track means the user
+          // ended the screen-share. Treat as an intentional stop.
+          console.warn('[mic] audio ended (share stopped) — stopping');
+          stopListening();
+        }
+      };
+      // onmute fires transiently (brief glitch) then unmutes — do NOT
+      // recover on it, only log. Permanent loss arrives via onended.
+      track.onmute = () => console.log('[mic] audio track muted (transient?)');
+      track.onunmute = () => console.log('[mic] audio track unmuted');
+    });
+  }, [stopListening]);
+
+  // Re-acquire a fresh capture stream and reconnect — the recovery path
+  // for a dead audio track (device change) on desktop. Deduped so a burst
+  // of close/onended events can't spawn parallel captures.
+  const reacquireStream = useCallback(async () => {
+    if (intentionalStopRef.current || reacquiringRef.current) return;
+    reacquiringRef.current = true;
+    setError('Reconnecting...');
+    try {
+      // Drop the dead stream's tracks before re-acquiring.
+      audioStreamRef.current?.getTracks().forEach(t => { try { t.stop(); } catch {} });
+      streamRef.current?.getTracks().forEach(t => { try { t.stop(); } catch {} });
+      const { stream, audioStream } = await getAudioStream();
+      if (intentionalStopRef.current) {
+        stream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+        return;
+      }
+      streamRef.current = stream;
+      setCurrentStream(stream);
+      audioStreamRef.current = audioStream;
+      wireTracks(stream, audioStream);
+      let keyToUse = deepgramKeyRef.current || '';
+      try {
+        keyToUse = await getDeepgramKey();
+        deepgramKeyRef.current = keyToUse;
+      } catch { /* keep old key */ }
+      if (!keyToUse) { setError('Voice service unavailable. Please restart the mic.'); return; }
+      connectDeepgram(audioStream, keyToUse);
+    } catch (e: any) {
+      console.error('[mic] re-acquire failed:', e?.message || e);
+      setError('Lost the microphone and could not recover. Please stop and start again.');
+    } finally {
+      reacquiringRef.current = false;
+    }
+  }, [connectDeepgram, wireTracks]);
+
+  // Late-bind recover so connectDeepgram's onclose can reach reacquireStream
+  // without a declaration cycle.
+  useEffect(() => { recoverRef.current = reacquireStream; }, [reacquireStream]);
 
   const startListening = useCallback(async () => {
     setError(null);
@@ -322,16 +462,10 @@ export const useSpeechRecognition = ({
       setCurrentStream(stream);
       audioStreamRef.current = audioStream;
 
-      // 3. Connect to Deepgram WebSocket
+      // 3. Wire failure handlers (video decoupled from audio; audio loss
+      //    recovers) then connect to Deepgram.
+      wireTracks(stream, audioStream);
       connectDeepgram(audioStream, cleanKey);
-
-      // Handle stream ending
-      const videoTracks = stream.getVideoTracks();
-      if (videoTracks.length > 0) {
-        videoTracks[0].onended = () => {
-          stopListening();
-        };
-      }
 
     } catch (err: any) {
       console.error("Capture Error:", err);
@@ -341,7 +475,7 @@ export const useSpeechRecognition = ({
         onError?.(msg);
       }
     }
-  }, [onResult, onError, stopListening, connectDeepgram]);
+  }, [onResult, onError, stopListening, connectDeepgram, wireTracks]);
 
   // ── Unmount cleanup ────────────────────────────────────────────────
   // The hook used to depend entirely on its consumer calling stopListening

@@ -15,17 +15,20 @@
 //  the audit trail. That keeps legitimate exceptions (support
 //  goodwill, retention saves) possible while preventing accidents.
 //
-//  Policy from REFUND_POLICY.md (Effective May 5, 2026):
-//    Basic ($25 / ₹1,999, 3 credits):
+//  Policy (2026-07 pricing):
+//    Basic ($30 / ₹2,499 · one 30-min interview):
 //      • 14 days from purchase
-//      • Zero of 3 credits used
-//    Pro ($29/mo / ₹2,499/mo):
-//      • 7 days from FIRST charge
-//      • < 60 min total session time across all meetings
-//    Max ($69/mo / ₹5,999/mo):
-//      • 7 days from FIRST charge
+//      • Zero of the interview credit used
+//    Pro ($50 / ₹4,199 · one 1-hour interview):
+//      • 7 days from purchase
 //      • < 60 min total session time
-//    +1 hour renewal ($6.99 / ₹599):
+//    Max ($89 / ₹7,399 · three 1-hour interviews):
+//      • 7 days from purchase
+//      • < 60 min total session time
+//    Ultra ($159/mo / ₹12,999/mo · unlimited subscription):
+//      • 7 days from first charge
+//      • < 60 min total session time
+//    +30 min extension ($25 / ₹2,099):
 //      • NEVER refundable once delivered
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -73,9 +76,12 @@ function computeRefundEligibility(payment, license, usageStats) {
     if (ageMs > 14 * ONE_DAY_MS) {
       return { eligible: false, code: 'window_expired', reason: `Basic refund window is 14 days; this payment is ${Math.round(ageMs / ONE_DAY_MS)} days old.` };
     }
-    // Initial Basic grant = 3 hours = 10800 s. If credits_remaining_seconds
-    // is anything less than that (or sessions_used > 0), they have used some.
-    const initialSeconds = 3 * 3600;
+    // Initial Basic grant = one 30-min interview = 1800 s (2026-07). If
+    // credits_remaining_seconds is less than that (or sessions_used > 0),
+    // they have used some. MUST match grantConfigForTier('basic') in
+    // payments.js / webhooks.js — a stale value here silently blocks
+    // legitimate refunds (this was 3*3600 from the pre-2026-07 3-credit model).
+    const initialSeconds = 30 * 60;
     const remaining = license?.credits_remaining_seconds;
     const sessionsUsed = (usageStats && Number.isFinite(usageStats.sessionsUsed))
       ? usageStats.sessionsUsed
@@ -89,8 +95,10 @@ function computeRefundEligibility(payment, license, usageStats) {
     return { eligible: true, reason: 'Within 14-day window with zero usage.' };
   }
 
-  // Pro / Max: 7-day window from FIRST charge + < 60 min total session time
-  if (tier === 'pro' || tier === 'max') {
+  // Pro / Max / Ultra: 7-day window + < 60 min total session time.
+  // (Pro/Max are one-time interviews; Ultra is the monthly subscription —
+  // same satisfaction window and usage cap apply.)
+  if (tier === 'pro' || tier === 'max' || tier === 'ultra') {
     if (ageMs > 7 * ONE_DAY_MS) {
       return { eligible: false, code: 'window_expired', reason: `${tier} refund window is 7 days from first charge; this payment is ${Math.round(ageMs / ONE_DAY_MS)} days old.` };
     }

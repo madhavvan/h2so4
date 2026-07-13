@@ -345,7 +345,7 @@
 }
 .pip-toggle:hover { background: rgba(255,255,255,0.06); }
 .pip-toggle.active-gold { background: rgba(211,172,99,0.20); color: var(--gold, #d3ac63); }
-.pip-toggle.active-red  { background: rgba(239,68,68,0.20); color: #ef4444; }
+.pip-toggle.active-green { background: rgba(16,185,129,0.20); color: #34d399; }
 html.electron-transparent:not(.dark) .pip-toggle:hover { background: rgba(20,20,19,0.06); }
 
 /* Typing indicator */

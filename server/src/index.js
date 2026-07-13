@@ -19,6 +19,7 @@ const db = database;
 const authRoutes = require('./routes/auth');
 const paymentRoutes = require('./routes/payments');
 const licenseRoutes = require('./routes/license');
+const usageRoutes = require('./routes/usage');
 const webhookRoutes = require('./routes/webhooks');
 const adminRoutes = require('./routes/admin');
 const aiRoutes = require('./routes/ai');
@@ -337,6 +338,8 @@ app.use((req, res, next) => {
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/payments', paymentRoutes);
 app.use('/api/v1/license', licenseRoutes);
+// Server-authoritative interview clock (start/heartbeat/stop/balance).
+app.use('/api/v1/usage', usageRoutes);
 app.use('/api/v1/admin', adminRoutes);
 app.use('/api/v1/ai', aiRoutes);
 app.use('/api/v1/conversations', conversationRoutes);
@@ -644,6 +647,60 @@ async function runCycleEndSweep() {
 // was down. After that, every 5 min via interval.
 runCycleEndSweep();
 setInterval(runCycleEndSweep, CYCLE_END_SWEEP_INTERVAL_MS).unref();
+
+// ── Stale usage-session sweeper ──
+// A client that crashed (or lost network) mid-interview stops
+// heartbeating; its open usage_session would otherwise dangle forever.
+// Settle any session silent past the stale threshold AT its last
+// heartbeat — the user is never charged for time after their client
+// died. Runs at boot (catch sessions orphaned by a server restart) and
+// every 60s after.
+function runUsageSessionSweep() {
+  try {
+    const closed = database.sweepStaleUsageSessions();
+    if (closed > 0) console.log(`[usage-sweep] settled ${closed} stale session(s) at last heartbeat`);
+  } catch (err) {
+    console.warn('[usage-sweep] error:', err && err.message);
+  }
+}
+runUsageSessionSweep();
+setInterval(runUsageSessionSweep, 60 * 1000).unref();
+
+// ── Pass-expiry reminder sweep ──
+// Basic/Pro/Max passes expire 30 days after purchase; paid-but-unused
+// time evaporating silently is a guaranteed support complaint. When a
+// license still holds >1 min and its window closes within 3 days, send
+// one reminder — markLifecycleEmailOnce keys on the exact expiry
+// timestamp, so re-runs (and extensions creating a NEW window) behave
+// correctly: one email per window, ever.
+const PASS_EXPIRY_LOOKAHEAD_MS = 3 * 24 * 60 * 60 * 1000;
+function runPassExpirySweep() {
+  try {
+    const expiring = database.getExpiringPassLicenses(PASS_EXPIRY_LOOKAHEAD_MS);
+    for (const row of expiring) {
+      try {
+        if (!database.markLifecycleEmailOnce(row.user_id, 'pass-expiry', row.credits_expire_at)) continue;
+        const { sendMail, renderPassExpiryEmail } = require('./email');
+        if (typeof renderPassExpiryEmail !== 'function') continue;
+        const { subject, html, text } = renderPassExpiryEmail({
+          name: row.name,
+          tier: row.tier,
+          minutesLeft: Math.floor((row.credits_remaining_seconds || 0) / 60),
+          expiresDate: new Date(row.credits_expire_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+          signInUrl: process.env.FRONTEND_URL || 'https://minicaai.com',
+        });
+        sendMail({ to: row.email, subject, html, text }).catch(() => { /* mail outage — row is claimed; acceptable */ });
+        console.log(`[pass-expiry-sweep] reminder sent to ${row.email} (${row.tier}, ${Math.floor((row.credits_remaining_seconds || 0) / 60)}m left)`);
+      } catch (perUserErr) {
+        console.warn('[pass-expiry-sweep] per-user failure:', row.user_id, perUserErr.message);
+      }
+    }
+  } catch (err) {
+    console.warn('[pass-expiry-sweep] outer error:', err && err.message);
+  }
+}
+runPassExpirySweep();
+setInterval(runPassExpirySweep, 6 * 60 * 60 * 1000).unref();
 
 // Daily SQLite VACUUM INTO snapshot. Single-file SQLite has no replication;
 // this is the one defense against volume corruption / accidental delete /

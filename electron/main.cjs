@@ -1,4 +1,37 @@
-const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage, dialog, shell, globalShortcut, Notification, crashReporter } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage, dialog, shell, globalShortcut, Notification, crashReporter, powerSaveBlocker } = require('electron');
+
+// ── Display-sleep blocker (live-interview mic reliability) ──
+// While a session is active the user is often still (listening to the
+// interviewer, reading the answer), so the OS dims → sleeps the display
+// or drops to the lock screen. That ends the desktop-capture video track,
+// whose onended tears down the WHOLE capture (mic included) in
+// useSpeechRecognition.ts. Holding a 'prevent-display-sleep' block for the
+// duration of the session stops the display from sleeping so capture — and
+// therefore the mic — survives. Acquired/released from the 'session-active'
+// IPC (which the renderer fires when isListening flips) and released on
+// quit. Module-scope id so start/stop is idempotent across rapid toggles.
+let displaySleepBlockerId = null;
+function startDisplaySleepBlocker() {
+  try {
+    if (displaySleepBlockerId !== null && powerSaveBlocker.isStarted(displaySleepBlockerId)) return;
+    displaySleepBlockerId = powerSaveBlocker.start('prevent-display-sleep');
+    electronLog.info('[power] display-sleep blocker started', displaySleepBlockerId);
+  } catch (e) {
+    electronLog.warn('[power] start blocker failed:', e && e.message);
+  }
+}
+function stopDisplaySleepBlocker() {
+  try {
+    if (displaySleepBlockerId !== null && powerSaveBlocker.isStarted(displaySleepBlockerId)) {
+      powerSaveBlocker.stop(displaySleepBlockerId);
+      electronLog.info('[power] display-sleep blocker stopped');
+    }
+  } catch (e) {
+    electronLog.warn('[power] stop blocker failed:', e && e.message);
+  } finally {
+    displaySleepBlockerId = null;
+  }
+}
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -587,16 +620,23 @@ let API_BASE = process.env.MINICAAI_API_BASE || 'https://api.minicaai.com';
 // Probe a candidate local API base; resolves true if it answers a cheap
 // GET within the timeout. Used only in dev, only when MINICAAI_API_BASE
 // is unset.
-async function probeLocalApiBase(base, timeoutMs = 1200) {
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeoutMs);
-    const res = await fetch(`${base}/api/v1/geo`, { signal: ctrl.signal });
-    clearTimeout(t);
-    return res.ok;
-  } catch {
-    return false;
+async function probeLocalApiBase(base, timeoutMs = 1500) {
+  // Probe the cheapest always-200 route (/api/health ~10ms) instead of
+  // /api/v1/geo (~100ms, does a GeoIP lookup), and retry a few times: this
+  // runs during Electron's boot storm where the first attempt can lose a
+  // CPU race even though the server is up. The old single-shot geo probe
+  // false-negatived and silently sent dev traffic to PRODUCTION. (2026-07-09)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      const res = await fetch(`${base}/api/health`, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.ok) return true;
+    } catch { /* retry below */ }
+    await new Promise((r) => setTimeout(r, 400));
   }
+  return false;
 }
 
 // Dev-only: if MINICAAI_API_BASE wasn't explicitly set and a local
@@ -664,6 +704,16 @@ function createMainWindow() {
       // keystroke (Ctrl+Shift+I) can't pop an unprotected inspector up
       // during an interview screen-share.
       devTools: isDev,
+      // Keep timers running at full rate when the window is hidden /
+      // backgrounded — the NORMAL interview state (user is in Zoom/Meet,
+      // minicaai is behind it or hidden to tray). Electron's default
+      // (true) clamps setInterval/setTimeout to ~1/min for background
+      // windows, which throttles the Deepgram keepalive + reconnect
+      // timers (mic drops during silence, slow recovery) AND the
+      // credit-timer tick/heartbeat (the "timer freezes then jumps"
+      // reports). This is the single most load-bearing flag for
+      // mid-interview reliability.
+      backgroundThrottling: false,
     },
     // In packaged builds the icon must come from a path bundled by
     // electron-builder — dist/ is in `files`, so dist/favicon.ico ships.
@@ -913,6 +963,10 @@ function createPopoutWindow(options = {}) {
       // Same rationale as main window — unprotected DevTools HWND would
       // bypass setContentProtection on the popout during screen-share.
       devTools: isDev,
+      // The popout is the visible surface during an interview, but it can
+      // still be occluded / blurred; keep its timers full-rate too so any
+      // renderer-side capture/timer logic mirrored here isn't throttled.
+      backgroundThrottling: false,
     },
     title: 'Interview Copilot — Pop-out',
     show: false,
@@ -1401,6 +1455,10 @@ ipcMain.on('session-active', (_event, payload) => {
   if (next === sessionActive) return;
   sessionActive = next;
   if (sessionActive) {
+    // Keep the display awake for the whole session so capture (and the
+    // mic with it) can't die to a screen sleep / lock. See the blocker
+    // helpers up top.
+    startDisplaySleepBlocker();
     // Tear down the tray. createTray re-attaches on session-end.
     // Stop the periodic menu refresh first — otherwise the next tick
     // calls tray.setContextMenu() on null and crashes the main process
@@ -1429,6 +1487,8 @@ ipcMain.on('session-active', (_event, payload) => {
       }
     }
   } else {
+    // Session ended — let the display sleep normally again.
+    stopDisplaySleepBlocker();
     // Re-create only if app is still running and tray is gone.
     if (!tray && typeof createTray === 'function') {
       try { createTray(); } catch (err) {
@@ -4271,6 +4331,9 @@ function _cleanupUIAScriptFile() {
   _uiaScriptPath = null;
 }
 app.on('will-quit', _cleanupUIAScriptFile);
+// Release the display-sleep block on the way out (defensive — session-active
+// false normally clears it, but a hard quit mid-session would skip that).
+app.on('will-quit', stopDisplaySleepBlocker);
 
 // Spawn once, reuse for the life of the app. If spawn fails, remember that
 // so we don't thrash trying to restart a bridge that won't start.

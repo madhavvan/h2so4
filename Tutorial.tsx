@@ -11,23 +11,44 @@
 //
 //  Bumped the version key (TUTORIAL_VERSION) when major UI changes warrant
 //  re-showing existing users — they'll see it again on next launch.
+//
+//  Web users get WEB_STEPS (tab-audio capture, no "mic" language) with a
+//  separate localStorage key so desktop completion does not skip web
+//  onboarding and vice versa.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 import React, { useEffect, useRef, useState } from 'react';
 import {
     X, Crown, Cpu, Mic, Camera, Keyboard, Monitor, FileText,
-    EyeOff, Sparkles, ChevronLeft, ChevronRight, Check,
+    EyeOff, Sparkles, ChevronLeft, ChevronRight, Check, ScreenShare, Download,
 } from 'lucide-react';
 import { WizardHat } from './WizardHat';
 
 const TUTORIAL_VERSION = 'v1';
+const WEB_ONBOARDING_VERSION = 'v1';
+
+const isElectronEnv = () =>
+    typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
 
 export function tutorialKey(userId: string | null | undefined): string | null {
     if (!userId) return null;
     return `tutorial_${TUTORIAL_VERSION}_completed_${userId}`;
 }
 
+/** Web-only onboarding key — independent of desktop tutorial completion. */
+export function webOnboardingKey(userId: string | null | undefined): string | null {
+    if (!userId) return null;
+    return `web_onboarding_${WEB_ONBOARDING_VERSION}_${userId}`;
+}
+
 export function shouldShowTutorial(userId: string | null | undefined): boolean {
+    if (!userId) return false;
+    if (!isElectronEnv()) {
+        const key = webOnboardingKey(userId);
+        if (!key) return false;
+        try { return localStorage.getItem(key) !== 'true'; }
+        catch { return false; }
+    }
     const key = tutorialKey(userId);
     if (!key) return false;
     try { return localStorage.getItem(key) !== 'true'; }
@@ -35,16 +56,52 @@ export function shouldShowTutorial(userId: string | null | undefined): boolean {
 }
 
 export function markTutorialCompleted(userId: string | null | undefined): void {
+    if (!userId) return;
+    if (!isElectronEnv()) {
+        const key = webOnboardingKey(userId);
+        if (!key) return;
+        try { localStorage.setItem(key, 'true'); } catch {}
+        return;
+    }
     const key = tutorialKey(userId);
     if (!key) return;
     try { localStorage.setItem(key, 'true'); } catch {}
 }
 
 export function clearTutorialCompletion(userId: string | null | undefined): void {
+    if (!userId) return;
+    if (!isElectronEnv()) {
+        const key = webOnboardingKey(userId);
+        if (!key) return;
+        try { localStorage.removeItem(key); } catch {}
+        return;
+    }
     const key = tutorialKey(userId);
     if (!key) return;
     try { localStorage.removeItem(key); } catch {}
 }
+
+// ── [PENDING-WEB-REQ] ────────────────────────────────────────────────
+// Owner has one more web-version requirement coming. Extend here without
+// rework: add copy/flags to WEB_ONBOARDING, or new steps via WEB_STEPS.
+// App.tsx mounts Tutorial; download CTA uses onOpenDownload when provided.
+export const WEB_ONBOARDING = {
+    version: WEB_ONBOARDING_VERSION,
+    storageKeyPrefix: 'web_onboarding_v1_',
+    // [PENDING-WEB-REQ]: plug next owner requirement (flag, step, CTA) here.
+    pendingOwnerRequirement: null as null | {
+        id: string;
+        title?: string;
+        body?: string;
+        enabled?: boolean;
+    },
+    upsell: {
+        downloadLabel: 'Download the desktop app',
+        downloadBlurb:
+            'for the invisible always-on-top popout, Auto-Type into coding editors, and screen-share-proof mode.',
+    },
+} as const;
+// ── end [PENDING-WEB-REQ] ────────────────────────────────────────────
 
 interface TutorialStep {
     icon: React.ComponentType<{ size?: number; className?: string }>;
@@ -210,9 +267,89 @@ const STEPS: TutorialStep[] = [
     },
 ];
 
-export function Tutorial({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
+/** Web-only walkthrough — tab audio, never microphone; ends with desktop upsell. */
+function buildWebSteps(onOpenDownload?: () => void): TutorialStep[] {
+    return [
+        {
+            icon: ScreenShare,
+            accent: 'from-emerald-500 to-teal-500',
+            title: 'Share the interviewer\'s audio',
+            body: (
+                <>
+                    When you hit listen, pick the <span className="font-semibold text-white">meeting tab</span> when prompted
+                    and check <span className="font-semibold">Share tab audio</span>. We capture only that stream —
+                    never your microphone.
+                </>
+            ),
+        },
+        {
+            icon: Mic,
+            accent: 'from-blue-500 to-cyan-500',
+            title: 'They ask → it transcribes live',
+            body: (
+                <>
+                    Questions appear as a live transcript of the interviewer's voice only —
+                    <span className="font-semibold text-emerald-300"> never yours</span>.
+                </>
+            ),
+        },
+        {
+            icon: Cpu,
+            accent: 'from-purple-500 to-pink-500',
+            title: 'Pick a model → perfect answer',
+            body: (
+                <>
+                    Choose a model from the picker. A polished answer streams to your screen in seconds —
+                    tailored to your knowledge base when you've uploaded a résumé + JD.
+                </>
+            ),
+        },
+        {
+            icon: Download,
+            accent: 'from-amber-500 to-orange-500',
+            title: 'Read it naturally',
+            body: (
+                <>
+                    Deliver the answer in your own voice. On the desktop app, that answer floats
+                    <span className="font-semibold text-cyan-300"> invisibly</span> — hidden from screen-share.
+                    <div className="mt-3 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg text-sm">
+                        <div className="font-semibold text-blue-200 mb-1">
+                            ⬇️ {WEB_ONBOARDING.upsell.downloadLabel}
+                        </div>
+                        <p className="text-xs text-gray-300 leading-relaxed mb-2">
+                            {WEB_ONBOARDING.upsell.downloadBlurb}
+                        </p>
+                        {onOpenDownload && (
+                            <button
+                                type="button"
+                                onClick={(e) => { e.stopPropagation(); onOpenDownload(); }}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-gradient-to-r from-blue-500 to-purple-600 text-white hover:opacity-90 transition-opacity"
+                            >
+                                <Download size={12} /> Download desktop app
+                            </button>
+                        )}
+                    </div>
+                    {/* [PENDING-WEB-REQ]: extra owner step / CTA can mount below this block. */}
+                </>
+            ),
+        },
+    ];
+}
+
+export function Tutorial({
+    isOpen,
+    onClose,
+    onOpenDownload,
+}: {
+    isOpen: boolean;
+    onClose: () => void;
+    /** Web only — opens MainApp Download modal from onboarding CTA. */
+    onOpenDownload?: () => void;
+}) {
     const [step, setStep] = useState(0);
     const dialogRef = useRef<HTMLDivElement | null>(null);
+    const inElectron = isElectronEnv();
+    const steps = inElectron ? STEPS : buildWebSteps(onOpenDownload);
 
     // Reset to step 0 every time the tutorial opens — so a re-launch from
     // Settings starts fresh, not at wherever the user left off.
@@ -227,7 +364,7 @@ export function Tutorial({ isOpen, onClose }: { isOpen: boolean; onClose: () => 
             if (e.key === 'Escape') { e.stopPropagation(); onClose(); return; }
             if (e.key === 'ArrowRight' || e.key === 'Enter') {
                 e.preventDefault();
-                if (step < STEPS.length - 1) setStep(s => s + 1);
+                if (step < steps.length - 1) setStep(s => s + 1);
                 else onClose();
             } else if (e.key === 'ArrowLeft') {
                 e.preventDefault();
@@ -236,15 +373,14 @@ export function Tutorial({ isOpen, onClose }: { isOpen: boolean; onClose: () => 
         };
         document.addEventListener('keydown', onKey, true);
         return () => document.removeEventListener('keydown', onKey, true);
-    }, [isOpen, step, onClose]);
+    }, [isOpen, step, onClose, steps.length]);
 
     if (!isOpen) return null;
 
-    const current = STEPS[step];
+    const current = steps[step];
     const Icon = current.icon;
-    const isLast = step === STEPS.length - 1;
+    const isLast = step === steps.length - 1;
     const isFirst = step === 0;
-    const inElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
 
     return (
         <div
@@ -288,7 +424,7 @@ export function Tutorial({ isOpen, onClose }: { isOpen: boolean; onClose: () => 
 
                 {/* Step dots */}
                 <div className="flex items-center justify-center gap-1.5 px-6 py-3">
-                    {STEPS.map((_, i) => (
+                    {steps.map((_, i) => (
                         <button
                             key={i}
                             onClick={() => setStep(i)}
@@ -313,7 +449,7 @@ export function Tutorial({ isOpen, onClose }: { isOpen: boolean; onClose: () => 
                     >
                         <ChevronLeft size={16} /> Back
                     </button>
-                    <span className="text-xs text-gray-500 font-medium">{step + 1} / {STEPS.length}</span>
+                    <span className="text-xs text-gray-500 font-medium">{step + 1} / {steps.length}</span>
                     <button
                         onClick={() => isLast ? onClose() : setStep(s => s + 1)}
                         className="flex items-center gap-1 px-4 py-2 rounded-lg text-sm font-bold bg-gradient-to-r from-primary to-blue-500 text-white shadow-lg hover:shadow-primary/30 transition-all"

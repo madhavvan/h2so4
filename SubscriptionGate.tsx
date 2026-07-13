@@ -28,7 +28,7 @@ import {
 } from '@phosphor-icons/react';
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import { geoService, GeoData } from './services/geoService';
-import { pricingService, RegionPricing, PricingTier } from './services/pricingService';
+import { pricingService, RegionPricing, PricingTier, getExtensionPacks } from './services/pricingService';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
 // Same component the Electron desktop chat-header uses. On the web post-
 // auth download surface we render it as a modal so paid users have full
@@ -3916,7 +3916,7 @@ const LandingMobile: React.FC<LandingMobileProps> = ({
           <PhArrowRight size={15} weight="bold" />
         </button>
         <p className="mt-5 text-[12.5px]" style={{ color: 'var(--ink-muted)' }}>
-          No card. 30-minute trial. Upgrade only if it earned the offer.
+          No card. 10-minute trial. Upgrade only if it earned the offer.
         </p>
       </section>
 
@@ -4201,7 +4201,7 @@ const AuthMobile: React.FC<AuthMobileProps> = ({
 
   const subhead =
     mode === 'login' ? 'Sign in to continue with your interview copilot.' :
-    mode === 'signup' ? 'Free 30-minute trial. No card. Upgrade only if it earned the offer.' :
+    mode === 'signup' ? 'Free 10-minute trial. No card. Upgrade only if it earned the offer.' :
     forgotSent ? `If an account exists for ${email}, a reset link is on its way. The link expires in one hour.` :
     "Enter the email you signed up with and we'll send you a link to reset your password.";
 
@@ -4932,6 +4932,8 @@ interface DownloadMobileProps {
   // SubscriptionGateInner so its single <Documentation> instance covers
   // both desktop /download nav and the mobile DownloadMobile flow.
   onOpenDocs?: () => void;
+  /** Enter the browser MainApp (web trial surface). */
+  onOpenWebApp?: () => void;
 }
 
 const DOWNLOAD_PLATFORMS = [
@@ -4952,7 +4954,7 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
     setView, currentUser, setCurrentUser, currentLicense, handleLogout, justSignedUp, setJustSignedUp,
     paymentError, paymentSuccess, paymentLoading, geo, pricing, lastSuccessfulTier,
     cancelConfirm, setCancelConfirm, handleManageSubscription, handleCancelSubscription,
-    initiateRenewal, initiateCheckout, basicExpiryLabel, onOpenDocs,
+    initiateRenewal, initiateCheckout, basicExpiryLabel, onOpenDocs, onOpenWebApp,
   } = props;
 
   const [showAccountSheet, setShowAccountSheet] = useState(false);
@@ -5063,11 +5065,25 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
           className="text-[14.5px] mx-auto"
           style={{ color: 'var(--ink-soft)', lineHeight: 1.55, maxWidth: '92%' }}
         >
-          Runs as a desktop app — invisible to screen sharing, system audio capture, always-on-top overlay.
+          Desktop unlocks the invisible popout, Auto-Type, system-audio capture, and screen-share-proof mode. Or try the web app first.
         </p>
+        {onOpenWebApp && currentUser && currentLicense && (
+          <button
+            type="button"
+            onClick={onOpenWebApp}
+            className="ios-press mt-5 inline-flex items-center gap-2 px-5 py-2.5 rounded-full text-[13px] font-semibold"
+            style={{
+              background: 'var(--ink)',
+              color: 'var(--cream)',
+              boxShadow: '0 8px 20px rgba(20, 20, 19, 0.18)',
+            }}
+          >
+            Open web app <ArrowRight size={14} />
+          </button>
+        )}
       </section>
 
-      {/* Web-not-available chip */}
+      {/* Web-available chip */}
       <section className="px-5 pb-5 flex justify-center">
         <div
           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[12px]"
@@ -5077,8 +5093,8 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
             color: 'var(--accent)',
           }}
         >
-          <AlertTriangle size={11} />
-          The web version is not available
+          <Sparkles size={11} />
+          Try the web experience — download desktop for stealth mode
         </div>
       </section>
 
@@ -5098,7 +5114,7 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
             <div className="flex-1">
               <div className="text-[14px] font-medium" style={{ color: 'var(--ink)' }}>Welcome to minicaai.</div>
               <div className="text-[12.5px] mt-0.5" style={{ color: 'var(--ink-muted)', lineHeight: 1.5 }}>
-                Your 30-minute free trial is running. Download below to start your first session.
+                Your 10-minute free trial is running. Download below to start your first session.
               </div>
             </div>
             <button
@@ -5278,7 +5294,9 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
                     style={{ background: 'var(--ink)', color: 'var(--cream)' }}
                   >
                     {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
-                    {`Renew +1h · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`}
+                    {/* Basic's top-up unit is +30 min (2026-07 plan-specific
+                        renewal) — the old "+1h" label overpromised. */}
+                    {`Extend +30 min · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`}
                   </button>
                 )}
               </div>
@@ -6346,9 +6364,11 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
   if (tier === 'basic') {
     actions.push({
       key: 'renew',
+      // Basic's plan-specific top-up unit is +30 min (2026-07) — the old
+      // "+1 hour" title/subtitle overpromised what $25/₹2099 buys.
       Icon: Zap, iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857',
-      title: 'Renew · +1 hour',
-      subtitle: 'Adds another hour of session time',
+      title: 'Extend · +30 min',
+      subtitle: 'Adds another 30 minutes of session time',
       price: renewalPriceLabel || undefined,
       variant: 'primary',
       onClick: wrapAction('renew', () => initiateRenewal()),
@@ -6592,7 +6612,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
                 )}
                 {tier === 'free' && (
                   <p className="text-[13px] mt-1.5" style={{ color: 'var(--ink-soft)', lineHeight: 1.5 }}>
-                    5 sessions / month · Gemini only.
+                    One-time 10-min trial · all models except Claude.
                   </p>
                 )}
                 {currentUser && (
@@ -7206,6 +7226,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // Payment state
   const [selectedProUpgrade, setSelectedProUpgrade] = useState(false);
   const [paymentLoading, setPaymentLoading] = useState(false);
+  const [selectedRenewalPack, setSelectedRenewalPack] = useState('m30');
   const [paymentError, setPaymentError] = useState<string | null>(null);
   // Which tier the user clicked on the pricing card. Persisted across
   // signup → checkout transitions (otherwise a non-authenticated user
@@ -7287,10 +7308,17 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     }
   };
 
-  // Renewal (Basic +1 credit / +1 hour) gets its own banner — saying
-  // "3 credits unlocked (14 days)" after a $6.99 renewal would be a lie.
-  const welcomeForRenewal = (): string =>
-    'Renewal successful — 1 extra interview unlocked (1 hour added to your plan).';
+  // Renewal (plan-specific top-up) gets its own banner — saying "3 credits
+  // unlocked (14 days)" after a top-up would be a lie. The unit is keyed
+  // to the CURRENT tier (Basic +30 min · Pro/Max +1 hour) via the same
+  // RENEWAL_BY_TIER mirror the charge sites use.
+  const welcomeForRenewal = (): string => {
+    const r = pricingService.getRenewalPrice(
+      geo?.country_code || 'US',
+      currentLicense?.tier || 'basic',
+    );
+    return `Renewal successful — 1 extra interview unlocked (${r.label} added to your plan).`;
+  };
 
   // "Expires in N days" / "Expires today" / "Expired" subtitle for the
   // Basic tier chip. Returns null for unlimited (Pro/Max, expires_at=-1)
@@ -7384,16 +7412,24 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         setPricing(pricingService.getPricing('US'));
       }
 
-      // Restore saved session so refresh stays on the download page instead of login.
+      // URL-based overrides for incoming deep-links.
+      const urlParams = new URLSearchParams(window.location.search);
+      const isPaymentSuccess = urlParams.get('payment') === 'success';
+
+      // Restore saved session. Electron + browser both enter the app via
+      // onAuthenticated, except when returning from Stripe/Razorpay
+      // (?payment=success) — that path must land on the download view so
+      // the success banner + justPurchasedTier logic still run.
       const savedAuth = licenseService.loadAuth();
       if (savedAuth.user && savedAuth.license && licenseService.isLicenseValid(savedAuth.license)) {
         setCurrentUser(savedAuth.user);
         setCurrentLicense(savedAuth.license);
-        setView('download');
+        if (!isPaymentSuccess) {
+          onAuthenticated(savedAuth.user, savedAuth.license);
+          setIsLoading(false);
+          return;
+        }
       }
-
-      // URL-based overrides for incoming deep-links.
-      const urlParams = new URLSearchParams(window.location.search);
 
       // Deep-link from the server-rendered reset-password "Link expired" page:
       // clicking "Request a new reset link" lands here with ?view=forgot_password
@@ -7436,7 +7472,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           const urlTierHint = urlParams.get('tier');
           // `mode=renewal` is stamped on the success URL by /create-renewal.
           // Renewal banners don't advertise "3 credits / 14 days" — they
-          // say "1 extra interview / 1 hour" instead.
+          // name the plan's top-up unit instead (welcomeForRenewal).
           const isRenewal = urlParams.get('mode') === 'renewal';
           // Client-side renewal credit grant. Keyed by Stripe session_id so
           // a refresh of the success URL can't grant the same credit twice.
@@ -7510,10 +7546,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       setCurrentLicense(license);
       setJustSignedUp(true);
 
-      if (isElectron) {
-        // In Electron, go straight to app
-        onAuthenticated(user, license);
-      } else if (selectedProUpgrade) {
+      if (selectedProUpgrade && !isElectron) {
         // User selected a paid plan on the pricing page — go to checkout
         // with the tier they chose (Basic/Pro/Max). Falls back to Pro if
         // no selection was persisted (shouldn't happen in practice).
@@ -7523,8 +7556,8 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         setTimeout(() => initiateCheckout(tier), 300);
         setView('download');
       } else {
-        // In browser, show download page
-        setView('download');
+        // Electron + browser free path: enter the app
+        onAuthenticated(user, license);
       }
     } catch (err: any) {
       setAuthError(err.message || 'Signup failed');
@@ -7548,9 +7581,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       setCurrentUser(user);
       setCurrentLicense(license);
 
-      if (isElectron) {
-        onAuthenticated(user, license);
-      } else if (selectedProUpgrade) {
+      if (selectedProUpgrade && !isElectron) {
         // Plan-aware redirect: existing user clicked a paid plan on the
         // landing page, hit the auth wall, switched to Login (because they
         // already had an account), and just logged in. Honor their original
@@ -7563,7 +7594,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         setTimeout(() => initiateCheckout(tier), 300);
         setView('download');
       } else {
-        setView('download');
+        onAuthenticated(user, license);
       }
     } catch (err: any) {
       setAuthError(err.message || 'Login failed');
@@ -7673,17 +7704,20 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     });
   };
 
-  // Renewals don't change `tier` — they extend `expires_at` by ~1h via
-  // grantBasicRenewal on the server. We watch for a forward delta on the
-  // license's expires_at; validateWithServer's renewal-credit propagation
-  // path (services/licenseService.ts) lands the +3600s credit locally as
+  // Renewals don't change `tier` — they extend `expires_at` by the plan's
+  // unit (Basic +30 min · Pro/Max +1 hour) via grantTimeExtension on the
+  // server. We watch for a forward delta on the license's expires_at;
+  // validateWithServer's renewal-credit propagation path
+  // (services/licenseService.ts) lands the tier-sized credit locally as
   // soon as the matching delta is detected, so we just refresh React
-  // state when it does. 30-min lower bound on the delta absorbs clock
-  // skew but stays well above any non-renewal noise.
+  // state when it does. 15-min lower bound on the delta (matches App.tsx
+  // pollForExternalRenewal) sits safely BELOW the smallest unit (30 min —
+  // the old 30-min bound was knife-edge equal to Basic's bump) and well
+  // above any non-renewal noise.
   const pollForRenewal = async (): Promise<void> => {
     const POLL_INTERVAL_MS = 4000;
     const POLL_TIMEOUT_MS = 10 * 60 * 1000;
-    const RENEWAL_THRESHOLD_MS = 30 * 60 * 1000;
+    const RENEWAL_THRESHOLD_MS = 15 * 60 * 1000;
     const startedAt = Date.now();
     const baselineExpires = currentLicense?.expires_at || 0;
     return new Promise<void>((resolve) => {
@@ -7893,12 +7927,14 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     }
   };
 
-  // ── Basic-tier renewal (+1 interview, +1 hour) ──────────────────────
+  // ── Plan renewal (+1 interview of the plan's unit — Basic +30 min;
+  //    the server prices/grants per the live tier) ─────────────────────
   // Separate from initiateCheckout because the backend routes it to
-  // /create-renewal and grants only a top-up (not a fresh 3/14-day
-  // Basic grant). openRazorpayCheckout reads checkoutData.mode and
+  // /create-renewal and grants only a top-up (not a fresh full-plan
+  // grant). openRazorpayCheckout reads checkoutData.mode and
   // /verify-razorpay reads the stamped notes.mode to pick the right
-  // success copy on both ends.
+  // success copy on both ends. (UI surfaces that call this are
+  // Basic-gated today; Pro/Max use the one-click /extend-now paths.)
   const initiateRenewal = async () => {
     setPaymentLoading(true);
     setPaymentError(null);
@@ -7923,7 +7959,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         response = await fetch(`${API_BASE_PLAN}/api/v1/payments/create-renewal`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-          body: JSON.stringify({ country_code: countryCode }),
+          body: JSON.stringify({ country_code: countryCode, pack: selectedRenewalPack }),
           signal: controller.signal,
         });
       } catch (fetchErr: any) {
@@ -7946,8 +7982,9 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         // long comment at the matching block in initiateCheckout. Without
         // this, a desktop user clicking Renew gets stranded on the website
         // after Stripe's redirect. pollForRenewal watches expires_at on
-        // the cached license — when validateWithServer detects the +1h
-        // delta from grantBasicRenewal, the +3600s credit lands locally.
+        // the cached license — when validateWithServer detects the
+        // plan-unit delta from grantTimeExtension, the tier-sized credit
+        // lands locally.
         if (isElectron && window.electronAPI) {
           // Same robust opener path as initiateCheckout — see the comment
           // there for the rationale.
@@ -8208,14 +8245,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       setCurrentUser(data.user);
       setCurrentLicense(data.license);
 
-      if (isElectron) {
-        onAuthenticated(data.user, data.license);
-      } else if (selectedProUpgrade) {
+      if (selectedProUpgrade && !isElectron) {
         setSelectedProUpgrade(false);
         setTimeout(() => initiateCheckout(), 300);
         setView('download');
       } else {
-        setView('download');
+        onAuthenticated(data.user, data.license);
       }
     } catch (err: any) {
       setAuthError(err.message || 'Google sign-in failed');
@@ -8403,10 +8438,8 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             // "you can close this tab" page leaves the desktop app hidden
             // behind it otherwise.
             try { window.electronAPI.send('focus-main-window'); } catch {}
-            onAuthenticated(data.user, data.license);
-          } else {
-            setView('download');
           }
+          onAuthenticated(data.user, data.license);
           return;
         }
 
@@ -8740,6 +8773,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             initiateCheckout={initiateCheckout}
             basicExpiryLabel={basicExpiryLabel}
             onOpenDocs={() => setWebDocsOpen(true)}
+            onOpenWebApp={
+              currentUser && currentLicense
+                ? () => onAuthenticated(currentUser, currentLicense)
+                : undefined
+            }
           />
           {/* Documentation overlay sibling — mobile branch early-returns
               here so the desktop branch's Documentation mount wouldn't be
@@ -8936,12 +8974,21 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
 
           <h1 className="text-3xl font-bold mb-3">Download minicaai Desktop</h1>
           <p className="text-gray-400 max-w-md mx-auto mb-4 text-sm leading-relaxed">
-            minicaai runs as a desktop app for the best experience — invisible to screen sharing, system audio capture, and always-on-top overlay.
+            The desktop app unlocks the invisible always-on-top popout, Auto-Type into coding editors, system-audio capture, and screen-share-proof mode.
           </p>
 
-          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/[0.08] border border-amber-500/20 text-amber-400 text-xs mb-10">
-            <AlertTriangle size={12} />
-            The web version is not available. Please download the desktop app.
+          {currentUser && currentLicense && (
+            <button
+              onClick={() => onAuthenticated(currentUser, currentLicense)}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold bg-gradient-to-r from-blue-500 to-purple-600 text-white shadow-lg shadow-blue-500/25 hover:shadow-blue-500/40 transition-all mb-6"
+            >
+              Open web app <ArrowRight size={14} />
+            </button>
+          )}
+
+          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-blue-500/[0.08] border border-blue-500/20 text-blue-300 text-xs mb-10">
+            <Sparkles size={12} />
+            Try the full web experience first — download desktop when you need stealth mode.
           </div>
 
           {/* First-time welcome for Starter/Free users. Cleared as soon as
@@ -8956,7 +9003,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               <div className="flex-1">
                 <div className="font-semibold">Welcome to minicaai.</div>
                 <div className="text-xs text-blue-300/80 mt-0.5 leading-relaxed">
-                  Your 30-minute free trial is running. Download the desktop app to start your first session.
+                  Your 10-minute free trial is running. Download the desktop app to start your first session.
                 </div>
               </div>
               <button
@@ -9144,17 +9191,32 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                         </div>
                       )}
                     </div>
-                    {isConfirmedBasic && (
+                    {/* Pack picker for renewal */}
+                {['basic', 'pro', 'max'].includes(currentLicense?.tier || '') && (() => {
+                  const packs = getExtensionPacks(geo?.country_code || 'US');
+                  return (
+                    <div className="flex gap-1 mb-2">
+                      {packs.map(p => (
+                        <button key={p.id} onClick={() => setSelectedRenewalPack(p.id)}
+                          className={"px-2 py-1 rounded text-[10px] font-bold border transition-all " + (selectedRenewalPack === p.id ? "bg-emerald-500/25 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20")}>
+                          {p.label + " · " + p.currencySymbol + p.price}
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })()}
+                {isConfirmedBasic && (
                       <button
                         onClick={initiateRenewal}
                         disabled={paymentLoading}
                         className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center gap-2 disabled:opacity-50"
-                        aria-label="Renew +1 interview (1 hour)"
+                        aria-label="Extend interview time (+30 minutes)"
                       >
                         {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
                         {(() => {
-                          const r = pricingService.getBasicRenewalPrice(geo?.country_code || 'US');
-                          return `Renew +1h · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
+                          // Basic's plan-specific unit: +30 min (2026-07).
+                          const r = pricingService.getRenewalPrice(geo?.country_code || 'US', 'basic');
+                          return `Extend ${r.label} · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
                         })()}
                       </button>
                     )}
@@ -9670,7 +9732,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             <PhArrowRight size={15} weight="bold" />
           </button>
           <p className="mt-6 text-[13px]" style={{ color: 'var(--ink-muted)' }}>
-            No card. 30-minute trial. Upgrade only if it earned the offer.
+            No card. 10-minute trial. Upgrade only if it earned the offer.
           </p>
         </section>
 
@@ -10020,7 +10082,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               Create your account.
             </h2>
             <p className="mt-1 text-[13px] mb-5" style={{ color: 'var(--ink-muted)' }}>
-              Free 30-minute trial. No card. Upgrade only if it earned the offer.
+              Free 10-minute trial. No card. Upgrade only if it earned the offer.
             </p>
 
             <form onSubmit={handleSignup} className="space-y-3">

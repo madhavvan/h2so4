@@ -52,6 +52,77 @@ function geminiQuotaGate(req, res, next) {
   }
 }
 
+// ─── Time-remaining gate (2026-07 policy) ─────────────────────────────
+// The free tier is a ONE-TIME 10-minute trial (all models except Claude);
+// once the trial bucket hits 0 NOTHING is free. Basic/Pro/Max draw from
+// their paid credit bucket and hit the same 402 when it empties. Ultra,
+// admins, and legacy unlimited licenses (credits/expiry -1 sentinels →
+// resolveTimeBucket 'unlimited') bypass. Applied as the LAST middleware
+// on every model route (chat + stream, all five providers) — NOT on
+// /prefetch-context, /deepgram-key, or autotype-* (those are covered by
+// their own gates and don't map 1:1 to interview minutes).
+//
+// FAIL OPEN: this app runs during live interviews. A DB blip inside this
+// gate must never break a paying user's session — any internal error logs
+// and lets the request through. Denial happens ONLY on a positively
+// resolved empty bucket.
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+
+// Paid-plan lapse predicate — the SAME two checks requireTier applies to
+// paid tiers (hasAccess status + expires_at), shared via
+// services/subscriptionStates so the gemini routes (which deliberately
+// carry no requireTier) and /usage/start deny a LAPSED plan the way every
+// tiered route already does. Free rows are exempt by design: their status
+// sits at 'trial' forever and their real wall is the trial bucket (the
+// pinned free-trial contract in test/free-trial-gate-chain.test.js).
+// Without this, a refunded/expired paid license kept riding the ungated
+// Gemini route (and kept opening usage sessions) as long as its credit
+// window hadn't lapsed — while all other model routes 403'd. The client
+// reverts lapsed plans to Free features, so this closes the one
+// "server allows it but client hides it" hole.
+const { hasAccess, isPlanLapsed } = require('../services/subscriptionStates');
+
+function requireTimeRemaining(req, res, next) {
+  try {
+    if (ADMIN_EMAILS.includes((req.user?.email || '').toLowerCase())) return next();
+    // requireTier already attached req.license on the tiered routes; the
+    // gemini routes (quota-gated, no tier gate) look it up here.
+    const license = req.license || db.getLicenseByUserId(req.user.id);
+    // No license row → let the tier/region gate own that case (don't
+    // double-deny with a confusing 402 on top of their 403).
+    if (!license) return next();
+    // Lapsed paid plan → the RENEW-shaped 403 (matches requireTier's copy
+    // exactly, so the client's lapse handling sees one consistent shape).
+    // On the tiered routes requireTier already denied before we run, so
+    // this only ever fires for the gemini chain. Positively-resolved
+    // deny only — internal errors still fail open below.
+    if (isPlanLapsed(license)) {
+      return res.status(403).json({
+        error: 'tier_required',
+        current: license.tier,
+        current_status: hasAccess(license.status) ? 'lapsed' : license.status,
+        message: 'Your subscription has expired. Please renew to continue.',
+      });
+    }
+    const bucket = db.resolveTimeBucket(license);
+    if (bucket.source === 'unlimited') return next();
+    if (bucket.remaining <= 0) {
+      return res.status(402).json({
+        error: 'no_time_remaining',
+        source: bucket.source,
+        message: bucket.source === 'trial'
+          ? 'Your 10-minute free trial is used up. Pick a plan to keep going.'
+          : 'Your interview time is used up. Extend or buy another interview to continue.',
+      });
+    }
+    next();
+  } catch (err) {
+    console.warn('[time-gate] threw:', err && err.message);
+    next(); // FAIL OPEN — never break a live interview on an internal error
+  }
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  FRESH_CONTEXT injection helpers
 //
@@ -177,14 +248,31 @@ function rateLimitedJson(provider) {
 // ── Tier gate aliases ──
 // Mirrors services/licenseService.ts FEATURE_GATES.models, in shorthand.
 // The 2026-07 pricing overhaul re-laddered model access:
-//   - PAID        → basic + pro + max + ultra  (GPT-5.5, Grok, Groq GPT-OSS-120B)
-//   - CLAUDE_TIERS→ pro + max + ultra          (Claude Sonnet 5 — Basic excludes Claude)
+//   - TRIAL_MODELS→ free + all paid tiers      (GPT-5.5, Grok, Groq — every model
+//                    except Claude; 'free' only counts while the one-time
+//                    10-minute trial bucket has seconds, enforced by
+//                    requireTimeRemaining → 402 at 0)
+//   - PAID        → basic + pro + max + ultra  (kept for non-trial paid gates)
+//   - CLAUDE_TIERS→ pro + max + ultra          (Claude Sonnet 5 — Basic and the
+//                    free trial both exclude Claude)
 //   - ULTRA_ONLY  → ultra only                 (Auto-Type — the Ultra-exclusive feature)
-// Free tier: only Gemini, ungated. Defined here so adding a new model
+// Free tier (2026-07): the 10-minute trial covers the four non-Claude
+// models; after it nothing is free — Gemini included (it stays behind
+// geminiQuotaGate + the time gate). Defined here so adding a new model
 // route only requires picking the right gate, not hand-listing tiers.
+const TRIAL_MODELS = ['free', 'basic', 'pro', 'max', 'ultra'];
 const PAID = ['basic', 'pro', 'max', 'ultra'];
 const CLAUDE_TIERS = ['pro', 'max', 'ultra'];
 const ULTRA_ONLY = ['ultra'];
+
+// TODO(owner-decision): the 10-minute free trial is currently NOT available
+// in India. requireActiveSubscriptionInRegion (mounted above via router.use)
+// hard-403s any non-paid license for country_code='IN' BEFORE the TRIAL_MODELS
+// carve-outs below ever run — an IN free signup never reaches the trial gates.
+// If the owner wants IN signups to get the same one-time 10-minute trial, that
+// is a regionGate.js POLICY change (e.g. allow tier='free' while
+// trial_remaining_seconds > 0), not a change here. Deliberately left as-is per
+// the 2026-07 policy freeze: do NOT silently widen free access in IN.
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  /prefetch-context — speculative cache warming during transcription
@@ -271,7 +359,7 @@ router.post('/prefetch-context', async (req, res) => {
 function _resetPrefetchDedup() { _prefetchDedup.clear(); }
 
 // ── Gemini ──
-router.post('/chat/gemini', geminiQuotaGate, async (req, res) => {
+router.post('/chat/gemini', geminiQuotaGate, requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Gemini not configured' });
 
@@ -315,9 +403,9 @@ router.post('/chat/gemini', geminiQuotaGate, async (req, res) => {
 // `none, low, medium, high, xhigh` — `minimal` is gpt-5-only and
 // returns HTTP 400 here. The client (App.tsx) sends the user's
 // chosen level in `req.body.reasoning_effort`; resolveReasoningEffort
-// validates the input AND tier-gates it: only Max users can pick
-// anything other than 'none'. Without the tier gate, a tampered
-// client could escalate to 'high' on a basic/pro subscription.
+// validates the input AND tier-gates it: only Max/Ultra users (and
+// admins) can pick anything other than 'none'. Without the tier gate,
+// a tampered client could escalate to 'high' on a basic/pro plan.
 //
 // We deliberately do NOT pass `verbosity` — that parameter is on
 // the Responses API surface and openai-node's chat.completions
@@ -366,9 +454,10 @@ const AUTO_EFFORT_BY_CATEGORY = {
 const { classifyQuestion } = require('../services/questionClassifier');
 
 // Single source of truth for tier-gating + validation. Returns the
-// effort string to pass to OpenAI. Non-Max tiers always get 'none'
-// regardless of what the client sent — defense in depth, since the
-// client UI also locks the bar but a tampered client could bypass it.
+// effort string to pass to OpenAI. Tiers below Max/Ultra (non-admin)
+// always get 'none' regardless of what the client sent — defense in
+// depth, since the client UI also locks the bar but a tampered client
+// could bypass it.
 //
 // `transcript` (optional) — when client sends `reasoning_effort: 'auto'`
 // (or doesn't send the field), we classify the transcript and pick the
@@ -393,11 +482,18 @@ function resolveReasoningEffort(req, transcript) {
     validated = requested;
   }
 
-  // Tier gate: non-Max users always get 'none' (cost control — high
-  // reasoning_effort is ~5x the per-call cost). Auto-classification
-  // for non-Max users still runs but is silently downgraded here.
+  // Tier gate: the reasoning dial is a Max AND Ultra feature (mirror of
+  // the client's FEATURE_GATES.reasoningEffortControl — pricing copy
+  // sells Ultra as "Train Model + full reasoning control"); admins bypass
+  // every gate. Everyone else always gets 'none' (cost control — high
+  // reasoning_effort is ~5x the per-call cost), regardless of what a
+  // tampered client sends. Auto-classification for gated users still
+  // runs but is silently downgraded here. Note this reads the RAW tier:
+  // a time-exhausted Max/Ultra keeps the dial (their plan is still
+  // theirs) — requireTimeRemaining is what blocks out-of-time sends.
   const tier = req.license?.tier || 'free';
-  if (tier !== 'max' && validated !== 'none') {
+  const isAdminCaller = ADMIN_EMAILS.includes((req.user?.email || '').toLowerCase());
+  if (tier !== 'max' && tier !== 'ultra' && !isAdminCaller && validated !== 'none') {
     return 'none';
   }
   return validated;
@@ -476,7 +572,7 @@ function scaleTokensForInstructions(systemText, baseMax, hardCap) {
   return Math.min(Math.round(baseMax * multiplier), hardCap);
 }
 
-router.post('/chat/openai', requireTier(...PAID), async (req, res) => {
+router.post('/chat/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OpenAI not configured' });
 
@@ -516,7 +612,7 @@ router.post('/chat/openai', requireTier(...PAID), async (req, res) => {
 });
 
 // ── xAI (Grok) ──
-router.post('/chat/xai', requireTier(...PAID), async (req, res) => {
+router.post('/chat/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.XAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'xAI not configured' });
 
@@ -566,7 +662,7 @@ router.post('/chat/xai', requireTier(...PAID), async (req, res) => {
 //   - max_tokens added explicitly: Groq's default for Scout was small
 //     and was likely truncating long answers. 8000 covers any realistic
 //     interview answer with margin.
-router.post('/chat/groq', requireTier(...PAID), async (req, res) => {
+router.post('/chat/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Groq not configured' });
 
@@ -622,7 +718,7 @@ const _AnthropicMod = (() => {
 })();
 const Anthropic = _AnthropicMod && (_AnthropicMod.default || _AnthropicMod);
 
-router.post('/chat/claude', requireTier(...CLAUDE_TIERS), async (req, res) => {
+router.post('/chat/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
 
@@ -728,7 +824,7 @@ function openSseStream(req, res) {
 }
 
 // ── Gemini (stream) ──
-router.post('/stream/gemini', geminiQuotaGate, async (req, res) => {
+router.post('/stream/gemini', geminiQuotaGate, requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Gemini not configured' });
 
@@ -779,10 +875,11 @@ router.post('/stream/gemini', geminiQuotaGate, async (req, res) => {
 
 // ── OpenAI (stream) ──
 // Mirrors /chat/openai: client-supplied reasoning_effort flows through
-// resolveReasoningEffort (validates the value AND tier-gates — only Max
-// users can opt into anything beyond 'none'). See the chat handler
-// comment block above for full rationale on which params are safe to pass.
-router.post('/stream/openai', requireTier(...PAID), async (req, res) => {
+// resolveReasoningEffort (validates the value AND tier-gates — only
+// Max/Ultra users and admins can opt into anything beyond 'none'). See
+// the chat handler comment block above for full rationale on which
+// params are safe to pass.
+router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OpenAI not configured' });
 
@@ -837,7 +934,7 @@ router.post('/stream/openai', requireTier(...PAID), async (req, res) => {
 });
 
 // ── xAI Grok (stream) ──
-router.post('/stream/xai', requireTier(...PAID), async (req, res) => {
+router.post('/stream/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.XAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'xAI not configured' });
 
@@ -893,7 +990,7 @@ router.post('/stream/xai', requireTier(...PAID), async (req, res) => {
 // ── Groq (stream) ──
 // Same model upgrade as /chat/groq: Llama-4-Scout-17B → GPT-OSS-120B.
 // See chat handler comment for full rationale.
-router.post('/stream/groq', requireTier(...PAID), async (req, res) => {
+router.post('/stream/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Groq not configured' });
 
@@ -951,7 +1048,7 @@ router.post('/stream/groq', requireTier(...PAID), async (req, res) => {
 // out by the helper, so the candidate sees only the final answer text.
 // Web search runs server-side on Anthropic's infra during a single API
 // call — no extra round-trip on our end.
-router.post('/stream/claude', requireTier(...CLAUDE_TIERS), async (req, res) => {
+router.post('/stream/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
 
@@ -1497,3 +1594,21 @@ router.get('/deepgram-key', deepgramKeyHandler);
 router.post('/deepgram-key', deepgramKeyHandler);
 
 module.exports = router;
+
+// ── Test surface (Vitest only) ──
+// Exposes the exact gate middlewares + tier lists the model routes are
+// wired with, so test/free-trial-gate-chain.test.js can prove the full
+// chain (region → tier → time) against a real in-memory license row —
+// the free-trial contract can then never silently regress in a refactor.
+// Runtime callers are unaffected: they import the router itself, and
+// extra properties on the router function are invisible to app.use().
+module.exports._test = {
+  requireTimeRemaining,
+  geminiQuotaGate,
+  resolveReasoningEffort,
+  TRIAL_MODELS,
+  PAID,
+  CLAUDE_TIERS,
+  ULTRA_ONLY,
+  _resetPrefetchDedup,
+};

@@ -7,6 +7,14 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const crypto = require('crypto');
 
+// ── Free-tier trial policy (2026-07) ──
+// The free "Starter" tier is a ONE-TIME 10-minute trial. During it the
+// user can use every model EXCEPT Claude (Gemini, GPT-5.5, Grok, Groq);
+// once it's exhausted NOTHING is free — the paywall owns the account
+// until they buy a plan. Enforced at the AI routes via resolveTimeBucket
+// (see routes/ai.js requireTimeRemaining).
+const FREE_TRIAL_SECONDS = 10 * 60;
+
 let db = null;
 
 function getDB() {
@@ -417,6 +425,22 @@ function getDB() {
     db.exec("UPDATE licenses SET credits_expire_at = expires_at WHERE tier = 'basic' AND credits_expire_at = 0 AND expires_at > 0");
   }
 
+  // ── Plan-window grant anchor for the Settings → Usage card (2026-07) ──
+  // credits_granted_seconds records the TOTAL seconds seeded into the
+  // CURRENT paid window: updateLicenseOnPayment sets it to the seeded
+  // balance on every purchase/upgrade, and grantTimeExtension ADDS the
+  // pack seconds on every renewal/top-up. The Usage card renders
+  // used = granted - remaining as an iOS-style bar; without a granted
+  // anchor the client could only guess the window size from tier
+  // constants, which the +30-min top-ups immediately falsify. Backfill
+  // existing paid rows from their live balance so they start at a sane
+  // "0% used" anchor (the /summary route also self-heals legacy rows
+  // with MAX(granted, remaining) so the bar can never exceed 100%).
+  if (!licenseCols.find(c => c.name === 'credits_granted_seconds')) {
+    db.exec('ALTER TABLE licenses ADD COLUMN credits_granted_seconds INTEGER DEFAULT 0');
+    db.exec("UPDATE licenses SET credits_granted_seconds = credits_remaining_seconds WHERE credits_granted_seconds = 0 AND tier IN ('basic','pro','max') AND credits_remaining_seconds > 0");
+  }
+
   // Defense-in-depth against the /verify-razorpay ↔ payment.captured race:
   // both paths grant the same payment if they both see "no row yet" between
   // their dedup check and their transaction. The in-transaction re-check
@@ -489,6 +513,68 @@ function getDB() {
   }
   if (!licenseCols.find(c => c.name === 'gemini_calls_day')) {
     db.exec("ALTER TABLE licenses ADD COLUMN gemini_calls_day TEXT DEFAULT ''");
+  }
+
+  // ── Server-authoritative usage ledger (2026-07 billing mastery) ──
+  // The old model ("Option A") ticked interview time in a renderer
+  // setInterval and stored the balance in localStorage — so background-tab
+  // throttling froze timers mid-interview, clearing storage reset paid
+  // time, popout+main double-ran clocks, and the server never learned
+  // that consumption happened. usage_sessions makes the SERVER CLOCK the
+  // only clock: the client opens a session, heartbeats every ~20s, and
+  // each heartbeat charges wall-clock elapsed (clamped) against the
+  // license row atomically. A crash costs the user nothing past their
+  // last heartbeat (the stale-session sweeper settles it there).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS usage_sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      license_key TEXT NOT NULL,
+      device_id TEXT,
+      source TEXT NOT NULL,              -- 'trial' | 'credits' | 'unlimited'
+      started_at INTEGER NOT NULL,       -- unix ms, server clock
+      last_heartbeat_at INTEGER NOT NULL,
+      ended_at INTEGER,                  -- NULL while live
+      end_reason TEXT,                   -- 'stopped'|'exhausted'|'stale'|'superseded'
+      seconds_charged INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_sessions_user ON usage_sessions(user_id, started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_usage_sessions_open ON usage_sessions(last_heartbeat_at) WHERE ended_at IS NULL;
+  `);
+
+  // Lifecycle-email dedup ledger. One row per (user, kind, period): the
+  // INSERT OR IGNORE in markLifecycleEmailOnce is the send gate, so a
+  // sweep that runs every few hours can never double-send the same
+  // reminder for the same expiry window.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lifecycle_emails (
+      user_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      period_key INTEGER NOT NULL,
+      sent_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, kind, period_key)
+    );
+  `);
+
+  // Consumption-based trial balance. The old client derived trial time as
+  // "30 min minus wall-clock since signup" on every fresh login — a user
+  // who signed up Monday and returned Wednesday had zero trial without
+  // ever using it (the #1 trial complaint). This column burns ONLY while
+  // an interview session is live. One-time backfill snapshots the old
+  // wall-clock semantics so nobody gains back time they already lost;
+  // from then on it's consumption-only. New free signups seed
+  // FREE_TRIAL_SECONDS in createLicense. trial_granted_at <= 0 keeps the
+  // legacy fail-closed rule.
+  if (!licenseCols.find(c => c.name === 'trial_remaining_seconds')) {
+    db.exec('ALTER TABLE licenses ADD COLUMN trial_remaining_seconds INTEGER DEFAULT 0');
+    db.prepare(`
+      UPDATE licenses SET trial_remaining_seconds =
+        CASE
+          WHEN tier != 'free' OR trial_granted_at <= 0 THEN 0
+          ELSE MAX(0, ${FREE_TRIAL_SECONDS} - CAST((? - trial_granted_at) / 1000 AS INTEGER))
+        END
+    `).run(Date.now());
   }
 
   return db;
@@ -770,10 +856,17 @@ function createLicense({ key, user_id, email, tier, status, country_code, expire
   // get 0 (the column default) — they don't use the trial bucket.
   const now = Date.now();
   const trialGrantedAt = tier === 'free' ? now : 0;
+  // Consumption-based trial: free signups get a real FREE_TRIAL_SECONDS
+  // (one-time 10-minute, all models except Claude, then paywall — see the
+  // policy note at the top of this module) balance that burns only while
+  // a usage session is live (see usage_sessions). The trial_granted_at
+  // stamp stays for audit/back-compat, but the balance column is the
+  // authority now.
+  const trialSeconds = tier === 'free' ? FREE_TRIAL_SECONDS : 0;
   d.prepare(`
-    INSERT INTO licenses (key, user_id, email, tier, status, country_code, activated_at, expires_at, sessions_used, sessions_limit, trial_granted_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-  `).run(key, user_id, email.toLowerCase(), tier, status, country_code, now, expires_at, sessions_limit, trialGrantedAt);
+    INSERT INTO licenses (key, user_id, email, tier, status, country_code, activated_at, expires_at, sessions_used, sessions_limit, trial_granted_at, trial_remaining_seconds)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+  `).run(key, user_id, email.toLowerCase(), tier, status, country_code, now, expires_at, sessions_limit, trialGrantedAt, trialSeconds);
 
   return getLicenseByKey(key);
 }
@@ -812,6 +905,12 @@ function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_lim
   const args = [tier, status, expires_at, sessions_limit];
   if (credits_remaining_seconds !== undefined) {
     sets.push('credits_remaining_seconds = ?');
+    args.push(credits_remaining_seconds);
+    // A payment seeds a FRESH plan window, so the granted anchor mirrors
+    // the seeded balance (Usage bar starts at 0% used). Renewal top-ups
+    // don't come through here — they go via grantTimeExtension, which
+    // ADDS to granted instead of resetting it.
+    sets.push('credits_granted_seconds = ?');
     args.push(credits_remaining_seconds);
   }
   if (credits_expire_at !== undefined) {
@@ -1478,6 +1577,281 @@ function grantBasicRenewal(userId) {
     WHERE user_id = ?
   `).run(newTier, newExpiresAt, newLimit, newCreditsRemaining, newCreditsExpireAt, userId);
   return getLicenseByUserId(userId);
+}
+
+// Generalizes grantBasicRenewal for ALL time-gated tiers: unlike the
+// legacy function this PRESERVES the tier — a Pro/Max user's top-up must
+// not relabel them Basic. A free/expired user topping up reactivates as
+// Basic (legacy behavior kept). Unlimited/comp licenses no-op so a replayed
+// legacy webhook can't shrink an admin grant (Ultra never reaches here —
+// resolveTimeBucket reports it unlimited and every charge site refuses to
+// sell it a top-up). Repeatable without limit — eligibility windowing
+// (interview-day-only) is enforced at the /extend-now route, not here,
+// because webhook-driven grants for already-paid money must always land.
+//
+// 2026-07: the top-up is a single flat +30-minute SKU ($25 / ₹2099 —
+// RENEWAL_* in payments.js). Tier is preserved; the granted time is the
+// same 30 minutes for every tier.
+function grantTimeExtension(userId, seconds) {
+  const license = getLicenseByUserId(userId);
+  if (!license) return null;
+  if (license.sessions_limit === -1 || license.expires_at === -1
+      || (license.credits_remaining_seconds ?? 0) === -1) {
+    return license; // unlimited — nothing to top up
+  }
+  const tier = ['basic', 'pro', 'max'].includes(license.tier) ? license.tier : 'basic';
+  const EXT_S = (typeof seconds === 'number' && seconds > 0) ? Math.floor(seconds) : 30 * 60; // graduated pack seconds, default +30 min
+  const EXT_MS = EXT_S * 1000;
+  const base = Math.max(Date.now(), license.expires_at || 0);
+  const newExpiresAt = base + EXT_MS;
+  // Stale credits past their window don't carry (the user couldn't have
+  // used them); a live balance stacks.
+  const creditsValid = (license.credits_expire_at || 0) > Date.now();
+  const existing = creditsValid ? (license.credits_remaining_seconds || 0) : 0;
+  // The granted anchor follows the exact same stale-window rule as
+  // remaining: a renewal raises BOTH by the pack seconds, so the Usage
+  // card's used (= granted - remaining) stays flat and the bar recedes.
+  const existingGranted = creditsValid ? (license.credits_granted_seconds || 0) : 0;
+  getDB().prepare(`
+    UPDATE licenses SET
+      tier = ?, status = 'active',
+      expires_at = ?, sessions_limit = sessions_limit + 1,
+      credits_remaining_seconds = ?, credits_expire_at = ?,
+      credits_granted_seconds = ?
+    WHERE user_id = ?
+  `).run(tier, newExpiresAt, existing + EXT_S, newExpiresAt, existingGranted + EXT_S, userId);
+  return getLicenseByUserId(userId);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+//  USAGE SESSIONS — the server-authoritative interview clock
+// ━━━━━━━━━━━━━━━━━━━━━━━━━
+// One open session per user at a time. The client heartbeats every ~20s;
+// each heartbeat charges wall-clock elapsed (server clock, clamped) against
+// the license's time bucket inside a transaction. Withholding heartbeats
+// doesn't buy free time — the session just goes stale and gets settled at
+// the LAST heartbeat, and the interview UI dies with it (self-defeating).
+
+const USAGE_HEARTBEAT_CAP_S = 45;        // max chargeable seconds per beat (~2× the 20s cadence + slack)
+const USAGE_STALE_AFTER_MS = 90 * 1000;  // silent this long → sweeper settles the session
+
+// Which bucket does this license draw live-interview time from?
+// Mirrors the client's getLiveTimeBalance so both sides agree on semantics:
+//   ultra / -1 sentinels        → unlimited
+//   basic|pro|max               → credits (0 once past credits_expire_at)
+//   free                        → trial
+function resolveTimeBucket(license) {
+  if (!license) return { source: 'none', remaining: 0 };
+  if (license.tier === 'ultra') return { source: 'unlimited', remaining: -1 };
+  if (['basic', 'pro', 'max'].includes(license.tier)) {
+    if ((license.credits_remaining_seconds ?? 0) === -1
+        || license.expires_at === -1
+        || license.credits_expire_at === -1) {
+      return { source: 'unlimited', remaining: -1 };
+    }
+    const expireAt = license.credits_expire_at || 0;
+    if (expireAt > 0 && Date.now() > expireAt) return { source: 'credits', remaining: 0 };
+    return { source: 'credits', remaining: Math.max(0, license.credits_remaining_seconds || 0) };
+  }
+  // free — consumption-based trial balance
+  return { source: 'trial', remaining: Math.max(0, license.trial_remaining_seconds || 0) };
+}
+
+// Charge `seconds` against the license's bucket. Returns the post-charge
+// remaining. MAX(0, ...) at the SQL layer so concurrent writers can't
+// drive the balance negative.
+function chargeLicenseSeconds(userId, source, seconds) {
+  const d = getDB();
+  if (seconds <= 0) {
+    const lic = getLicenseByUserId(userId);
+    return resolveTimeBucket(lic).remaining;
+  }
+  if (source === 'credits') {
+    d.prepare(`
+      UPDATE licenses SET credits_remaining_seconds = MAX(0, credits_remaining_seconds - ?)
+      WHERE user_id = ? AND credits_remaining_seconds > 0
+    `).run(seconds, userId);
+  } else if (source === 'trial') {
+    d.prepare(`
+      UPDATE licenses SET trial_remaining_seconds = MAX(0, trial_remaining_seconds - ?)
+      WHERE user_id = ? AND trial_remaining_seconds > 0
+    `).run(seconds, userId);
+  }
+  const lic = getLicenseByUserId(userId);
+  return resolveTimeBucket(lic).remaining;
+}
+
+// Open a session. Any prior open session for this user is settled first
+// (charged only through its last heartbeat) and marked 'superseded' — this
+// is what stops popout+main or a second device from double-burning the
+// clock, and it makes "sign in elsewhere and continue" just work.
+function startUsageSession(userId, deviceId, { unlimitedOverride = false } = {}) {
+  const d = getDB();
+  const license = getLicenseByUserId(userId);
+  if (!license) return { error: 'no_license' };
+
+  const bucket = unlimitedOverride ? { source: 'unlimited', remaining: -1 } : resolveTimeBucket(license);
+  if (bucket.source !== 'unlimited' && bucket.remaining <= 0) {
+    return { error: 'exhausted', source: bucket.source, remaining: 0 };
+  }
+
+  const now = Date.now();
+  const id = crypto.randomUUID();
+  const tx = d.transaction(() => {
+    // Settle + supersede any dangling open sessions (no extra charge —
+    // they were already charged through their own last heartbeat).
+    d.prepare(`
+      UPDATE usage_sessions SET ended_at = ?, end_reason = 'superseded'
+      WHERE user_id = ? AND ended_at IS NULL
+    `).run(now, userId);
+    d.prepare(`
+      INSERT INTO usage_sessions (id, user_id, license_key, device_id, source, started_at, last_heartbeat_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, userId, license.key, deviceId || null, bucket.source, now, now);
+  });
+  tx();
+
+  return {
+    session_id: id,
+    source: bucket.source,
+    remaining: bucket.remaining,
+    server_now: now,
+  };
+}
+
+// Heartbeat: charge elapsed-since-last-beat (clamped) and report the
+// authoritative remaining balance. Returns exhausted:true exactly once —
+// the beat that drains the bucket also closes the session.
+function heartbeatUsageSession(userId, sessionId) {
+  const d = getDB();
+  const now = Date.now();
+  let result = null;
+  const tx = d.transaction(() => {
+    const sess = d.prepare(
+      'SELECT * FROM usage_sessions WHERE id = ? AND user_id = ? AND ended_at IS NULL'
+    ).get(sessionId, userId);
+    if (!sess) { result = { error: 'no_session' }; return; }
+
+    const elapsed = Math.min(
+      USAGE_HEARTBEAT_CAP_S,
+      Math.max(0, Math.floor((now - sess.last_heartbeat_at) / 1000)),
+    );
+
+    if (sess.source === 'unlimited') {
+      d.prepare('UPDATE usage_sessions SET last_heartbeat_at = ? WHERE id = ?').run(now, sessionId);
+      result = { remaining: -1, source: 'unlimited', charged: 0, server_now: now };
+      return;
+    }
+
+    const remaining = chargeLicenseSeconds(userId, sess.source, elapsed);
+    d.prepare(`
+      UPDATE usage_sessions SET last_heartbeat_at = ?, seconds_charged = seconds_charged + ?
+      WHERE id = ?
+    `).run(now, elapsed, sessionId);
+
+    if (remaining <= 0) {
+      d.prepare(`
+        UPDATE usage_sessions SET ended_at = ?, end_reason = 'exhausted' WHERE id = ?
+      `).run(now, sessionId);
+      result = { remaining: 0, source: sess.source, charged: elapsed, exhausted: true, server_now: now };
+      return;
+    }
+    result = { remaining, source: sess.source, charged: elapsed, server_now: now };
+  });
+  tx();
+  return result;
+}
+
+// Clean stop: settle the final partial interval, close the session.
+function stopUsageSession(userId, sessionId) {
+  const d = getDB();
+  const now = Date.now();
+  let result = null;
+  const tx = d.transaction(() => {
+    const sess = d.prepare(
+      'SELECT * FROM usage_sessions WHERE id = ? AND user_id = ? AND ended_at IS NULL'
+    ).get(sessionId, userId);
+    if (!sess) { result = { error: 'no_session' }; return; }
+
+    const elapsed = sess.source === 'unlimited' ? 0 : Math.min(
+      USAGE_HEARTBEAT_CAP_S,
+      Math.max(0, Math.floor((now - sess.last_heartbeat_at) / 1000)),
+    );
+    const remaining = sess.source === 'unlimited'
+      ? -1
+      : chargeLicenseSeconds(userId, sess.source, elapsed);
+    d.prepare(`
+      UPDATE usage_sessions
+      SET ended_at = ?, end_reason = 'stopped', last_heartbeat_at = ?, seconds_charged = seconds_charged + ?
+      WHERE id = ?
+    `).run(now, now, elapsed, sessionId);
+    result = { remaining, source: sess.source, charged: elapsed, server_now: now };
+  });
+  tx();
+  return result;
+}
+
+// Claim the right to send a lifecycle email exactly once per
+// (user, kind, period). Returns true when this caller won the claim.
+function markLifecycleEmailOnce(userId, kind, periodKey) {
+  const r = getDB().prepare(`
+    INSERT OR IGNORE INTO lifecycle_emails (user_id, kind, period_key, sent_at)
+    VALUES (?, ?, ?, ?)
+  `).run(userId, kind, periodKey, Date.now());
+  return r.changes > 0;
+}
+
+// Licenses whose paid, unused interview time expires within `windowMs` —
+// the pass-expiry reminder sweep's work list. Only balances worth
+// mentioning (> 60s) and only live windows (expiry still ahead).
+function getExpiringPassLicenses(windowMs) {
+  const now = Date.now();
+  return getDB().prepare(`
+    SELECT l.user_id, l.tier, l.credits_remaining_seconds, l.credits_expire_at,
+           u.email, u.name
+    FROM licenses l JOIN users u ON u.id = l.user_id
+    WHERE l.tier IN ('basic', 'pro', 'max')
+      AND l.status = 'active'
+      AND l.credits_remaining_seconds > 60
+      AND l.credits_expire_at > ?
+      AND l.credits_expire_at <= ?
+  `).all(now, now + windowMs);
+}
+
+// Sweeper: sessions silent past USAGE_STALE_AFTER_MS get settled AT their
+// last heartbeat — the user is never charged for time after their client
+// died. Runs from index.js on an interval.
+function sweepStaleUsageSessions() {
+  const d = getDB();
+  const cutoff = Date.now() - USAGE_STALE_AFTER_MS;
+  const stale = d.prepare(
+    'SELECT id, last_heartbeat_at FROM usage_sessions WHERE ended_at IS NULL AND last_heartbeat_at < ?'
+  ).all(cutoff);
+  for (const s of stale) {
+    d.prepare(`
+      UPDATE usage_sessions SET ended_at = ?, end_reason = 'stale' WHERE id = ? AND ended_at IS NULL
+    `).run(s.last_heartbeat_at, s.id);
+  }
+  return stale.length;
+}
+
+// Lifetime interview totals for the Settings → Usage card. seconds_charged
+// accrues on every heartbeat/stop against the SERVER clock, so the SUM is
+// the true metered interview time (not wall-clock guesswork). The count
+// covers completed sessions only (ended_at set); a currently-live session's
+// already-charged seconds still show up in the sum, which is exactly what a
+// live usage readout wants.
+function getUsageTotals(userId) {
+  const row = getDB().prepare(`
+    SELECT COALESCE(SUM(seconds_charged), 0) AS s,
+           COUNT(CASE WHEN ended_at IS NOT NULL THEN 1 END) AS c
+    FROM usage_sessions
+    WHERE user_id = ?
+  `).get(userId);
+  return {
+    lifetime_used_seconds: (row && row.s) || 0,
+    session_count: (row && row.c) || 0,
+  };
 }
 
 // Look up a user's most recent Razorpay subscription id from the payments
@@ -2563,6 +2937,7 @@ function closeDB() {
 
 module.exports = {
   getDB,
+  FREE_TRIAL_SECONDS,
   // Users
   createUser, getUserByEmail, getUserById, getUserByGoogleId, linkGoogleAccount, verifyUserPassword,
   updateUserTier, updateUserPassword, banUser, unbanUser, getAllUsers, getUserCount, getProUserCount, getActiveToday,
@@ -2573,9 +2948,14 @@ module.exports = {
   // Licenses
   createLicense, getLicenseByKey, getLicenseByUserId,
   incrementSessionCount, updateLicenseStatus, updateLicenseOnPayment,
-  extendLicenseExpiry, grantCreditSessions, grantBasicRenewal,
+  extendLicenseExpiry, grantCreditSessions, grantBasicRenewal, grantTimeExtension,
   getLatestRazorpaySubscriptionId,
   setRazorpaySubscriptionId,
+  // Usage sessions — server-authoritative interview clock
+  resolveTimeBucket, startUsageSession, heartbeatUsageSession,
+  stopUsageSession, sweepStaleUsageSessions, getUsageTotals,
+  // Lifecycle emails (pass-expiry reminders etc.)
+  markLifecycleEmailOnce, getExpiringPassLicenses,
   // Cycle-end downgrade (paid → free safety net)
   transitionLicenseToFree, getExpiredCancelingUserIds,
   // Devices

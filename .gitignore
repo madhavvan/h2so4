@@ -100,3 +100,8 @@ Desktop.ini
 .autotype-plans.jsonl
 .autotype-test/
 server/scripts/.autotype-test/
+
+# Local dev CDP probes + design-iteration screenshots (not for commit)
+/cdp-*.mjs
+/current-*.png
+/globe-*.png

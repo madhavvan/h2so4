@@ -37,7 +37,7 @@
 //  │  IMPORTANT: 'trial' has NO automatic transition. The 30-day│
 //  │  expires_at on free signups is bookkeeping for the         │
 //  │  ui banner; functional access is gated by tier=='free' (→  │
-//  │  Gemini only, with daily quota) and never by trial-status- │
+//  │  the 10-min trial bucket) and never by trial-status-       │
 //  │  expiry. After 30 days, status STAYS 'trial' until the     │
 //  │  user pays (→ active) or an admin changes it. Region-gated │
 //  │  users (IN) are blocked at the AI router regardless — see  │
@@ -111,6 +111,29 @@ function isTerminal(status) {
   return typeof status === 'string' && TERMINAL_STATUSES.has(status);
 }
 
+// ── Paid-plan lapse predicate ──
+// The canonical "has this PAID plan ended?" check: a non-access status
+// (expired / refunded / revoked / paused / disputed) OR a passed
+// expires_at (-1 sentinel = never expires, 0 = no expiry recorded).
+// These are the SAME two checks middleware/tier.js applies to paid tiers;
+// factored here so gates without a requireTier (the gemini model routes,
+// /usage/start) can deny a lapsed plan identically instead of each
+// growing its own drifting copy. Free rows are exempt by design — their
+// status sits at 'trial' forever (see the state-machine diagram above)
+// and their real wall is the one-time trial bucket.
+//
+// Lapse is deliberately DISTINCT from time exhaustion: a Basic/Pro/Max
+// whose credit seconds hit 0 inside a valid window is NOT lapsed — they
+// keep their tier (client mirrors this in licenseService.isPlanLapsed)
+// and get 402 "top up" from the time gate, never 403 "renew".
+function isPlanLapsed(license) {
+  if (!license) return false;
+  if (!['basic', 'pro', 'max', 'ultra'].includes(license.tier)) return false;
+  if (!hasAccess(license.status)) return true;
+  if (license.expires_at > 0 && Date.now() > license.expires_at) return true;
+  return false;
+}
+
 // Throws when a writer would persist an unknown status. Use at the top
 // of update functions so a typo at a call site is caught at write time
 // (loud) rather than silently corrupting the row (hidden until a reader
@@ -133,5 +156,6 @@ module.exports = {
   isValidStatus,
   hasAccess,
   isTerminal,
+  isPlanLapsed,
   assertValidStatus,
 };

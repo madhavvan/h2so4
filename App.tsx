@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, Mic, MicOff, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Download, Monitor, Laptop, Terminal, LogOut, Crown, Sparkles, Loader2, EyeOff, ShieldCheck, ScanSearch, Headphones } from 'lucide-react';
+import { Settings, Mic, MicOff, FileText, Upload, Trash2, Cpu, FileCheck, RefreshCw, HelpCircle, AlertTriangle, Zap, MessageSquare, Edit3, X, ChevronDown, Menu, ExternalLink, Moon, Sun, Copy, Check, Save, ToggleLeft, ToggleRight, Info, ScreenShare, ScreenShareOff, Plus, FilePlus, Download, Monitor, Laptop, Terminal, LogOut, Crown, Sparkles, Loader2, EyeOff, ScanSearch, Headphones, Keyboard, Gauge } from 'lucide-react';
 // Minica support chat — mounted as a Help → Support modal inside MainApp so
 // signed-in users can talk to the bot (or escalate to a human) without
 // leaving the app. The component is shared with SubscriptionGate's
@@ -8,7 +8,6 @@ import { Settings, Mic, MicOff, FileText, Upload, Trash2, Cpu, FileCheck, Refres
 // to fill the modal body and inherit the user's light/dark theme.
 import SupportBot from './SupportBot';
 import { WizardHat } from './WizardHat';
-import { BrandMark, type BrandMarkState } from './BrandMark';
 import { PaperAirplane } from './GitHubIcons';
 import { GeminiIcon, OpenAIIcon, ClaudeIcon, GrokIcon, GroqIcon } from './ProviderIcons';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -27,9 +26,9 @@ import { Message, AppSettings, ContextFile } from './types';
 import { SubscriptionGate } from './SubscriptionGate';
 import { Tutorial, shouldShowTutorial, markTutorialCompleted, clearTutorialCompletion } from './Tutorial';
 import { ManageSubscription } from './ManageSubscription';
-import { licenseService, UserProfile, LicenseData, TIME_CONSTANTS } from './services/licenseService';
+import { licenseService, UserProfile, LicenseData, TIME_CONSTANTS, fetchUsageSummary, UsageSummary } from './services/licenseService';
 import { creditTimerService } from './services/creditTimerService';
-import { pricingService } from './services/pricingService';
+import { pricingService, getExtensionPacks } from './services/pricingService';
 import './pip-styles.css';
 
 // --- Electron Helpers ---
@@ -37,7 +36,22 @@ import './pip-styles.css';
 // instead of the old `process.versions.electron`, which isn't exposed
 // when contextIsolation:true + nodeIntegration:false.
 const isElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
-const isPopoutMode = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('mode') === 'popout';
+// Electron popout is a second BrowserWindow with ?mode=popout. In a plain
+// browser the web popout is Document-PiP, not a second tab — ignore/strip
+// a stray ?mode=popout so authenticated web users land in normal MainApp.
+const isPopoutMode = isElectron
+  && typeof window !== 'undefined'
+  && new URLSearchParams(window.location.search).get('mode') === 'popout';
+if (!isElectron && typeof window !== 'undefined') {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('mode') === 'popout') {
+      params.delete('mode');
+      const qs = params.toString();
+      window.history.replaceState({}, '', window.location.pathname + (qs ? `?${qs}` : '') + window.location.hash);
+    }
+  } catch { /* ignore */ }
+}
 
 // Add popout-mode class to HTML for CSS targeting (cursor override for screen share)
 if (isPopoutMode && typeof document !== 'undefined') {
@@ -576,7 +590,7 @@ const CodeBlock: React.FC<{
             <div className="flex items-center justify-between px-4 py-2 bg-black/40 border-b border-gray-700/50">
                 <span className="text-xs font-mono text-gray-400 lowercase">{language || 'code'}</span>
                 <div className="flex items-center gap-3">
-                    {isElectron && (
+                    {isElectron ? (
                         <button
                             onClick={handleAutoType}
                             disabled={!canAutoType && atPhase === 'idle'}
@@ -596,6 +610,19 @@ const CodeBlock: React.FC<{
                                 : <Zap size={12} className={atPhase !== 'idle' ? 'animate-pulse' : ''} />}
                             <span>{autoTypeLabel}</span>
                             {!canAutoType && atPhase === 'idle' && <WizardHat size={10} className="text-amber-400" />}
+                        </button>
+                    ) : (
+                        // Web: never invoke auto-type:* IPC — upsell desktop instead.
+                        <button
+                            type="button"
+                            onClick={() => window.dispatchEvent(new CustomEvent('app:open-download'))}
+                            className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-amber-300 transition-colors"
+                            title="Auto-Type types code into your editor — desktop app only"
+                            aria-label="Auto-Type — Desktop only. Download the desktop app."
+                        >
+                            <Keyboard size={12} />
+                            <span>Auto-Type — Desktop only</span>
+                            <Download size={10} className="text-blue-400" />
                         </button>
                     )}
                     <button
@@ -924,21 +951,22 @@ const ChatInterface = ({
     creditTimer,
     effectiveTier,
     markPendingPopoutModel,
+    sidebarOpen,
+    handlePlaySampleQuestion,
+    onClosePip,
 }: any) => {
 
-    // ── Brand-mark state — the identity medallion's motion story ──
-    // One derivation shared by the header jewel and both empty states:
-    // answering (tokens streaming) > thinking (request in flight) >
-    // listening (audio capture live) > idle. streamingMsg/isProcessing/
-    // isListening are already popout-synced upstream, so the pop-out's
-    // mark mirrors the main window with no extra IPC.
-    const brandState: BrandMarkState = streamingMsg
-        ? 'answering'
-        : isProcessing
-            ? 'thinking'
-            : isListening
-                ? 'listening'
-                : 'idle';
+    // Document PiP renders ChatInterface into a separate window. Portals must
+    // target that window's body or menus open on the main "Safe to Share" tab.
+    const getOverlayPortalRoot = (): HTMLElement => {
+        try {
+            const pipWin = (window as any).documentPictureInPicture?.window as Window | null | undefined;
+            if (isPipMode && !isElectron && pipWin?.document?.body) {
+                return pipWin.document.body;
+            }
+        } catch { /* ignore */ }
+        return document.body;
+    };
 
     const setSelectedModel = (newModel: 'gemini' | 'groq' | 'openai' | 'xai' | 'claude') => {
         // ── Feature Gate: Block model switch for free users ──
@@ -1009,10 +1037,28 @@ const ChatInterface = ({
         document.addEventListener('mousedown', closeOnOutside);
         document.addEventListener('keydown', closeOnEsc);
         window.addEventListener('resize', closeOnResize);
+        // In the web pop-out the menu + trigger live in the Document-PiP
+        // window, so outside-clicks / Esc / resize fire on THAT window's
+        // document — the main-document listeners above never see them and
+        // the menu would get "stuck" open. Mirror the listeners onto the
+        // PiP window too.
+        const pipWin = (isPipMode && !isElectron)
+            ? ((window as any).documentPictureInPicture?.window as Window | null | undefined)
+            : null;
+        if (pipWin) {
+            pipWin.document.addEventListener('mousedown', closeOnOutside);
+            pipWin.document.addEventListener('keydown', closeOnEsc);
+            pipWin.addEventListener('resize', closeOnResize);
+        }
         return () => {
             document.removeEventListener('mousedown', closeOnOutside);
             document.removeEventListener('keydown', closeOnEsc);
             window.removeEventListener('resize', closeOnResize);
+            if (pipWin) {
+                pipWin.document.removeEventListener('mousedown', closeOnOutside);
+                pipWin.document.removeEventListener('keydown', closeOnEsc);
+                pipWin.removeEventListener('resize', closeOnResize);
+            }
         };
     }, [isModelMenuOpen]);
 
@@ -1021,6 +1067,21 @@ const ChatInterface = ({
         const btn = modelButtonRef.current;
         if (!btn) return;
         const rect = btn.getBoundingClientRect();
+        // In the WEB pop-out the menu is portaled into the Document-PiP
+        // window (see getOverlayPortalRoot), so its `position: fixed`
+        // coordinates resolve against the PIP window's viewport — NOT the
+        // main tab's. The trigger button also lives in the PiP document, so
+        // its getBoundingClientRect() is already PiP-relative. We therefore
+        // must read innerWidth/innerHeight from the PiP window too, or the
+        // right/bottom offsets are computed against the wrong (main-window)
+        // dimensions and the menu lands off-screen — which is exactly why
+        // the model list "didn't work" in the web pop-out.
+        let viewW = window.innerWidth;
+        let viewH = window.innerHeight;
+        if (isPipMode && !isElectron) {
+            const pipWin = (window as any).documentPictureInPicture?.window as Window | null | undefined;
+            if (pipWin) { viewW = pipWin.innerWidth; viewH = pipWin.innerHeight; }
+        }
         // Flip up when there isn't enough room below the trigger. The
         // input-area picker sits near the bottom of the chat window, so a
         // down-opening popover would clip the lower rows. 5 rows × ~30px
@@ -1028,18 +1089,18 @@ const ChatInterface = ({
         // last row doesn't graze the viewport edge.
         const POPOVER_H = 200;
         const GAP = 4;
-        const spaceBelow = window.innerHeight - rect.bottom;
+        const spaceBelow = viewH - rect.bottom;
         const spaceAbove = rect.top;
         const openUpward = spaceBelow < POPOVER_H + GAP && spaceAbove > spaceBelow;
         setModelMenuPos(
             openUpward
                 ? {
-                    bottom: window.innerHeight - rect.top + GAP,
-                    right: window.innerWidth - rect.right,
+                    bottom: viewH - rect.top + GAP,
+                    right: viewW - rect.right,
                   }
                 : {
                     top: rect.bottom + GAP,
-                    right: window.innerWidth - rect.right,
+                    right: viewW - rect.right,
                   }
         );
         setIsModelMenuOpen(true);
@@ -1048,6 +1109,7 @@ const ChatInterface = ({
     if (isPipMode) {
         // Detect Electron for window controls
         const inElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
+        const overlayRoot = getOverlayPortalRoot();
 
         const cycleSize = () => {
             const next = (sizeIndex + 1) % sizePresets.length;
@@ -1065,18 +1127,24 @@ const ChatInterface = ({
             color: 'var(--text-main)',
         };
 
+        // Web PiP now carries the `electron-transparent` class (set in
+        // PiPWindow.initPip), so `.popup` is transparent in both modes and the
+        // obsidian base painted on the PiP <html> shows through — the header/
+        // footer render as the same floating rounded glass bands as the
+        // Electron pop-out.
         return (
-            <div className="popup open" style={inElectron ? { background: 'transparent' } : undefined}>
+            <div className="popup open" style={{ background: 'transparent' }}>
                 <div className="bg-layer"></div>
                 
                 {/* ── HEADER ── */}
                 <div
                     className="popup-header"
                     id="dragHandle"
-                    style={inElectron ? { WebkitAppRegion: 'drag', padding: '10px 12px' } as any : undefined}
+                    style={inElectron ? { WebkitAppRegion: 'drag', padding: '10px 12px' } as any : { padding: '10px 12px' }}
                 >
-                    {/* Left: empty draggable region — identity wordmark removed
-                        for a clean, minimal futuristic header (controls only). */}
+                    {/* Left: empty flex spacer keeps controls right-aligned and the
+                        header band draggable (matches the Electron pop-out, which
+                        also shows no brand text). */}
                     <div style={{ flex: 1, minWidth: 0 }} />
 
                     {/* Right: Controls row */}
@@ -1084,24 +1152,36 @@ const ChatInterface = ({
                         className="ml-auto flex items-center"
                         style={inElectron ? { WebkitAppRegion: 'no-drag', gap: '6px' } as any : { gap: '6px' }}
                     >
+                        {/* Live indicator for web (compact) */}
+                        {!inElectron && (
+                          <div
+                            className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-semibold ${
+                              isListening ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/[0.04] text-gray-500'
+                            }`}
+                          >
+                            <span className={`w-1.5 h-1.5 rounded-full ${isListening ? 'bg-emerald-400 animate-pulse' : 'bg-gray-600'}`} />
+                            {isListening ? 'LIVE' : 'OFF'}
+                          </div>
+                        )}
                         {/* Tier & credit chips — only at M/L sizes so the S preset
-                            (340px) doesn't wrap the controls onto two rows. */}
-                        {sizeIndex >= 1 && effectiveTier === 'max' && (
+                            (340px) doesn't wrap the controls onto two rows.
+                            Web PiP always shows tier (no size cycle). */}
+                        {(sizeIndex >= 1 || !inElectron) && effectiveTier === 'max' && (
                           <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-gradient-to-r from-amber-500/15 to-purple-500/10 text-amber-400">
                             <WizardHat size={9} /> MAX
                           </div>
                         )}
-                        {sizeIndex >= 1 && effectiveTier === 'pro' && (
+                        {(sizeIndex >= 1 || !inElectron) && effectiveTier === 'pro' && (
                           <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-blue-500/10 text-blue-400">
                             <Crown size={9} /> PRO
                           </div>
                         )}
-                        {sizeIndex >= 1 && effectiveTier === 'basic' && (
+                        {(sizeIndex >= 1 || !inElectron) && effectiveTier === 'basic' && (
                           <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-emerald-500/10 text-emerald-400">
                             <Zap size={9} /> BASIC
                           </div>
                         )}
-                        {sizeIndex >= 1 && creditTimer && (creditTimer.source === 'credits' || creditTimer.source === 'trial') && creditTimer.remaining > 0 && (
+                        {(sizeIndex >= 1 || !inElectron) && creditTimer && (creditTimer.source === 'credits' || creditTimer.source === 'trial') && creditTimer.remaining > 0 && (
                           <div
                             className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-semibold ${
                               creditTimer.remaining <= TIME_CONSTANTS.LOW_WARNING_SECONDS
@@ -1113,11 +1193,15 @@ const ChatInterface = ({
                             aria-label={creditTimer.source === 'trial' ? 'Free trial time remaining' : 'Plan time remaining'}
                           >
                             {creditTimer.source === 'trial' ? 'TRIAL' : ''} {formatTimeRemaining(creditTimer.remaining)}
+                            {/* Used-vs-granted tube — renders only when the plan
+                                grant is known (fail-soft: unknown/unlimited keeps
+                                the chip exactly as before). */}
+                            <TimeTubeGauge granted={creditTimer.granted} remaining={creditTimer.remaining} width={26} />
                           </div>
                         )}
                         {/* Model selector — custom popover (not native <select>) so the
                             options list lives inside the popout's compositor surface.
-                            See comment block above on `MODEL_OPTIONS` for the rationale. */}
+                            Web: portal into Document-PiP document, not main tab. */}
                         <div className="relative flex items-center">
                           <button
                               ref={modelButtonRef}
@@ -1135,15 +1219,15 @@ const ChatInterface = ({
                             <div
                               ref={modelMenuRef}
                               role="listbox"
-                              className="fixed z-[9999] py-2 px-1.5 rounded-2xl min-w-[160px] overflow-y-auto custom-scrollbar"
+                              className="fixed z-[9999] py-2 px-1.5 rounded-2xl min-w-[160px] overflow-y-auto custom-scrollbar border"
                               style={{
                                   top: modelMenuPos.top,
                                   bottom: modelMenuPos.bottom,
                                   right: modelMenuPos.right,
                                   maxHeight: 'calc(100vh - 24px)',
-                                  background: 'var(--model-menu-bg)',
-                                  borderColor: 'var(--model-menu-border)',
-                                  boxShadow: 'var(--model-menu-shadow)',
+                                  background: 'var(--model-menu-bg, rgba(18,16,11,0.96))',
+                                  borderColor: 'var(--model-menu-border, rgba(255,255,255,0.12))',
+                                  boxShadow: 'var(--model-menu-shadow, 0 12px 40px rgba(0,0,0,0.45))',
                                   backdropFilter: 'blur(20px) saturate(1.2)',
                                   WebkitAppRegion: 'no-drag',
                               } as any}
@@ -1166,7 +1250,7 @@ const ChatInterface = ({
                                 />
                               ))}
                             </div>,
-                            document.body
+                            overlayRoot
                           )}
                         </div>
 
@@ -1174,6 +1258,32 @@ const ChatInterface = ({
                         <button onClick={onOpenSettings} className="p-1 rounded transition-colors hover:bg-white/10" aria-label="Settings" style={glassBtn}>
                             <Settings size={13} strokeWidth={1.5} />
                         </button>
+
+                        {/* Web: download + close (Electron has native window controls) */}
+                        {!inElectron && (
+                            <>
+                                <button
+                                    type="button"
+                                    onClick={() => onOpenDownload?.()}
+                                    className="p-1 rounded transition-colors hover:bg-white/10 text-blue-300"
+                                    aria-label="Download desktop app"
+                                    title="Download desktop app — invisible always-on-top popout"
+                                    style={glassBtn}
+                                >
+                                    <Download size={13} strokeWidth={1.5} />
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => onClosePip?.()}
+                                    className="p-1 rounded transition-colors hover:bg-red-500/30"
+                                    aria-label="Close pop-out"
+                                    title="Bring back to tab"
+                                    style={glassBtn}
+                                >
+                                    <X size={13} strokeWidth={1.5} />
+                                </button>
+                            </>
+                        )}
 
                         {/* ── Electron-only controls ── */}
                         {inElectron && (
@@ -1215,6 +1325,17 @@ const ChatInterface = ({
                     </div>
                 </div>
 
+                {/* Web Document-PiP: desktop upsell (Electron popout is already invisible). */}
+                {!inElectron && (
+                    <button
+                        type="button"
+                        onClick={() => onOpenDownload?.()}
+                        className="shrink-0 px-3 py-1.5 text-[10px] leading-snug text-amber-200/90 bg-amber-500/10 border-b border-amber-500/20 hover:bg-amber-500/15 text-left transition-colors w-full"
+                    >
+                        Download the desktop app for the invisible, always-on-top version.
+                    </button>
+                )}
+
                 <div style={{ position: 'relative', flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
                 <div
                     className="messages"
@@ -1222,26 +1343,44 @@ const ChatInterface = ({
                     ref={chatContainerRef}
                     onScroll={handleScroll}
                 >
-                    {messages.length === 0 && (
-                        <div className="flex flex-col items-center justify-center h-full space-y-4 mt-10" style={{ color: 'var(--text-muted)' }}>
-                            {/* The identity medallion (BrandMark) replaces the old flat
-                                Mic-in-a-circle. Its state carries the whole story —
-                                idle / listening / thinking / answering — so no separate
-                                mic glyph is needed. Self-grounded obsidian coin: reads
-                                on any wallpaper behind this transparent window. */}
-                            <div className="relative">
-                                <BrandMark size={76} state={brandState} />
-                                {settings.autoSend && <div className="absolute top-1.5 right-1.5 w-3 h-3 rounded-full border-2" style={{ background: 'var(--text-main)', borderColor: 'var(--glass-bg)' }}></div>}
-                            </div>
-                            <div className="text-center px-4 opacity-80">
-                                <p className="font-medium mb-1 text-sm" style={{ color: 'var(--text-main)' }}>System Audio Copilot</p>
-                                <p className="text-xs leading-relaxed max-w-xs mx-auto">
-                                    {isListening ? 'Listening to system audio — speak or wait for the interviewer.' : 'Press Mic to start capturing system audio.'}
-                                </p>
-                            </div>
+                    {/* Empty state — web: tab-audio copy + sample question; Electron: mic hint */}
+                    {messages.length === 0 && !isListening && (
+                        <div className="h-full flex flex-col items-center justify-center gap-3 px-4 animate-in fade-in duration-1000">
+                            <p
+                              className="text-center text-sm leading-relaxed select-none pointer-events-none"
+                              style={{ fontFamily: 'var(--serif)', color: 'var(--text-muted)', opacity: 0.9 }}
+                            >
+                                {!inElectron
+                                  ? <>Share the meeting tab's audio, or try a sample below</>
+                                  : <>Turn on the mic and set <span style={{ color: '#d3ac63' }}>Manual → Auto</span> for the best experience</>
+                                }
+                            </p>
+                            {!inElectron && handlePlaySampleQuestion && (
+                                <button
+                                    type="button"
+                                    onClick={handlePlaySampleQuestion}
+                                    disabled={isProcessing}
+                                    className="pointer-events-auto flex items-center gap-2 pl-1 pr-3 py-1 rounded-full text-[11px] font-bold bg-gradient-to-r from-blue-500/20 to-purple-500/20 text-blue-200 border border-blue-500/30 hover:from-blue-500/30 hover:to-purple-500/30 transition-all disabled:opacity-50"
+                                    aria-label="Play a sample question"
+                                >
+                                    <span
+                                        className="relative inline-flex items-center justify-center w-7 h-7 rounded-full shrink-0 shadow-[0_2px_8px_rgba(0,0,0,0.45)] ring-1 ring-white/10"
+                                        style={{ background: 'linear-gradient(160deg, #2a2a2e 0%, #0a0a0c 55%, #000 100%)' }}
+                                        aria-hidden
+                                    >
+                                        {isProcessing ? (
+                                            <Loader2 size={12} className="text-white/90 animate-spin" strokeWidth={2.25} />
+                                        ) : (
+                                            <svg width="9" height="10" viewBox="0 0 11 12" fill="none" className="ml-0.5">
+                                                <path d="M1.2 0.85C1.2 0.28 1.82 -0.07 2.3 0.22l8.1 4.85c.46.28.46.94 0 1.21l-8.1 4.85c-.48.29-1.1-.06-1.1-.63V0.85z" fill="white" fillOpacity="0.95" />
+                                            </svg>
+                                        )}
+                                    </span>
+                                    Play a sample question
+                                </button>
+                            )}
                         </div>
                     )}
-
                     {messages.map((msg: Message) => (
                         <div key={msg.id} className={`msg ${msg.role === 'user' ? 'user' : 'ai'}`}>
                             <span className="msg-name">{msg.role === 'user' ? 'You' : 'minicaai'}</span>
@@ -1322,33 +1461,57 @@ const ChatInterface = ({
                 )}
                 </div>
 
-                <div className="input-area" style={{ flexDirection: 'column', gap: '0' }}>
+                {/* The `.input-area` CSS uses `align-items: flex-end` (for the
+                    Electron send-button alignment), so with our `flex-direction:
+                    column` override the direct children DON'T stretch — they
+                    shrink-wrap to the right. That collapsed the textarea to its
+                    content width (~130px) instead of filling the shell. Force
+                    each child to full width so the composer spans the whole
+                    pop-out, exactly like the main-app composer. */}
+                <div className="input-area" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '0' }}>
                     {/* ── Textarea — spans the FULL width of the shell so there's
                          maximum room to type; auto-grows then scrolls (see the
                          styled scrollbar + max-height in pip-styles.css). ── */}
-                    <textarea
-                        id="inputBox"
-                        className="pip-textarea"
-                        placeholder={settings.autoSend ? "Listening for interviewer..." : "Type a message…"}
-                        rows={1}
-                        value={inputText}
-                        // `field-sizing: content` delegates auto-grow to the browser and
-                        // avoids the JS-triggered layout recomputation that caused
-                        // per-keystroke typing lag. max-height in pip-styles.css caps the
-                        // grow region, with the styled scrollbar taking over past it.
-                        style={{ fieldSizing: 'content', maxHeight: 80 } as React.CSSProperties}
-                        onChange={(e) => setInputText(e.target.value)}
-                        onKeyDown={(e) => {
-                            if (e.key === 'Enter' && !e.shiftKey) {
-                                e.preventDefault();
-                                handleManualSend();
+                    <div style={{ position: 'relative', width: '100%' }}>
+                        {interimText && (
+                            <div
+                                className="pointer-events-none absolute left-2.5 top-2 right-2.5 text-[12px] italic truncate z-0"
+                                style={{ color: 'var(--text-muted)', opacity: 0.7 }}
+                            >
+                                {inputText}{interimText}
+                            </div>
+                        )}
+                        <textarea
+                            id="inputBox"
+                            className="pip-textarea relative z-10"
+                            placeholder={
+                              !inElectron
+                                ? (settings.autoSend ? "Listening for interviewer (tab audio)…" : "Type a message…")
+                                : (settings.autoSend ? "Listening for interviewer..." : "Type a message…")
                             }
-                        }}
-                    />
+                            rows={1}
+                            value={inputText}
+                            // Explicit `width: 100%` fills the shell; `field-sizing:
+                            // content` then drives only the HEIGHT auto-grow (an
+                            // explicit width disables field-sizing's width axis).
+                            // max-height in pip-styles.css caps the grow region,
+                            // with the styled scrollbar taking over past it. Without
+                            // the explicit width, field-sizing:content collapsed the
+                            // box to its text width.
+                            style={{ fieldSizing: 'content', width: '100%', maxHeight: 80 } as React.CSSProperties}
+                            onChange={(e) => setInputText(e.target.value)}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter' && !e.shiftKey) {
+                                    e.preventDefault();
+                                    handleManualSend();
+                                }
+                            }}
+                        />
+                    </div>
 
-                    {/* ── Controls row: AUTO / MIC on the left, Send + Auto-Solve
+                    {/* ── Controls row: AUTO / LIVE on the left, Send + Auto-Solve
                          on the right — sits BELOW the full-width textarea. ── */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', paddingTop: '6px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', paddingTop: '6px', flexWrap: 'wrap' }}>
                         <button
                             onClick={toggleAutoSend}
                             className={`pip-toggle ${settings.autoSend ? 'active-gold' : ''}`}
@@ -1358,14 +1521,15 @@ const ChatInterface = ({
 
                         <button
                             onClick={isListening ? stopListening : startListening}
-                            className={`pip-toggle ${isListening ? 'active-red' : ''}`}
+                            className={`pip-toggle ${isListening ? 'active-green' : ''}`}
+                            title={!inElectron ? "Share the meeting tab's audio — never your mic" : undefined}
                         >
                             {isListening ? <Mic size={10} /> : <MicOff size={10} />}
-                            {isListening ? 'LIVE' : 'MIC OFF'}
+                            {isListening ? 'LIVE' : (!inElectron ? 'LISTEN' : 'MIC OFF')}
                         </button>
 
                         {speechError && (
-                            <span style={{ fontSize: '9px', color: '#ef4444', maxWidth: '90px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            <span style={{ fontSize: '9px', color: '#ef4444', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                 {speechError}
                             </span>
                         )}
@@ -1384,7 +1548,7 @@ const ChatInterface = ({
 
                             <button
                                 className="send-btn ml-2"
-                                aria-label={gate.canAutoSolve ? "Auto-Solve" : "Auto-Solve — Pro only"}
+                                aria-label={gate.canAutoSolve ? "Auto-Solve" : "Auto-Solve — available on every paid plan"}
                                 onClick={handleAutoSolve}
                                 disabled={isProcessing || !gate.canAutoSolve}
                                 style={{ opacity: (isProcessing || !gate.canAutoSolve) ? 0.4 : 1, position: 'relative' }}
@@ -1399,6 +1563,12 @@ const ChatInterface = ({
                             </button>
                         </div>
                     </div>
+                    {/* Web privacy line — interviewer-only transcription */}
+                    {!inElectron && (
+                        <p style={{ fontSize: 9, lineHeight: 1.35, color: 'var(--text-muted)', marginTop: 6, opacity: 0.85 }}>
+                            We only transcribe the interviewer's questions — never your voice.
+                        </p>
+                    )}
                 </div>
             </div>
         );
@@ -1408,60 +1578,11 @@ const ChatInterface = ({
         <div className={`flex-1 flex flex-col h-full overflow-hidden relative bg-transparent text-text transition-colors duration-300 ${settings.theme === 'dark' ? 'dark' : ''}`}>
              {/* --- RESPONSIVE HEADER --- */}
             <header className={`h-14 md:h-16 bg-transparent flex items-center justify-between px-4 shrink-0 z-20 sticky top-0`}>
-                <div className="flex items-center gap-2 md:gap-3">
-                {/* Living identity jewel — the BrandMark doubles as an ambient
-                    status light: it breathes while listening, races light around
-                    its bezel while the model thinks, and emits while answering.
-                    Always visible (the text wordmark still hides below xs). */}
-                <BrandMark size={26} state={brandState} />
+                {/* When the sidebar is closed, the floating hamburger
+                    (fixed top-3 left-3, ends at x≈48px) overlaps the header's
+                    left edge — indent the wordmark clear of it. */}
+                <div className={`flex items-center gap-2 md:gap-3${sidebarOpen ? '' : ' ml-10'}`}>
                 <h1 className="font-bold text-base md:text-lg tracking-tight hidden xs:block">minica<span className="text-blue-500">ai</span></h1>
-                {/* Hide button — replaces the previous always-visible kbd chip.
-                    Three improvements over the old approach:
-                      1. CLEAR PURPOSE: labeled "Hide" with EyeOff icon, framed
-                         in the hover tooltip as a screen-share safety feature
-                         (not the ambiguous "hide/show" the user saw before).
-                      2. CLICKABLE: clicking it routes through the same
-                         close-window IPC the X button uses, which triggers
-                         the smoothHide() flow in main.cjs. So users now have
-                         THREE consistent paths: this button, Ctrl+Alt+Space,
-                         the X button.
-                      3. RESILIENT TO LAYOUT: the kbd chord is hidden below
-                         lg breakpoint when the conversations panel narrows
-                         the header — only "Hide" + icon stays visible. The
-                         hover tooltip still shows the shortcut in full, so
-                         the user can always learn it.
-                    Lives inside the main window (setContentProtection=true),
-                    so it's automatically invisible during screen-share. */}
-                <div className="relative group hidden md:block md:ml-12">
-                    <button
-                        onClick={() => electronIPC.send('close-window')}
-                        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] transition-all text-[11px] font-medium text-gray-400 hover:text-[#d3ac63]"
-                        aria-label="Hide app for screen-share safety. Also available via Ctrl+Alt+Space."
-                    >
-                        <EyeOff size={12} />
-                        <span>Hide</span>
-                        <kbd className="hidden lg:inline-flex px-1 py-0.5 rounded bg-white/[0.06] font-mono text-[9px] text-white/50">
-                            {/(Mac|iPhone|iPad)/i.test(typeof navigator !== 'undefined' ? navigator.platform : '') ? '⌘' : 'Ctrl'}+Alt+Space
-                        </kbd>
-                    </button>
-                    {/* Tooltip — appears on hover, explains the safety
-                        framing the user asked for. pointer-events-none so
-                        the tooltip itself doesn't intercept the mouse. z-60
-                        sits above the sticky header (z-20) but below modals
-                        (z-99999). */}
-                    <div className="absolute top-full left-0 mt-2 w-80 p-3.5 rounded-xl bg-zinc-900/95 backdrop-blur-md shadow-2xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 z-[60] pointer-events-none" style={{ boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.06), 0 24px 60px -20px rgba(0,0,0,0.85)' }}>
-                        <div className="flex items-center gap-2 mb-2">
-                            <ShieldCheck size={14} className="text-emerald-400" />
-                            <div className="text-xs font-bold text-white">Quick hide for screen-share safety</div>
-                        </div>
-                        <p className="text-[12px] text-white/70 leading-relaxed">
-                            Click here (or press <kbd className="inline-block px-1 py-0.5 rounded bg-white/10 font-mono text-[10px] text-white align-baseline">{/(Mac|iPhone|iPad)/i.test(typeof navigator !== 'undefined' ? navigator.platform : '') ? '⌘' : 'Ctrl'}+Alt+Space</kbd>) to instantly hide Interview Copilot from your interviewer's view during screen share.
-                        </p>
-                        <p className="text-[12px] text-white/70 leading-relaxed mt-2">
-                            Press the same shortcut to bring it back any time.
-                        </p>
-                    </div>
-                </div>
                 </div>
 
                 <div className="flex items-center gap-2 md:gap-3">
@@ -1510,13 +1631,52 @@ const ChatInterface = ({
                         aria-label={creditTimer.source === 'trial' ? 'Free trial time remaining' : 'Basic plan time remaining'}
                       >
                         {creditTimer.source === 'trial' ? 'TRIAL' : ''} {formatTimeRemaining(creditTimer.remaining)}
+                        {/* Used-vs-granted tube — renders only when the plan
+                            grant is known (fail-soft: unknown/unlimited keeps
+                            the chip exactly as before). */}
+                        <TimeTubeGauge granted={creditTimer.granted} remaining={creditTimer.remaining} width={36} />
                       </div>
                     )}
-                    <div className={`hidden md:flex px-3 py-1 rounded-full text-xs font-medium items-center gap-2 transition-all duration-300 ${isListening ? 'bg-red-500/15 text-red-500' : 'bg-white/[0.04] text-gray-400'}`}>
-                        <div className={`w-2 h-2 rounded-full ${isListening ? 'bg-red-500 animate-pulse' : 'bg-gray-500'}`}></div>
+                    <div className={`hidden md:flex px-3 py-1 rounded-full text-xs font-medium items-center gap-2 transition-all duration-300 ${isListening ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/[0.04] text-gray-400'}`}>
+                        <div className={`w-2 h-2 rounded-full ${isListening ? 'bg-emerald-400 animate-pulse' : 'bg-gray-500'}`}></div>
                         {isListening ? 'LIVE' : 'OFF'}
                     </div>
                     
+                    {/* Hide — Electron: close-window IPC (smoothHide + hotkey).
+                        Web: dead control — upsell desktop download instead. */}
+                    {isElectron ? (
+                      <button
+                          onClick={() => electronIPC.send('close-window')}
+                          className="p-2 rounded-lg text-gray-400 hover:text-[#d3ac63] hover:bg-white/[0.06] transition-all"
+                          title={`Hide from screen share (${/(Mac|iPhone|iPad)/i.test(typeof navigator !== 'undefined' ? navigator.platform : '') ? '⌘' : 'Ctrl'}+Alt+Space to bring back)`}
+                          aria-label="Hide app (screen-share safety)"
+                      >
+                          <EyeOff size={20} />
+                      </button>
+                    ) : (
+                      <button
+                          onClick={() => onOpenDownload?.()}
+                          className="p-2 rounded-lg text-gray-500 hover:text-amber-300 hover:bg-white/[0.06] transition-all"
+                          title="Desktop only — invisible hide + global hotkey. Download the desktop app."
+                          aria-label="Hide from screen share — Desktop only. Download the desktop app."
+                      >
+                          <EyeOff size={20} />
+                      </button>
+                    )}
+
+                    {/* Web: prominent download CTA for desktop-only powers */}
+                    {!isElectron && onOpenDownload && (
+                      <button
+                          onClick={onOpenDownload}
+                          className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] md:text-xs font-bold bg-blue-500/15 text-blue-300 hover:bg-blue-500/25 border border-blue-500/20 transition-all"
+                          title="Download desktop app — invisible popout, Auto-Type, system audio"
+                          aria-label="Download desktop app"
+                      >
+                          <Download size={14} />
+                          Download desktop app
+                      </button>
+                    )}
+
                     {!isPipMode && (
                         <button
                             onClick={togglePip}
@@ -1525,7 +1685,7 @@ const ChatInterface = ({
                                 ? 'text-[#d3ac63] hover:bg-white/[0.06]'
                                 : 'text-gray-500 cursor-not-allowed opacity-60'
                             }`}
-                            aria-label={gate.canPopout ? "Pop Out (Hide from Screen Share)" : "Pop-out Mode — Pro only"}
+                            aria-label={gate.canPopout ? "Pop Out (Hide from Screen Share)" : "Pop-out Mode — available on every paid plan"}
                         >
                             <ExternalLink size={20} />
                             {!gate.canPopout && <Crown size={8} className="absolute top-1 right-1 text-amber-400" />}
@@ -1552,28 +1712,44 @@ const ChatInterface = ({
                     onScroll={handleScroll}
                     className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 md:space-y-6 pb-40 md:pb-48 custom-scrollbar"
                 >
-                    {messages.length === 0 && (
-                        <div className="flex flex-col items-center justify-center h-[60%] space-y-6 mt-10">
-                            {/* The identity medallion (BrandMark) replaces the old
-                                ScreenShare-icon-in-a-circle. Idle = polished gold at
-                                rest; listening = sound arcs arrive + the coin breathes;
-                                thinking = comets race the bezel; answering = arcs emit.
-                                The LIVE red pill in the header still carries the
-                                explicit capture-state signal. */}
-                            <div className="relative">
-                                <BrandMark size={104} state={brandState} />
-                                {settings.autoSend && <div className="absolute top-2 right-2 w-3.5 h-3.5 rounded-full" style={{ background: '#d3ac63', boxShadow: '0 0 10px rgba(211,172,99,0.6)' }}></div>}
-                            </div>
-                            <div className="text-center px-6">
-                                <p className="mb-2 text-xl" style={{ fontFamily: 'var(--serif)', fontWeight: 500, letterSpacing: '-0.02em', color: 'var(--text-color)' }}>System Audio Copilot</p>
-                                <p className="text-sm leading-relaxed max-w-xs mx-auto text-gray-500">
-                                    Click the Mic button to share your screen tab.<br/>
-                                    <strong style={{ color: 'rgba(211,172,99,0.78)' }}>Remember to check "Share tab audio"</strong>.
-                                </p>
-                            </div>
+                    {/* Watermark — setup hint while chat is empty. Web adds a
+                        sample-question control so users can try streaming without
+                        a live interviewer. */}
+                    {messages.length === 0 && !isListening && (
+                        <div className="h-[60%] mt-10 flex flex-col items-center justify-center gap-4 animate-in fade-in duration-1000">
+                            <p className="text-center text-lg md:text-xl px-8 leading-relaxed select-none pointer-events-none" style={{ fontFamily: 'var(--serif)', letterSpacing: '0.01em', color: 'var(--text-color)', opacity: 0.22 }}>
+                                {!isElectron
+                                  ? <>Share the meeting tab's audio, or play a sample question below</>
+                                  : <>Turn on the mic and set <span style={{ color: '#d3ac63' }}>Manual → Auto</span> for the best experience</>
+                                }
+                            </p>
+                            {!isElectron && handlePlaySampleQuestion && (
+                                <button
+                                    type="button"
+                                    onClick={handlePlaySampleQuestion}
+                                    disabled={isProcessing}
+                                    className="pointer-events-auto flex items-center gap-2.5 pl-1.5 pr-4 py-1.5 rounded-full text-sm font-bold bg-gradient-to-r from-blue-500/20 to-purple-500/20 text-blue-200 border border-blue-500/30 hover:from-blue-500/30 hover:to-purple-500/30 transition-all disabled:opacity-50"
+                                    aria-label="Play a sample question"
+                                >
+                                    {/* Premium black play disc — solid circle + crisp triangle, not a unicode glyph */}
+                                    <span
+                                        className="relative inline-flex items-center justify-center w-8 h-8 rounded-full shrink-0 shadow-[0_2px_8px_rgba(0,0,0,0.45)] ring-1 ring-white/10"
+                                        style={{ background: 'linear-gradient(160deg, #2a2a2e 0%, #0a0a0c 55%, #000 100%)' }}
+                                        aria-hidden
+                                    >
+                                        {isProcessing ? (
+                                            <Loader2 size={14} className="text-white/90 animate-spin" strokeWidth={2.25} />
+                                        ) : (
+                                            <svg width="11" height="12" viewBox="0 0 11 12" fill="none" className="ml-0.5">
+                                                <path d="M1.2 0.85C1.2 0.28 1.82 -0.07 2.3 0.22l8.1 4.85c.46.28.46.94 0 1.21l-8.1 4.85c-.48.29-1.1-.06-1.1-.63V0.85z" fill="white" fillOpacity="0.95" />
+                                            </svg>
+                                        )}
+                                    </span>
+                                    Play a sample question
+                                </button>
+                            )}
                         </div>
                     )}
-                    
                     {messages.map((msg: Message) => (
                     <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end animate-in slide-in-from-bottom-2 duration-300' : 'justify-start'}`}>
                         <div className={`max-w-[95%] md:max-w-[85%] rounded-2xl p-3 md:p-5 shadow-lg ${
@@ -1674,13 +1850,19 @@ const ChatInterface = ({
                                         onClick={isListening ? stopListening : startListening}
                                         className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] md:text-xs font-bold transition-all ${
                                             isListening
-                                            ? 'bg-red-500/20 text-red-500'
+                                            ? 'bg-emerald-500/20 text-emerald-400'
                                             : 'bg-white/[0.04] text-gray-400 hover:bg-white/[0.07]'
                                         }`}
+                                        title={!isElectron ? "Share the meeting tab's audio — we never capture your mic" : undefined}
                                     >
                                         {isListening ? <Mic size={12} /> : <MicOff size={12} />}
                                         {isListening ? 'ON' : 'OFF'}
                                     </button>
+                                    {!isElectron && (
+                                        <span className="text-[9px] md:text-[10px] text-gray-500 max-w-[140px] md:max-w-[220px] leading-tight" title="Privacy">
+                                            We only transcribe the interviewer's questions — never your voice.
+                                        </span>
+                                    )}
 
                                     {/* --- QUICK MODEL SWITCHER ---
                                         Custom popover instead of native <select>.
@@ -1795,7 +1977,7 @@ const ChatInterface = ({
                                     <button
                                         onClick={handleAutoSolve}
                                         disabled={isProcessing || !gate.canAutoSolve}
-                                        aria-label={gate.canAutoSolve ? "Auto-Solve Screen" : "Auto-Solve — Pro only"}
+                                        aria-label={gate.canAutoSolve ? "Auto-Solve Screen" : "Auto-Solve — available on every paid plan"}
                                         className="btn-ios-violet relative w-10 h-10 rounded-full flex items-center justify-center text-white"
                                     >
                                         <ScanSearch size={18} strokeWidth={2} />
@@ -1828,8 +2010,21 @@ const ChatInterface = ({
 };
 
 // PiP Window Logic
+// Module-scope singleton for the Document-PiP setup. React 18 StrictMode
+// double-mounts effects in dev (mount → unmount → remount), so two
+// concurrent initPip runs both called requestWindow: the first succeeded
+// and consumed the user activation, the second threw NotAllowedError and
+// its catch onClose()'d the feature — leaving an orphaned empty PiP window
+// while the main tab snapped back out of "Safe to Share". Both effect runs
+// must share ONE requestWindow call.
+let pipSetupPromise: Promise<{ pipWindow: Window; div: HTMLDivElement }> | null = null;
+
 const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = ({ children, onClose }) => {
     const [container, setContainer] = useState<HTMLElement | null>(null);
+    // Set only once this instance has adopted the PiP window — distinguishes
+    // a real unmount (must close the OS window) from StrictMode's synchronous
+    // fake unmount (fires before the async setup resolves; must NOT close).
+    const adoptedWindowRef = useRef<Window | null>(null);
 
     useEffect(() => {
         if (!window.documentPictureInPicture) {
@@ -1842,15 +2037,23 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
             return;
         }
 
-        async function initPip() {
-            try {
+        let disposed = false;
+
+        async function initPip(): Promise<{ pipWindow: Window; div: HTMLDivElement }> {
                 // Request a vertical phone-like window
                 const pipWindow = await window.documentPictureInPicture.requestWindow({
                     width: 450,
                     height: 700,
                 });
 
-                // Copy styles from main document to PiP
+                // Copy EVERY stylesheet from the main document into the PiP
+                // window — this includes pip-styles.css (imported in App.tsx),
+                // index.css, and the Tailwind utility layer. Copying them all
+                // is what lets the pop-out render with the exact same obsidian+
+                // gold glass theme as the Electron pop-out: the ChatInterface
+                // markup uses .popup/.messages/.bubble/.input-area, and the
+                // `html.electron-transparent …` rules in pip-styles.css style
+                // them — we activate those rules by adding the class below.
                 [...document.styleSheets].forEach((styleSheet) => {
                     try {
                         const cssRules = [...styleSheet.cssRules]
@@ -1860,57 +2063,50 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
                         style.textContent = cssRules;
                         pipWindow.document.head.appendChild(style);
                     } catch (e) {
+                    // Cross-origin sheet (e.g. Google Fonts): .cssRules throws,
+                    // so re-attach it as a <link> instead of inlining.
                     const link = document.createElement("link");
                     link.rel = "stylesheet";
                     link.type = styleSheet.type;
                     link.media = styleSheet.media.mediaText;
-                    link.href = styleSheet.href;
+                    if (styleSheet.href) link.href = styleSheet.href;
                     pipWindow.document.head.appendChild(link);
                     }
                 });
-                
-                // Add Tailwind CDN directly to be sure
-                const twScript = pipWindow.document.createElement('script');
-                twScript.src = "https://cdn.tailwindcss.com";
-                twScript.onload = () => {
-                     // Re-inject config
-                     const configScript = pipWindow.document.createElement('script');
-                     configScript.innerHTML = `
-                      tailwind.config = {
-                        darkMode: 'class',
-                        theme: {
-                          extend: {
-                            colors: {
-                              background: 'var(--bg-color)',
-                              surface: 'var(--surface-color)',
-                              border: 'var(--border-color)',
-                              text: 'var(--text-color)',
-                              primary: '#d3ac63',
-                              accent: '#f59e0b',
-                            },
-                          },
-                        },
-                      }
-                   `;
-                   pipWindow.document.head.appendChild(configScript);
-                };
-                pipWindow.document.head.appendChild(twScript);
 
-                // Inject CSS Vars + Cursor overrides for screen share
-                 const style = pipWindow.document.createElement('style');
-                style.textContent = `
-                 :root { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
-                 .dark { --bg-color: #000000; --surface-color: rgba(25, 25, 25, 0.5); --border-color: rgba(255, 255, 255, 0.1); --text-color: #ffffff; }
-                 body { background-color: var(--bg-color); color: var(--text-color); }
-                 .pip-body { background: #000000; cursor: default !important; }
-                 /* Force default cursor everywhere in popout - looks natural on screen share */
-                 .pip-body *, .pip-body *::before, .pip-body *::after { cursor: default !important; }
-                 /* Text cursor only for actual inputs */
-                 .pip-body textarea, .pip-body input[type="text"], .pip-body input[type="email"], .pip-body input[type="password"] { cursor: text !important; }
-                 /* Code blocks and message bubbles - default cursor, text still selectable */
-                 .pip-body code, .pip-body pre, .pip-body .bubble { cursor: default !important; user-select: text; }
-                `;
-                pipWindow.document.head.appendChild(style);
+                // ── Activate the exact Electron pop-out theme ──
+                // pip-styles.css keys its obsidian+gold glass on
+                // `html.electron-transparent` (dark) / `:not(.dark)` (light).
+                // Adding these classes to the PiP <html> makes the copied
+                // rules apply, so the web pop-out looks identical to the
+                // Electron transparent pop-out. We mirror the parent's dark/
+                // light choice so the pop-out follows Settings → Theme.
+                const parentIsDark = document.documentElement.classList.contains('dark');
+                pipWindow.document.documentElement.classList.add('electron-transparent');
+                if (parentIsDark) {
+                    pipWindow.document.documentElement.classList.add('dark');
+                } else {
+                    pipWindow.document.documentElement.classList.remove('dark');
+                }
+
+                // The one intentional divergence from Electron: an Electron
+                // pop-out is an OS-transparent window floating over the live
+                // desktop, so its glass plates sit on whatever is behind it. A
+                // browser Document-PiP window is NOT OS-transparent — it needs
+                // its own opaque base, or the translucent gold/obsidian plates
+                // would render against the browser's default white and look
+                // wrong. So we paint the PiP root the app's deep obsidian; the
+                // gold glass then reads exactly as it does in Electron, just on
+                // its own dark surface instead of the desktop wallpaper.
+                const baseStyle = pipWindow.document.createElement('style');
+                baseStyle.textContent = parentIsDark
+                    ? `html, body { background: #0a0a0b !important; }
+                       html.electron-transparent, html.electron-transparent body,
+                       html.electron-transparent .pip-body { background: #0a0a0b !important; }`
+                    : `html, body { background: #f4f1ea !important; }
+                       html.electron-transparent, html.electron-transparent body,
+                       html.electron-transparent .pip-body { background: #f4f1ea !important; }`;
+                pipWindow.document.head.appendChild(baseStyle);
 
                 pipWindow.document.body.className = 'pip-body';
 
@@ -1918,22 +2114,47 @@ const PiPWindow: React.FC<{ children: React.ReactNode; onClose: () => void }> = 
                 div.style.height = '100%';
                 div.style.display = 'flex';
                 div.style.flexDirection = 'column';
-                // Force dark mode if main app is dark, else light
-                if (document.documentElement.classList.contains('dark')) {
-                    div.classList.add('dark');
-                }
+                if (parentIsDark) div.classList.add('dark');
                 pipWindow.document.body.appendChild(div);
-                setContainer(div);
+                return { pipWindow, div };
+        }
 
-                pipWindow.addEventListener("pagehide", () => {
+        // First mount (or reopen after close) starts the setup; StrictMode's
+        // remount reuses the same in-flight promise instead of issuing a
+        // second requestWindow.
+        if (!pipSetupPromise) {
+            pipSetupPromise = initPip();
+            pipSetupPromise.catch(() => { pipSetupPromise = null; });
+        }
+
+        pipSetupPromise
+            .then(({ pipWindow, div }) => {
+                if (disposed) return; // StrictMode throwaway instance — the live remount adopts instead
+                adoptedWindowRef.current = pipWindow;
+                pipWindow.addEventListener('pagehide', () => {
+                    pipSetupPromise = null;
                     onClose();
                 });
-            } catch (err) {
-                console.error("PiP Error:", err);
+                setContainer(div);
+            })
+            .catch((err) => {
+                if (disposed) return;
+                console.error('PiP Error:', err);
                 onClose();
+            });
+
+        return () => {
+            disposed = true;
+            // Real unmount (e.g. "Restore here" flips isPipMode off): close the
+            // OS PiP window too, or it lingers as an orphaned empty window.
+            // StrictMode's fake unmount runs before the async setup resolves,
+            // so adoptedWindowRef is still null there and this no-ops.
+            if (adoptedWindowRef.current) {
+                pipSetupPromise = null;
+                try { adoptedWindowRef.current.close(); } catch { /* already closed */ }
+                adoptedWindowRef.current = null;
             }
-        }
-        initPip();
+        };
     }, []);
 
     if (!container) return null;
@@ -1950,13 +2171,23 @@ import { FEATURE_GATES } from './services/licenseService';
 // separately for billing/upgrade UI that should ignore the trial boost.
 function useFeatureGate(license: LicenseData | null) {
   const tier = licenseService.getEffectiveTier(license);
-  const actualTier = (license?.tier ?? 'free') as 'free' | 'basic' | 'pro' | 'max';
+  const actualTier = (license?.tier ?? 'free') as 'free' | 'basic' | 'pro' | 'max' | 'ultra';
   const gates = FEATURE_GATES[tier];
   const onTrial = licenseService.isTrialActive(license);
+  // Plan state for MESSAGING (licenseService.getPlanState):
+  //   timeExhausted — plan valid, live balance 0. Paid tiers KEEP every
+  //                   feature (models, Pop-out); only live use is blocked,
+  //                   with a "top up" prompt — never "upgrade".
+  //   planLapsed    — calendar expiry / cancel / refund / revoke. Features
+  //                   revert to Free (tier above resolves 'free'); prompts
+  //                   say "renew", never mislabeling a paying customer.
+  const planState = licenseService.getPlanState(license);
 
   return {
     tier,
     actualTier,
+    planLapsed: planState === 'lapsed',
+    timeExhausted: planState === 'time_exhausted',
     isMax: tier === 'max',
     isPro: tier === 'pro',
     isBasic: tier === 'basic',
@@ -2067,6 +2298,57 @@ const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
 
 const MODEL_ORDER: ModelKey[] = ['gemini', 'groq', 'openai', 'xai', 'claude'];
 
+// ── Provider-outage detection + model fallback ──
+// When a model's UPSTREAM provider is having a problem (Google/OpenAI/xAI/Groq
+// returning 403 "denied access", 5xx, or a rate-limit) the user shouldn't see a
+// raw JSON error mid-interview. Instead we detect an outage, switch to another
+// model the user is allowed to use, and silently retry the same question.
+//
+// This is deliberately NARROW: it must NOT swallow paywall/tier/auth problems
+// (those need the existing upgrade/paywall UX, not a model swap) or user aborts.
+// It only fires for transient upstream provider failures.
+function looksLikeProviderOutage(rawMessage: string | undefined): boolean {
+  if (!rawMessage) return false;
+  const m = rawMessage.toLowerCase();
+  // Never treat these as outages — they have their own handled paths.
+  if (m.includes('tier_required') || m.includes('requires') ||
+      m.includes('upgrade') || m.includes('trial') ||
+      m.includes('used up') || m.includes('paywall') ||
+      m.includes('no active license') || m.includes('not active') ||
+      m.includes('expired') || m.includes('time is used')) {
+    return false;
+  }
+  return (
+    // Google Gemini "project denied access" (the exact error seen in prod).
+    m.includes('denied access') ||
+    m.includes('permission_denied') ||
+    // Generic upstream signatures the proxy surfaces.
+    m.includes('service error') ||
+    m.includes('server error') ||
+    m.includes('rate limit') || m.includes('rate-limit') || m.includes('rate limited') ||
+    m.includes('overloaded') ||
+    m.includes('unavailable') ||
+    m.includes('forbidden') ||
+    m.includes('request too large') ||
+    m.includes('service problem') ||
+    m.includes('quota')
+  );
+}
+
+// Pick the best alternative model to fall back to after `failed` errored.
+// Preference order favors the most reliable general-purpose models first, and
+// is filtered to what THIS user is allowed to use (trial/Basic get the four
+// non-Claude models; Pro+ can also land on Claude). Returns null if there's no
+// other usable model (caller then shows the plain error).
+const FALLBACK_PREFERENCE: ModelKey[] = ['openai', 'xai', 'gemini', 'groq', 'claude'];
+function pickFallbackModel(failed: string, allowedModels: string[]): ModelKey | null {
+  for (const cand of FALLBACK_PREFERENCE) {
+    if (cand === failed) continue;
+    if (allowedModels.includes(cand)) return cand;
+  }
+  return null;
+}
+
 // Lock-badge text shown on a model the current user cannot access. We
 // collapse Basic/Pro into a single "PRO" prompt because Pro is the
 // headline upgrade — Basic is the cheap credit-pack and rarely the path
@@ -2075,6 +2357,346 @@ function lockBadgeFor(modelTier: ModelMeta['tier']): 'PRO' | 'MAX' | null {
   if (modelTier === 'max') return 'MAX';
   if (modelTier === 'basic' || modelTier === 'pro') return 'PRO';
   return null;
+}
+
+// ── UsagePanel (Settings → Usage tab) ──
+// Consumption TUBE: empty at 0% used, fills left→right with exact used time
+// as a % of the plan grant. Math:
+//   granted  = summary.granted_seconds  (server: plan window / FREE_TRIAL)
+//   remaining = live clock when available, else summary.remaining_seconds
+//   used     = clamp(granted - remaining, 0, granted)
+//   usedPct  = used / granted * 100
+// Same ledger as the interview clock (GET /usage/summary + creditTimerService).
+
+function formatUsageDuration(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  if (s === 0) return '0s';
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return rs > 0 ? `${m}m ${rs}s` : `${m} min`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm > 0 ? `${h}h ${rm}m` : `${h}h`;
+}
+
+function formatUsageExpire(ts?: number): string | null {
+  if (!ts || !Number.isFinite(ts) || ts <= 0) return null;
+  try {
+    return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  } catch {
+    return null;
+  }
+}
+
+function UsagePanel({ tier, onRenew }: { tier: string; onRenew: () => void }) {
+  const [summary, setSummary] = useState<UsageSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  // Live remaining from creditTimerService / cached license. Always seeded on
+  // mount (works even when the session clock is idle).
+  const [liveRemaining, setLiveRemaining] = useState<number | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      fetchUsageSummary().then(s => { if (alive) { setSummary(s); setLoading(false); } });
+    };
+    setLoading(true);
+    load();
+    // Re-fetch periodically so a mid-tab renewal/top-up updates the grant.
+    const poll = window.setInterval(load, 20_000);
+
+    const readClock = () => {
+      const v = creditTimerService.getRemainingSeconds();
+      // Infinity (unlimited) must not drive the tube.
+      if (Number.isFinite(v) && v >= 0) setLiveRemaining(v);
+      else if (v === Infinity) setLiveRemaining(null);
+    };
+    readClock();
+    const offs = [
+      creditTimerService.on('tick', readClock),
+      creditTimerService.on('started', (p: any) => {
+        readClock();
+        // Fresh grant/remaining after a new session opens.
+        if (typeof p?.remainingSeconds === 'number' && Number.isFinite(p.remainingSeconds)) {
+          setLiveRemaining(Math.max(0, p.remainingSeconds));
+        }
+        load();
+      }),
+      creditTimerService.on('stopped', () => { readClock(); load(); }),
+      creditTimerService.on('exhausted', () => { setLiveRemaining(0); load(); }),
+    ];
+    return () => {
+      alive = false;
+      window.clearInterval(poll);
+      offs.forEach(off => off());
+    };
+  }, []);
+
+  const pillTier = (summary?.tier || tier || 'free').toUpperCase();
+  const unlimited = !!summary?.unlimited;
+
+  // ── Exact consumption math (metered only) ──
+  const granted = !summary || unlimited ? 0 : Math.max(0, summary.granted_seconds ?? 0);
+  const remainingRaw = !summary || unlimited
+    ? 0
+    : (liveRemaining !== null ? liveRemaining : (summary.remaining_seconds ?? 0));
+  const remaining = Math.max(0, Math.min(granted > 0 ? granted : remainingRaw, remainingRaw));
+  // used fills the tube: empty when unused, full at 100% of plan.
+  const used = granted > 0
+    ? Math.max(0, Math.min(granted, granted - remaining))
+    : Math.max(0, summary?.used_seconds ?? 0);
+  const usedPct = granted > 0
+    ? Math.min(100, Math.round((used / granted) * 1000) / 10)
+    : 0;
+  // Prefer server percent only when idle and no live override yet (same math).
+  const displayPct = liveRemaining === null && typeof summary?.used_percent === 'number'
+    ? summary.used_percent
+    : usedPct;
+
+  const high = displayPct >= 92;
+  const mid = displayPct >= 75 && !high;
+  const expireLabel = formatUsageExpire(summary?.credits_expire_at);
+  const windowLabel = summary?.source === 'trial'
+    ? 'Free trial window'
+    : summary?.source === 'credits'
+      ? 'Current plan window'
+      : 'Plan window';
+
+  const liquid = high
+    ? 'linear-gradient(90deg, #f87171 0%, #ef4444 55%, #dc2626 100%)'
+    : mid
+      ? 'linear-gradient(90deg, #fbbf24 0%, #d3ac63 60%, #b58f45 100%)'
+      : 'linear-gradient(90deg, #f6e4b0 0%, #d3ac63 50%, #b58f45 100%)';
+
+  return (
+    <div className="space-y-4">
+      <div
+        className="rounded-[16px] overflow-hidden border border-black/[0.06] dark:border-white/[0.08]"
+        style={{ background: 'var(--surface-color, rgba(255,255,255,0.04))' }}
+      >
+        <div className="px-4 pt-4 pb-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <div
+              className="w-8 h-8 rounded-[9px] flex items-center justify-center shrink-0"
+              style={{
+                background: 'linear-gradient(160deg, #f6e4b0 0%, #d3ac63 50%, #b58f45 100%)',
+                boxShadow: '0 1px 0 rgba(255,255,255,0.35) inset, 0 4px 12px rgba(211,172,99,0.22)',
+              }}
+            >
+              <Gauge size={15} className="text-[#241b08]" strokeWidth={2.25} />
+            </div>
+            <div className="min-w-0">
+              <div className="text-[15px] font-semibold text-text tracking-tight">Interview time</div>
+              <div className="text-[11px] text-gray-500 dark:text-gray-400 truncate">{windowLabel}</div>
+            </div>
+          </div>
+          <span className="shrink-0 text-[10px] font-semibold tracking-[0.1em] uppercase text-gray-500 dark:text-gray-300 bg-black/[0.05] dark:bg-white/[0.06] px-2.5 py-1 rounded-full border border-black/[0.06] dark:border-white/10">
+            {pillTier === 'ADMIN' ? 'ADMIN' : pillTier}
+          </span>
+        </div>
+
+        <div className="px-4 pb-5">
+          {loading ? (
+            <div className="space-y-4 animate-pulse py-2" aria-hidden="true">
+              <div className="flex flex-col items-center gap-2 py-3">
+                <div className="h-10 w-28 rounded-xl bg-black/10 dark:bg-white/10" />
+                <div className="h-3 w-20 rounded bg-black/[0.06] dark:bg-white/[0.06]" />
+              </div>
+              <div className="h-5 w-full rounded-full bg-black/10 dark:bg-white/10" />
+            </div>
+          ) : !summary ? (
+            <p className="text-center text-[13px] text-gray-500 py-8">
+              Usage is unavailable right now.
+            </p>
+          ) : unlimited ? (
+            <div className="pt-1 space-y-4">
+              <div className="text-center py-2">
+                <div className="text-[34px] font-semibold tracking-tight text-text leading-none" style={{ fontVariantNumeric: 'tabular-nums' }}>
+                  Unlimited
+                </div>
+                <div className="text-[13px] text-gray-500 dark:text-gray-400 mt-1.5">No time cap on this plan</div>
+              </div>
+              <div
+                className="relative h-5 rounded-full overflow-hidden"
+                style={{
+                  background: 'linear-gradient(90deg, #f6e4b0 0%, #d3ac63 50%, #b58f45 100%)',
+                  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.4), inset 0 -1px 2px rgba(0,0,0,0.15)',
+                }}
+              >
+                <div className="absolute inset-x-0 top-0 h-[45%] rounded-full bg-gradient-to-b from-white/50 to-transparent pointer-events-none" />
+              </div>
+            </div>
+          ) : (
+            <div className="pt-1 space-y-4">
+              {/* Hero = USED (what fills the tube) */}
+              <div className="text-center py-1">
+                <div
+                  className={`text-[40px] font-semibold tracking-tight leading-none ${
+                    high ? 'text-red-400' : mid ? 'text-amber-400' : 'text-text'
+                  }`}
+                  style={{ fontVariantNumeric: 'tabular-nums', letterSpacing: '-0.02em' }}
+                >
+                  {formatUsageDuration(used)}
+                </div>
+                <div className="text-[13px] text-gray-500 dark:text-gray-400 mt-1.5 font-medium">
+                  used of {formatUsageDuration(granted)}
+                </div>
+                <div
+                  className={`mt-1 text-[12px] font-semibold tabular-nums ${
+                    high ? 'text-red-400/90' : mid ? 'text-amber-400/90' : 'text-[#d3ac63]'
+                  }`}
+                >
+                  {displayPct % 1 === 0 ? `${displayPct}%` : `${displayPct.toFixed(1)}%`} of plan
+                </div>
+              </div>
+
+              {/* ── Consumption TUBE ──
+                  Hollow track when unused; liquid fills left→right with used %. */}
+              <div className="space-y-2">
+                <div
+                  className="relative h-5 rounded-full overflow-hidden"
+                  role="progressbar"
+                  aria-valuenow={displayPct}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`${displayPct} percent of plan used`}
+                  style={{
+                    // Empty glass tube
+                    background:
+                      'linear-gradient(180deg, rgba(0,0,0,0.22) 0%, rgba(120,120,128,0.14) 40%, rgba(120,120,128,0.20) 100%)',
+                    boxShadow:
+                      'inset 0 2px 4px rgba(0,0,0,0.35), inset 0 -1px 0 rgba(255,255,255,0.06), 0 0 0 1px rgba(255,255,255,0.06)',
+                  }}
+                >
+                  {/* Inner bore highlight (empty tube lip) */}
+                  <div
+                    className="absolute inset-[2px] rounded-full pointer-events-none"
+                    style={{
+                      boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.08)',
+                      background: displayPct <= 0
+                        ? 'linear-gradient(180deg, rgba(255,255,255,0.04), transparent 50%)'
+                        : 'transparent',
+                    }}
+                  />
+
+                  {/* Liquid fill — exact used % */}
+                  <div
+                    className="absolute inset-y-[2px] left-[2px] rounded-full transition-[width] duration-500 ease-out"
+                    style={{
+                      width: displayPct <= 0 ? 0 : `calc(${displayPct}% - 4px)`,
+                      maxWidth: 'calc(100% - 4px)',
+                      background: liquid,
+                      boxShadow:
+                        displayPct > 0
+                          ? 'inset 0 1px 0 rgba(255,255,255,0.45), 0 0 8px rgba(211,172,99,0.25)'
+                          : undefined,
+                    }}
+                  >
+                    {/* Surface gloss */}
+                    <div className="absolute inset-x-0 top-0 h-[48%] rounded-full bg-gradient-to-b from-white/55 to-transparent pointer-events-none" />
+                    {/* Meniscus at the fill edge */}
+                    {displayPct > 2 && displayPct < 99.5 && (
+                      <div
+                        className="absolute right-0 top-0 bottom-0 w-2.5 rounded-r-full pointer-events-none"
+                        style={{
+                          background: 'linear-gradient(90deg, transparent, rgba(255,255,255,0.28))',
+                        }}
+                      />
+                    )}
+                  </div>
+
+                  {/* Centered % chip on the tube when there's room */}
+                  {displayPct >= 18 && (
+                    <div
+                      className="absolute inset-0 flex items-center justify-center pointer-events-none"
+                      style={{ fontSize: 10, fontWeight: 700, color: 'rgba(36,27,8,0.85)', letterSpacing: '0.02em' }}
+                    >
+                      {displayPct % 1 === 0 ? `${displayPct}%` : `${displayPct.toFixed(1)}%`}
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-between text-[11px] tabular-nums text-gray-500">
+                  <span>{displayPct <= 0 ? 'Empty · nothing used yet' : `${formatUsageDuration(used)} used`}</span>
+                  <span>{formatUsageDuration(remaining)} left</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {!loading && summary && (
+        <div
+          className="rounded-[16px] overflow-hidden border border-black/[0.06] dark:border-white/[0.08] divide-y divide-black/[0.06] dark:divide-white/[0.08]"
+          style={{ background: 'var(--surface-color, rgba(255,255,255,0.04))' }}
+        >
+          {!unlimited && (
+            <>
+              <div className="flex items-center justify-between px-4 py-3.5">
+                <span className="text-[15px] text-text">Plan grant</span>
+                <span className="text-[15px] text-gray-500 tabular-nums">{formatUsageDuration(granted)}</span>
+              </div>
+              <div className="flex items-center justify-between px-4 py-3.5">
+                <span className="text-[15px] text-text">Used</span>
+                <span className="text-[15px] text-gray-500 tabular-nums">
+                  {formatUsageDuration(used)}
+                  <span className="text-gray-600 ml-1.5">
+                    ({displayPct % 1 === 0 ? `${displayPct}%` : `${displayPct.toFixed(1)}%`})
+                  </span>
+                </span>
+              </div>
+              <div className="flex items-center justify-between px-4 py-3.5">
+                <span className="text-[15px] text-text">Remaining</span>
+                <span className="text-[15px] text-gray-500 tabular-nums">{formatUsageDuration(remaining)}</span>
+              </div>
+            </>
+          )}
+          <div className="flex items-center justify-between px-4 py-3.5">
+            <span className="text-[15px] text-text">Interviews</span>
+            <span className="text-[15px] text-gray-500 tabular-nums">{summary.session_count}</span>
+          </div>
+          <div className="flex items-center justify-between px-4 py-3.5">
+            <span className="text-[15px] text-text">All-time use</span>
+            <span className="text-[15px] text-gray-500 tabular-nums">
+              {formatUsageDuration(summary.lifetime_used_seconds)}
+            </span>
+          </div>
+          {expireLabel && !unlimited && (
+            <div className="flex items-center justify-between px-4 py-3.5">
+              <span className="text-[15px] text-text">Credits expire</span>
+              <span className="text-[15px] text-gray-500 tabular-nums">{expireLabel}</span>
+            </div>
+          )}
+          {summary.source === 'trial' && !unlimited && (
+            <div className="flex items-center justify-between px-4 py-3.5">
+              <span className="text-[15px] text-text">Window</span>
+              <span className="text-[15px] text-gray-500">10-min free trial</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {!loading && summary && !unlimited && (
+        <button
+          type="button"
+          onClick={onRenew}
+          className="w-full py-3.5 rounded-[14px] text-[15px] font-semibold text-[#241b08] transition-transform active:scale-[0.98]"
+          style={{
+            background: 'linear-gradient(180deg, #f0d78a 0%, #d3ac63 48%, #b8963f 100%)',
+            boxShadow: '0 1px 0 rgba(255,255,255,0.35) inset, 0 6px 16px rgba(211,172,99,0.28)',
+          }}
+        >
+          {summary.source === 'trial' ? 'Get more time' : 'Renew to add time'}
+        </button>
+      )}
+
+      <p className="text-center text-[11px] text-gray-500 px-2 leading-relaxed">
+        Tube fills only when interview time is charged (listening or generating).
+      </p>
+    </div>
+  );
 }
 
 // ── ModelPickerCard ──
@@ -2179,7 +2801,7 @@ function ModelPickerCard({
       <span className="mp-card-right">
         {selected ? (
           <span className={`mp-card-active${isMax ? ' mp-card-active-max' : ''}`}>
-            <Check size={11} strokeWidth={3} /> Active
+            <span className="mp-live-dot" aria-hidden="true" /> Active
           </span>
         ) : !allowed ? (
           <span className={`mp-card-lock${isMax ? ' mp-card-lock-max' : ''}`}>
@@ -2203,6 +2825,57 @@ function formatTimeRemaining(seconds: number): string {
   return `${ss}s`;
 }
 
+// ── TimeTubeGauge ──
+// Miniature of the Settings Usage card's iOS consumption tube, sized for
+// the live interview-time chips: inset glass groove, glossy gold liquid
+// that fills left→right with USED time (empty when unused). Math mirrors
+// the Usage card exactly: used = clamp(granted - remaining, 0, granted).
+//
+// FAIL-SOFT BY CONTRACT (live-interview product): renders NOTHING unless
+// both bounds are known finite positives. Unknown grant (summary offline /
+// null), unlimited plans (granted=Infinity or remaining=Infinity), and any
+// malformed value all fall through to null — the chip then renders exactly
+// as it did before this gauge existed. Never a spinner, never an error.
+function TimeTubeGauge({ granted, remaining, width = 34 }: {
+  granted: number | null | undefined;
+  remaining: number;
+  width?: number;
+}) {
+  if (typeof granted !== 'number' || !Number.isFinite(granted) || granted <= 0) return null;
+  if (typeof remaining !== 'number' || !Number.isFinite(remaining) || remaining < 0) return null;
+  const used = Math.max(0, Math.min(granted, granted - remaining));
+  const pct = Math.max(0, Math.min(100, (used / granted) * 100));
+  return (
+    <span
+      role="progressbar"
+      aria-valuenow={Math.round(pct)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-label={`${Math.round(pct)} percent of interview time used`}
+      className="relative inline-block rounded-full overflow-hidden shrink-0"
+      style={{
+        width,
+        height: 5,
+        // Empty glass groove — same inset treatment as the Usage card tube.
+        background: 'linear-gradient(180deg, rgba(0,0,0,0.30) 0%, rgba(120,120,128,0.16) 100%)',
+        boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.28), 0 0 0 1px rgba(255,255,255,0.07)',
+      }}
+    >
+      <span
+        className="absolute inset-y-0 left-0 rounded-full transition-[width] duration-500 ease-out"
+        style={{
+          width: pct <= 0 ? 0 : `${pct}%`,
+          background: 'linear-gradient(90deg, #f6e4b0 0%, #d3ac63 50%, #b58f45 100%)',
+          boxShadow: pct > 0 ? 'inset 0 1px 0 rgba(255,255,255,0.45), 0 0 6px rgba(211,172,99,0.25)' : undefined,
+        }}
+      >
+        {/* Top-half white gloss — the liquid's surface highlight */}
+        <span className="absolute inset-x-0 top-0 h-1/2 rounded-full bg-gradient-to-b from-white/55 to-transparent pointer-events-none" />
+      </span>
+    </span>
+  );
+}
+
 // ── useCreditTimer ──
 // Drives the ticking session clock for Basic users and Free-tier trial users.
 // Pro/Max = unlimited; creditTimerService.start() silently no-ops for them so
@@ -2218,6 +2891,13 @@ function useCreditTimer(params: {
   const [hourBoundary, setHourBoundary] = useState(false);
   const [lowWarning, setLowWarning] = useState(false);
   const [exhausted, setExhausted] = useState(false);
+  // ── Plan-window grant (drives the interview-time tube gauge) ──
+  // granted_seconds from GET /usage/summary — the SAME plan-window anchor
+  // the Settings Usage card renders, so the header tube and the card can
+  // never disagree. null = unknown (offline / summary unavailable / not
+  // fetched yet); Infinity = unlimited plan. Consumers MUST fail soft on
+  // null: render the plain chip exactly as before, no tube.
+  const [granted, setGranted] = useState<number | null>(null);
 
   // onForceStop may be a fresh arrow every render (e.g. Electron popout path).
   // Pin it to a ref so the listener-subscription effect runs exactly once.
@@ -2253,11 +2933,62 @@ function useCreditTimer(params: {
     return () => { offStarted(); offTick(); offHour(); offLow(); offOut(); };
   }, []);
 
-  // Start/stop mirror the mic. Pro/Max = unlimited → start() no-ops internally.
+  // Fetch the plan-window grant once per session boundary (started/stopped)
+  // plus one seed on mount, and cache it in state — NOT on every tick. The
+  // grant only moves on purchase/top-up, so this stays cheap. FAIL-SOFT BY
+  // CONTRACT: fetchUsageSummary never throws and returns null on any
+  // failure; on null we KEEP the last known value (or stay null) so a
+  // network blip mid-interview can never blank or break the timer chip —
+  // the tube simply doesn't render until the grant is known.
   useEffect(() => {
-    if (isListening) creditTimerService.start();
-    else creditTimerService.stop();
+    let alive = true;
+    const refresh = () => {
+      void fetchUsageSummary().then(s => {
+        if (!alive || !s) return; // fail-soft: keep last known grant
+        if (s.unlimited) { setGranted(Infinity); return; }
+        setGranted(
+          typeof s.granted_seconds === 'number' && Number.isFinite(s.granted_seconds) && s.granted_seconds > 0
+            ? s.granted_seconds
+            : null
+        );
+      });
+    };
+    refresh(); // seed before the first session so the tube can show pre-interview
+    const offs = [
+      creditTimerService.on('started', refresh),
+      creditTimerService.on('stopped', refresh),
+    ];
+    return () => { alive = false; offs.forEach(off => off()); };
+  }, []);
+
+  // Start/stop mirror the mic — DEBOUNCED on the stop side. `isListening` is
+  // Deepgram's raw socket state, which flickers false→true on every reconnect
+  // (network blip). Without debouncing, each flicker would cycle
+  // creditTimerService.start()/stop() — churning the server billing session
+  // and re-firing the low-time toast. Start immediately; defer the stop ~8s so
+  // a quick reconnect cancels it (start() then no-ops since the timer's still
+  // running → continuous session). A real user-stop still settles within 8s,
+  // and the server's stale-session sweeper backstops anything longer.
+  const stopDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (isListening) {
+      if (stopDebounceRef.current) { clearTimeout(stopDebounceRef.current); stopDebounceRef.current = null; }
+      void creditTimerService.start();
+    } else {
+      if (stopDebounceRef.current) clearTimeout(stopDebounceRef.current);
+      stopDebounceRef.current = setTimeout(() => {
+        stopDebounceRef.current = null;
+        creditTimerService.stop();
+      }, 8000);
+    }
   }, [isListening]);
+  // Settle the timer on FINAL unmount only (empty deps → cleanup runs once).
+  // Kept separate from the effect above so a reconnect's dep-change cleanup
+  // can't fire an immediate stop and defeat the debounce.
+  useEffect(() => () => {
+    if (stopDebounceRef.current) { clearTimeout(stopDebounceRef.current); stopDebounceRef.current = null; }
+    creditTimerService.stop();
+  }, []);
 
   const acknowledgeHourBoundary = useCallback((decision: 'continue' | 'stop') => {
     creditTimerService.acknowledgeHourBoundary(decision);
@@ -2268,6 +2999,7 @@ function useCreditTimer(params: {
   return {
     remaining,
     source,
+    granted,
     hourBoundary,
     lowWarning,
     exhausted,
@@ -2305,36 +3037,221 @@ const HourBoundaryModal = ({ remainingSeconds, onDecision }: { remainingSeconds:
   </div>
 );
 
-// ── Low-warning toast — 2-minute warning, auto-dismiss after 8s
-const LowWarningToast = ({ remainingSeconds, onDismiss }: { remainingSeconds: number; onDismiss: () => void }) => {
+// ── Low-warning toast — fires at T-2 minutes with a one-click extend.
+// The lead time (owner spec 2026-07: "a min or 2 before" expiry —
+// LOW_WARNING_SECONDS=120) exists exactly so a running-long interview
+// can be extended BEFORE the clock dies: one click charges the card on
+// file and the timer jumps by the PLAN'S unit (Basic +30 min · $25,
+// Pro/Max +1 hour · $45) without leaving the call. Renders on whichever
+// window the user is on: main mounts it directly; the popout mirrors it
+// via the credit-sync IPC push and relays Extend/Dismiss back to main
+// (see the isPopoutElectron render path + cmd-credit-* handlers).
+const LowWarningToast = ({ remainingSeconds, actualTier, countryCode, onDismiss, onExtend }: {
+  remainingSeconds: number;
+  actualTier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+  countryCode: string;
+  onDismiss: () => void;
+  onExtend?: (packId?: string) => void;
+}) => {
+  const [selectedPack, setSelectedPack] = React.useState('m30');
   useEffect(() => {
-    const t = setTimeout(onDismiss, 8000);
+    const t = setTimeout(onDismiss, 20000);
     return () => clearTimeout(t);
   }, [onDismiss]);
+  const packs = getExtensionPacks(countryCode);
   return (
-    <div className="fixed top-20 right-6 z-[95] max-w-sm px-4 py-3 rounded-xl bg-amber-500/[0.12] border border-amber-500/40 text-amber-300 text-sm font-medium shadow-xl backdrop-blur-sm flex items-center gap-3 animate-pulse">
-      <AlertTriangle size={16} className="shrink-0" />
-      <span>Only <b>{formatTimeRemaining(remainingSeconds)}</b> left on your plan. Wrap up or renew soon.</span>
-      <button onClick={onDismiss} className="text-amber-400 hover:text-amber-200 ml-1"><X size={14} /></button>
+    <div className="fixed top-20 right-6 z-[95] max-w-xs px-4 py-3 rounded-xl bg-amber-500/[0.12] border border-amber-500/40 text-amber-300 text-sm font-medium shadow-xl backdrop-blur-sm">
+      <div className="flex items-center gap-3 mb-2">
+        <AlertTriangle size={16} className="shrink-0" />
+        <span><b>{formatTimeRemaining(remainingSeconds)}</b> left. Running long?</span>
+        <button onClick={onDismiss} className="text-amber-400 hover:text-amber-200 ml-auto"><X size={14} /></button>
+      </div>
+      {onExtend && (
+        <>
+          <div className="flex gap-1 mb-2">
+            {packs.map(p => (
+              <button key={p.id} onClick={() => setSelectedPack(p.id)}
+                className={"flex-1 px-1 py-1 rounded text-[10px] font-bold border transition-all " + (selectedPack === p.id ? "bg-emerald-500/30 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20")}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+          <button onClick={() => { onExtend(selectedPack); onDismiss(); }}
+            className="w-full px-2 py-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold hover:bg-emerald-500/30 transition-all">
+            {(() => { const p = packs.find(x => x.id === selectedPack) || packs[0]; return p.label + ' · ' + p.currencySymbol + p.price; })()}
+          </button>
+        </>
+      )}
     </div>
   );
 };
 
-// ── Exhausted modal — blocking; offers the +30-min extension for Basic,
-// plan picker for everyone (2026-07 model: Basic/Pro/Max are one-time
-// interviews, Ultra is the unlimited monthly subscription).
+// ── Plan / trial expiry notice (2026-07) ──
+// Non-blocking, dismissible toast shown ONCE per distinct expiry state.
+// Four states, computed from the license row the same way the gates are:
+//   trial_used_up  — free tier, trial bucket at 0 (post-trial paywall)
+//   expiring_soon  — paid tier, soonest of expires_at / credits_expire_at
+//                    lands within EXPIRY_WARNING_DAYS (covers the Ultra
+//                    monthly sub and every dated one-time plan)
+//   time_used_up   — metered paid tier (Basic/Pro/Max), plan window still
+//                    VALID but the interview clock is at 0 → TOP-UP copy.
+//                    The tier's features persist; only live use is blocked.
+//   plan_ended     — plan LAPSED (past expires_at, or a dead status:
+//                    expired/refunded/revoked/paused/disputed) → RENEW
+//                    copy. This — never mere time exhaustion — is what
+//                    reverts features to Free.
+// Fingerprints embed the license key + deadline so a renewal (new
+// expires_at) or a top-up (new credits_expire_at) re-arms the warning
+// while the SAME state never re-nags.
+// -1 sentinels (never-expires / comp licenses) produce no notice.
+const EXPIRY_WARNING_DAYS = 3;
+
+type PlanNotice = {
+  kind: 'trial_used_up' | 'expiring_soon' | 'plan_ended' | 'time_used_up';
+  fingerprint: string;
+  message: string;
+  cta: string;
+};
+
+function computePlanNotice(license: LicenseData | null): PlanNotice | null {
+  if (!license) return null;
+  // Admins never get plan/expiry nags. They resolve to full Ultra access via
+  // getEffectiveTier's is_admin short-circuit (before any license check), so a
+  // placeholder admin license row that happens to be an EXPIRED ultra/paid tier
+  // must not surface a "plan ended / expiring" toast. The tier heuristic below
+  // (effectiveTier==='ultra' && tier!=='ultra') only catches admins whose row
+  // tier isn't 'ultra'; this closes the gap when the row IS an expired ultra.
+  try { if (licenseService.loadAuth().user?.is_admin) return null; } catch { /* localStorage unavailable */ }
+  const now = Date.now();
+  const tier = license.tier;
+  const effectiveTier = licenseService.getEffectiveTier(license);
+  // Admins resolve to 'ultra' (or their explicit test-tier override) —
+  // never nag an admin about a placeholder license row.
+  if (effectiveTier === 'ultra' && tier !== 'ultra') return null;
+
+  if (tier === 'basic' || tier === 'pro' || tier === 'max' || tier === 'ultra') {
+    const label = tier.charAt(0).toUpperCase() + tier.slice(1);
+    // Ended = plan LAPSE only (calendar expiry, cancel completion, refund,
+    // revoke — the same predicate the tier gates use, so this toast can
+    // never call a still-valid plan "ended"). This is how the Ultra
+    // monthly shows up once it lapses. The copy says RENEW — the user
+    // already bought this plan; "upgrade" would mislabel them.
+    if (licenseService.isPlanLapsed(license)) {
+      return {
+        kind: 'plan_ended',
+        fingerprint: `plan_ended:${license.key}:${license.expires_at || 0}`,
+        message: `Your ${label} plan has ended — renew to continue.`,
+        cta: 'Renew',
+      };
+    }
+    // Metered tiers (Basic/Pro/Max) with the interview clock at 0 while
+    // the plan window is still VALID: top-up prompt. Features persist —
+    // this is deliberately NOT "plan ended". Fingerprint keys on
+    // credits_expire_at, which every top-up pushes forward, so a
+    // re-exhaustion after a top-up re-arms while the same empty state
+    // never re-nags. (Unlimited/comp licenses report Infinity and never
+    // land here; admins resolve out at the effectiveTier guard above.)
+    if (tier !== 'ultra') {
+      const bal = licenseService.getLiveTimeBalance(license);
+      if (bal.source === 'credits' && bal.seconds <= 0) {
+        return {
+          kind: 'time_used_up',
+          fingerprint: `time_used_up:${license.key}:${license.credits_expire_at || 0}`,
+          message: `Your ${label} interview time is used up — top up minutes to keep going. Your plan keeps its models and Pop-out.`,
+          cta: 'Top up',
+        };
+      }
+    }
+    // Nearing expiry: soonest applicable deadline within the window.
+    // Ultra has no credit window; metered tiers warn on whichever of
+    // expires_at / credits_expire_at comes first. -1 sentinels and 0
+    // (unset) are filtered by the `> now` guard.
+    const candidates = [
+      license.expires_at,
+      tier !== 'ultra' ? (license.credits_expire_at ?? 0) : 0,
+    ].filter((t): t is number => typeof t === 'number' && t > now);
+    const deadline = candidates.length ? Math.min(...candidates) : 0;
+    if (deadline > 0 && deadline - now <= EXPIRY_WARNING_DAYS * 86400000) {
+      const days = Math.max(1, Math.ceil((deadline - now) / 86400000));
+      return {
+        kind: 'expiring_soon',
+        fingerprint: `expiring_soon:${license.key}:${deadline}`,
+        message: days === 1
+          ? `Your ${label} plan expires within a day — renew to continue.`
+          : `Your ${label} plan expires in ${days} days — renew to continue.`,
+        cta: 'Renew',
+      };
+    }
+    return null;
+  }
+
+  // Free tier: post-trial paywall state (trial bucket at 0; undefined on
+  // a legacy row also reads as 0 — either way there is nothing usable).
+  if (tier === 'free' && effectiveTier === 'free'
+      && licenseService.getTrialRemainingSeconds(license) <= 0) {
+    return {
+      kind: 'trial_used_up',
+      fingerprint: `trial_used_up:${license.key}`,
+      message: 'Your free 10-minute trial is used up — upgrade to keep going.',
+      cta: 'See plans',
+    };
+  }
+  return null;
+}
+
+// Toast shell — same anchor + capsule language as LowWarningToast (amber
+// obsidian card, top-right, backdrop blur), with the gold CTA treatment
+// from the Usage card. Non-blocking by design: it never traps focus and
+// never times anything out on its own.
+const PlanExpiryNotice = ({ message, cta, onCta, onDismiss }: {
+  message: string;
+  cta: string;
+  onCta: () => void;
+  onDismiss: () => void;
+}) => (
+  <div
+    role="status"
+    className="fixed top-20 right-6 z-[94] max-w-xs px-4 py-3 rounded-xl bg-amber-500/[0.12] border border-amber-500/40 text-amber-200 text-sm font-medium shadow-xl backdrop-blur-sm"
+  >
+    <div className="flex items-start gap-3">
+      <Crown size={16} className="shrink-0 mt-0.5 text-[#d3ac63]" />
+      <span className="leading-snug">{message}</span>
+      <button onClick={onDismiss} className="text-amber-400 hover:text-amber-200 ml-auto shrink-0" aria-label="Dismiss">
+        <X size={14} />
+      </button>
+    </div>
+    <button
+      onClick={onCta}
+      className="mt-2.5 w-full px-2 py-1.5 rounded-lg text-[11px] font-bold text-[#241b08] transition-transform active:scale-[0.98]"
+      style={{
+        background: 'linear-gradient(180deg, #f0d78a 0%, #d3ac63 48%, #b8963f 100%)',
+        boxShadow: '0 1px 0 rgba(255,255,255,0.35) inset, 0 4px 10px rgba(211,172,99,0.25)',
+      }}
+    >
+      {cta}
+    </button>
+  </div>
+);
+
+// ── Exhausted modal — blocking; offers the PLAN-SPECIFIC extension for
+// Basic/Pro/Max (Basic +30 min · $25, Pro/Max +1 hour · $45 — see
+// pricingService.getRenewalPrice), plan picker for everyone (2026-07
+// model: Basic/Pro/Max are one-time interviews, Ultra is the unlimited
+// monthly subscription and never reaches this modal).
 const ExhaustedModal = ({
   source, actualTier, countryCode, onRenew, onUpgrade, onDismiss,
 }: {
   source: 'trial' | 'credits' | 'unlimited' | 'none';
   actualTier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
   countryCode: string;
-  onRenew: () => void;
+  onRenew: (packId?: string) => void;
   onUpgrade: () => void;
   onDismiss: () => void;
 }) => {
+  const [selectedPack, setSelectedPack] = React.useState('m30');
   const wasTrial = source === 'trial' || actualTier === 'free';
-  const renewal = pricingService.getBasicRenewalPrice(countryCode);
+  const packs = getExtensionPacks(countryCode);
+  const chosenPack = packs.find(p => p.id === selectedPack) || packs[0];
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm">
       <div className="max-w-md w-full mx-4 rounded-2xl border border-red-500/30 bg-[#0a0a0f] shadow-2xl shadow-red-500/10 p-6">
@@ -2344,22 +3261,33 @@ const ExhaustedModal = ({
           </div>
           <div>
             <h3 className="text-base font-bold text-white">{wasTrial ? 'Trial complete' : "You're out of interview time"}</h3>
-            <p className="text-xs text-gray-500">{wasTrial ? 'Your 30-minute trial just ended.' : 'This interview\'s time has been used.'}</p>
+            <p className="text-xs text-gray-500">{wasTrial ? 'Your 10-minute trial just ended.' : 'This interview\'s time has been used.'}</p>
           </div>
         </div>
         <p className="text-sm text-gray-400 mb-5 leading-relaxed">
           {wasTrial
             ? 'Buy the interview that\'s ahead of you — a 30-minute Basic, a 1-hour Pro with all five models, or go unlimited with Ultra.'
-            : actualTier === 'basic'
-              ? 'Extend this interview by 30 minutes, or pick a bigger pass — Pro is a full hour with Claude, Ultra is unlimited.'
+            : ['basic', 'pro', 'max'].includes(actualTier)
+              ? 'Interview running long? Pick a time pack — your card on file is charged instantly.'
               : 'Grab another interview pass, or go unlimited with Ultra.'}
         </p>
         <div className="flex flex-col gap-2">
-          {!wasTrial && actualTier === 'basic' && (
-            <button onClick={onRenew} className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-bold transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2">
-              <Zap size={14} />
-              Extend +30 min · {pricingService.formatPrice(renewal.price, renewal.currencySymbol, renewal.currency)}
-            </button>
+          {!wasTrial && ['basic', 'pro', 'max'].includes(actualTier) && (
+            <>
+              <div className="flex gap-2 mb-1">
+                {packs.map(p => (
+                  <button key={p.id} onClick={() => setSelectedPack(p.id)}
+                    className={"flex-1 px-2 py-2 rounded-lg text-xs font-bold border transition-all " + (selectedPack === p.id ? "bg-emerald-500/25 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20")}>
+                    <div>{p.label}</div>
+                    <div className="text-[10px] opacity-80">{p.currencySymbol}{p.price}</div>
+                  </button>
+                ))}
+              </div>
+              <button onClick={() => onRenew(selectedPack)} className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-bold transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2">
+                <Zap size={14} />
+                Extend {chosenPack.label} · {chosenPack.currencySymbol}{chosenPack.price}
+              </button>
+            </>
           )}
           <button onClick={onUpgrade} className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-400 hover:to-purple-400 text-white text-sm font-bold transition-all shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2">
             <Crown size={14} /> See plans
@@ -2440,12 +3368,13 @@ async function pollForExternalUpgrade(
   }
 }
 
-// Extensions don't change `tier` — they extend `expires_at` by ~30 min via
-// grantBasicRenewal on the server. We watch for a forward delta on the
-// license's expires_at; validateWithServer's extension-credit propagation
-// path lands the +1800s credit locally as soon as the matching delta is
-// detected. 15-min lower bound on the delta absorbs clock skew but stays
-// well above any non-extension noise.
+// Extensions don't change `tier` — they extend `expires_at` by the plan's
+// unit (Basic +30 min, Pro/Max +1 hour) via grantTimeExtension on the
+// server. We watch for a forward delta on the license's expires_at;
+// validateWithServer's extension-credit propagation path lands the
+// tier-sized credit locally as soon as the matching delta is detected.
+// 15-min lower bound on the delta absorbs clock skew but stays well
+// below the smallest unit (30 min) and well above non-extension noise.
 async function pollForExternalRenewal(onSuccess?: () => void) {
   if (externalCheckoutPollActive) return;
   externalCheckoutPollActive = true;
@@ -2464,7 +3393,9 @@ async function pollForExternalRenewal(onSuccess?: () => void) {
           emitCheckoutStatus({
             kind: 'completed',
             mode: 'renewal',
-            message: 'Extension added — +30 minutes now available.',
+            // Amount-neutral: this poll only sees the expires_at delta, and
+            // the granted unit is plan-specific (30 or 60 min).
+            message: 'Extension added — your extra interview time is now available.',
           });
           return;
         }
@@ -2699,14 +3630,115 @@ async function openProUpgrade(
   }
 }
 
-// ── Basic +30-min extension — opens the extension-specific checkout ──
-// Distinct from openProUpgrade because the server treats it differently:
-// /create-renewal grants +30 minutes for the extension price ($25 / ₹2099),
-// whereas /create-checkout would charge full Basic ($30 / ₹2499) and
-// reset to a fresh 30-min interview. Wiring the Basic out-of-time "Extend"
-// button to openProUpgrade silently double-billed users — the cure here
-// is a sibling function that hits the right endpoint.
-async function openProRenewal(onSuccess?: () => void) {
+// ── Razorpay in-app sheet loader (mid-interview top-up, India) ──
+// RBI rules forbid charging a saved card silently on one-time payments,
+// so the Indian top-up opens Razorpay's own modal INSIDE the app — one
+// tap on UPI/card, no browser round-trip. checkout.js is allowed by the
+// CSP (script-src includes checkout.razorpay.com) and cached after the
+// first load.
+let razorpayScriptPromise: Promise<boolean> | null = null;
+function loadRazorpayScript(): Promise<boolean> {
+  if ((window as any).Razorpay) return Promise.resolve(true);
+  if (!razorpayScriptPromise) {
+    razorpayScriptPromise = new Promise((resolve) => {
+      const s = document.createElement('script');
+      s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+      s.onload = () => resolve(true);
+      s.onerror = () => { razorpayScriptPromise = null; resolve(false); };
+      document.head.appendChild(s);
+    });
+  }
+  return razorpayScriptPromise;
+}
+
+async function openRazorpaySheetInApp(payload: any, token: string, onSuccess?: () => void): Promise<boolean> {
+  const ok = await loadRazorpayScript();
+  if (!ok || !(window as any).Razorpay) return false;
+  const { licenseService } = await import('./services/licenseService');
+  try {
+    const rzp = new (window as any).Razorpay({
+      key: payload.key_id,
+      amount: payload.amount,
+      currency: payload.currency,
+      name: payload.name,
+      description: payload.description,
+      order_id: payload.order_id,
+      prefill: { email: payload.user_email, name: payload.user_name },
+      theme: { color: '#10b981' },
+      handler: async (resp: any) => {
+        try {
+          const v = await fetch(`${licenseService.getApiBase()}/api/v1/payments/verify-razorpay`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            body: JSON.stringify(resp),
+          });
+          const vd = await v.json().catch(() => null);
+          if (v.ok && vd?.success) {
+            // Server message names the tier-correct amount ("+30 minutes"
+            // / "+1 hour"); the fallback stays amount-neutral so it can
+            // never state the wrong figure.
+            await licenseService.validateWithServer().catch(() => {});
+            emitCheckoutStatus({ kind: 'completed', mode: 'renewal', message: vd.message || 'Extra time added. Keep going.' });
+            onSuccess?.();
+          } else {
+            emitCheckoutStatus({
+              kind: 'error', mode: 'renewal',
+              message: vd?.error || 'Payment verification is pending — if you were charged, the time will land automatically in a moment.',
+            });
+          }
+        } catch {
+          emitCheckoutStatus({
+            kind: 'error', mode: 'renewal',
+            message: 'Payment made — verification will complete automatically in a moment.',
+          });
+        }
+      },
+      modal: { ondismiss: () => { /* user closed the sheet — no status noise */ } },
+    });
+    rzp.open();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Open a top-up checkout URL in the system browser + poll for the grant.
+// Shared by the legacy /create-renewal path and /extend-now's degraded
+// responses (no card on file yet, or the bank demanded 3DS).
+async function openRenewalCheckoutUrl(checkoutUrl: string, onSuccess?: () => void) {
+  const opened = await tryOpenCheckoutUrl(checkoutUrl);
+  if (!opened.ok) {
+    const detail = opened.attempts?.length
+      ? ` Tried: ${opened.attempts.map(a => `${a.method}${a.ok ? ' ok' : ` failed (${a.error})`}`).join('; ')}`
+      : opened.error ? ` (${opened.error})` : '';
+    emitCheckoutStatus({
+      kind: 'error',
+      mode: 'renewal',
+      message: `Couldn't open the browser automatically.${detail} Use the Copy URL button to open it yourself.`,
+      url: checkoutUrl,
+    });
+    // Still poll — the user may complete via the copied URL.
+  } else {
+    emitCheckoutStatus({
+      kind: 'opened',
+      mode: 'renewal',
+      message: `Top-up checkout opened in your browser (${opened.method}). Complete the payment there — your time will land here automatically. If you don't see a browser window, use Copy URL.`,
+      url: checkoutUrl,
+    });
+  }
+  pollForExternalRenewal(onSuccess);
+}
+
+// ── Plan-specific top-up — ONE CLICK first, checkout only as fallback ──
+// 2026-07 flow: /extend-now charges the card Stripe saved at the first
+// purchase (off-session) and grants the PLAN'S unit server-side in the
+// same transaction (Basic +30 min · $25, Pro/Max +1 hour · $45) — the
+// user never leaves the interview. Fallbacks, in order:
+//   · India → Razorpay's in-app sheet (RBI forbids silent one-time charges)
+//   · no saved card / bank demands 3DS → browser checkout (which saves
+//     the card via setup_future_usage, so NEXT time is one-click)
+//   · /extend-now unreachable (older server) → legacy /create-renewal
+async function openProRenewal(onSuccess?: () => void, packId?: string) {
   const { licenseService } = await import('./services/licenseService');
   const token = licenseService.getToken();
   if (!token) {
@@ -2714,43 +3746,75 @@ async function openProRenewal(onSuccess?: () => void) {
     emitCheckoutStatus({ kind: 'no-token', mode: 'renewal', message: 'Please sign in first to extend.' });
     return;
   }
-  emitCheckoutStatus({ kind: 'connecting', mode: 'renewal', message: 'Connecting to extension checkout…' });
+  // Tier-correct progress copy. The AMOUNTS are authoritative server-side
+  // (payments.js RENEWAL_BY_TIER keyed to the live license); this label is
+  // the client's mirror of the same table for user-facing status text.
+  const savedForLabel = licenseService.loadAuth();
+  const renewalInfo = pricingService.getRenewalPrice(
+    savedForLabel.user?.country_code || 'US',
+    savedForLabel.license?.tier || 'basic',
+  );
+  emitCheckoutStatus({ kind: 'connecting', mode: 'renewal', message: `Adding ${renewalInfo.minutes} minutes…` });
   try {
-    const saved = licenseService.loadAuth();
+    const saved = savedForLabel;
     const countryCode = saved.user?.country_code || 'US';
 
+    // ── One-click path ──
+    try {
+      const attemptId = (globalThis.crypto as any)?.randomUUID?.()
+        || `a_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const ext = await fetch(`${licenseService.getApiBase()}/api/v1/payments/extend-now`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ attempt_id: attemptId, pack: packId || 'm30' }),
+      });
+      const extendData: any = await ext.json().catch(() => null);
+
+      if (ext.ok && extendData?.success && extendData?.flow === 'off_session') {
+        // Charged the card on file; time already landed server-side. Pull
+        // the authoritative balance into local state and refresh the UI.
+        // Server message carries the tier-correct amount; the fallback
+        // mirrors it from the client-side renewal table.
+        await licenseService.validateWithServer().catch(() => {});
+        emitCheckoutStatus({ kind: 'completed', mode: 'renewal', message: extendData.message || `${renewalInfo.label} added. Keep going.` });
+        onSuccess?.();
+        return;
+      }
+      if (extendData?.already_unlimited) {
+        onSuccess?.();
+        return;
+      }
+      if (extendData?.provider === 'razorpay' && extendData?.flow === 'in_app_sheet') {
+        const openedSheet = await openRazorpaySheetInApp(extendData, token, onSuccess);
+        if (openedSheet) return; // the sheet's handler completes the flow
+        // checkout.js unavailable — fall through to the browser path below.
+      }
+      if (ext.ok && extendData?.checkout_url) {
+        // extend-now degraded itself to a checkout session (first purchase
+        // pre-dates card saving, or the bank wants 3DS).
+        return await openRenewalCheckoutUrl(extendData.checkout_url, onSuccess);
+      }
+      if (ext.status === 402 && extendData?.error === 'charge_failed') {
+        emitCheckoutStatus({ kind: 'error', mode: 'renewal', message: extendData.message || 'Your card was declined.' });
+        return;
+      }
+      if (ext.status === 403 && extendData?.error === 'not_interview_day') {
+        emitCheckoutStatus({ kind: 'error', mode: 'renewal', message: extendData.message });
+        return;
+      }
+      // Any other non-OK: fall through to the legacy endpoint below.
+    } catch { /* network / older server — legacy path below */ }
+
+    // ── Legacy fallback: /create-renewal browser checkout ──
     const response = await fetch(`${licenseService.getApiBase()}/api/v1/payments/create-renewal`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-      body: JSON.stringify({ country_code: countryCode }),
+      body: JSON.stringify({ country_code: countryCode, pack: packId || 'm30' }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Failed to start renewal');
     if (data.checkout_url) {
-      const opened = await tryOpenCheckoutUrl(data.checkout_url);
-      if (!opened.ok) {
-        const detail = opened.attempts?.length
-          ? ` Tried: ${opened.attempts.map(a => `${a.method}${a.ok ? ' ok' : ` failed (${a.error})`}`).join('; ')}`
-          : opened.error ? ` (${opened.error})` : '';
-        emitCheckoutStatus({
-          kind: 'error',
-          mode: 'renewal',
-          message: `Couldn't open the browser automatically.${detail} Use the Copy URL button to open it yourself.`,
-          url: data.checkout_url,
-        });
-        // Still poll — the user may complete via the copied URL.
-      } else {
-        emitCheckoutStatus({
-          kind: 'opened',
-          mode: 'renewal',
-          message: `Renewal checkout opened in your browser (${opened.method}). Switch to your browser to complete the payment — your credit will land here automatically. If you don't see a browser window, use Copy URL.`,
-          url: data.checkout_url,
-        });
-      }
-      // Fire-and-forget poll — same rationale as openProUpgrade. The
-      // renewal credit lands locally via validateWithServer's expires_at
-      // delta detection; onSuccess just refreshes React state.
-      pollForExternalRenewal(onSuccess);
+      await openRenewalCheckoutUrl(data.checkout_url, onSuccess);
     } else {
       emitCheckoutStatus({
         kind: 'error',
@@ -2854,6 +3918,9 @@ const ConversationSidebar = ({
     setDeleteConfirmId(null);
   };
 
+  // Web: sessions are Electron/sqlite-backed — show desktop upsell instead of empty no-ops.
+  const webHistoryUpsell = !db.isElectron;
+
   return (
     <>
       <aside className="w-64 shrink-0 h-full flex flex-col bg-[#0a0a0d] border-r border-white/[0.06]">
@@ -2871,6 +3938,27 @@ const ConversationSidebar = ({
           </button>
         </div>
 
+        {webHistoryUpsell ? (
+          <div className="flex-1 flex flex-col px-4 py-6 gap-4">
+            <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 p-4 text-center space-y-3">
+              <Download size={22} className="mx-auto text-blue-400" />
+              <p className="text-sm text-white/90 font-medium leading-snug">
+                Conversation history lives in the desktop app
+              </p>
+              <p className="text-xs text-gray-500 leading-relaxed">
+                Your current chat still works in this tab. Download the desktop app to keep sessions across interviews.
+              </p>
+              <button
+                type="button"
+                onClick={() => window.dispatchEvent(new CustomEvent('app:open-download'))}
+                className="w-full px-3 py-2 rounded-lg text-xs font-bold bg-gradient-to-r from-blue-500 to-purple-600 text-white hover:opacity-90 transition-opacity"
+              >
+                Download desktop app
+              </button>
+            </div>
+          </div>
+        ) : (
+        <>
         <button
           onClick={() => db.newSession()}
           className="mx-3 mt-3 px-3 py-2.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-sm text-white/90 font-medium transition-all flex items-center justify-center gap-2"
@@ -2965,6 +4053,8 @@ const ConversationSidebar = ({
             ))
           )}
         </div>
+        </>
+        )}
       </aside>
 
       {deleteConfirmId && (
@@ -3345,6 +4435,62 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     const handler = () => setManageSubOpen(true);
     window.addEventListener('app:open-manage-subscription', handler);
     return () => window.removeEventListener('app:open-manage-subscription', handler);
+  }, []);
+
+  // ── Plan/trial expiry notice (see computePlanNotice) ──
+  // Evaluated on license changes + a slow 60s cadence; NEVER while a live
+  // session is running (creditTimerService.isActive()) — mid-interview the
+  // low-warning/exhausted surfaces own that moment and a billing nag would
+  // be exactly the wrong thing to show. Reads the freshest license straight
+  // from storage (heartbeats mirror balances there ahead of React state).
+  // "Shown once per state": a fingerprint is persisted per-user on dismiss
+  // or CTA click; the same state never re-nags, while a renewal (new
+  // expires_at ⇒ new fingerprint) re-arms the warning. Entirely fail-soft —
+  // any error here just means no notice.
+  const [planNotice, setPlanNotice] = useState<PlanNotice | null>(null);
+  const planNoticeStoreKey = `minicaai_plan_notice_shown_${userProfile?.id || 'anon'}`;
+  useEffect(() => {
+    if (isElectron && isPopoutMode) return; // popout never hosts the notice
+    let alive = true;
+    const evaluate = () => {
+      try {
+        if (!alive) return;
+        if (creditTimerService.isActive()) return; // never mid-interview
+        const freshLicense = licenseService.loadAuth().license || userLicense;
+        const notice = computePlanNotice(freshLicense);
+        if (!notice) { setPlanNotice(null); return; }
+        let shown: string[] = [];
+        try { shown = JSON.parse(localStorage.getItem(planNoticeStoreKey) || '[]'); } catch { /* corrupt entry → treat as unshown */ }
+        if (!Array.isArray(shown)) shown = [];
+        if (shown.includes(notice.fingerprint)) return;
+        setPlanNotice(prev => (prev && prev.fingerprint === notice.fingerprint) ? prev : notice);
+      } catch { /* fail-soft: a notice bug must never touch the interview UI */ }
+    };
+    evaluate();
+    const t = window.setInterval(evaluate, 60_000);
+    return () => { alive = false; window.clearInterval(t); };
+  }, [userLicense, planNoticeStoreKey]);
+
+  const dismissPlanNotice = useCallback((fingerprint: string) => {
+    setPlanNotice(null);
+    try {
+      let shown: string[] = [];
+      try { shown = JSON.parse(localStorage.getItem(planNoticeStoreKey) || '[]'); } catch { /* start fresh */ }
+      if (!Array.isArray(shown)) shown = [];
+      if (!shown.includes(fingerprint)) shown.push(fingerprint);
+      // Cap the history — old fingerprints from long-gone plan windows
+      // have no future matches and would only grow the key forever.
+      localStorage.setItem(planNoticeStoreKey, JSON.stringify(shown.slice(-12)));
+    } catch { /* localStorage unavailable — worst case it shows again next boot */ }
+  }, [planNoticeStoreKey]);
+
+  // Web-only: Auto-Type / sidebar / EyeOff / PiP upsells open the Download modal
+  // via CustomEvent so deeply nested components stay memo-friendly.
+  useEffect(() => {
+    if (isElectron) return;
+    const handler = () => setShowDownloadModal(true);
+    window.addEventListener('app:open-download', handler);
+    return () => window.removeEventListener('app:open-download', handler);
   }, []);
 
   // ── Checkout-status toast ─────────────────────────────────────────
@@ -3764,6 +4910,11 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   }, []);
   const streamRef = useRef<MediaStream | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  // Settings modal tabs — General (prefs/models) vs Usage (iOS time meter).
+  const [settingsTab, setSettingsTab] = useState<'general' | 'usage'>('general');
+  useEffect(() => {
+    if (!showSettings) setSettingsTab('general');
+  }, [showSettings]);
   const [showContext, setShowContext] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
@@ -4483,24 +5634,77 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   }, []);
 
   // --- Core Logic ---
-  const executeSend = useCallback(async (textToSend: string, imageBase64?: string, isAutoSolve?: boolean) => {
+  const executeSend = useCallback(async (textToSend: string, imageBase64?: string, isAutoSolve?: boolean, _fallbackAttempt?: number) => {
       if (!textToSend.trim()) return;
+
+      // ── Live-time preflight (2026-07 plan-handling fix) ──
+      // Tier FEATURES persist at a 0 balance (a time-exhausted Pro is
+      // still Pro: models selectable, Pop-out open) — only live USE is
+      // blocked, here, before any server call. This mirrors the server's
+      // requireTimeRemaining (402) / requireTier-lapse (403) split with
+      // the matching copy: TOP-UP for a paid plan whose clock ran out,
+      // RENEW for a lapsed plan, plans for a used-up free trial. Reads
+      // fresh auth state (not the render-time gate closure) so a top-up
+      // that landed mid-session unblocks the very next send, and so the
+      // user never sees the server's raw 402/403 mid-interview.
+      {
+        const { license: liveLicense } = licenseService.loadAuth();
+        const planState = licenseService.getPlanState(liveLicense);
+        if (planState !== 'ok') {
+          const rawTier = liveLicense?.tier ?? 'free';
+          const tierLabel = rawTier.charAt(0).toUpperCase() + rawTier.slice(1);
+          const isPaidPlan = rawTier !== 'free';
+          const wallMsg: Message = {
+            id: Date.now().toString(),
+            role: 'model',
+            content: planState === 'lapsed'
+              ? `Your **${tierLabel} plan** has ended. [Renew your plan](upgrade) to continue.`
+              : isPaidPlan
+                ? `Your **interview time** is used up — your ${tierLabel} plan and its models are still yours. [Top up minutes](upgrade) to keep going.`
+                : 'Your **10-minute free trial** is used up — pick a plan to keep going. [See plans](upgrade)',
+            timestamp: Date.now()
+          };
+          if (db.isElectron) { db.addMessage(wallMsg); } else { setMessages(prev => [...prev, wallMsg]); }
+          return;
+        }
+      }
 
       // ── Feature Gate: Block disallowed models ──
       const currentModel = settingsRef.current.selectedModel;
       if (!gate.canUseModel(currentModel)) {
+        // Post-trial free users have NO usable models —
+        // FEATURE_GATES.free.models is empty under the 2026-07 policy and
+        // the server 402s every model route. (Time-exhausted paid users
+        // no longer land here — their tier persists and the preflight
+        // above already returned with top-up/renew copy; this branch is
+        // the belt-and-braces fallback for auth-state races.) Show the
+        // paywall message instead of "switching" to a model that's just
+        // as locked (and would error server-side mid-interview).
+        if (gate.allowedModels.length === 0) {
+          const wallMsg: Message = {
+            id: Date.now().toString(),
+            role: 'model',
+            content: gate.actualTier === 'free'
+              ? 'Your **10-minute free trial** is used up — pick a plan to keep going. [See plans](upgrade)'
+              : `Your **${gate.actualTier.charAt(0).toUpperCase() + gate.actualTier.slice(1)} plan** has ended. [Renew your plan](upgrade) to continue.`,
+            timestamp: Date.now()
+          };
+          if (db.isElectron) { db.addMessage(wallMsg); } else { setMessages(prev => [...prev, wallMsg]); }
+          return;
+        }
         const fallback = gate.getDefaultModel();
         setSettings(prev => ({ ...prev, selectedModel: fallback as any }));
         localStorage.setItem("SELECTED_MODEL", fallback);
         // Notify user — tier-aware so we don't promise the wrong upgrade.
-        // Claude is Max-only; the other paid models (GPT, Grok, Groq) are
-        // Basic+. Sending a Pro user to "Upgrade to Pro" because they
-        // tried Claude would be a confusing dead-end (they're already
-        // Pro and Pro doesn't unlock Claude).
+        // 2026-07 gate map (FEATURE_GATES / server CLAUDE_TIERS): Claude
+        // unlocks at PRO (pro/max/ultra); the other four models are
+        // Basic+. In practice this branch only fires for a Basic user who
+        // picked Claude — every no-models tier (post-trial free, expired
+        // paid) already returned via the paywall branch above.
         const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-        const requiredTier = currentModel === 'claude' ? 'Max' : 'Pro';
+        const requiredTier = currentModel === 'claude' ? 'Pro' : 'Basic';
         const reasonClause = currentModel === 'claude'
-          ? `is a Max-only model`
+          ? `is available from the Pro plan up`
           : `requires a paid plan`;
         const gateMsg: Message = {
           id: Date.now().toString(),
@@ -4519,10 +5723,14 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         timestamp: Date.now()
       };
 
-      if (db.isElectron) {
-        db.addMessage(userMsg);
-      } else {
-        setMessages(prev => [...prev, userMsg]);
+      // On a fallback retry the user's question is already in the transcript —
+      // re-adding it would duplicate the bubble. Only add it on the first try.
+      if (!_fallbackAttempt) {
+        if (db.isElectron) {
+          db.addMessage(userMsg);
+        } else {
+          setMessages(prev => [...prev, userMsg]);
+        }
       }
       setIsProcessing(true);
       setInterimText("");
@@ -4696,12 +5904,55 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
         }
-        // Show a generic error — never suggest the user log out / log in again.
-        // Mid-interview re-auth prompts are catastrophic, and the previous
-        // "Session expired. Please log out and log back in." message was
-        // effectively telling the user to abandon the interview.
+
         const actualError = err?.message || 'Unknown error';
-        const errorContent = `Error: ${actualError}`;
+
+        // ── Auto-fallback on upstream provider outage ──
+        // If the model's provider is having a temporary problem (e.g. Gemini
+        // "project denied access", a 5xx, or a rate-limit) don't dump a raw
+        // error into a live interview. Switch to another model the user can
+        // use and silently retry the SAME question. Only once (guarded by
+        // _fallbackAttempt) so we never loop across a full provider outage.
+        const failedModel = settingsRef.current.selectedModel;
+        if (!_fallbackAttempt && looksLikeProviderOutage(actualError)) {
+          const next = pickFallbackModel(failedModel, gate.allowedModels);
+          if (next) {
+            const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+            const failedLabel = MODEL_REGISTRY[failedModel as ModelKey]?.short ?? cap(failedModel);
+            const nextLabel = MODEL_REGISTRY[next]?.short ?? cap(next);
+            // Persist + reflect the switch so the picker + subsequent sends
+            // use the working model too (not just this one retry). The
+            // existing state-sync effect (keyed on settings.selectedModel)
+            // relays the change to the Electron popout automatically.
+            setSettings(prev => ({ ...prev, selectedModel: next }));
+            try { localStorage.setItem('SELECTED_MODEL', next); } catch { /* quota */ }
+            const noticeMsg: Message = {
+              id: Date.now().toString(),
+              role: 'model',
+              content: `⚠️ **${failedLabel}** is having a temporary service problem. Switched to **${nextLabel}** and retried your question.`,
+              timestamp: Date.now(),
+            };
+            if (db.isElectron) { db.addMessage(noticeMsg); } else { setMessages(prev => [...prev, noticeMsg]); }
+            // settingsRef updates on the next render; pass the model explicitly
+            // is unnecessary because we re-read settingsRef inside the retry,
+            // but React may not have flushed setSettings yet — so mutate the
+            // ref directly for this immediate retry.
+            settingsRef.current = { ...settingsRef.current, selectedModel: next };
+            // Clear processing for THIS attempt's controller before recursing;
+            // the retry seeds its own controller + isProcessing.
+            if (streamAbortRef.current === abort) { streamAbortRef.current = null; }
+            void executeSend(textToSend, imageBase64, isAutoSolve, (_fallbackAttempt || 0) + 1);
+            return;
+          }
+        }
+
+        // No fallback available (or already retried) — show a friendly error.
+        // For a known provider outage with no alternative model, phrase it as a
+        // service problem rather than a raw JSON dump; otherwise show the
+        // message as-is. Never suggest logging out (catastrophic mid-interview).
+        const errorContent = looksLikeProviderOutage(actualError)
+          ? `⚠️ ${MODEL_REGISTRY[failedModel as ModelKey]?.short ?? failedModel} is having a temporary service problem. Please try again in a moment, or pick another model.`
+          : `Error: ${actualError}`;
 
         const errorMsg: Message = {
           id: Date.now().toString(),
@@ -4816,6 +6067,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const [remoteCreditLowWarning, setRemoteCreditLowWarning] = useState(false);
   const [remoteCreditExhausted, setRemoteCreditExhausted] = useState(false);
   const [remoteCreditRemaining, setRemoteCreditRemaining] = useState(0);
+  // Plan-window grant for the popout's tube gauge. null = unknown/unlimited
+  // → the popout chip renders with no tube (fail-soft), same as main.
+  const [remoteCreditGrantedSeconds, setRemoteCreditGrantedSeconds] = useState<number | null>(null);
   const [remoteCreditSource, setRemoteCreditSource] = useState<'trial' | 'credits' | 'unlimited' | 'none'>('none');
   const [remoteCreditActualTier, setRemoteCreditActualTier] = useState<'free' | 'basic' | 'pro' | 'max'>('free');
   const [remoteCreditCountryCode, setRemoteCreditCountryCode] = useState('US');
@@ -4861,7 +6115,8 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const creditTimerRef = useRef<{
     hourBoundary: boolean; lowWarning: boolean; exhausted: boolean;
     remaining: number; source: 'trial' | 'credits' | 'unlimited' | 'none';
-  }>({ hourBoundary: false, lowWarning: false, exhausted: false, remaining: 0, source: 'none' });
+    granted: number | null;
+  }>({ hourBoundary: false, lowWarning: false, exhausted: false, remaining: 0, source: 'none', granted: null });
   const userProfileRef = useRef(userProfile);
   useEffect(() => { userProfileRef.current = userProfile; }, [userProfile]);
 
@@ -4943,6 +6198,14 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         setRemoteCreditLowWarning(!!data.lowWarning);
         setRemoteCreditExhausted(!!data.exhausted);
         setRemoteCreditRemaining(typeof data.remaining === 'number' ? data.remaining : 0);
+        // Tube grant: only finite positives count; anything else (absent
+        // field from an older main build, unlimited, malformed) → null →
+        // no tube. Fail-soft by construction.
+        setRemoteCreditGrantedSeconds(
+          typeof data.grantedSeconds === 'number' && Number.isFinite(data.grantedSeconds) && data.grantedSeconds > 0
+            ? data.grantedSeconds
+            : null
+        );
         setRemoteCreditSource(data.source ?? 'none');
         setRemoteCreditActualTier(data.actualTier ?? 'free');
         setRemoteCreditCountryCode(data.countryCode ?? 'US');
@@ -5018,19 +6281,24 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       exhausted: creditTimer.exhausted,
       remaining: creditTimer.remaining,
       source: creditTimer.source,
+      granted: creditTimer.granted,
     };
-  }, [creditTimer.hourBoundary, creditTimer.lowWarning, creditTimer.exhausted, creditTimer.remaining, creditTimer.source]);
+  }, [creditTimer.hourBoundary, creditTimer.lowWarning, creditTimer.exhausted, creditTimer.remaining, creditTimer.source, creditTimer.granted]);
 
   // Main → popout: push credit-timer state so the popout can render its own
   // copy of the modals. The first state-sync effect above is declared before
   // `creditTimer` exists, so we keep this as a separate effect (no TDZ).
   //
-  // `creditTimer.remaining` ticks every second, but the popout only reads it
-  // when a boolean (hourBoundary / lowWarning / exhausted) flips — and during
-  // hour-boundary the tick loop is paused anyway. So we deliberately leave
-  // `remaining` OUT of the dep list and read the latest value from the ref
-  // (which the effect above keeps fresh). This stops the IPC from firing
-  // every second during a session.
+  // `remaining` IS in the dep list below so this fires every tick. The popout
+  // is a separate renderer whose local timer is a no-op, so its countdown chip
+  // + tube only stay in lockstep with main if we re-push on each tick. (Owner
+  // ask: the popout timer must sync exactly.) Cost is one small IPC + setState
+  // per second; every field except `remaining` is unchanged tick-to-tick, so
+  // the popout's setState calls bail out of re-render via React's Object.is
+  // check and only the countdown/tube repaint. During an hour-boundary the
+  // tick loop is paused, so `remaining` stops changing and this goes quiet.
+  // (We still read the value from the ref, kept fresh by the effect above,
+  // which runs first on the same commit.)
   useEffect(() => {
     if (!isElectron || isPopoutMode) return;
     electronIPC.send('relay-to-popout', {
@@ -5040,11 +6308,15 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       exhausted: creditTimer.exhausted,
       remaining: creditTimerRef.current.remaining,
       source: creditTimer.source,
+      // Tube grant for the popout gauge. Infinity (unlimited) is sent as
+      // null on purpose — "no fraction" is the unlimited treatment and
+      // null survives any IPC serialization; Infinity might not.
+      grantedSeconds: Number.isFinite(creditTimer.granted as number) ? creditTimer.granted : null,
       actualTier: gate.actualTier,
       countryCode: userProfile?.country_code || 'US',
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [creditTimer.hourBoundary, creditTimer.lowWarning, creditTimer.exhausted, creditTimer.source, gate.actualTier, userProfile?.country_code]);
+  }, [creditTimer.remaining, creditTimer.hourBoundary, creditTimer.lowWarning, creditTimer.exhausted, creditTimer.source, creditTimer.granted, gate.actualTier, userProfile?.country_code]);
 
   // Refresh React state from the localStorage that licenseService just
   // updated. Used as the onSuccess callback for the post-checkout polling
@@ -5187,11 +6459,11 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     }
   }, [setSettings, setManageSubOpen, handleReplayTutorial, refreshAuthFromStorage, onLogout]);
 
-  const handleRenewCredit = useCallback(async () => {
-    // Routes to /create-renewal (the +1h top-up) so a Basic user clicking
-    // "Renew" on the out-of-credits prompt pays the renewal price and gets
-    // 1 added hour — not a fresh full-plan purchase at the regular price.
-    try { await openProRenewal(refreshAuthFromStorage); } catch (e) { console.warn('renew failed:', e); }
+  const handleRenewCredit = useCallback(async (packId?: string) => {
+    // Routes to /extend-now (one-click, graduated top-up: m30 $25 / h1 $45 / h3 $80)
+    // with checkout fallbacks. Pack determines price+seconds; server re-derives
+    // the amount from the id. Also the target of the popout's cmd-credit-renew relay.
+    try { await openProRenewal(refreshAuthFromStorage, packId); } catch (e) { console.warn('renew failed:', e); }
   }, [refreshAuthFromStorage]);
 
   const handleOpenUpgrade = useCallback(async () => {
@@ -5221,7 +6493,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
    * Browser: uses the existing display stream if video track is still alive.
    */
   const captureScreenshot = useCallback(async (): Promise<string | null> => {
-    // ── Feature Gate: Screen capture is Pro only ──
+    // ── Feature Gate: Screen capture ships with every paid plan ──
     if (!gate.canScreenCapture) {
       console.warn('[FeatureGate] Screen capture blocked — free tier');
       return null;
@@ -5386,6 +6658,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             exhausted: creditTimerRef.current.exhausted,
             remaining: creditTimerRef.current.remaining,
             source: creditTimerRef.current.source,
+            grantedSeconds: Number.isFinite(creditTimerRef.current.granted as number)
+              ? creditTimerRef.current.granted
+              : null,
             actualTier: gateRef.current.actualTier,
             countryCode: userProfileRef.current?.country_code || 'US',
           });
@@ -5396,12 +6671,18 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   }, [executeSend, captureScreenshot, _rawStartListening, _rawStopListening]);
 
   const handleAutoSolve = async () => {
-    // ── Feature Gate: Auto-Solve is Pro only ──
+    // ── Feature Gate: Auto-Solve ships with every paid plan ──
     if (!gate.canAutoSolve) {
+      // Auto-Solve ships with every paid plan (FEATURE_GATES.*.autoSolve).
+      // Only post-trial Free and lapsed plans land here — tier-aware copy
+      // so a lapsed paying customer is told to RENEW, not to "upgrade".
+      const autoSolveTierLabel = gate.actualTier.charAt(0).toUpperCase() + gate.actualTier.slice(1);
       const gateMsg: Message = {
         id: Date.now().toString(),
         role: 'model',
-        content: '**Auto-Solve** is a Pro feature. [Upgrade to Pro](upgrade) to capture your screen and get instant AI solutions.',
+        content: gate.planLapsed && gate.actualTier !== 'free'
+          ? `**Auto-Solve** comes with your plan, but your **${autoSolveTierLabel} plan** has ended. [Renew your plan](upgrade) to keep using it.`
+          : '**Auto-Solve** comes with every paid plan. [See plans](upgrade) to capture your screen and get instant AI solutions.',
         timestamp: Date.now()
       };
       if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
@@ -5822,20 +7103,39 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     messages, streamingMsg: effectiveStreamingMsg, settings, setSettings, isListening, isProcessing, inputText, setInputText, interimText,
     speechError, toggleAutoSend, startListening, stopListening, handleManualSend, handleAutoSolve,
     handleClear, handleRegenerate, chatContainerRef, textareaRef, handleScroll,
-    isPinned, newSinceUnpin, handleJumpToLatest,
+    isPinned, newSinceUnpin, handleJumpToLatest, sidebarOpen,
     onOpenSettings: () => setShowSettings(true),
     onOpenContext: () => setShowContext(true),
     onOpenHelp: () => setShowHelp(true),
     onOpenSupport: () => setShowSupport(true),
     onOpenDownload: () => { if (!isElectron) setShowDownloadModal(true); },
+    handlePlaySampleQuestion: !isElectron ? () => {
+      const sample =
+        'Tell me about a time you had to debug a production incident under pressure.';
+      void executeSend(sample);
+    } : undefined,
+    onClosePip: () => {
+      if (isElectron) {
+        electronIPC.send('close-popout');
+      }
+      setIsPipMode(false);
+    },
     isPipMode,
     togglePip: () => {
-      // ── Feature Gate: Popout is Pro only ──
+      // ── Feature Gate: Pop-out ships with EVERY paid plan (Basic and up —
+      // FEATURE_GATES.*.popout). Only post-trial Free users and LAPSED
+      // plans land here; a time-exhausted Basic/Pro/Max keeps canPopout
+      // (their tier persists — see getEffectiveTier) and never hits this
+      // block. Copy is tier-aware so a lapsed Pro is told to RENEW the
+      // plan they already bought — never to "upgrade" to it.
       if (!gate.canPopout) {
+        const tierLabel = gate.actualTier.charAt(0).toUpperCase() + gate.actualTier.slice(1);
         const gateMsg: Message = {
           id: Date.now().toString(),
           role: 'model',
-          content: '**Pop-out Mode** is a Pro feature. [Upgrade to Pro](upgrade) to use the invisible overlay during interviews.',
+          content: gate.planLapsed && gate.actualTier !== 'free'
+            ? `**Pop-out Mode** comes with your plan, but your **${tierLabel} plan** has ended. [Renew your plan](upgrade) to keep using the invisible overlay.`
+            : '**Pop-out Mode** comes with every paid plan. [See plans](upgrade) to use the invisible overlay during interviews.',
           timestamp: Date.now()
         };
         if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
@@ -5879,6 +7179,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       exhausted: remoteCreditExhausted,
       remaining: remoteCreditRemaining,
       source: remoteCreditSource,
+      granted: remoteCreditGrantedSeconds,
       acknowledgeHourBoundary: creditTimer.acknowledgeHourBoundary,
       dismissLowWarning: creditTimer.dismissLowWarning,
       dismissExhausted: creditTimer.dismissExhausted,
@@ -5993,9 +7294,21 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                     <p className="text-gray-500 max-w-md mx-auto">
                         {isElectron 
                           ? <>The AI copilot is running in a transparent overlay.<br/>It is <strong className="text-green-400">invisible to screen share</strong>.</>
-                          : <>This tab is now "Safe to Share".<br/>The AI interface has moved to a separate window that is hidden from screen share.</>
+                          : <>This tab is now "Safe to Share".<br/>The AI interface has moved to a Picture-in-Picture window.</>
                         }
                     </p>
+                    {!isElectron && (
+                      <p className="text-xs text-amber-300/90 max-w-md mx-auto mt-3 leading-relaxed">
+                        Download the desktop app for the invisible, always-on-top version.{' '}
+                        <button
+                          type="button"
+                          onClick={() => window.dispatchEvent(new CustomEvent('app:open-download'))}
+                          className="underline font-semibold text-blue-300 hover:text-blue-200"
+                        >
+                          Download desktop app
+                        </button>
+                      </p>
+                    )}
                 </div>
                 <div className="p-4 bg-surface rounded-lg border border-border text-left w-full max-w-lg shadow-sm">
                     <p className="text-xs text-gray-400 uppercase tracking-wider font-bold mb-2">Safe View Placeholder</p>
@@ -6030,13 +7343,91 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       {/* --- MODALS --- */}
       
       <Modal isOpen={showSettings} onClose={() => setShowSettings(false)} title="Settings">
-         <div className="space-y-6">
-            
+         <div className="space-y-5">
+
+            {/* iOS segmented control — General | Usage */}
+            <div
+              className="flex p-0.5 rounded-[10px]"
+              role="tablist"
+              aria-label="Settings sections"
+              style={{ background: 'rgba(120,120,128,0.16)' }}
+            >
+              {([
+                { id: 'general' as const, label: 'General' },
+                { id: 'usage' as const, label: 'Usage' },
+              ]).map(tab => {
+                const active = settingsTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => setSettingsTab(tab.id)}
+                    className={`flex-1 py-1.5 rounded-[8px] text-[13px] font-semibold transition-all ${
+                      active
+                        ? 'bg-white dark:bg-[#3a3a3c] text-text shadow-sm'
+                        : 'text-gray-500 dark:text-gray-400 hover:text-text'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            {settingsTab === 'usage' ? (
+              /* Usage tab — iOS-style interview-time meter (server ledger + live clock) */
+              <UsagePanel
+                tier={userLicense?.tier || 'free'}
+                onRenew={() => { setShowSettings(false); setManageSubOpen(true); }}
+              />
+            ) : (
+            <>
+            {/* Subscription / Billing — dedicated, always-visible entry so web
+                users (and admins on ultra) have an obvious, named place to view
+                their plan, update payment, or cancel, instead of only the small
+                header tier badge. Opens the same ManageSubscription surface via
+                the existing setShowSettings(false)+setManageSubOpen(true) pattern
+                used by the model-picker locked-card handler below. */}
+            <div className="bg-black/[0.04] dark:bg-white/[0.025] p-4 rounded-2xl space-y-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <label className="text-sm font-bold text-text flex items-center gap-2">
+                        <Crown size={16} /> Subscription &amp; Billing
+                    </label>
+                    <span className="text-[10px] font-semibold tracking-[0.08em] uppercase text-gray-300 bg-white/[0.06] px-2.5 py-0.5 rounded-full border border-white/10">
+                        {(userLicense?.tier || 'free').toUpperCase()} plan
+                    </span>
+                </div>
+                <p className="text-xs text-gray-400">
+                    View your current plan, update your payment method, upgrade, or cancel — all in one place.
+                </p>
+                <button
+                    onClick={() => { setShowSettings(false); setManageSubOpen(true); }}
+                    className="w-full py-2.5 rounded-xl text-sm font-semibold bg-gradient-to-r from-blue-500/15 to-purple-500/10 text-blue-300 hover:from-blue-500/25 hover:to-purple-500/20 border border-blue-500/25 transition-all flex items-center justify-center gap-2"
+                >
+                    <ExternalLink size={14} /> Manage subscription
+                </button>
+            </div>
+
             {/* Model Selection */}
             <div className="bg-black/[0.04] dark:bg-white/[0.025] p-4 rounded-2xl space-y-3.5">
                 <div className="flex items-center justify-between gap-3 flex-wrap">
                     <label className="text-sm font-bold text-text flex items-center gap-2">
-                        <Sparkles size={16} /> AI Model Selection
+                        {/* Faceted-gem mark (gold hairline) — premium, and
+                            echoes the landing's crystal orb. Replaces the
+                            generic Sparkles glyph. */}
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" style={{ flexShrink: 0 }}>
+                          <defs>
+                            <linearGradient id="pl-modelmark" x1="4" y1="3" x2="20" y2="21" gradientUnits="userSpaceOnUse">
+                              <stop stopColor="#f6e4b0" />
+                              <stop offset="1" stopColor="#b58f45" />
+                            </linearGradient>
+                          </defs>
+                          <path d="M12 2.6 20.4 7.5v9L12 21.4 3.6 16.5v-9L12 2.6Z" stroke="url(#pl-modelmark)" strokeWidth="1.3" strokeLinejoin="round" />
+                          <path d="M12 8.1 15.5 10.15v3.7L12 15.9 8.5 13.85v-3.7L12 8.1Z" stroke="url(#pl-modelmark)" strokeWidth="1" strokeLinejoin="round" opacity="0.6" />
+                        </svg>
+                        AI Model Selection
                     </label>
                     {/* Tier-aware upgrade prompt. Max → "Full access" pill (no
                         nag, just confirmation). Pro → Claude path. Basic → both
@@ -6046,21 +7437,13 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                         which was misleading because Pro also has 4 models —
                         the only model going from Pro→Max unlocks is Claude. */}
                     {gate.isMax ? (
-                      <span className="text-[10px] font-semibold tracking-[0.10em] uppercase text-[#f4dba0] bg-[rgba(201,165,92,0.10)] px-2.5 py-0.5 rounded-full border border-[rgba(201,165,92,0.45)] flex items-center gap-1">
-                        <WizardHat size={9} /> Full access
-                      </span>
+                      <span className="mp-hint"><WizardHat size={9} /> Full access</span>
                     ) : gate.isPro ? (
-                      <span className="text-[10px] text-amber-300 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/25 flex items-center gap-1">
-                        <Crown size={9} /> Max adds Claude with Web Search
-                      </span>
+                      <span className="mp-hint"><Crown size={9} /> Max adds Train Model + reasoning</span>
                     ) : gate.isBasic ? (
-                      <span className="text-[10px] text-amber-300 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/25 flex items-center gap-1">
-                        <Crown size={9} /> Pro · unlimited · Max adds Claude
-                      </span>
+                      <span className="mp-hint"><Crown size={9} /> Pro adds Claude · Max adds Train Model</span>
                     ) : (
-                      <span className="text-[10px] text-amber-300 font-medium bg-amber-400/10 px-2 py-0.5 rounded-full border border-amber-400/25 flex items-center gap-1">
-                        <Crown size={9} /> Pro unlocks 4 models · Max adds Claude
-                      </span>
+                      <span className="mp-hint"><Crown size={9} /> Basic: 4 models · Pro adds Claude</span>
                     )}
                 </div>
                 {/* Layout — 2x2 grid for Gemini / Groq / GPT / Grok in
@@ -6109,7 +7492,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                 className={`w-full px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all ${
                     saveStatus === 'saved'
                     ? 'bg-emerald-500/90 text-white'
-                    : 'bg-gradient-to-b from-[#e8cf8f] to-[#c9a655] text-[#2a2109] hover:from-[#f0d99a] hover:to-[#d3ac63] shadow-[0_6px_18px_-8px_rgba(211,172,99,0.55)]'
+                    : 'btn-gold-glass'
                 }`}
             >
                 {saveStatus === 'saved' ? <Check size={16} /> : <Save size={16} />}
@@ -6355,12 +7738,18 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                 )}
               </div>
             )}
+            </>
+            )}
 
          </div>
       </Modal>
 
       {/* --- First-launch Tutorial (auto on first login per account, replayable from Help) --- */}
-      <Tutorial isOpen={tutorialOpen} onClose={handleTutorialClose} />
+      <Tutorial
+        isOpen={tutorialOpen}
+        onClose={handleTutorialClose}
+        onOpenDownload={!isElectron ? () => setShowDownloadModal(true) : undefined}
+      />
 
       {/* --- Manage Subscription full-screen overlay (opened from tier badge) --- */}
       <ManageSubscription
@@ -6846,7 +8235,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                            <button
                                onClick={handleAddPasteText}
                                disabled={!pasteContent.trim() || (gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles)}
-                               className={`p-2 rounded-lg transition-all ${pasteContent.trim() && !(gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) ? 'bg-gradient-to-b from-[#e8cf8f] to-[#c9a655] text-[#2a2109] shadow-[0_4px_12px_-4px_rgba(211,172,99,0.5)] hover:from-[#f0d99a] hover:to-[#d3ac63]' : 'bg-black/[0.05] dark:bg-white/[0.04] text-gray-500 cursor-not-allowed'}`}
+                               className={`p-2 rounded-lg transition-all ${pasteContent.trim() && !(gate.maxContextFiles !== -1 && db.contextFiles.length >= gate.maxContextFiles) ? 'btn-gold-glass' : 'bg-black/[0.05] dark:bg-white/[0.04] text-gray-500 cursor-not-allowed'}`}
                                aria-label="Add pasted text as context"
                                title="Add as context"
                            >
@@ -6904,7 +8293,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                       <li>A browser popup will ask to share your screen.</li>
                       <li>Select the <span className="text-text font-bold">Chrome Tab</span> where your meeting is running (e.g., Google Meet, Zoom Web).</li>
                       <li><span className="text-red-400 font-bold underline decoration-wavy">CRITICAL:</span> Check the box <strong>"Also share tab audio"</strong> in the bottom left of the popup.</li>
-                      <li>Click <strong>Share</strong>. The status will turn to <span className="text-red-500 font-bold">LIVE</span>.</li>
+                      <li>Click <strong>Share</strong>. The status will turn to <span className="text-emerald-400 font-bold">LIVE</span>.</li>
                   </ol>
               </div>
               <div className="p-4 bg-surface border border-border rounded-xl space-y-2">
@@ -6993,7 +8382,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       {!isPopoutElectron && creditTimer.lowWarning && (
         <LowWarningToast
           remainingSeconds={creditTimer.remaining}
+          actualTier={gate.actualTier}
+          countryCode={userProfile?.country_code || 'US'}
           onDismiss={creditTimer.dismissLowWarning}
+          onExtend={['basic', 'pro', 'max'].includes(gate.actualTier) ? handleRenewCredit : undefined}
         />
       )}
       {!isPopoutElectron && creditTimer.exhausted && (
@@ -7004,6 +8396,17 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           onRenew={handleRenewCredit}
           onUpgrade={handleOpenUpgrade}
           onDismiss={creditTimer.dismissExhausted}
+        />
+      )}
+      {/* Plan/trial expiry notice — main window only, and it yields the
+          top-right anchor to the live credit surfaces (low-warning toast /
+          exhausted modal) so two billing prompts never stack. */}
+      {!isPopoutElectron && planNotice && !creditTimer.lowWarning && !creditTimer.exhausted && !manageSubOpen && (
+        <PlanExpiryNotice
+          message={planNotice.message}
+          cta={planNotice.cta}
+          onCta={() => { dismissPlanNotice(planNotice.fingerprint); setManageSubOpen(true); }}
+          onDismiss={() => dismissPlanNotice(planNotice.fingerprint)}
         />
       )}
       {/* Popout path: mirror main's state via IPC and relay user actions back. */}
@@ -7018,7 +8421,12 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       {isPopoutElectron && remoteCreditLowWarning && (
         <LowWarningToast
           remainingSeconds={remoteCreditRemaining}
+          actualTier={remoteCreditActualTier}
+          countryCode={remoteCreditCountryCode}
           onDismiss={() => electronIPC.send('relay-to-main', { type: 'cmd-credit-low-dismiss' })}
+          onExtend={['basic', 'pro', 'max'].includes(remoteCreditActualTier)
+            ? () => electronIPC.send('relay-to-main', { type: 'cmd-credit-renew' })
+            : undefined}
         />
       )}
       {isPopoutElectron && remoteCreditExhausted && (
@@ -7043,6 +8451,14 @@ export default function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [user, setUser] = useState<UserProfile | null>(null);
   const [license, setLicense] = useState<LicenseData | null>(null);
+  // Web checkout return (?payment=success) must stay on SubscriptionGate so
+  // the success banner + justPurchasedTier path still runs. Cleared when the
+  // user enters MainApp via onAuthenticated (e.g. "Open web app").
+  const [webPaymentReturn, setWebPaymentReturn] = useState(() => {
+    if (typeof window === 'undefined' || isElectron) return false;
+    try { return new URLSearchParams(window.location.search).get('payment') === 'success'; }
+    catch { return false; }
+  });
   // Guards the focus-revalidation handler from firing concurrently. Fast
   // alt-tab in/out (common when paying in an external browser window and
   // bouncing back) otherwise queues multiple validateWithServer calls; if
@@ -7051,6 +8467,8 @@ export default function App() {
   const focusRevalidatingRef = useRef(false);
 
   useEffect(() => {
+    // Don't auto-enter MainApp while handling a checkout return — gate owns that.
+    if (webPaymentReturn) return;
     const saved = licenseService.loadAuth();
     if (saved.user && saved.license && licenseService.isLicenseValid(saved.license)) {
       setUser(saved.user);
@@ -7058,7 +8476,7 @@ export default function App() {
       setAuthenticated(true);
       licenseService.startRevalidation();
     }
-  }, []);
+  }, [webPaymentReturn]);
 
   // Revalidate license when app regains focus (e.g. after paying in browser)
   useEffect(() => {
@@ -7098,35 +8516,23 @@ export default function App() {
     setLicense(null);
   };
 
-  if (!authenticated) {
+  if (!authenticated || webPaymentReturn) {
     return (
       <SubscriptionGate
         onAuthenticated={(u, l) => {
           setUser(u);
           setLicense(l);
           setAuthenticated(true);
+          setWebPaymentReturn(false);
           licenseService.startRevalidation();
         }}
       />
     );
   }
 
-  // Web is not an official surface — authenticated web users see the download page
-  // inside SubscriptionGate, not MainApp. The app itself is Electron-only.
-  if (!isElectron && !isPopoutMode) {
-    return (
-      <ErrorBoundary>
-        <SubscriptionGate
-          onAuthenticated={(u, l) => {
-            setUser(u);
-            setLicense(l);
-            setAuthenticated(true);
-          }}
-        />
-      </ErrorBoundary>
-    );
-  }
-
+  // Authenticated users (Electron or browser) enter MainApp. Unauthenticated
+  // users already returned SubscriptionGate above. Web popout is Document-PiP
+  // inside MainApp; Electron popout still uses ?mode=popout BrowserWindow.
   return (
     <ErrorBoundary>
       <MainApp userProfile={user} userLicense={license} onLogout={handleLogout} setUserProfile={setUser} setUserLicense={setLicense} />

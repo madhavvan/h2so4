@@ -34,8 +34,8 @@ Because Basic/Pro/Max are one-time buys, there's nothing recurring on them to "d
 
 | Feature | Free | Basic | Pro | Max | Ultra |
 |---|---|---|---|---|---|
-| Interview time | 30-min trial total | One 30-min interview | One 1-hour interview | Three 1-hour interviews | Unlimited |
-| AI models | Gemini | + GPT-5.5, Grok, Groq | + Claude Sonnet 5 (all 5) | All 5 | All 5 |
+| Interview time | 10-min trial total | One 30-min interview | One 1-hour interview | Three 1-hour interviews | Unlimited |
+| AI models | 4 during trial (no Claude) | Gemini, GPT-5.5, Grok, Groq | + Claude Sonnet 5 (all 5) | All 5 | All 5 |
 | Context files | 1 | Unlimited | Unlimited | Unlimited | Unlimited |
 | Pop-out window | — | ✓ | ✓ | ✓ | ✓ |
 | Screen capture (Auto-Solve) | — | ✓ | ✓ | ✓ | ✓ |
@@ -57,7 +57,7 @@ Notes on the more premium features:
 
 ## 3. Trial mechanics
 
-The Free tier is genuinely free — no card on file, no auto-conversion. You get 5 sessions of 30 minutes total combined trial time, on Gemini, with one context file. After the 30 minutes are spent, you'll see a prompt to upgrade.
+The Free tier is genuinely free — no card on file, no auto-conversion. You get a one-time 10 minutes of combined trial time with every model except Claude, and one context file. After the 10 minutes are spent, you'll see a prompt to upgrade — nothing stays free past the trial.
 
 We do not auto-convert Free trials to paid subscriptions. You explicitly pick a tier and enter payment details.
 

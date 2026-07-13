@@ -512,24 +512,22 @@ html.dark .mp-card:not(.mp-card-max):hover {
     rgba(21,19,13,0.82) !important;
 }
 html.dark .mp-card.is-selected:not(.mp-card-max) {
-  border-color: rgba(211,172,99,0.5) !important;
-  box-shadow:
-    inset 0 0 0 1px rgba(211,172,99,0.28),
-    inset 0 0 40px -12px rgba(211,172,99,0.10),
-    0 10px 30px -14px rgba(211,172,99,0.30) !important;
+  /* Single clean hairline + a soft lift — no doubled inset ring (that
+     inset was the "huge border" heaviness). */
+  border-color: rgba(211,172,99,0.42) !important;
+  box-shadow: 0 6px 22px -16px rgba(211,172,99,0.28) !important;
 }
-/* RECOMMENDED badge: green → gold. (ACTIVE check tints via text-emerald
-   elsewhere — that stays as the semantic "on" tick.) */
+/* RECOMMENDED badge: a quiet muted-gold label, no filled pill. */
 html.dark .mp-card-badge-recommended {
-  background: rgba(211,172,99,0.15) !important;
-  color: var(--gold-1) !important;
-  border-color: rgba(211,172,99,0.38) !important;
+  background: none !important;
+  color: rgba(211,172,99,0.72) !important;
+  border-color: transparent !important;
 }
-/* "ACTIVE" pill on the selected card pulls the model's brand colour
-   (green for GPT); make it gold to match the gold-selected card. */
+/* ACTIVE: the green live-dot carries the "on" signal; the label stays a
+   quiet muted paper, not a gold pill. */
 html.dark .mp-card-active:not(.mp-card-active-max) {
-  background: rgba(211,172,99,0.15) !important;
-  color: var(--gold-1) !important;
+  background: none !important;
+  color: rgba(244,244,245,0.62) !important;
 }
 html.dark .bg-blue-500\/\[0\.08\] { background-color: rgba(211, 172, 99, 0.08) !important; }
 html.dark .from-blue-500\/\[0\.08\] { --tw-gradient-from: rgb(211 172 99 / 0.08) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(211 172 99 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
@@ -602,120 +600,3 @@ html:not(.popout-mode).dark #root { position: relative; z-index: 1; }
 /* Respect reduced motion isn't needed here (static layers), but honor
    it for the serif swap? No — typography is not motion. Nothing to gate. */
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   BRAND MARK — motion states (2026-07)
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   Drives BrandMark.tsx (the gold-on-obsidian identity medallion). One
-   class per app state on the <svg> root: .bm--idle / .bm--listening /
-   .bm--thinking / .bm--answering. The story: sound arrives from the
-   LEFT (listening), light races the bezel + the m glows from within
-   (thinking = the loading action), wavefronts emit to the RIGHT
-   (answering). All keyframes are transform/opacity ONLY — safe for
-   the transparent pop-out (no backdrop-filter, no live blurs) and
-   cheap on the GPU. Loaded here (not index.html) because index.css is
-   linked by BOTH the main window and the pop-out.
-
-   Element transforms use transform-box: view-box so origins are in
-   viewBox units (the medallion's center is 48px 48px). The always-on
-   .bm-sweep translates in the m's own 1024-space (its parent group
-   carries the scale), hence the large px values.
-
-   Both global prefers-reduced-motion kill-switches (index.html `*`
-   rule + pip-styles .pip-body rule) already neutralize these. */
-
-.bm { display: block; flex-shrink: 0; }
-
-/* Cross-fade between states: when a state class drops its animation,
-   the layer eases back to its resting opacity instead of popping. */
-.bm .bm-bloom,
-.bm .bm-waves,
-.bm .bm-orbit,
-.bm .bm-mglow {
-  transition: opacity 0.45s var(--ease-ios);
-}
-
-/* Resting layer visibilities (idle shows only bloom + sweep). */
-.bm .bm-bloom { opacity: 0.28; }
-.bm .bm-waves { opacity: 0; }
-.bm .bm-orbit { opacity: 0; }
-.bm .bm-mglow { opacity: 0; }
-
-/* The idle signature: a specular band gliding across the gold m every
-   ~6.4s — polished metal catching light. Runs in every state. */
-.bm .bm-sweep { animation: bm-sweep 6.4s infinite; }
-@keyframes bm-sweep {
-  0%   { transform: translateX(-380px); animation-timing-function: cubic-bezier(0.45, 0.05, 0.35, 0.95); }
-  16%  { transform: translateX(680px); }
-  100% { transform: translateX(680px); }
-}
-
-/* ── LISTENING — sound arrives; the coin breathes ── */
-.bm--listening .bm-bloom { animation: bm-bloom-breathe 3.6s ease-in-out infinite; }
-.bm--listening .bm-body {
-  transform-box: view-box;
-  transform-origin: 48px 48px;
-  animation: bm-breathe 3.6s ease-in-out infinite;
-}
-.bm--listening .bm-waves-in { animation: bm-wave-in 1.8s cubic-bezier(0.33, 0, 0.35, 1) infinite; }
-.bm--listening .bm-mglow { animation: bm-mglow-soft 3.6s ease-in-out infinite; }
-
-/* ── THINKING — the loading action: comets race the bezel, the m
-      pulses with inner light ── */
-.bm--thinking .bm-orbit {
-  transform-box: view-box;
-  transform-origin: 48px 48px;
-  animation: bm-orbit 1.4s linear infinite;
-  opacity: 1;
-}
-.bm--thinking .bm-mglow { animation: bm-mglow-think 1.4s ease-in-out infinite; }
-.bm--thinking .bm-bloom { animation: bm-bloom-think 1.4s ease-in-out infinite; }
-
-/* ── ANSWERING — the mark speaks: wavefronts emit rightward ── */
-.bm--answering .bm-waves-out { animation: bm-wave-out 1.5s cubic-bezier(0.3, 0, 0.4, 1) infinite; }
-.bm--answering .bm-mglow { animation: bm-mglow-answer 2.2s ease-in-out infinite; }
-.bm--answering .bm-bloom { opacity: 0.62; }
-.bm--answering .bm-orbit {
-  transform-box: view-box;
-  transform-origin: 48px 48px;
-  animation: bm-orbit 3.4s linear infinite;
-  opacity: 0.5;
-}
-
-@keyframes bm-orbit { to { transform: rotate(360deg); } }
-@keyframes bm-breathe {
-  0%, 100% { transform: scale(1); }
-  50%      { transform: scale(1.014); }
-}
-@keyframes bm-bloom-breathe {
-  0%, 100% { opacity: 0.22; }
-  50%      { opacity: 0.55; }
-}
-@keyframes bm-bloom-think {
-  0%, 100% { opacity: 0.3; }
-  50%      { opacity: 0.6; }
-}
-/* Wavefront travelling INTO the mark (left side, moving right). */
-@keyframes bm-wave-in {
-  0%   { transform: translateX(-5px); opacity: 0; }
-  30%  { opacity: 1; }
-  78%  { opacity: 0.2; }
-  100% { transform: translateX(3.5px); opacity: 0; }
-}
-/* Wavefront emitted AWAY from the mark (right side, moving right). */
-@keyframes bm-wave-out {
-  0%   { transform: translateX(-4px); opacity: 0; }
-  25%  { opacity: 1; }
-  100% { transform: translateX(6px); opacity: 0; }
-}
-@keyframes bm-mglow-soft {
-  0%, 100% { opacity: 0; }
-  50%      { opacity: 0.22; }
-}
-@keyframes bm-mglow-think {
-  0%, 100% { opacity: 0.08; }
-  50%      { opacity: 0.5; }
-}
-@keyframes bm-mglow-answer {
-  0%, 100% { opacity: 0.3; }
-  50%      { opacity: 0.48; }
-}

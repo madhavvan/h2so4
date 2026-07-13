@@ -89,15 +89,30 @@ function normalizeTier(t) {
   return VALID_TIERS.includes(t) ? t : 'pro';
 }
 
-// ── Basic-tier renewal: +1 interview, +1 hour wall-clock. Cheap top-up
-//    for a Basic user who ran out mid-interview. Must match the per-region
-//    amounts returned by pricingService.getBasicRenewalPrice() on the
-//    client so the amount shown on the checkout modal matches the pill.
-// Basic 30-min interview EXTENSION (+30 min). Repriced 2026-07 ($25 / ₹2099).
-// (Constant names kept as RENEWAL_* for call-site compatibility; semantically
-// this is now the "+30 minutes" extension top-up, not a Basic credit renewal.)
+// ── GRADUATED TOP-UP PACKS — SINGLE SOURCE OF TRUTH (2026-07) ──────────
+// ── Mid-interview top-up: +30 minutes on the existing pass ──────────
+// A flat single SKU — $25 / ₹2099 for +30 min — offered to Basic/Pro/Max
+// (Ultra is unlimited and exempt). Tier is PRESERVED (a Max top-up stays
+// Max); the granted time is the same 30 minutes for every tier. Must match
+// the per-region amount pricingService.getBasicRenewalPrice() shows on the
+// client so the charge sheet matches the pill. (Constant names kept as
+// RENEWAL_* for call-site compatibility; semantically this is the "+30 min"
+// extension top-up.)
 const RENEWAL_USD_CENTS = 2500;   // $25
 const RENEWAL_INR_PAISE = 209900; // ₹2099
+// ── GRADUATED TOP-UP PACKS — 2026-07 ───────────────────────────────────
+// Three packs the user picks; the SERVER re-derives amount+seconds from the
+// pack id. Client sends only the id — any client-sent price is ignored.
+// Unknown / absent pack id defaults to m30.
+const EXTENSION_PACKS = {
+  m30: { id: 'm30', seconds: 1800,  usd_cents: 2500,  inr_paise: 209900, label: '+30 min' },
+  h1:  { id: 'h1',  seconds: 3600,  usd_cents: 4500,  inr_paise: 379900, label: '+1 hour' },
+  h3:  { id: 'h3',  seconds: 10800, usd_cents: 8000,  inr_paise: 679900, label: '+3 hours' },
+};
+const DEFAULT_EXTENSION_PACK = 'm30';
+function resolveExtensionPack(packId) {
+  return EXTENSION_PACKS[packId] || EXTENSION_PACKS[DEFAULT_EXTENSION_PACK];
+}
 
 // ── Pricing validation ──────────────────────────────────────────────
 // Rooted bug: the client hardcoded $29/$69 in pricingService.ts but the
@@ -648,30 +663,28 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  CREATE RENEWAL — Basic top-up only
+//  CREATE RENEWAL — +30 min top-up (browser-checkout fallback)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Separate route from /create-checkout because the semantics differ: this
-// charges the renewal price (a fraction of the Basic price) and the
-// webhook/verify flow grants +1 session / +1 hour instead of resetting
-// to the full 3-sessions / 14-days Basic grant. metadata.mode === 'renewal'
-// is the signal the webhook reads to branch into the renewal grant.
+// charges the flat top-up price ($25 / ₹2099) and the webhook/verify flow
+// grants +30 min via grantTimeExtension instead of resetting to the full
+// plan grant. metadata.mode === 'renewal' is the signal the webhook reads
+// to branch into the top-up grant. This route is the browser-checkout
+// fallback used when /extend-now can't charge silently (no card / 3DS).
 router.post('/create-renewal', authMiddleware, async (req, res) => {
   try {
     // ── Tier gate ──
-    // Renewal is the Basic +1h top-up. ONLY Basic-tier subscribers should
-    // be able to buy it. Without this gate the endpoint accepted any
-    // authenticated user and:
-    //   • Free user → bumped to tier='basic' with 1h credit (confusing
-    //     partial Basic grant for someone who wanted Pro/Max instead)
-    //   • Pro/Max user → grantBasicRenewal preserved unlimited values so
-    //     the user paid $6.99/₹599 for nothing — pure money waste
-    // We allow ANY Basic license through (active, expired, exhausted)
-    // because the explicit user intent is "I want more time on my Basic
-    // plan." An expired-Basic user renewing is the most common case.
+    // Top-ups are for the METERED tiers only (Basic/Pro/Max):
+    //   • Free user → rejected (a top-up would silently bump them to a
+    //     partial Basic grant — confusing for someone comparing plans)
+    //   • Ultra → unlimited, nothing to top up (also caught by the
+    //     unlimited no-op in grantTimeExtension as defense-in-depth)
+    // We allow ANY basic/pro/max license through (active, expired,
+    // exhausted) because the explicit user intent is "I want more time."
     const license = db.getLicenseByUserId(req.user.id);
-    if (!license || license.tier !== 'basic') {
+    if (!license || !['basic', 'pro', 'max'].includes(license.tier)) {
       return res.status(400).json({
-        error: 'Renewal is only available to Basic plan subscribers. Buy the Basic plan to start.',
+        error: 'Top-ups extend the Basic, Pro, and Max interview passes. Buy a pass to start.',
       });
     }
     // SECURITY: Same currency-injection mitigation as /create-checkout.
@@ -690,6 +703,219 @@ router.post('/create-renewal', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Renewal checkout error:', err.message, err.stack);
     res.status(500).json({ error: err.message || 'Failed to start renewal. Please try again.' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  EXTEND NOW — one-click +30 min on the card on file (2026-07)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// The mid-interview top-up. Business rules (owner-confirmed):
+//   · $25 / ₹2099 per +30 minutes (flat — RENEWAL_* constants)
+//   · repeatable WITHOUT limit
+//   · but only while the pass is live on its interview day (an open
+//     usage session, or session activity within the last 12 hours)
+//   · tier preserved (a Pro top-up must never relabel the user Basic)
+//   · Ultra/admin exempt — unlimited, never offered, never charged
+//
+// Stripe path: charge the saved card off-session — the user clicks one
+// button in the app and the time lands; NO checkout redirect. Degrades
+// to a normal checkout session when there's no card on file yet or the
+// bank demands 3DS (both rare after the first purchase, since every
+// checkout now saves the card via setup_future_usage).
+//
+// Razorpay path: RBI rules forbid silent off-session charges on one-time
+// payments, so India gets an instant IN-APP payment sheet (order payload
+// returned; client opens the Razorpay modal and verifies through the
+// existing /verify-razorpay flow with notes.mode='extension').
+//
+// Grant safety: the direct grant here races only with itself (no webhook
+// grants bare PaymentIntents — checkout.session.completed never fires for
+// them), and the UNIQUE(provider, provider_payment_id) index plus the
+// in-tx dedup make client retries idempotent. The Stripe idempotencyKey
+// (from the client's attempt_id) makes double-clicks safe at the charge
+// layer too — same key returns the same PaymentIntent, not a second charge.
+const EXTENSION_ELIGIBLE_WINDOW_MS = 12 * 60 * 60 * 1000;
+
+router.post('/extend-now', authMiddleware, async (req, res) => {
+  try {
+    // Admins are unlimited — nothing to extend.
+    if (isAdminEmail(req.user.email)) {
+      return res.json({ success: true, already_unlimited: true, message: 'Admin accounts have unlimited time.' });
+    }
+
+    const license = db.getLicenseByUserId(req.user.id);
+    if (!license || !['basic', 'pro', 'max'].includes(license.tier)) {
+      return res.status(400).json({
+        error: 'no_pass',
+        message: 'Top-ups extend the Basic, Pro, and Max interview passes. Buy a pass to start.',
+      });
+    }
+    if (db.resolveTimeBucket(license).source === 'unlimited') {
+      return res.json({ success: true, already_unlimited: true });
+    }
+
+    // ── Interview-day gate ──
+    // Unlimited repeats, but only while the pass is actually in use: an
+    // open usage session (mid-interview — the primary case) or activity
+    // in the last 12 hours (interviewer called back for another round
+    // the same day). A week-old pass can't be topped up — buy a fresh
+    // interview instead.
+    const d = db.getDB();
+    const recentActivity = d.prepare(`
+      SELECT id FROM usage_sessions
+      WHERE user_id = ? AND (ended_at IS NULL OR last_heartbeat_at > ?)
+      LIMIT 1
+    `).get(req.user.id, Date.now() - EXTENSION_ELIGIBLE_WINDOW_MS);
+    if (!recentActivity) {
+      return res.status(403).json({
+        error: 'not_interview_day',
+        message: 'Top-ups are available during your interview day. Start your interview first, or buy a new interview pass.',
+      });
+    }
+
+    const attemptId = String(req.body?.attempt_id || '').slice(0, 64);
+    const extPack = resolveExtensionPack(req.body?.pack);
+    const country = db.getUserById(req.user.id)?.country_code || 'US';
+
+    // ── India → instant in-app Razorpay sheet ──
+    if (getPaymentProvider(country) === 'razorpay') {
+      if (!razorpay) return res.status(503).json({ error: 'Razorpay is not configured. Contact support.' });
+      const order = await razorpay.orders.create({
+        amount: extPack.inr_paise,
+        currency: 'INR',
+        receipt: `ext_${req.user.id}_${Date.now()}`,
+        notes: {
+          user_email: req.user.email,
+          user_id: String(req.user.id),
+          mode: 'extension',
+          tier: license.tier,
+          pack: extPack.id,
+        },
+      });
+      return res.json({
+        provider: 'razorpay',
+        flow: 'in_app_sheet',
+        order_id: order.id,
+        key_id: process.env.RAZORPAY_KEY_ID,
+        amount: order.amount,
+        currency: order.currency,
+        name: `minicaai — ${extPack.label}`,
+        description: `Adds ${extPack.label.replace('+','')} to your interview time.`,
+        pack: extPack.id,
+        user_email: req.user.email,
+        user_name: req.user.name || '',
+        mode: 'extension',
+      });
+    }
+
+    // ── Global → off-session charge on the saved card ──
+    if (!stripe) return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
+    const user = db.getUserById(req.user.id);
+    const customerId = user?.stripe_customer_id?.startsWith('cus_') ? user.stripe_customer_id : null;
+    // No customer / no saved card yet → normal checkout (which saves the
+    // card via setup_future_usage, so the NEXT top-up is one-click).
+    if (!customerId) return await createStripeRenewal(req, res);
+
+    let paymentMethodId = null;
+    try {
+      const customer = await stripe.customers.retrieve(customerId);
+      paymentMethodId = customer?.invoice_settings?.default_payment_method || null;
+      if (!paymentMethodId) {
+        const pms = await stripe.paymentMethods.list({ customer: customerId, type: 'card', limit: 1 });
+        paymentMethodId = pms.data[0]?.id || null;
+      }
+    } catch (lookupErr) {
+      console.warn('[extend-now] customer/PM lookup failed:', lookupErr.message);
+    }
+    if (!paymentMethodId) return await createStripeRenewal(req, res);
+
+    let intent;
+    try {
+      intent = await stripe.paymentIntents.create({
+        amount: extPack.usd_cents,
+        currency: 'usd',
+        customer: customerId,
+        payment_method: paymentMethodId,
+        off_session: true,
+        confirm: true,
+        description: `minicaai — ${extPack.label} interview time`,
+        metadata: {
+          user_email: req.user.email,
+          user_id: String(req.user.id),
+          mode: 'extension',
+          tier: license.tier,
+          pack: extPack.id,
+        },
+      }, attemptId ? { idempotencyKey: `extend_${req.user.id}_${attemptId}` } : undefined);
+    } catch (chargeErr) {
+      const code = chargeErr?.code || chargeErr?.raw?.code;
+      if (code === 'authentication_required') {
+        // Bank demands 3DS — impossible silently. Degrade to checkout so
+        // the user can complete it in the browser without losing the flow.
+        return await createStripeRenewal(req, res);
+      }
+      const msg = chargeErr?.raw?.message || chargeErr?.message || 'Your card was declined.';
+      console.warn('[extend-now] off-session charge failed:', req.user.email, code, msg);
+      return res.status(402).json({
+        error: 'charge_failed',
+        message: `${msg} You can update your card from Manage Subscription, or complete the top-up in the browser.`,
+      });
+    }
+    if (!intent || intent.status !== 'succeeded') {
+      return await createStripeRenewal(req, res);
+    }
+
+    // Charge landed — grant + record atomically. In-tx dedup + the UNIQUE
+    // payment index make a duplicate (idempotent Stripe retry returning
+    // the same intent id) a no-op instead of a double grant.
+    const sqlite = db.getDB();
+    let alreadyGranted = false;
+    sqlite.transaction(() => {
+      const dup = sqlite.prepare(
+        "SELECT id FROM payments WHERE provider = 'stripe' AND provider_payment_id = ? AND status = 'completed' LIMIT 1"
+      ).get(intent.id);
+      if (dup) { alreadyGranted = true; return; }
+      db.grantTimeExtension(req.user.id, extPack.seconds);
+      db.recordPayment({
+        user_id: req.user.id,
+        email: req.user.email,
+        provider: 'stripe',
+        provider_payment_id: intent.id,
+        provider_subscription_id: null,
+        amount: extPack.usd_cents,
+        currency: 'USD',
+        status: 'completed',
+        tier_granted: license.tier,
+        metadata: { mode: 'extension', off_session: true, pack: extPack.id, granted_seconds: extPack.seconds, attempt_id: attemptId || null },
+      });
+    })();
+
+    try {
+      writeAudit(req, 'user-extend-time', { id: req.user.id, email: req.user.email }, {
+        provider: 'stripe', off_session: true, amount_cents: extPack.usd_cents, pack: extPack.id, duplicate: alreadyGranted,
+      });
+    } catch (auditErr) {
+      console.warn('[extend-now] audit log failed:', auditErr.message);
+    }
+
+    const updated = db.getLicenseByUserId(req.user.id);
+    const bucket = db.resolveTimeBucket(updated);
+    return res.json({
+      success: true,
+      provider: 'stripe',
+      flow: 'off_session',
+      duplicate: alreadyGranted,
+      charged_cents: extPack.usd_cents,
+      pack: extPack.id,
+      granted_seconds: extPack.seconds,
+      remaining: bucket.remaining,
+      source: bucket.source,
+      license: updated ? { ...updated, last_validated: Date.now() } : null,
+      message: `${extPack.label} added. Keep going.`,
+    });
+  } catch (err) {
+    console.error('[extend-now] error:', err.message, err.stack);
+    res.status(500).json({ error: err.message || 'Top-up failed. Please try again.' });
   }
 });
 
@@ -902,6 +1128,27 @@ async function createStripeCheckout(req, res, tier) {
         tier,
       },
     };
+  } else {
+    // ── Card on file (2026-07) ──
+    // One-time interview purchases SAVE the payment method for off-session
+    // reuse — this is what powers the mid-interview "+30 min, one click"
+    // top-up (/extend-now) without ever sending the user back through a
+    // checkout page. setup_future_usage requires the PM to attach to a
+    // durable Customer, so when we don't have one on file yet we tell
+    // Checkout to always create one; the checkout.session.completed
+    // webhook persists session.customer → users.stripe_customer_id.
+    // (Subscriptions save their PM automatically — no flag needed.)
+    sessionParams.payment_intent_data = {
+      setup_future_usage: 'off_session',
+      metadata: {
+        user_email: req.user.email,
+        user_id: String(req.user.id),
+        tier,
+      },
+    };
+    if (!reuseCustomerId) {
+      sessionParams.customer_creation = 'always';
+    }
   }
 
   const session = await stripe.checkout.sessions.create(sessionParams);
@@ -1069,66 +1316,89 @@ async function createRazorpayCheckout(req, res, tier) {
 // ── STRIPE RENEWAL ─────────────────────────────────────────────────
 // Uses `price_data` inline (not a pre-created price ID) so we don't have
 // to make the user configure yet another env var for the renewal amount.
-// mode: 'payment' — one-time charge, no recurring semantics.
+// mode: 'payment' — one-time charge, no recurring semantics. Flat +30 min
+// top-up ($25 — RENEWAL_USD_CENTS). Serves both /create-renewal and
+// /extend-now's degraded paths (no card on file / 3DS challenge).
 async function createStripeRenewal(req, res) {
   if (!stripe) {
     return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
   }
+  const renewalPack = resolveExtensionPack(req.body?.pack);
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3005';
-  const session = await stripe.checkout.sessions.create({
+  // Reuse the stored customer so the saved card powers future one-click
+  // top-ups; create one when this is the user's first Stripe touch.
+  const existingUser = db.getUserById(req.user.id);
+  const reuseCustomerId = existingUser?.stripe_customer_id?.startsWith('cus_')
+    ? existingUser.stripe_customer_id
+    : null;
+  const sessionParams = {
     mode: 'payment',
     payment_method_types: ['card'],
-    customer_email: req.user.email,
     line_items: [{
       price_data: {
         currency: 'usd',
         product_data: {
-          name: 'minicaai Basic — Renewal (+1 interview)',
-          description: 'Adds 1 interview credit and extends your Basic plan by 1 hour.',
+          name: `minicaai — ${renewalPack.label}`,
+          description: `Adds ${renewalPack.label.replace('+','')} to your interview time.`,
         },
-        unit_amount: RENEWAL_USD_CENTS,
+        unit_amount: renewalPack.usd_cents,
       },
       quantity: 1,
     }],
     // `mode=renewal` in the success URL lets the frontend pick the right
     // welcome banner ("renewed" vs "3 credits unlocked") even before the
     // webhook lands.
-    success_url: `${frontendUrl}?payment=success&mode=renewal&session_id={CHECKOUT_SESSION_ID}`,
+    success_url: `${frontendUrl}?payment=success&mode=renewal&pack=${renewalPack.id}&session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${frontendUrl}?payment=cancelled`,
     metadata: {
       user_email: req.user.email,
       user_id: String(req.user.id),
       provider: 'stripe',
       mode: 'renewal',  // CRITICAL: webhook branches on this
+      pack: renewalPack.id,
     },
     billing_address_collection: 'required',
-  });
+    // Save the card for off-session reuse (the one-click /extend-now path).
+    payment_intent_data: { setup_future_usage: 'off_session', metadata: { pack: renewalPack.id } },
+  };
+  if (reuseCustomerId) {
+    sessionParams.customer = reuseCustomerId;
+  } else {
+    sessionParams.customer_email = req.user.email;
+    sessionParams.customer_creation = 'always';
+  }
+  const session = await stripe.checkout.sessions.create(sessionParams);
   res.json({
     provider: 'stripe',
     checkout_url: session.url,
     session_id: session.id,
     mode: 'renewal',
+    pack: renewalPack.id,
   });
 }
 
 // ── RAZORPAY RENEWAL ───────────────────────────────────────────────
-// One-time order at the renewal price. notes.mode === 'renewal' is the
-// signal webhook + verify read to call grantBasicRenewal instead of the
-// full tier grant. notes.tier='basic' is kept for any legacy guard that
-// still requires a valid tier string.
+// One-time order at the flat top-up price (RENEWAL_INR_PAISE). notes.mode
+// === 'renewal' is the signal webhook + verify read to call
+// grantTimeExtension (flat +30 min) instead of the full tier grant.
 async function createRazorpayRenewal(req, res) {
   if (!razorpay) {
     return res.status(503).json({ error: 'Razorpay is not configured. Contact support.' });
   }
+  const renewalPack = resolveExtensionPack(req.body?.pack);
+  const renewalLicense = db.getLicenseByUserId(req.user.id);
+  const renewalTier = ['basic', 'pro', 'max'].includes(renewalLicense?.tier)
+    ? renewalLicense.tier : 'basic';
   const order = await razorpay.orders.create({
-    amount: RENEWAL_INR_PAISE,
+    amount: renewalPack.inr_paise,
     currency: 'INR',
     receipt: `renew_${req.user.id}_${Date.now()}`,
     notes: {
       user_email: req.user.email,
       user_id: String(req.user.id),
       mode: 'renewal',
-      tier: 'basic',
+      tier: renewalTier,
+      pack: renewalPack.id,
     },
   });
   res.json({
@@ -1137,11 +1407,12 @@ async function createRazorpayRenewal(req, res) {
     key_id: process.env.RAZORPAY_KEY_ID,
     amount: order.amount,
     currency: order.currency,
-    name: 'minicaai Basic — Renewal',
-    description: '+1 interview (1 hour)',
+    name: `minicaai — ${renewalPack.label}`,
+    description: `Adds ${renewalPack.label.replace('+','')} to your interview time`,
     user_email: req.user.email,
     user_name: req.user.name || '',
     mode: 'renewal',
+    pack: renewalPack.id,
   });
 }
 
@@ -1252,9 +1523,10 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
         const t = order && order.notes && order.notes.tier;
         if (VALID_TIERS.includes(t)) grantedTier = t;
         if (typeof order?.amount === 'number') grantedAmount = order.amount;
-        // Renewal orders carry notes.mode === 'renewal'. Flag it so the
-        // grant below branches to +1/+1h instead of full Basic.
-        if (order && order.notes && order.notes.mode === 'renewal') {
+        // Top-up orders carry notes.mode 'renewal' (legacy) or 'extension'
+        // (2026-07 one-click). Flag them so the grant below branches to
+        // the +30-min top-up instead of a full tier reset.
+        if (order && order.notes && (order.notes.mode === 'renewal' || order.notes.mode === 'extension')) {
           isRenewal = true;
         }
       }
@@ -1279,7 +1551,12 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
     // trail) and return success-with-pending so the client shows a friendly
     // message. The signature-verified webhook will land within seconds and
     // grant the right tier from the full payload.
-    if (lookupFailed || !grantedTier) {
+    // A verified top-up (isRenewal) doesn't need a resolved TIER to grant —
+    // it preserves whatever tier the license already has and adds +30 min.
+    // Only fall into the pending/reconcile branch when the LOOKUP
+    // itself failed (can't trust the order at all). A first-time tier
+    // PURCHASE still requires a resolved tier (never default-grant a tier).
+    if (lookupFailed || (!grantedTier && !isRenewal)) {
       try {
         db.recordPayment({
           user_id: req.user.id,
@@ -1335,8 +1612,9 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
         if (dup) { alreadyGranted = true; return; }
 
         if (isRenewal) {
-          // Renewal: +1 session, +1 hour — no tier reset, no expiry overwrite.
-          db.grantBasicRenewal(user.id);
+          // Top-up: tier preserved. Pack determines seconds — re-derived from order notes.
+          const verifyPack = resolveExtensionPack(fetchedOrder?.notes?.pack);
+          db.grantTimeExtension(user.id, verifyPack.seconds);
           const post = db.getLicenseByUserId(user.id);
           grantedTierLabel = (post && post.tier) || 'basic';
         } else {
@@ -1361,14 +1639,15 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
           db.setRazorpaySubscriptionId(user.id, razorpay_subscription_id);
         }
 
-        // Record payment in history
+        // Record payment in history. For a renewal, use the flat top-up
+        // price (RENEWAL_INR_PAISE) unless the fetched order amount is known.
         db.recordPayment({
           user_id: user.id,
           email: user.email,
           provider: 'razorpay',
           provider_payment_id: razorpay_payment_id,
           provider_subscription_id: razorpay_subscription_id || null,
-          amount: isRenewal ? RENEWAL_INR_PAISE : grantedAmount,
+          amount: isRenewal ? (typeof fetchedOrder?.amount === 'number' ? fetchedOrder.amount : resolveExtensionPack(fetchedOrder?.notes?.pack).inr_paise) : grantedAmount,
           currency: 'INR',
           status: 'completed',
           tier_granted: grantedTierLabel,
@@ -1402,7 +1681,7 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
     res.json({
       success: true,
       message: isRenewal
-        ? 'Renewal successful — 1 extra interview unlocked (1 hour).'
+        ? 'Top-up successful — 30 extra minutes added to your interview time.'
         : `Payment verified. Account upgraded to ${grantedTierLabel.toUpperCase()}!`,
       tier: grantedTierLabel,
       mode: isRenewal ? 'renewal' : 'tier',
@@ -1451,6 +1730,80 @@ router.get('/subscription', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Subscription status error:', err.message);
     res.status(500).json({ error: 'Failed to check subscription' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PAYMENT HISTORY — the Billing Hub's invoice list
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Reads the payments table we already write on every grant/refund/failure.
+// Client-safe projection only — provider ids are included (they're the
+// user's own receipts) but internal metadata is parsed and reduced.
+router.get('/history', authMiddleware, (req, res) => {
+  try {
+    const rows = db.getPaymentsByUser(req.user.id) || [];
+    const items = rows.slice(0, 50).map((p) => {
+      let mode = 'purchase';
+      try {
+        const meta = JSON.parse(p.metadata || '{}');
+        if (meta.mode === 'renewal' || meta.mode === 'extension') mode = 'top-up';
+        else if (meta.mode) mode = meta.mode;
+      } catch { /* metadata unparseable — keep default */ }
+      return {
+        id: p.id,
+        created_at: p.created_at,
+        provider: p.provider,
+        amount: p.amount,
+        currency: p.currency,
+        status: p.status,
+        tier: p.tier_granted,
+        mode,
+        reference: p.provider_payment_id || null,
+      };
+    });
+    res.json({ payments: items });
+  } catch (err) {
+    console.error('[payments/history] error:', err.message);
+    res.status(500).json({ error: 'Failed to load payment history' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PAYMENT METHOD — what card is on file (Billing Hub)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Stripe only — Razorpay one-time flows don't retain a chargeable
+// instrument (RBI), so India reports none and the UI explains that
+// top-ups go through the instant UPI/card sheet instead.
+router.get('/payment-method', authMiddleware, async (req, res) => {
+  try {
+    const user = db.getUserById(req.user.id);
+    const customerId = user?.stripe_customer_id?.startsWith('cus_') ? user.stripe_customer_id : null;
+    if (!customerId || !stripe) {
+      const isIndia = (user?.country_code || 'US') === 'IN';
+      return res.json({ has_card: false, provider: isIndia ? 'razorpay' : 'stripe' });
+    }
+    let pm = null;
+    const customer = await stripe.customers.retrieve(customerId);
+    const defaultId = customer?.invoice_settings?.default_payment_method || null;
+    if (defaultId) {
+      pm = await stripe.paymentMethods.retrieve(defaultId);
+    } else {
+      const pms = await stripe.paymentMethods.list({ customer: customerId, type: 'card', limit: 1 });
+      pm = pms.data[0] || null;
+    }
+    if (!pm?.card) return res.json({ has_card: false, provider: 'stripe' });
+    res.json({
+      has_card: true,
+      provider: 'stripe',
+      brand: pm.card.brand,
+      last4: pm.card.last4,
+      exp_month: pm.card.exp_month,
+      exp_year: pm.card.exp_year,
+    });
+  } catch (err) {
+    console.error('[payments/payment-method] error:', err.message);
+    // Non-fatal for the Billing Hub — render the "no card" state.
+    res.json({ has_card: false, provider: 'stripe', lookup_failed: true });
   }
 });
 
@@ -1916,4 +2269,7 @@ module.exports._test = {
   EXPECTED_INR_PAISE,
   razorpayPlanCache,
   PRICE_VALIDATION_TTL_MS,
+  // Extension pack tests
+  EXTENSION_PACKS,
+  resolveExtensionPack,
 };

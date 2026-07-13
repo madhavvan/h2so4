@@ -80,7 +80,10 @@
          display=swap so we never block render on the font itself. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Inter:wght@400;500;600;700&display=swap" />
+    <!-- ital axis included: the landing's signature lines are true-italic
+         serif (hero typed line, closing). Without the italic cuts the
+         browser synthesizes a sheared roman — the classic cheap-type tell. -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500;1,6..72,600&family=Inter:wght@400;500;600;700&display=swap" />
     <!-- Tailwind compiled via PostCSS; loaded BEFORE the inline <style> so
          our custom iOS-token CSS below wins the cascade (matches the order
          Play CDN used to produce). Vite processes this through tailwind.config.cjs + postcss.config.cjs. -->
@@ -808,24 +811,33 @@
         width: auto;
         padding: 1px;
         border-radius: inherit;
+        /* Refined obsidian-gold hairline (was a saturated amber→purple
+           band). Softer stops read as a fine metallic line, not a thick
+           rim — and gold matches the rest of the app instead of the
+           leftover purple. */
         background: linear-gradient(135deg,
-          rgba(245, 158, 11, 0.55) 0%,
-          rgba(251, 191, 36, 0.50) 35%,
-          rgba(168, 85, 247, 0.50) 70%,
-          rgba(139, 92, 246, 0.55) 100%);
+          rgba(246, 228, 176, 0.58) 0%,
+          rgba(211, 172, 99, 0.42) 48%,
+          rgba(181, 143, 69, 0.44) 100%);
         -webkit-mask:
           linear-gradient(#000 0 0) content-box,
           linear-gradient(#000 0 0);
         -webkit-mask-composite: xor;
                 mask-composite: exclude;
         pointer-events: none;
-        opacity: 0.80;
+        opacity: 0.70;
         transition: opacity 240ms var(--ease-ios);
       }
-      .mp-card-max:hover::before { opacity: 1; }
+      .mp-card-max:hover::before { opacity: 0.9; }
+      /* Selection BRIGHTENS the same 1px line — it does NOT thicken it
+         (the old padding:2px is what read as a giant border). The
+         "selected" signal comes from a soft gold lift below. */
       .mp-card-max.is-selected::before {
         opacity: 1;
-        padding: 2px;
+        padding: 1px;
+      }
+      .mp-card-max.is-selected {
+        box-shadow: 0 10px 32px -16px rgba(211, 172, 99, 0.45);
       }
       .mp-card-max.is-locked::before { opacity: 0.45; }
 
@@ -851,17 +863,18 @@
       .mp-card.is-selected .mp-card-mono {
         box-shadow: 0 0 0 1px var(--mp-accent) inset, 0 6px 18px -8px var(--mp-accent);
       }
-      /* Max monogram — amber→purple gradient chip, same palette as the rim. */
+      /* Max monogram — refined gold chip, same obsidian-gold palette as
+         the rim (was amber→purple). */
       .mp-card-mono-max {
-        background: linear-gradient(135deg, rgba(245, 158, 11, 0.22), rgba(168, 85, 247, 0.20));
-        border: 1px solid rgba(245, 158, 11, 0.55);
-        color: #fcd34d;
+        background: linear-gradient(135deg, rgba(246, 228, 176, 0.16), rgba(181, 143, 69, 0.12));
+        border: 1px solid rgba(211, 172, 99, 0.50);
+        color: #f6e4b0;
       }
       .mp-card-max:hover .mp-card-mono-max { transform: translateY(-1px); }
       .mp-card-max.is-selected .mp-card-mono-max {
         box-shadow:
-          0 0 0 1px rgba(245, 158, 11, 0.55) inset,
-          0 6px 22px -6px rgba(168, 85, 247, 0.35);
+          0 0 0 1px rgba(211, 172, 99, 0.50) inset,
+          0 6px 22px -6px rgba(211, 172, 99, 0.30);
       }
 
       /* Body — name + tagline */
@@ -896,24 +909,44 @@
         display: flex;
         align-items: center;
       }
+      /* Active = a quiet "live" indicator, not a loud pill: a small green
+         glowing dot + a low-weight label. Green reads instantly as "on"
+         and stays distinct from the gold selected-card chrome. */
       .mp-card-active {
         display: inline-flex;
         align-items: center;
-        gap: 4px;
-        font-size: 9.5px;
-        font-weight: 700;
-        letter-spacing: 0.10em;
-        text-transform: uppercase;
-        padding: 4px 8px;
-        border-radius: 999px;
-        background: color-mix(in oklab, var(--mp-accent, #10b981) 14%, transparent);
-        color: var(--mp-fg, #34d399);
-        border: 1px solid color-mix(in oklab, var(--mp-accent, #10b981) 40%, transparent);
+        gap: 7px;
+        font-size: 10px;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+        text-transform: none;
+        padding: 0;
+        background: none;
+        border: none;
+        color: rgba(244, 244, 245, 0.62);
       }
+      .mp-live-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #34d399;
+        box-shadow: 0 0 6px rgba(52, 211, 153, 0.7);
+        animation: mp-live-pulse 2.4s ease-out infinite;
+      }
+      @keyframes mp-live-pulse {
+        0%   { box-shadow: 0 0 6px rgba(52,211,153,0.70), 0 0 0 0 rgba(52,211,153,0.45); }
+        70%  { box-shadow: 0 0 6px rgba(52,211,153,0.70), 0 0 0 5px rgba(52,211,153,0); }
+        100% { box-shadow: 0 0 6px rgba(52,211,153,0.70), 0 0 0 0 rgba(52,211,153,0); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .mp-live-dot { animation: none; }
+      }
+      /* Max keeps the same quiet green live-dot — the gold flagship rim
+         already carries the tier signal, so no gold pill here. */
       .mp-card-active-max {
-        background: linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(168, 85, 247, 0.16));
-        color: #fcd34d;
-        border: 1px solid rgba(245, 158, 11, 0.50);
+        color: rgba(244, 244, 245, 0.62);
+        background: none;
+        border: none;
       }
       .mp-card-lock {
         display: inline-flex;
@@ -934,28 +967,73 @@
         border: 1px solid rgba(245, 158, 11, 0.50);
       }
       /* Inline badges — "Recommended" (GPT) and "Flagship" (Claude) */
+      /* Badges are quiet labels, not filled pills — small-caps, light
+         weight, no border/background. Recommended = muted gold; Flagship
+         = a brighter gold ✦ + label. */
       .mp-card-badge {
         display: inline-flex;
         align-items: center;
-        gap: 3px;
+        gap: 4px;
         font-size: 9px;
-        font-weight: 700;
-        letter-spacing: 0.06em;
+        font-weight: 600;
+        letter-spacing: 0.10em;
         text-transform: uppercase;
-        padding: 2px 7px;
-        border-radius: 999px;
+        padding: 0;
+        background: none;
+        border: none;
         white-space: nowrap;
       }
       .mp-card-badge-recommended {
-        background: rgba(16, 185, 129, 0.18);
-        color: #34d399;
-        border: 1px solid rgba(16, 185, 129, 0.40);
+        color: rgba(211, 172, 99, 0.72);
       }
       .mp-card-badge-flagship {
-        background: linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(168, 85, 247, 0.16));
-        color: #fcd34d;
-        border: 1px solid rgba(245, 158, 11, 0.50);
+        color: rgba(211, 172, 99, 0.92);
       }
+      /* Tier-upgrade hint in the model-selection header — ONE refined gold
+         hairline treatment (replaces three mismatched amber pills). Quiet,
+         premium, and consistent with the obsidian-and-gold system. */
+      .mp-hint {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 10px;
+        font-weight: 500;
+        letter-spacing: 0.015em;
+        color: #f0d9a0;
+        background: rgba(201, 165, 92, 0.08);
+        border: 1px solid rgba(201, 165, 92, 0.26);
+        border-radius: 999px;
+        padding: 3px 10px;
+        white-space: nowrap;
+      }
+      .mp-hint svg { opacity: 0.85; }
+
+      /* ── Premium "gold glass" primary button ──
+         Replaces the bright solid gold-gradient fills (e.g. Save Settings)
+         with a frosted, gold-tinted glass surface + gold hairline + warm
+         gold text. Far less bright than the old #e8cf8f→#c9a655 fill, but
+         still unmistakably the primary action. Reusable everywhere those
+         bright gold buttons live. */
+      .btn-gold-glass {
+        position: relative;
+        color: #f0d9a0;
+        background: linear-gradient(180deg, rgba(211, 172, 99, 0.17), rgba(211, 172, 99, 0.075));
+        border: 1px solid rgba(211, 172, 99, 0.34);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 6px 20px -14px rgba(211, 172, 99, 0.35);
+        -webkit-backdrop-filter: blur(8px);
+        backdrop-filter: blur(8px);
+        transition:
+          background 200ms var(--ease-ios),
+          border-color 200ms var(--ease-ios),
+          box-shadow 200ms var(--ease-ios),
+          transform 160ms var(--ease-ios);
+      }
+      .btn-gold-glass:hover {
+        background: linear-gradient(180deg, rgba(211, 172, 99, 0.24), rgba(211, 172, 99, 0.12));
+        border-color: rgba(211, 172, 99, 0.50);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10), 0 8px 26px -14px rgba(211, 172, 99, 0.45);
+      }
+      .btn-gold-glass:active { transform: translateY(0.5px); }
 
       /* ── Compact full-card variant ──
          Used for the four non-Max models in the settings panel's 2-col

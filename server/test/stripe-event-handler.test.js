@@ -32,6 +32,7 @@ const mocks = {
   updateLicenseOnPayment: vi.fn(),
   recordPayment: vi.fn(),
   grantBasicRenewal: vi.fn(),
+  grantTimeExtension: vi.fn(),
   getDB: vi.fn(),
 };
 for (const [k, v] of Object.entries(mocks)) {
@@ -308,8 +309,8 @@ describe('customer.subscription.paused dedicated event preserves tier', () => {
 
 // ─── checkout.session.completed renewal ───
 describe('checkout.session.completed renewal mode', () => {
-  it('grants Basic renewal via grantBasicRenewal (not full grant)', async () => {
-    mocks.grantBasicRenewal.mockReturnValue({ tier: 'basic' });
+  it('grants the +30-min top-up via grantTimeExtension (not full grant)', async () => {
+    mocks.grantTimeExtension.mockReturnValue({ tier: 'basic' });
     await handleStripeEvent({
       type: 'checkout.session.completed',
       created: Math.floor(Date.now() / 1000),
@@ -324,7 +325,7 @@ describe('checkout.session.completed renewal mode', () => {
         },
       },
     });
-    expect(mocks.grantBasicRenewal).toHaveBeenCalledWith(TEST_USER.id);
+    expect(mocks.grantTimeExtension).toHaveBeenCalledWith(TEST_USER.id, 1800); // default pack (m30) when no pack in metadata
     expect(mocks.updateUserTier).not.toHaveBeenCalled();  // renewal isn't a tier change
     expect(mocks.recordPayment).toHaveBeenCalledWith(expect.objectContaining({
       tier_granted: 'basic',

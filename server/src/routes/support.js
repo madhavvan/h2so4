@@ -509,8 +509,14 @@ router.post('/chat', async (req, res) => {
   };
 
   try {
-    const { runAnthropicChatLoop } = require('../services/anthropicSupport');
-    await runAnthropicChatLoop({
+    // Per-role model routing. Admin → Claude (claude-sonnet-5): needs the
+    // full engineering-docs corpus inline + reliable destructive-tool
+    // step-up. User (Basic+) → DeepSeek V4 Flash when DEEPSEEK_API_KEY is
+    // set (fast + cheap for the lighter user tool surface), falling back to
+    // Claude if the key is absent so user chat never goes dark. Both loops
+    // share the identical argument object + SSE contract, so the renderer
+    // is model-agnostic. (anon/free are gated above and never reach here.)
+    const loopArgs = {
       systemPrompt: systemForRequest,
       toolCatalog: tools,
       callerMessages: messages,
@@ -520,7 +526,16 @@ router.post('/chat', async (req, res) => {
       sse,
       emitToolCallToClient,
       abortSignal: abortController.signal,
-    });
+    };
+    const useDeepSeek = role === 'user' && !!process.env.DEEPSEEK_API_KEY;
+    console.log(`[support/chat] model loop=${useDeepSeek ? 'deepseek' : 'claude'} role=${role}`);
+    if (useDeepSeek) {
+      const { runDeepSeekChatLoop } = require('../services/deepseekSupport');
+      await runDeepSeekChatLoop(loopArgs);
+    } else {
+      const { runAnthropicChatLoop } = require('../services/anthropicSupport');
+      await runAnthropicChatLoop(loopArgs);
+    }
     try { res.end(); } catch {}
     return;
   } catch (err) {
@@ -819,7 +834,7 @@ const SCRIPTED_TOPICS = {
         {
           id: 'plan-comparison',
           q: 'What are the plan differences?',
-          a: 'Free: Gemini, 5 sessions, 30-min trial total, one file. Basic: + GPT/Grok/Groq, unlimited sessions with a 3-hour credit bank, pop-out + Auto-Solve. Pro: same models, unlimited time. Max: + Claude with web search, Auto-Type, Train Model, reasoning-effort knob. Full matrix in Features.',
+          a: 'Free: one-time 10-min trial (every model except Claude), one file — after the trial you pick a plan. Basic: + GPT/Grok/Groq, unlimited sessions with a 3-hour credit bank, pop-out + Auto-Solve. Pro: same models, unlimited time. Max: + Claude with web search, Auto-Type, Train Model, reasoning-effort knob. Full matrix in Features.',
         },
         {
           id: 'pricing',

@@ -22,7 +22,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   X, Crown, Zap, Sparkles, Check, Loader2, ExternalLink, AlertTriangle,
-  Cpu, ChevronRight, Info, ShieldCheck, UploadCloud,
+  Cpu, ChevronRight, Info, ShieldCheck, UploadCloud, CreditCard, Receipt,
 } from 'lucide-react';
 import { WizardHat } from './WizardHat';
 import { UltraMark } from './UltraMark';
@@ -32,6 +32,7 @@ import { UltraMark } from './UltraMark';
 // WizardHat marks on currentColor.)
 import { BasicMark, ProMark, MaxMark } from './TierMarks';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
+import { pricingService, getExtensionPacks } from './services/pricingService';
 import { backfillAllConversations, BackfillProgress } from './services/aiProxyService';
 import { RefundPolicy } from './RefundPolicy';
 import { useAnimatedModal } from './hooks/useAnimatedModal';
@@ -43,8 +44,73 @@ const API_BASE = (import.meta as any).env?.PROD
   ? 'https://api.minicaai.com'
   : ((import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com');
 
+// ── Razorpay in-app sheet for the +30-min top-up (India) ──
+// RBI rules forbid charging a saved card silently on one-time payments, so
+// the Indian top-up opens Razorpay's own modal in-app. checkout.js is CSP-
+// allowed and cached after first load. onDone fires only after the payment
+// is signature-verified server-side.
+let rzpTopUpScriptPromise: Promise<boolean> | null = null;
+function loadRazorpayTopUpScript(): Promise<boolean> {
+  if ((window as any).Razorpay) return Promise.resolve(true);
+  if (!rzpTopUpScriptPromise) {
+    rzpTopUpScriptPromise = new Promise((resolve) => {
+      const s = document.createElement('script');
+      s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+      s.onload = () => resolve(true);
+      s.onerror = () => { rzpTopUpScriptPromise = null; resolve(false); };
+      document.head.appendChild(s);
+    });
+  }
+  return rzpTopUpScriptPromise;
+}
+
+async function openRazorpayTopUpSheet(
+  payload: any,
+  token: string,
+  onDone: (message: string) => void | Promise<void>,
+): Promise<boolean> {
+  const ok = await loadRazorpayTopUpScript();
+  if (!ok || !(window as any).Razorpay) return false;
+  try {
+    const rzp = new (window as any).Razorpay({
+      key: payload.key_id,
+      amount: payload.amount,
+      currency: payload.currency,
+      name: payload.name,
+      description: payload.description,
+      order_id: payload.order_id,
+      prefill: { email: payload.user_email, name: payload.user_name },
+      theme: { color: '#10b981' },
+      handler: async (resp: any) => {
+        try {
+          const v = await fetch(`${API_BASE}/api/v1/payments/verify-razorpay`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            body: JSON.stringify(resp),
+          });
+          const vd = await v.json().catch(() => null);
+          // Server message names the tier-correct amount; the fallback is
+          // amount-neutral so it can never state the wrong figure.
+          await onDone(
+            (v.ok && vd?.success)
+              ? (vd.message || 'Extra time added to your interview clock.')
+              : 'Payment received — your time will land automatically in a moment.',
+          );
+        } catch {
+          await onDone('Payment received — your time will land automatically in a moment.');
+        }
+      },
+      modal: { ondismiss: () => { /* user closed — nothing to report */ } },
+    });
+    rzp.open();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 interface SubscriptionStatus {
-  status: 'active' | 'canceling' | 'trial' | 'expired' | 'revoked' | 'paused' | 'refunded' | 'disputed' | 'none';
+  status: 'active' | 'canceling' | 'past_due' | 'trial' | 'expired' | 'revoked' | 'paused' | 'refunded' | 'disputed' | 'none';
   tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
   provider: 'stripe' | 'razorpay' | null;
   expires_at: number;
@@ -79,9 +145,10 @@ interface ManageSubscriptionProps {
   // to the parent, the chat-header tier badge would keep showing the old
   // tier until next reload. Pairs with onProfileUpdated.
   onLicenseUpdated?: (license: LicenseData) => void;
-  // Basic +1h top-up. Optional so older callers don't break — when not
-  // provided, the Renew row is hidden and Basic users are pointed at the
-  // credit-exhausted modal's renew button instead.
+  // Plan-specific time top-up (Basic +30 min · Pro/Max +1 hour). Optional
+  // so older callers don't break — when not provided, the Renew row is
+  // hidden and users are pointed at the credit-exhausted modal's renew
+  // button instead.
   onRenewRequested?: () => void;
   // Externally-tracked upgrade-in-flight signal (Free → paid). Lets the
   // upgrade buttons here render their own loading state while the parent
@@ -90,8 +157,8 @@ interface ManageSubscriptionProps {
   // — modal closed instantly with no feedback. Now button shows spinner
   // until the parent decides to close us, smoothly.
   upgradePending?: 'basic' | 'pro' | 'max' | 'ultra' | null;
-  // Same pattern but for the +1h Basic top-up — separate flag so the
-  // renewal spinner doesn't accidentally light up the upgrade rows.
+  // Same pattern but for the plan-specific time top-up — separate flag so
+  // the renewal spinner doesn't accidentally light up the upgrade rows.
   renewPending?: boolean;
 }
 
@@ -107,7 +174,7 @@ const TIER_INFO: Record<string, {
     color: 'text-gray-300',
     gradient: 'from-slate-700 to-slate-800',
     icon: Sparkles,
-    blurb: '5 sessions/month, Gemini only.',
+    blurb: 'One-time 10-min trial (all models except Claude) — then pick a plan.',
   },
   basic: {
     label: 'Basic',
@@ -121,7 +188,7 @@ const TIER_INFO: Record<string, {
     color: 'text-blue-400',
     gradient: 'from-blue-600/50 to-purple-700/50',
     icon: Crown,
-    blurb: 'One 1-hour interview · all five models incl. Claude Sonnet 5. Pop-out + Auto-Solve.',
+    blurb: 'One 1-hour interview · all five models incl. Claude Sonnet 5. Extendable +30 min.',
   },
   max: {
     // WizardHat is the dedicated Max-tier identity icon (custom SVG at
@@ -135,7 +202,7 @@ const TIER_INFO: Record<string, {
     color: 'text-amber-400',
     gradient: 'from-amber-600/40 via-orange-600/40 to-purple-700/40',
     icon: WizardHat,
-    blurb: 'Three 1-hour interviews · all five models incl. Claude Sonnet 5 · Train Model.',
+    blurb: 'Three 1-hour interviews · all five models incl. Claude Sonnet 5 · Train Model. Extendable +30 min.',
   },
   ultra: {
     // Amethyst flagship — the only unlimited, monthly-subscription tier.
@@ -154,6 +221,9 @@ const STATUS_LABEL: Record<string, { text: string; color: string }> = {
   // Amber instead of green/red to read as "scheduled to end" — neither
   // healthy nor dead — and to draw the eye to the Reactivate CTA below.
   canceling: { text: 'Cancellation scheduled', color: 'bg-amber-500/15 text-amber-300 border-amber-500/30' },
+  // Payment failed, provider auto-retrying (~7 days) — access retained
+  // during the retry window (server ACCESS_STATUSES), so amber not red.
+  past_due:  { text: 'Payment past due',      color: 'bg-amber-500/15 text-amber-300 border-amber-500/30' },
   expired:   { text: 'Expired',               color: 'bg-red-500/15 text-red-300 border-red-500/30' },
   revoked:   { text: 'Revoked',               color: 'bg-red-500/15 text-red-300 border-red-500/30' },
   // Stripe collection paused — soft revoke, can be resumed.
@@ -203,8 +273,12 @@ function formatTrialTime(seconds: number | undefined): string {
 // the unlimited monthly subscription. Auto-Type is Ultra-only; Claude unlocks
 // at Pro.
 const FEATURE_ROWS: Array<{ label: string; values: Record<string, string | boolean> }> = [
-  { label: 'Interview time',      values: { free: '30-min trial', basic: 'One 30-min',  pro: 'One 1-hour', max: 'Three 1-hour', ultra: 'Unlimited' } },
-  { label: 'AI models',           values: { free: 'Gemini',       basic: '4 (no Claude)', pro: 'All 5',    max: 'All 5',        ultra: 'All 5' } },
+  { label: 'Interview time',      values: { free: '10-min trial', basic: 'One 30-min',  pro: 'One 1-hour', max: 'Three 1-hour', ultra: 'Unlimited' } },
+  // Flat +30-min top-up (2026-07). Currency-neutral here — the exact price
+  // ($25 / ₹2099) renders on the charge surfaces via
+  // pricingService.getRenewalPrice, which is region-aware.
+  { label: 'Extend on interview day', values: { free: false,      basic: '+30 min',     pro: '+30 min',    max: '+30 min',      ultra: 'Unlimited' } },
+  { label: 'AI models',           values: { free: '4 during trial', basic: '4 (no Claude)', pro: 'All 5',    max: 'All 5',        ultra: 'All 5' } },
   { label: 'Pop-out window',      values: { free: false,          basic: true,          pro: true,         max: true,           ultra: true } },
   { label: 'Auto-Solve (screen)', values: { free: false,          basic: true,          pro: true,         max: true,           ultra: true } },
   { label: 'Train Model',         values: { free: false,          basic: false,         pro: false,        max: true,           ultra: true } },
@@ -330,6 +404,17 @@ export function ManageSubscription({
   const [nameSaving, setNameSaving] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
   const [nameSaved, setNameSaved] = useState(false);
+  // ── Billing Hub (2026-07): card on file, invoice history, one-click top-up ──
+  const [pmInfo, setPmInfo] = useState<{
+    has_card: boolean; brand?: string; last4?: string;
+    exp_month?: number; exp_year?: number; provider?: string;
+  } | null>(null);
+  const [billingHistory, setBillingHistory] = useState<Array<{
+    id: number; created_at: number; amount: number; currency: string;
+    status: string; tier: string | null; mode: string; provider: string;
+  }> | null>(null);
+  const [extendLoading, setExtendLoading] = useState(false);
+  const [selectedExtPack, setSelectedExtPack] = useState('m30');
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -401,6 +486,81 @@ export function ManageSubscription({
   // local license back to status='active'. Inline so the user gets visible
   // confirmation without bouncing out to the Stripe portal — that round
   // trip is what made canceled-then-regretted users churn for good.
+  // ── Billing Hub data fetch — card on file + payment history ──
+  // Fire-and-forget on open; both endpoints degrade to empty states so a
+  // blip here never blocks the subscription view itself.
+  useEffect(() => {
+    if (!isOpen) return;
+    const token = licenseService.getToken();
+    if (!token) return;
+    const headers = { 'Authorization': `Bearer ${token}` };
+    fetch(`${API_BASE}/api/v1/payments/payment-method`, { headers })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (mountedRef.current && d) setPmInfo(d); })
+      .catch(() => {});
+    fetch(`${API_BASE}/api/v1/payments/history`, { headers })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (mountedRef.current && d?.payments) setBillingHistory(d.payments); })
+      .catch(() => {});
+  }, [isOpen]);
+
+  // ── One-click +30-min top-up ──
+  // Same server contract as the mid-interview flow: off-session charge on
+  // the card on file → time lands instantly; degrades to browser checkout
+  // (no saved card / 3DS) or the in-app Razorpay sheet (India).
+  const handleExtendNow = useCallback(async () => {
+    setExtendLoading(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const token = licenseService.getToken();
+      if (!token) throw new Error('Please sign in again to top up.');
+      const attemptId = (globalThis.crypto as any)?.randomUUID?.()
+        || `a_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const res = await fetch(`${API_BASE}/api/v1/payments/extend-now`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ attempt_id: attemptId, pack: selectedExtPack }),
+      });
+      const data: any = await res.json().catch(() => ({}));
+      if (res.ok && data.success && data.flow === 'off_session') {
+        // Server message names the tier-correct amount ("+30 minutes" /
+        // "+1 hour"); the fallback stays amount-neutral so it can never
+        // state the wrong figure.
+        await licenseService.validateWithServer().catch(() => {});
+        if (!mountedRef.current) return;
+        setSuccess(data.message || 'Extra time added to your interview clock.');
+        fetchSubscription();
+        return;
+      }
+      if (data.already_unlimited) {
+        setSuccess('Your account already has unlimited time.');
+        return;
+      }
+      if (data.provider === 'razorpay' && data.flow === 'in_app_sheet') {
+        const opened = await openRazorpayTopUpSheet(data, token, async (msg) => {
+          await licenseService.validateWithServer().catch(() => {});
+          if (!mountedRef.current) return;
+          setSuccess(msg);
+          fetchSubscription();
+        });
+        if (!opened) throw new Error('Could not open the payment sheet. Please try again.');
+        return;
+      }
+      if (res.ok && data.checkout_url) {
+        if (window.electronAPI?.openExternal) window.electronAPI.openExternal(data.checkout_url);
+        else window.open(data.checkout_url, '_blank', 'noopener');
+        setSuccess('Complete the top-up in your browser — your time lands here automatically.');
+        return;
+      }
+      throw new Error(data.message || data.error || 'Top-up failed. Please try again.');
+    } catch (e: any) {
+      if (mountedRef.current) setError(e?.message || 'Top-up failed. Please try again.');
+    } finally {
+      if (mountedRef.current) setExtendLoading(false);
+    }
+  }, [fetchSubscription, selectedExtPack]);
+
   const handleReactivate = useCallback(async () => {
     setActionLoading('reactivate');
     setError(null);
@@ -678,7 +838,7 @@ export function ManageSubscription({
   // from the last fetch. Prefer the more conservative (lower-rank) tier so a
   // downgrade is reflected before the in-flight refetch completes; otherwise
   // we'd show "Cancel subscription" on a tier the user no longer has.
-  const tierRank: Record<string, number> = { free: 0, basic: 1, pro: 2, max: 3 };
+  const tierRank: Record<string, number> = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4 };
   const subTier = sub?.tier;
   const licTier = userLicense?.tier;
   const tier = (subTier && licTier)
@@ -773,7 +933,7 @@ export function ManageSubscription({
           </div>
 
           {/* Plan-specific detail strip — Basic shows credit balance, Pro/Max
-              show renewal date, Free-on-trial shows the 30-min countdown. */}
+              show renewal date, Free-on-trial shows the 10-min countdown. */}
           {(tier !== 'free' || trialActive) && (
             <div className="mt-5 pt-4 border-t border-white/10 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
               {trialActive ? (
@@ -784,18 +944,50 @@ export function ManageSubscription({
                   </div>
                   <div>
                     <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">After trial</div>
-                    <div className="font-semibold text-white">Free plan · Gemini only · 5 sessions/mo</div>
+                    <div className="font-semibold text-white">Pick a plan to keep going</div>
                   </div>
                 </>
-              ) : tier === 'basic' ? (
+              ) : ['basic', 'pro', 'max'].includes(tier) ? (
                 <>
                   <div>
                     <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Time remaining</div>
                     <div className="font-semibold text-white">{formatCredits(userLicense?.credits_remaining_seconds)}</div>
                   </div>
                   <div>
-                    <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Credits expire</div>
+                    <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Pass expires</div>
                     <div className="font-semibold text-white">{userLicense?.credits_expire_at ? formatExpiry(userLicense.credits_expire_at) : '—'}</div>
+                  </div>
+                  <div className="sm:col-span-2">
+                    {(() => {
+                      const packs = getExtensionPacks(userProfile?.country_code || 'US');
+                      return (
+                        <div className="flex gap-1 mb-2">
+                          {packs.map(p => (
+                            <button key={p.id} onClick={() => setSelectedExtPack(p.id)}
+                              className={"px-2 py-1 rounded text-[10px] font-bold border transition-all " + (selectedExtPack === p.id ? "bg-emerald-500/25 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20")}>
+                              {p.label + " · " + p.currencySymbol + p.price}
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                    <button
+                      onClick={handleExtendNow}
+                      disabled={extendLoading}
+                      className="w-full sm:w-auto px-4 py-2 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold hover:bg-emerald-500/25 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
+                    >
+                      {extendLoading ? <Loader2 size={13} className="animate-spin" /> : <Zap size={13} />}
+                      {(() => {
+                        // Plan-specific top-up: Basic +30 min · $25, Pro/Max
+                        // +1 hour · $45 (server charges by the live license
+                        // tier — this label mirrors pricingService's table).
+                        const r = pricingService.getRenewalPrice(userProfile?.country_code || 'US', tier);
+                        return `Add ${r.minutes} minutes · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
+                      })()}
+                    </button>
+                    <p className="text-[10px] text-white/40 mt-1.5">
+                      One click on your card on file. Repeat as often as you need on your interview day.
+                    </p>
                   </div>
                 </>
               ) : (
@@ -834,6 +1026,80 @@ export function ManageSubscription({
           </div>
         )}
 
+        {/* ── Payment method on file (Billing Hub) ─────────────────── */}
+        {pmInfo && (
+          <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-white/[0.06] flex items-center justify-center shrink-0">
+                  <CreditCard size={16} className="text-white/70" />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[10px] uppercase tracking-wider text-white/50">Payment method</div>
+                  {pmInfo.has_card ? (
+                    <div className="text-sm font-semibold text-white truncate">
+                      {(pmInfo.brand || 'Card').toUpperCase()} •••• {pmInfo.last4}
+                      <span className="text-white/40 font-normal ml-2">
+                        {pmInfo.exp_month}/{String(pmInfo.exp_year || '').slice(-2)}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="text-sm text-white/60">
+                      {pmInfo.provider === 'razorpay'
+                        ? 'Top-ups use an instant UPI/card sheet — no card stored (RBI rules).'
+                        : 'No card on file yet — it saves automatically at your next purchase.'}
+                    </div>
+                  )}
+                </div>
+              </div>
+              {pmInfo.has_card && (
+                <button
+                  onClick={handleStripePortal}
+                  className="shrink-0 px-3 py-1.5 rounded-lg border border-white/15 text-white/70 text-xs font-semibold hover:bg-white/[0.06] transition-all flex items-center gap-1.5"
+                >
+                  Update <ExternalLink size={11} />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── Payment history (Billing Hub) ─────────────────────────── */}
+        {billingHistory && billingHistory.length > 0 && (
+          <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <Receipt size={14} className="text-white/60" />
+              <span className="text-[10px] uppercase tracking-wider text-white/50 font-semibold">Payment history</span>
+            </div>
+            <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
+              {billingHistory.map((p) => (
+                <div key={p.id} className="flex items-center justify-between gap-3 text-xs py-1.5 border-b border-white/[0.05] last:border-0">
+                  <div className="min-w-0">
+                    <span className="text-white/80 font-medium">
+                      {/* Amount-neutral: top-up units are plan-specific
+                          (30 or 60 min) and historical rows predate the
+                          split — the amount column tells the story. */}
+                      {p.mode === 'top-up' ? 'Time top-up' : p.tier ? `${p.tier.charAt(0).toUpperCase()}${p.tier.slice(1)} plan` : 'Payment'}
+                    </span>
+                    <span className="text-white/35 ml-2">{new Date(p.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-white/70 font-semibold tabular-nums">
+                      {p.currency === 'INR' ? '₹' : '$'}{(p.amount / 100).toFixed(2)}
+                    </span>
+                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide ${
+                      p.status === 'completed' ? 'bg-emerald-500/15 text-emerald-300'
+                      : p.status === 'refunded' ? 'bg-blue-500/15 text-blue-300'
+                      : p.status === 'failed' ? 'bg-red-500/15 text-red-300'
+                      : 'bg-white/[0.08] text-white/50'
+                    }`}>{p.status}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* ── Available plans (tier-driven, every user sees their valid switches) ──
             Previously this section was provider-driven: Stripe paid users
             saw only "Manage billing" (a Stripe Portal link), with no inline
@@ -849,24 +1115,34 @@ export function ManageSubscription({
         <div className="space-y-3">
           <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500 dark:text-white/50">Available plans</h4>
 
-          {/* Basic-tier renewal top-up (+30 min) — Basic only */}
-          {tier === 'basic' && onRenewRequested && (
-            <button
-              onClick={onRenewRequested}
-              disabled={renewPending || upgradePending != null}
-              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl transition-all hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ border: '1px solid rgba(211,172,99,0.38)', background: 'rgba(211,172,99,0.09)' }}
-            >
-              <div className="flex items-center gap-3">
-                <span style={{ color: '#d3ac63', display: 'inline-flex' }}><Zap size={18} /></span>
-                <div className="text-left">
-                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">{renewPending ? 'Preparing checkout…' : 'Renew · +30 min'}</div>
-                  <div className="text-xs text-zinc-600 dark:text-white/60">Add another 30 minutes of interview time to your Basic plan.</div>
+          {/* Plan renewal top-up row — Basic only. Pro/Max users get the
+              plan-specific "Add N minutes" one-click button in the detail
+              strip above (handleExtendNow); this second affordance exists
+              for Basic because it predates that strip. Label/price resolve
+              through the same RENEWAL_BY_TIER mirror so the row can never
+              disagree with what the server charges. */}
+          {tier === 'basic' && onRenewRequested && (() => {
+            const r = pricingService.getRenewalPrice(userProfile?.country_code || 'US', tier);
+            return (
+              <button
+                onClick={onRenewRequested}
+                disabled={renewPending || upgradePending != null}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl transition-all hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{ border: '1px solid rgba(211,172,99,0.38)', background: 'rgba(211,172,99,0.09)' }}
+              >
+                <div className="flex items-center gap-3">
+                  <span style={{ color: '#d3ac63', display: 'inline-flex' }}><Zap size={18} /></span>
+                  <div className="text-left">
+                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">
+                      {renewPending ? 'Preparing checkout…' : `Renew · ${r.label} · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`}
+                    </div>
+                    <div className="text-xs text-zinc-600 dark:text-white/60">{`Add another ${r.minutes} minutes of interview time to your ${TIER_INFO[tier]?.label || 'current'} plan.`}</div>
+                  </div>
                 </div>
-              </div>
-              {renewPending ? <Loader2 size={16} className="animate-spin" style={{ color: '#d3ac63' }} /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
-            </button>
-          )}
+                {renewPending ? <Loader2 size={16} className="animate-spin" style={{ color: '#d3ac63' }} /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
+              </button>
+            );
+          })()}
           {/* Purchase / upgrade — every option is a fresh checkout (2026-07 model):
               Basic/Pro/Max are one-time, Ultra is the monthly subscription.
               Ultra renders in amethyst; the rest in gold (see UpgradeRow). */}
@@ -971,7 +1247,7 @@ export function ManageSubscription({
                 <div className="text-left">
                   <div className="font-semibold text-zinc-900 dark:text-white text-sm">Switch to Free{!isPaidProvider && ' (admin)'}</div>
                   <div className="text-xs text-zinc-600 dark:text-white/60">{isPaidProvider
-                    ? `Stop paying. You keep ${tierMeta.label} access until ${formatExpiry(expiresAt)}, then drop to Free (5 sessions/month, Gemini only).`
+                    ? `Stop paying. You keep ${tierMeta.label} access until ${formatExpiry(expiresAt)}, then drop to Free (no interview time — pick a plan to start again).`
                     : 'No payment provider on file — instant tier flip to Free (admin grant).'
                   }</div>
                 </div>
@@ -1002,6 +1278,46 @@ export function ManageSubscription({
               </div>
               <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />
             </button>
+          )}
+
+          {/* === Ultra → step down / cancel ===
+              Ultra is the ONLY subscription; Basic/Pro/Max are one-time
+              passes. So there is no in-place "downgrade" — moving off Ultra
+              means cancelling the monthly sub (access continues to cycle
+              end), after which a one-time pass can be purchased. Without
+              this block Ultra subscribers (and admins, who resolve to
+              Ultra) saw an EMPTY plan section — no way to change or cancel
+              their plan from here. Provider-aware: real subs go through the
+              cancel modal; admin grants (no provider) flip instantly. */}
+          {tier === 'ultra' && (
+            <>
+              <button
+                onClick={() => {
+                  if (isPaidProvider) {
+                    setCancelConfirm(true);
+                  } else {
+                    handleUpgradeTier('free' as any);
+                  }
+                }}
+                disabled={!!actionLoading}
+                className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-zinc-100 dark:bg-white/[0.06] transition-colors disabled:opacity-50"
+              >
+                <div className="flex items-center gap-3">
+                  <X size={18} className="text-white/60" />
+                  <div className="text-left">
+                    <div className="font-semibold text-zinc-900 dark:text-white text-sm">Cancel Ultra{!isPaidProvider && ' (admin)'}</div>
+                    <div className="text-xs text-zinc-600 dark:text-white/60">{isPaidProvider
+                      ? `Stop the monthly subscription. You keep unlimited access until ${formatExpiry(expiresAt)}, then drop to Free (no interview time — pick a plan to start again).`
+                      : 'No payment provider on file — instant tier flip to Free (admin grant).'
+                    }</div>
+                  </div>
+                </div>
+                <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />
+              </button>
+              <p className="text-xs text-zinc-500 dark:text-white/40 px-1">
+                Prefer a one-time pass? Cancel Ultra above — once your billing cycle ends and you're on Free, this screen will offer Basic, Pro, and Max.
+              </p>
+            </>
           )}
         </div>
 

@@ -39,7 +39,7 @@ Free, Basic, Pro, Max, and Ultra. Free is genuinely free (no card required). Bas
 Pricing varies by region. The website's **Pricing page** shows your local currency once we detect your region. In USD: Basic is $30 (one 30-minute interview), Pro is $50 (one 1-hour interview), Max is $89 (three 1-hour interviews) — all one-time. Ultra is $159/month for unlimited interviews plus Auto-Type.
 
 **Can I try before I buy?**
-Yes. Free tier gives you 5 sessions of 30 minutes total trial time on Gemini, with one knowledge file. No card on file, no auto-conversion to paid.
+Yes. The Free tier gives you a one-time 10 minutes of trial time with every model except Claude, and one knowledge file. No card on file, no auto-conversion to paid — after the trial you pick a plan to keep going.
 
 **Does the Free trial auto-convert to paid?**
 No. Free is genuinely free — we never charge you unless you explicitly pick a paid tier and enter payment details.

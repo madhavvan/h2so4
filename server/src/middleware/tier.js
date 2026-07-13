@@ -65,6 +65,20 @@ function requireTier(...allowedTiers) {
           message: `This feature requires ${allowedTiers.join(' or ')} tier.`,
         });
       }
+      // Free tier (2026-07): routes that EXPLICITLY allow 'free' (the
+      // 10-minute-trial model routes in routes/ai.js) must not bounce
+      // free users on the paid-subscription checks below — free licenses
+      // sit at status='trial' forever (hasAccess() is false by design;
+      // see services/subscriptionStates.js: 'trial' has no automatic
+      // transition) and their 30-day expires_at is UI bookkeeping, not
+      // an access boundary. The free tier's real limit is the one-time
+      // consumption trial bucket, enforced by requireTimeRemaining
+      // (402 at 0 seconds). Routes that don't list 'free' are unaffected:
+      // the allowedTiers check above already rejected free there.
+      if (license.tier === 'free') {
+        req.license = license;
+        return next();
+      }
       // Tier matches. The tier is meant to encode "paid for this feature" —
       // webhooks reset tier→free on cancel/refund/expiry. But if a webhook
       // is LOST (and the cycle-end sweeper only scans 'canceling'), a stale

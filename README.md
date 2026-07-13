@@ -53,14 +53,14 @@ The website at `minicaai.com` is the marketing + auth + download surface only. T
 
 | Tier  | Price (USD)   | Price (INR)      | Models                                   | Time per session                        | Auto-Solve | Auto-Type | Train Model |
 |-------|---------------|------------------|------------------------------------------|-----------------------------------------|:----------:|:---------:|:-----------:|
-| Free  | $0            | ₹0               | Gemini only                              | 30-min trial · 5 sessions/month         |     —      |     —     |      —      |
+| Free  | $0            | ₹0               | All except Claude (during trial)         | One-time 10-min trial                   |     —      |     —     |      —      |
 | Basic | $25 one-time  | ₹1999 one-time   | + GPT-5.5, Grok, Groq                    | 3 credits / 14 days · renewable +1h     |     ✓      |     —     |      —      |
 | Pro   | $29 / month   | ₹2499 / month    | Same four (no Claude)                    | Unlimited                               |     ✓      |     —     |      —      |
 | Max   | $69 / month   | ₹5999 / month    | All four + Claude Sonnet 4.6             | Unlimited                               |     ✓      |     ✓     |      ✓      |
 
 **Renewal** for Basic users is +1 hour for $6.99 / ₹599. The server's `grantBasicRenewal` extends `license.expires_at` by 1 h; the client detects the cross-device delta on the next `validateWithServer` call and credits the local ledger so a renewal paid on one device propagates to all devices.
 
-**Region routing** is geo-detected at signup (browser timezone + ipapi.co), then locked to the user record. The server's `regionGate` middleware enforces paid-required for India: free / trial / expired Indian accounts get HTTP 403 from every AI route. Other regions retain the free tier with Gemini-only access.
+**Region routing** is geo-detected at signup (browser timezone + ipapi.co), then locked to the user record. The server's `regionGate` middleware enforces paid-required for India: free / trial / expired Indian accounts get HTTP 403 from every AI route. Other regions get the one-time 10-minute free trial (nothing stays free after it).
 
 **Admins** (configured via `ADMIN_EMAILS` on the server) bypass every tier gate and region gate, with an unlimited time bucket. The client mirrors this short-circuit so the in-app surface always renders "Max" for admins regardless of stored tier.
 
@@ -119,7 +119,7 @@ For the full architecture deep-dive (process model, IPC channel reference, secur
 1. Visit [https://get.minicaai.com](https://get.minicaai.com) and download the installer for your OS.
 2. On Windows, the installer is signed via Azure Trusted Signing — no SmartScreen warnings.
 3. Sign up with email + password, or click **Sign in with Google**.
-4. New accounts get a 30-minute trial of the full Basic experience automatically (Gemini + GPT + Grok + Groq).
+4. New accounts get a one-time 10-minute trial of the full Basic experience automatically (Gemini + GPT + Grok + Groq — no Claude). After it, you pick a plan; nothing stays free.
 5. Optional: upload your resume + the JD in **Knowledge Base** (the file icon in the toolbar) for grounded answers.
 6. Click the mic icon to start listening. Talk to your interviewer; the AI answers as you.
 

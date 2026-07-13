@@ -158,7 +158,7 @@ You can't pay one company's subscription with the other provider's account. The 
 |---|---|---|---|---|
 | AI models | Gemini | + GPT, Grok, Groq | Same four | + Claude (with web search) |
 | Sessions per month | 5 | Unlimited (credit-gated time) | Unlimited | Unlimited |
-| Time per session | 30-min trial total | Credit-gated (3-hour bank) | Unlimited | Unlimited |
+| Time per session | 10-min trial total | Credit-gated (3-hour bank) | Unlimited | Unlimited |
 | Knowledge files | 1 | Unlimited | Unlimited | Unlimited |
 | Pop-out window | — | ✓ | ✓ | ✓ |
 | Auto-Solve | — | ✓ | ✓ | ✓ |

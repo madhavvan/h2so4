@@ -1,6 +1,12 @@
 const express = require('express');
 const crypto = require('crypto');
 const db = require('../database');
+
+// ── Extension pack seconds — duplicated here for worker isolation ──
+// (Same duplication pattern as grantConfigForTier: webhooks may run in a
+// separate process that doesn't import payments.js.)
+const EXTENSION_PACK_SECONDS = { m30: 1800, h1: 3600, h3: 10800 };
+function packSecondsFor(id) { return EXTENSION_PACK_SECONDS[id] || 1800; }
 const { sendMail, renderPaymentFailedEmail } = require('../email');
 
 const router = express.Router();
@@ -169,9 +175,13 @@ async function handleStripeEvent(event) {
     case 'checkout.session.completed': {
       const session = event.data.object;
       const email = session.customer_email || session.metadata?.user_email;
-      // `mode === 'renewal'` signals the Basic +1/+1h top-up flow —
-      // grant the renewal instead of resetting to full Basic.
-      const isRenewal = session.metadata?.mode === 'renewal';
+      // 'renewal' (legacy) and 'extension' (2026-07 one-click top-up) both
+      // mean "+30 minutes on the existing pass" — grant the top-up instead
+      // of resetting to a full tier. grantTimeExtension preserves the
+      // buyer's tier (a Pro top-up must not relabel them Basic) and adds a
+      // flat 30 minutes.
+      const isRenewal = session.metadata?.mode === 'renewal'
+        || session.metadata?.mode === 'extension';
       const tier = resolveTier(session.metadata?.tier);
       console.log('[WEBHOOK] Payment completed:', email, isRenewal ? '(renewal)' : `tier: ${tier || 'UNKNOWN'}`);
 
@@ -223,7 +233,8 @@ async function handleStripeEvent(event) {
       let grantedTier;
       const apply = sqlite.transaction(() => {
         if (isRenewal) {
-          const updated = db.grantBasicRenewal(user.id);
+          const packSeconds = packSecondsFor(session.metadata?.pack);
+          const updated = db.grantTimeExtension(user.id, packSeconds);
           grantedTier = (updated && updated.tier) || 'basic';
         } else {
           const grant = grantConfigForTier(tier);
@@ -1047,11 +1058,14 @@ async function handleRazorpayEvent(body) {
       const payment = payload.payment?.entity;
       const email = payment?.notes?.user_email;
       const rawTier = payment?.notes?.tier;
-      // `notes.mode === 'renewal'` signals a Basic top-up (+1 session /
-      // +1h) rather than a fresh tier grant. Either flow requires a
-      // known tier stamped at order creation — that blocks stray
-      // payment.captured events for unrelated orders.
-      const isRenewal = payment?.notes?.mode === 'renewal';
+      // 'renewal' (legacy) and 'extension' (2026-07 one-click top-up)
+      // both mean "+30 minutes on the existing pass" (grantTimeExtension
+      // preserves the tier and adds a flat 30 minutes) rather than a fresh
+      // tier grant. Either flow requires a known tier stamped at order
+      // creation — that blocks stray payment.captured events for
+      // unrelated orders.
+      const isRenewal = payment?.notes?.mode === 'renewal'
+        || payment?.notes?.mode === 'extension';
       console.log('[RZP WEBHOOK] Payment captured:', email, isRenewal ? '(renewal)' : `tier: ${rawTier}`);
 
       if (!email) return;
@@ -1096,7 +1110,8 @@ async function handleRazorpayEvent(body) {
         if (dup) { alreadyGranted = true; return; }
 
         if (isRenewal) {
-          const updated = db.grantBasicRenewal(user.id);
+          const packSeconds = packSecondsFor(payment?.notes?.pack);
+          const updated = db.grantTimeExtension(user.id, packSeconds);
           grantedTier = (updated && updated.tier) || 'basic';
         } else {
           const grant = grantConfigForTier(rawTier);

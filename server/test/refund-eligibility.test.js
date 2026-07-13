@@ -99,7 +99,7 @@ describe('computeRefundEligibility — Basic tier', () => {
   it('eligible: 5 days old, zero credits used', () => {
     const r = computeRefundEligibility(
       makePayment({ tier_granted: 'basic', amount: 2500 }),
-      makeLicense({ tier: 'basic', credits_remaining_seconds: 3 * 3600, sessions_used: 0 })
+      makeLicense({ tier: 'basic', credits_remaining_seconds: 30 * 60, sessions_used: 0 })
     );
     expect(r.eligible).toBe(true);
   });
@@ -122,10 +122,40 @@ describe('computeRefundEligibility — Basic tier', () => {
     expect(r.code).toBe('usage_exceeded');
   });
 
-  it('ineligible: credits remaining < initial 3 hours (silent usage)', () => {
+  it('ineligible: credits remaining < initial 30 min (silent usage)', () => {
     const r = computeRefundEligibility(
       makePayment({ tier_granted: 'basic', amount: 2500 }),
-      makeLicense({ tier: 'basic', sessions_used: 0, credits_remaining_seconds: 3 * 3600 - 100 })
+      makeLicense({ tier: 'basic', sessions_used: 0, credits_remaining_seconds: 30 * 60 - 100 })
+    );
+    expect(r.eligible).toBe(false);
+    expect(r.code).toBe('usage_exceeded');
+  });
+});
+
+describe('computeRefundEligibility — Ultra tier (monthly subscription)', () => {
+  it('eligible: 2 days old, <60 min usage', () => {
+    const r = computeRefundEligibility(
+      makePayment({ tier_granted: 'ultra', amount: 15900 }),
+      makeLicense({ tier: 'ultra', credits_remaining_seconds: -1, sessions_used: 0 }),
+      { totalSessionSeconds: 20 * 60 }
+    );
+    expect(r.eligible).toBe(true);
+  });
+
+  it('ineligible: 8 days old (window expired)', () => {
+    const r = computeRefundEligibility(
+      makePayment({ tier_granted: 'ultra', amount: 15900, created_at: daysAgo(8) }),
+      makeLicense({ tier: 'ultra', credits_remaining_seconds: -1 })
+    );
+    expect(r.eligible).toBe(false);
+    expect(r.code).toBe('window_expired');
+  });
+
+  it('ineligible: 70 min used', () => {
+    const r = computeRefundEligibility(
+      makePayment({ tier_granted: 'ultra', amount: 15900 }),
+      makeLicense({ tier: 'ultra', credits_remaining_seconds: -1 }),
+      { totalSessionSeconds: 70 * 60 }
     );
     expect(r.eligible).toBe(false);
     expect(r.code).toBe('usage_exceeded');

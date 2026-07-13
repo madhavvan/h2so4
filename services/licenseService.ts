@@ -8,16 +8,17 @@
 //  - No offline grace period for Pro — forces server check
 //
 //  TIERS (2026-07 pricing — dollar/rupee amounts live in services/pricingService.ts):
-//  - Free: 5 sessions, Gemini only, no stealth. 30-minute full-experience trial
-//    on first signup (acts as Basic-level features for that window) — time-gated
-//    by trial_remaining_seconds.
+//  - Free: ONE-TIME 10-minute trial on first signup — every model except
+//    Claude (acts as Basic-level features for that window), time-gated by
+//    trial_remaining_seconds. Once the trial is exhausted NOTHING is free:
+//    the server 402s every model route and the client shows the paywall.
 //  - Basic ($30 one-time): ONE 30-min interview, four models (Gemini, GPT-5.5,
 //    Grok, Groq — NO Claude), stealth, Auto-Solve. No Auto-Type. Extend +30 min
 //    anytime. Time-gated by credits_remaining_seconds.
 //  - Pro ($50 one-time): ONE 1-hour interview, all five models incl. Claude
-//    Sonnet 5. No Auto-Type.
+//    Sonnet 5. No Auto-Type. Extend +1 hour anytime ($45).
 //  - Max ($89 one-time): THREE 1-hour interviews, all five models, full
-//    reasoning control + Train Model. No Auto-Type.
+//    reasoning control + Train Model. No Auto-Type. Extend +1 hour anytime ($45).
 //  - Ultra ($159/month): UNLIMITED interviews, all five models, Auto-Type +
 //    Train Model — the only recurring subscription.
 //  Admins bypass every gate (see isAdmin / getEffectiveTier) — full access,
@@ -38,13 +39,15 @@ export interface LicenseData {
   // STATUS_LABEL fallback.
   //   active    — paying customer, sub will renew
   //   canceling — cancel-at-period-end set; still has access until expires_at
-  //   trial     — Free user inside the 30-min trial window
+  //   past_due  — payment failed, provider auto-retrying (~7 days); access
+  //               RETAINED during the retry window (server ACCESS_STATUSES)
+  //   trial     — Free user inside the 10-min trial window
   //   expired   — sub ended (cycle close, unpaid, or natural completion)
   //   revoked   — admin revoked or hard ban
   //   paused    — Stripe collection paused (rare; soft revoke)
   //   refunded  — full refund issued; access revoked
   //   disputed  — chargeback opened; access revoked pending dispute outcome
-  status: 'active' | 'canceling' | 'trial' | 'expired' | 'revoked' | 'paused' | 'refunded' | 'disputed';
+  status: 'active' | 'canceling' | 'past_due' | 'trial' | 'expired' | 'revoked' | 'paused' | 'refunded' | 'disputed';
   country_code: string;
   device_id: string;
   activated_at: number;
@@ -56,7 +59,7 @@ export interface LicenseData {
   // Authoritative time balance in seconds. Pro/Max ignore these fields.
   credits_remaining_seconds?: number;  // Paid balance (Basic tier)
   credits_expire_at?: number;          // Unix ms — credits void after this
-  trial_remaining_seconds?: number;    // One-time 30-min trial for Free users
+  trial_remaining_seconds?: number;    // One-time 10-min trial for Free users
   // Server-stamped at license creation. Used to compute trial remaining
   // wall-clock seconds without trusting the client. Without this, a Free
   // user could log out + back in to re-seed a fresh trial on every login.
@@ -90,7 +93,15 @@ export interface UserProfile {
 // Auto-Type is Ultra-exclusive (the only recurring, unlimited tier).
 export const FEATURE_GATES = {
   free: {
-    models: ['gemini'] as string[],
+    // POST-TRIAL state (2026-07 policy). A free user with trial seconds
+    // left resolves to 'basic' via getEffectiveTier and never reads this
+    // row — during the one-time 10-minute trial they get the four
+    // non-Claude models from the basic gate. Once the trial hits 0
+    // NOTHING is free (the server 402s every model route, Gemini
+    // included), so no models are listed here: the pickers render fully
+    // locked and executeSend shows the trial-used-up paywall message
+    // instead of letting a send fail server-side mid-interview.
+    models: [] as string[],
     screenCapture: false,
     autoSolve: false,
     autoType: false,
@@ -166,10 +177,23 @@ const REVALIDATION_INTERVAL = 30 * 60 * 1000; // 30 minutes
 // client-side credit-math knobs.
 export const TIME_CONSTANTS = {
   SECONDS_PER_CREDIT: 3600,         // 1 credit = 1 hour of session time
-  EXTENSION_SECONDS: 30 * 60,       // Basic "+30 min" extension top-up (2026-07)
-  TRIAL_SECONDS: 30 * 60,           // Free signup = 30 minutes of Basic experience
+  // Basic's extension unit. Kept for back-compat with older call sites;
+  // tier-aware code must use EXTENSION_SECONDS_BY_TIER below instead.
+  EXTENSION_SECONDS: 30 * 60,
+  TRIAL_SECONDS: 10 * 60,           // Free signup = one-time 10 minutes of Basic experience
   BASIC_EXPIRY_DAYS: 14,            // Credits void 14 days after purchase
-  LOW_WARNING_SECONDS: 120,         // Fire "2 min left" warning here
+  LOW_WARNING_SECONDS: 120,         // Fire the "2 min left" pre-expiry warning here (owner: "a min or 2 before")
+} as const;
+
+// ── Extension unit (2026-07) ──
+// A flat +30-minute top-up for every metered tier (Basic/Pro/Max); Ultra
+// is unlimited and exempt. Optimistic client mirror of the server grant —
+// MUST stay in sync with the flat +30-min grantTimeExtension in
+// server/src/database.js and RENEWAL_* in services/pricingService.ts.
+export const EXTENSION_SECONDS_BY_TIER: Record<'basic' | 'pro' | 'max', number> = {
+  basic: 30 * 60,
+  pro: 30 * 60,
+  max: 30 * 60,
 } as const;
 
 // Admin check is done server-side via ADMIN_EMAILS env var.
@@ -273,7 +297,7 @@ class LicenseService {
   }
 
   // ── Feature gate check ──
-  // Gate answer is based on EFFECTIVE tier: Free users with an active 30-min
+  // Gate answer is based on EFFECTIVE tier: Free users with an active 10-min
   // trial are treated as Basic for this window so they can experience the
   // full product before the wall comes up.
   //
@@ -299,11 +323,57 @@ class LicenseService {
     return FEATURE_GATES[tier].models.includes(model);
   }
 
+  // ── Plan-lapse check (paid tiers) ──
+  // The client mirror of the SERVER's tier gate (server/src/middleware/tier.js:
+  // hasAccess(status) + expires_at, per services/subscriptionStates.js
+  // ACCESS_STATUSES = active | canceling | past_due). A paid plan keeps its
+  // FEATURES while the status retains access AND expires_at hasn't passed
+  // (-1 sentinel = never expires; 0 = no expiry recorded).
+  //
+  // Time exhaustion is deliberately NOT lapse: a Pro user whose interview
+  // clock hit 0 is still Pro — models and Pop-out stay unlocked; only live
+  // use is blocked (server requireTimeRemaining → 402 "top up") until they
+  // buy an extension pack. What lapses a plan is the calendar/status side:
+  // expires_at passing, cancel completing, refund, revoke, pause, dispute —
+  // exactly the cases where the server's requireTier starts returning 403
+  // "renew". Keeping the two sides identical is what guarantees the client
+  // never shows a feature the server would deny, and vice versa.
+  isPlanLapsed(license: LicenseData | null): boolean {
+    if (!license) return false;
+    if (license.tier === 'free') return false; // no plan to lapse — the trial bucket governs Free
+    const s = license.status as string;
+    const accessOk = s === 'active' || s === 'canceling' || s === 'past_due';
+    if (!accessOk) return true;
+    if (license.expires_at > 0 && Date.now() > license.expires_at) return true;
+    return false;
+  }
+
+  // ── Plan state for messaging (top-up vs renew vs trial-over) ──
+  //   'ok'             — plan usable right now (or unlimited/admin).
+  //   'time_exhausted' — plan VALID but the live balance is 0. Paid tiers
+  //                      keep every feature and get a TOP-UP prompt (never
+  //                      "upgrade" — they already own the tier). Free tier
+  //                      here means the one-time trial is used up → plans.
+  //   'lapsed'         — plan calendar-expired / canceled / refunded /
+  //                      revoked. Features revert to Free and the prompt is
+  //                      RENEW — distinct from the top-up prompt, and never
+  //                      mislabeling a (former) paying customer as Free.
+  getPlanState(license: LicenseData | null): 'ok' | 'time_exhausted' | 'lapsed' {
+    if (this.isAdmin()) return 'ok';
+    if (!license) return 'ok';
+    if (this.isPlanLapsed(license)) return 'lapsed';
+    const bal = this.getLiveTimeBalance(license);
+    if (bal.source !== 'unlimited' && bal.seconds <= 0) return 'time_exhausted';
+    return 'ok';
+  }
+
   // ── Effective tier resolution ──
   // Admins resolve to Ultra (full access) unless they opt into a lower tier via
   // the 'minicaai_admin_test_tier' localStorage override.
-  // Free user inside their 30-min trial window gets Basic features.
-  // Basic/Pro/Max whose interview clock is exhausted or expired fall back to Free.
+  // Free user inside their one-time 10-min trial window gets Basic features.
+  // Paid tiers (Basic/Pro/Max/Ultra) keep their tier until the PLAN lapses
+  // (calendar expiry / cancel / refund / revoke — see isPlanLapsed). Time
+  // exhaustion alone never demotes a paying user.
   getEffectiveTier(license: LicenseData | null): 'free' | 'basic' | 'pro' | 'max' | 'ultra' {
     // ── Admin full access ──
     // Admins resolve to the top tier (Ultra) for EVERY feature + model gate,
@@ -322,16 +392,25 @@ class LicenseService {
       return 'ultra';
     }
     if (!license) return 'free';
-    // Ultra is unlimited — no time gate.
-    if (license.tier === 'ultra') return 'ultra';
-    // Basic (30m) / Pro (1h) / Max (3×1h) are time-gated interviews. Once the
-    // live balance hits zero the interview is used up, so features fall back
-    // to Free until the user buys another interview.
-    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
-      if (this.getCreditsRemainingSeconds(license) > 0) return license.tier;
-      return 'free';
+    // ── Paid tiers: features follow the PLAN, not the clock (2026-07 fix) ──
+    // Mirrors the server exactly: requireTier grants tier features on
+    // tier + access-status + expires_at and NEVER looks at the seconds
+    // balance — time is a separate gate (requireTimeRemaining → 402 with
+    // "extend/top-up" copy). The old client behavior collapsed Basic/Pro/
+    // Max to 'free' the moment credits hit 0, which stripped Pop-out and
+    // every model from PAYING users and told a Pro user to "Upgrade to
+    // Pro" — the reported bug. Now: a time-exhausted paid user keeps the
+    // tier (models selectable, Pop-out opens); executeSend / the usage
+    // session gate block live use with a top-up prompt instead.
+    // Ultra is the monthly sub: same rule, minus the (nonexistent) meter.
+    if (license.tier === 'ultra') {
+      return this.isPlanLapsed(license) ? 'free' : 'ultra';
     }
-    // Free tier: the 30-min signup trial grants Basic-level features for its window.
+    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
+      return this.isPlanLapsed(license) ? 'free' : license.tier;
+    }
+    // Free tier: the one-time 10-min signup trial grants Basic-level features
+    // for its window. After it, 'free' = the post-trial paywall state (no models).
     if (this.isTrialActive(license)) return 'basic';
     return 'free';
   }
@@ -535,15 +614,20 @@ class LicenseService {
   // the remaining wall-clock seconds when there is no in-session local
   // ledger to preserve (e.g., logout → re-login on the same device).
   // Without this, the old code defaulted any login with
-  // trial_remaining_seconds === undefined to a fresh 30 min, which let
+  // trial_remaining_seconds === undefined to a fresh trial, which let
   // a free user reset their trial by logging out and back in. With this,
-  // the trial is authoritatively bounded by `trial_granted_at + 30 min`
-  // wall-clock, regardless of how many auth events the user triggers.
+  // the trial is authoritatively bounded by `trial_granted_at +
+  // TRIAL_SECONDS` wall-clock, regardless of how many auth events the
+  // user triggers.
   //
   // We still PREFER the in-session local ledger when present so a
   // legitimate session-tab refresh or background revalidation doesn't
   // reset what the timer already consumed.
-  private normalizeTrialState(license: LicenseData, priorLicense: LicenseData | null): LicenseData {
+  private normalizeTrialState(
+    license: LicenseData,
+    priorLicense: LicenseData | null,
+    opts?: { freshSignup?: boolean },
+  ): LicenseData {
     if (license.tier !== 'free') {
       // Paid tiers don't use the trial bucket — strip for cleanliness so
       // getEffectiveTier never reads a stale free-tier trial value.
@@ -551,15 +635,34 @@ class LicenseService {
       delete clean.trial_remaining_seconds;
       return clean as LicenseData;
     }
+    // Server-authoritative (2026-07): auth responses now carry the real
+    // consumption-based trial balance — trust it. The trial burns only
+    // while interviewing, never by wall-clock, so "signed up Monday,
+    // returned Wednesday, trial gone" can't happen anymore.
+    if (typeof license.trial_remaining_seconds === 'number') {
+      return license;
+    }
     if (
       priorLicense?.tier === 'free' &&
       typeof priorLicense.trial_remaining_seconds === 'number'
     ) {
-      // In-session preserve: the timer service is mid-tick and trusts
-      // its own balance. Server revalidation lands here too.
+      // Older server, in-session preserve: keep the local ledger.
       return { ...license, trial_remaining_seconds: priorLicense.trial_remaining_seconds };
     }
-    // Fresh login (no local ledger): derive from the server timestamp.
+    // Brand-new SIGNUP against a server that echoed neither the
+    // consumption balance nor a usable grant timestamp (pre-trial-ledger
+    // deploy): seed the full one-time grant locally so a fresh trial user
+    // never boots into the post-trial paywall (getEffectiveTier would
+    // otherwise resolve 'free' → every model locked on day zero). This
+    // cannot re-open the logout/login trial-farm hole — it runs ONLY on
+    // the signup path (account creation), never on login/google/validate,
+    // and the next successful revalidation against a current server
+    // replaces it with the server-metered balance.
+    if (opts?.freshSignup && !(license.trial_granted_at && license.trial_granted_at > 0)) {
+      return { ...license, trial_remaining_seconds: TIME_CONSTANTS.TRIAL_SECONDS };
+    }
+    // Older server, fresh login: derive from the grant timestamp
+    // (legacy wall-clock semantics — fail-closed).
     return { ...license, trial_remaining_seconds: this.computeTrialRemainingFromServer(license) };
   }
 
@@ -583,8 +686,10 @@ class LicenseService {
   //   · Non-Basic tier                  → strip Basic-only fields (cleanliness).
   //
   // Without this, tierChanged: 'free'→'basic' left credits_remaining_seconds
-  // undefined, which getEffectiveTier treats as 0 and silently downgrades
-  // the paying user back to 'free' features.
+  // undefined, which reads as a 0 balance — the interview clock (and the
+  // send preflight) would tell a fresh purchaser their time is already
+  // used up. (Features no longer collapse on a 0 balance — getEffectiveTier
+  // follows the plan window — but the BALANCE itself must still be right.)
   private normalizeLicenseCredits(license: LicenseData, priorLicense: LicenseData | null): LicenseData {
     // Only the time-limited tiers carry a credit bucket. Free (trial) and
     // Ultra (unlimited) strip the fields for cleanliness.
@@ -593,6 +698,15 @@ class LicenseService {
       delete clean.credits_remaining_seconds;
       delete clean.credits_expire_at;
       return clean as LicenseData;
+    }
+    // Server-authoritative (2026-07): when the server echoes a real credit
+    // balance (it meters consumption now), trust it verbatim — no local
+    // preservation or re-seeding needed.
+    if (
+      typeof license.credits_remaining_seconds === 'number' &&
+      typeof license.credits_expire_at === 'number'
+    ) {
+      return license;
     }
     // Carry the running balance only when the prior state is the SAME
     // time-limited tier (a Pro→Pro tab refresh keeps its clock; a tier change
@@ -613,7 +727,10 @@ class LicenseService {
     return { ...license, ...this.freshBasicCreditSeed(license) };
   }
 
-  // Credit the +30-minute extension (Basic top-up flow, 2026-07).
+  // Credit the plan-specific extension (top-up flow, 2026-07): Basic
+  // +30 min, Pro/Max +1 hour — the tier is PRESERVED (a Pro top-up must
+  // never relabel the user Basic). Free/expired tiers reactivate as Basic
+  // with Basic's unit, mirroring the server's grantTimeExtension.
   //
   // Base off effective balance, NOT the raw field: if the prior credits
   // already expired (credits_expire_at < now), effective balance is 0 and
@@ -621,23 +738,29 @@ class LicenseService {
   // expired with time unused would pay for the extension and silently get
   // the stale remainder back on top — a free partial credit.
   //
-  // Anchor the new expiry from max(now, license.expires_at) + 30 min,
-  // mirroring the server's grantBasicRenewal in database.js. /create-renewal
-  // does NOT pre-bump expires_at — the payment.captured webhook does — so
-  // when this runs from the success URL, license.expires_at is still the
-  // pre-extension value (often already past for a user who just hit the
-  // expiry wall). Using it verbatim would place credits_expire_at in the
-  // past and void the time the user just paid for. The next successful
-  // revalidation picks up the server-bumped expires_at and reconverges.
-  grantRenewalCredit(license: LicenseData): LicenseData {
+  // Anchor the new expiry from max(now, license.expires_at) + the unit,
+  // mirroring the server's grantTimeExtension in database.js.
+  // /create-renewal does NOT pre-bump expires_at — the payment.captured
+  // webhook does — so when this runs from the success URL,
+  // license.expires_at is still the pre-extension value (often already
+  // past for a user who just hit the expiry wall). Using it verbatim
+  // would place credits_expire_at in the past and void the time the user
+  // just paid for. The next successful revalidation picks up the
+  // server-bumped expires_at and reconverges.
+  grantRenewalCredit(license: LicenseData, packSeconds?: number): LicenseData {
     const effectiveRemaining = this.getCreditsRemainingSeconds(license);
-    const EXTENSION_MS = TIME_CONSTANTS.EXTENSION_SECONDS * 1000;
+    const tier: 'basic' | 'pro' | 'max' =
+      license.tier === 'pro' || license.tier === 'max' ? license.tier : 'basic';
+    const extensionSeconds = (typeof packSeconds === 'number' && packSeconds > 0)
+      ? packSeconds
+      : EXTENSION_SECONDS_BY_TIER[tier];
+    const extensionMs = extensionSeconds * 1000;
     const anchor = Math.max(Date.now(), license.expires_at > 0 ? license.expires_at : 0);
     const updated: LicenseData = {
       ...license,
-      tier: 'basic', // grantBasicRenewal also reactivates from free/expired → basic
-      credits_remaining_seconds: effectiveRemaining + TIME_CONSTANTS.EXTENSION_SECONDS,
-      credits_expire_at: anchor + EXTENSION_MS,
+      tier,
+      credits_remaining_seconds: effectiveRemaining + extensionSeconds,
+      credits_expire_at: anchor + extensionMs,
     };
     const user = this.loadAuth().user;
     if (user) this.saveAuth(user, updated);
@@ -686,8 +809,11 @@ class LicenseService {
     // rather than unconditionally defaulted to 30 min. On a brand-new signup
     // grantedAt ≈ Date.now(), so the computed remaining is ≈ TRIAL_SECONDS;
     // on subsequent re-auths the same code path correctly subtracts elapsed
-    // wall-clock time and never resets the trial.
-    data.license = this.normalizeTrialState(data.license, null);
+    // wall-clock time and never resets the trial. freshSignup additionally
+    // covers a legacy server that echoes NO trial fields at all — a
+    // brand-new account still gets its full local seed instead of booting
+    // straight into the post-trial paywall (see normalizeTrialState).
+    data.license = this.normalizeTrialState(data.license, null, { freshSignup: true });
     this.saveAuth(data.user, data.license, data.token);
     this.startRevalidation();
     return data;
@@ -713,7 +839,8 @@ class LicenseService {
     // balance (same user, new tab) or seed a fresh one when the server
     // says tier='basic' and we have no local state yet. Without this,
     // a Basic user re-logging in would land with credits undefined →
-    // getEffectiveTier() downgrades them to Free.
+    // a 0 balance, and the send preflight would wrongly report their
+    // interview time as used up.
     const { license: priorLicense } = this.loadAuth();
     data.license = this.normalizeTrialState(data.license, priorLicense);
     data.license = this.normalizeLicenseCredits(data.license, priorLicense);
@@ -749,8 +876,8 @@ class LicenseService {
       data.license = this.normalizeTrialState(data.license, priorLicense);
       // Basic-tier users returning via Google: preserve or seed the
       // client-side credit ledger. Server doesn't echo these fields and
-      // the 'basic' tier needs them or getEffectiveTier() falls through
-      // to Free.
+      // the 'basic' tier needs them or the balance reads 0 and the send
+      // preflight wrongly reports the interview time as used up.
       data.license = this.normalizeLicenseCredits(data.license, priorLicense);
     }
     this.saveAuth(data.user, data.license, data.token);
@@ -798,79 +925,44 @@ class LicenseService {
 
       const serverData = await response.json();
 
-      // ── Credit-field merge guard ──
-      // The client tick is authoritative for credits/trial seconds today
-      // (Option A, client-side ledger). A naive spread would let a stale
-      // server value overwrite the locally-consumed field — so on every
-      // focus/revalidation during a session the user would get their
-      // time refunded. Strip those fields from the merge so the in-memory
-      // ticker is never clobbered; tier transitions (e.g. Free → Basic
-      // after a webhook lands) are re-seeded deterministically below via
-      // normalizeLicenseCredits, which does NOT read from serverData —
-      // the server never echoes these fields in the first place (Option A).
+      // ── Server-authoritative balance merge (2026-07) ──
+      // The server now meters consumption itself (usage_sessions +
+      // /api/v1/usage heartbeats), so the credits/trial fields it echoes
+      // ARE the truth — we take them verbatim. This replaces the old
+      // "Option A" client-ledger guard that stripped these fields and the
+      // fragile expires_at-delta heuristic that inferred cross-device
+      // extension payments: extensions now land server-side and arrive
+      // here (and on every heartbeat) as a plain bigger number.
+      // is_admin is broken out — it lives on the user, not the license.
       const tierChanged = serverData.tier && serverData.tier !== license.tier;
-      // Fields that must NOT clobber the client ledger on revalidation.
-      // is_admin is also broken out — it lives on the user, not the license,
-      // so we strip it from the license merge and apply it to the user
-      // separately below.
-      const {
-        credits_remaining_seconds: _crs,
-        credits_expire_at: _cea,
-        trial_remaining_seconds: _trs,
-        trial_started_at: _tsa,
-        is_admin: serverIsAdmin,
-        ...serverSafe
-      } = serverData;
+      const { is_admin: serverIsAdmin, ...serverFields } = serverData;
 
       let updatedLicense: LicenseData = {
         ...license,
-        ...serverSafe,
+        ...serverFields,
         last_validated: Date.now(),
       };
 
+      // An OLDER server (pre-usage-ledger) omits the balance fields —
+      // keep the local values rather than clobbering them to undefined.
+      if (typeof serverData.credits_remaining_seconds !== 'number') {
+        updatedLicense.credits_remaining_seconds = license.credits_remaining_seconds;
+        updatedLicense.credits_expire_at = license.credits_expire_at;
+      }
+      if (typeof serverData.trial_remaining_seconds !== 'number') {
+        updatedLicense.trial_remaining_seconds = license.trial_remaining_seconds;
+      }
+
       if (tierChanged) {
-        // Fresh tier grant — re-seed the client ledger for the NEW tier.
-        // Pass the prior license so a Basic→Basic no-op (shouldn't happen
-        // here since tierChanged is true, but defensive) would still
-        // preserve balance. For Free→Basic this seeds 3 credits. For
-        // Basic→Pro/Max it strips the Basic-only credit fields.
-        updatedLicense = this.normalizeLicenseCredits(updatedLicense, license);
-        // If the user just left Free, clear the trial remnants so the
-        // Pro/Max timer service doesn't read a stale trial balance.
+        // Cleanliness on tier transitions: paid tiers don't read the trial
+        // bucket; free/ultra don't read the credit bucket. (With server
+        // echo these are cosmetic strips, not ledger re-seeds.)
         if (updatedLicense.tier !== 'free') {
           delete (updatedLicense as any).trial_remaining_seconds;
         }
-      } else if (license.tier === 'basic' && serverData.tier === 'basic') {
-        // ── Cross-device extension-credit propagation ──
-        // The server's grantBasicRenewal extends the license's expires_at
-        // by exactly 30 min on each extension payment. We use that delta
-        // as a change-detection signal: when the server's expires_at moves
-        // forward by ~30 min since our last sync, an extension payment
-        // landed somewhere (browser, another device, even the system
-        // browser launched from Electron). Apply +1800s to the local
-        // ledger so the time lands regardless of which device/window
-        // handled the payment-success URL.
-        //
-        // Idempotent: after we apply the credit, we save the new
-        // expires_at into local state. The NEXT validate compares the
-        // already-synced value with the server's same value → delta=0
-        // → no re-grant. Without consumption tracking this is the
-        // cleanest event-based propagation we can do.
-        const oldExpires = license.expires_at || 0;
-        const newExpires = serverData.expires_at || 0;
-        const EXTENSION_MS = TIME_CONSTANTS.EXTENSION_SECONDS * 1000;
-        const deltaMs = newExpires - oldExpires;
-        if (deltaMs >= 0.5 * EXTENSION_MS && deltaMs <= 1.5 * EXTENSION_MS) {
-          // Extension-shaped delta (15–45 min). Add 30 min of credit time
-          // + extend the credit window. Bigger deltas are full grants
-          // (handled by tierChanged when applicable) or unusual states we
-          // leave alone.
-          const existingCredits = updatedLicense.credits_remaining_seconds ?? 0;
-          updatedLicense = {
-            ...updatedLicense,
-            credits_remaining_seconds: existingCredits + TIME_CONSTANTS.EXTENSION_SECONDS,
-            credits_expire_at: newExpires,
-          };
+        if (!['basic', 'pro', 'max'].includes(updatedLicense.tier)) {
+          delete (updatedLicense as any).credits_remaining_seconds;
+          delete (updatedLicense as any).credits_expire_at;
         }
       }
 
@@ -987,3 +1079,47 @@ class LicenseService {
 }
 
 export const licenseService = new LicenseService();
+
+// ── Usage summary (Settings → Usage card) ──
+// Read-only mirror of GET /api/v1/usage/summary — the server computes
+// used/granted from the SAME ledger the interview clock charges against
+// (resolveTimeBucket + usage_sessions), so this can never disagree with
+// the in-interview timer. `unlimited: true` (admin/ultra) carries no
+// fraction fields; metered tiers always satisfy granted >= remaining,
+// so used >= 0 and the bar caps at 100%.
+export interface UsageSummary {
+  unlimited: boolean;
+  source: 'trial' | 'credits' | 'unlimited' | 'none';
+  tier: string;
+  /** Seconds left in the current plan window. Absent when unlimited. */
+  remaining_seconds?: number;
+  /** Total seconds seeded into the current window (purchase + top-ups). */
+  granted_seconds?: number;
+  /** granted - remaining, clamped >= 0. Absent when unlimited. */
+  used_seconds?: number;
+  /** used / granted * 100, one decimal. Absent when unlimited. */
+  used_percent?: number;
+  lifetime_used_seconds: number;
+  session_count: number;
+  credits_expire_at?: number;
+}
+
+// Fail-soft by contract: returns null on ANY failure (no auth, network
+// down, non-2xx, malformed body) and never throws — this runs while real
+// interviews are live, so the Usage card quietly shows nothing rather
+// than ever surfacing an error.
+export async function fetchUsageSummary(): Promise<UsageSummary | null> {
+  try {
+    const { token } = licenseService.loadAuth();
+    if (!token) return null;
+    const resp = await fetch(`${licenseService.getApiBase()}/api/v1/usage/summary`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json().catch(() => null);
+    if (!data || typeof data !== 'object' || typeof (data as any).unlimited !== 'boolean') return null;
+    return data as UsageSummary;
+  } catch {
+    return null;
+  }
+}
