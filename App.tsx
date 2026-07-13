@@ -23,7 +23,7 @@ import { extractTextFromPdf } from './services/pdfService';
 import { extractTextFromDocx } from './services/docxService';
 import { useDatabase, SessionSummary } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
-import { SubscriptionGate } from './SubscriptionGate';
+import { SubscriptionGate, AdminDashboard } from './SubscriptionGate';
 import { Tutorial, shouldShowTutorial, markTutorialCompleted, clearTutorialCompletion } from './Tutorial';
 import { ManageSubscription } from './ManageSubscription';
 import { licenseService, UserProfile, LicenseData, TIME_CONSTANTS, fetchUsageSummary, UsageSummary } from './services/licenseService';
@@ -936,6 +936,7 @@ const ChatInterface = ({
     newSinceUnpin,
     handleJumpToLatest,
     onOpenSettings,
+    onOpenAdmin,
     onOpenContext,
     onOpenHelp,
     onOpenSupport,
@@ -1700,6 +1701,18 @@ const ChatInterface = ({
                     )}
                     <button onClick={onOpenContext} className="p-2 rounded-lg text-gray-400 hover:text-[#d3ac63] hover:bg-white/[0.06] transition-all" aria-label="Files (Knowledge Base)"><FileText size={20} /></button>
                     <button onClick={onOpenSettings} className="p-2 rounded-lg transition-all text-gray-400 hover:text-[#d3ac63] hover:bg-white/[0.06]" aria-label="Settings"><Settings size={20} /></button>
+                    {/* Admin doorway restored after authenticated→MainApp routing.
+                        Same isDeveloper gate as SubscriptionGate's old Admin nav. */}
+                    {userProfile?.email && licenseService.isDeveloper(userProfile.email) && onOpenAdmin && (
+                      <button
+                        onClick={onOpenAdmin}
+                        className="px-2.5 py-1 rounded-lg text-[10px] font-bold tracking-wide bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-all"
+                        aria-label="Admin dashboard"
+                        title="Admin dashboard"
+                      >
+                        Admin
+                      </button>
+                    )}
                     <button onClick={onLogout} className="p-2 rounded-lg text-gray-400 hover:text-red-400 hover:bg-red-500/10 transition-all" aria-label="Logout"><LogOut size={20} /></button>
                 </div>
             </header>
@@ -4915,6 +4928,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   useEffect(() => {
     if (!showSettings) setSettingsTab('general');
   }, [showSettings]);
+  // Admin dashboard lives in SubscriptionGate.tsx but is orphaned once
+  // authenticated users route into MainApp. This flag re-opens it in-place
+  // without bouncing the user back through the unauthenticated gate.
+  const [showAdminDashboard, setShowAdminDashboard] = useState(false);
   const [showContext, setShowContext] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
@@ -7105,6 +7122,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     handleClear, handleRegenerate, chatContainerRef, textareaRef, handleScroll,
     isPinned, newSinceUnpin, handleJumpToLatest, sidebarOpen,
     onOpenSettings: () => setShowSettings(true),
+    onOpenAdmin: () => setShowAdminDashboard(true),
     onOpenContext: () => setShowContext(true),
     onOpenHelp: () => setShowHelp(true),
     onOpenSupport: () => setShowSupport(true),
@@ -7198,6 +7216,23 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
 
   // ── RENDER ──
   const isPopoutElectron = isElectron && isPopoutMode;
+
+  // Full-screen admin dashboard for is_admin users. Rendered inside MainApp
+  // (not App-level) so returning via onBack keeps chat/session state mounted.
+  // Gated with the same isDeveloper helper SubscriptionGate used before the
+  // web routing split — source of truth is user.is_admin from the server.
+  if (
+    showAdminDashboard
+    && userProfile
+    && licenseService.isDeveloper(userProfile.email)
+  ) {
+    return (
+      <AdminDashboard
+        onBack={() => setShowAdminDashboard(false)}
+        currentUser={userProfile}
+      />
+    );
+  }
 
   return (
     <div
@@ -7408,6 +7443,14 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                 >
                     <ExternalLink size={14} /> Manage subscription
                 </button>
+                {userProfile?.email && licenseService.isDeveloper(userProfile.email) && (
+                  <button
+                    onClick={() => { setShowSettings(false); setShowAdminDashboard(true); }}
+                    className="w-full py-2.5 rounded-xl text-sm font-semibold bg-red-500/10 text-red-400 hover:bg-red-500/20 border border-red-500/25 transition-all flex items-center justify-center gap-2"
+                  >
+                    Admin dashboard
+                  </button>
+                )}
             </div>
 
             {/* Model Selection */}
