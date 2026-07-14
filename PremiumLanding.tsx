@@ -311,12 +311,19 @@ const CSS = `
    the frames IS the card; a scan-line periodically reads the captured
    frame and finds nothing. The one foreign color on the page is the
    6px recording dot: recording lights are red in the physical world. */
-.pl-cap{position:relative;max-width:520px;margin-left:auto;}
-.pl-frame{border-radius:12px;overflow:hidden;background:linear-gradient(180deg,#0e0d0b,#090807);
-  border:1px solid var(--line);}
-.pl-frame--back{position:relative;opacity:.92;
+.pl-cap{position:relative;max-width:520px;margin-left:auto;
+  /* Room above the first frame so "They see" / "You see" pills aren't clipped. */
+  padding-top:14px;}
+/* overflow:visible so .pl-captag (top:-10px) can sit on the frame rim.
+   Interior clipping is handled on .pl-frame-surface instead. */
+.pl-frame{position:relative;overflow:visible;background:transparent;border:none;
+  box-shadow:none;}
+.pl-frame-surface{border-radius:12px;overflow:hidden;background:linear-gradient(180deg,#0e0d0b,#090807);
+  border:1px solid var(--line);position:relative;}
+.pl-frame--back .pl-frame-surface{opacity:.92;
   box-shadow:0 24px 60px -30px rgba(0,0,0,.85);}
-.pl-frame--front{position:relative;margin-top:26px;
+.pl-frame--front{margin-top:26px;}
+.pl-frame--front .pl-frame-surface{
   border-color:var(--gold-line);
   box-shadow:0 34px 90px -34px rgba(0,0,0,.92), 0 0 60px -24px var(--gold-glow), inset 0 1px 0 rgba(255,255,255,.05);}
 .pl-chrome{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid var(--line);}
@@ -339,15 +346,22 @@ const CSS = `
 .pl-scan{position:absolute;top:0;bottom:0;width:1px;background:linear-gradient(180deg,transparent,var(--gold-line),transparent);
   box-shadow:0 0 14px rgba(211,172,99,.25);opacity:0;animation:pl-scanmove 5.2s ease-in-out infinite;}
 @keyframes pl-scanmove{0%,54%{left:4%;opacity:0;}58%{opacity:.9;}88%{opacity:.9;}96%,100%{left:96%;opacity:0;}}
-.pl-captag{position:absolute;top:-9px;left:12px;z-index:3;font-size:9px;font-weight:700;
+.pl-captag{position:absolute;top:-10px;left:12px;z-index:5;font-size:9px;font-weight:700;
   letter-spacing:.18em;text-transform:uppercase;padding:3px 9px;border-radius:999px;
-  background:#0b0a08;border:1px solid var(--line);color:var(--faint);}
+  background:#0b0a08;border:1px solid var(--line);color:var(--faint);
+  white-space:nowrap;line-height:1.2;pointer-events:none;}
 .pl-captag--you{border-color:var(--gold-line);color:var(--gold);}
 .pl-mini{position:absolute;right:10px;bottom:10px;width:min(66%,250px);z-index:2;
   background:linear-gradient(180deg,#141109,#0c0a07);border:1px solid var(--gold-line);
   border-radius:10px;padding:10px 12px;
   box-shadow:0 18px 44px -18px rgba(0,0,0,.9), 0 0 30px -12px var(--gold-glow), inset 0 1px 0 rgba(255,255,255,.06);}
 @media (max-width:980px){ .pl-cap{margin-left:0;} }
+@media (max-width:767px){
+  .pl-cap{padding-top:16px;}
+  .pl-captag{font-size:10px;padding:4px 10px;letter-spacing:.14em;top:-11px;}
+  .pl-sharepill{font-size:8px;padding:3px 6px;letter-spacing:.1em;}
+  .pl-addr{font-size:9px;}
+}
 .pl-wave{display:flex;align-items:flex-end;gap:2.5px;height:22px;}
 .pl-wave i{display:block;width:2.5px;border-radius:999px;background:linear-gradient(to top,var(--gold-3),var(--gold-1));
   animation:pl-eq 1.15s ease-in-out infinite;}
@@ -1230,28 +1244,31 @@ const SKELINES: [number, number][] = [
 
 const ShareFrame: React.FC<{ overlay?: boolean; scan?: boolean }> = ({ overlay, scan }) => (
   <div className={`pl-frame ${overlay ? 'pl-frame--front' : 'pl-frame--back'}`}>
+    {/* Tag sits on the outer frame (overflow:visible). Surface clips the UI. */}
     <span className={`pl-captag${overlay ? ' pl-captag--you' : ''}`}>{overlay ? 'You see' : 'They see'}</span>
-    <div className="pl-chrome">
-      <span className="pl-dot3"><i /><i /><i /></span>
-      <span className="pl-addr">codesignal.com/assessment — final round</span>
-      <span className="pl-sharepill"><span className="pl-recdot" /> SHARING</span>
-    </div>
-    <div className="pl-editor">
-      <span className="pl-gutter">{SKELINES.map((_, i) => <span key={i}>{i + 1}</span>)}</span>
-      <span className="pl-lines">
-        {SKELINES.map(([ind, w], i) => (
-          <span key={i} className="pl-skl" style={{ marginLeft: ind, width: `${w}%` }} />
-        ))}
-      </span>
-      {scan && <span className="pl-scan" />}
-      {overlay && (
-        <div className="pl-mini">
-          <div className="pl-gold" style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', marginBottom: 5 }}>You say</div>
-          <p className="pl-serif" style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--paper)', margin: 0 }}>
-            Start with the trade-offs, then the design…<span className="pl-caret" style={{ height: '.8em' }} />
-          </p>
-        </div>
-      )}
+    <div className="pl-frame-surface">
+      <div className="pl-chrome">
+        <span className="pl-dot3"><i /><i /><i /></span>
+        <span className="pl-addr">codesignal.com/assessment — final round</span>
+        <span className="pl-sharepill"><span className="pl-recdot" /> SHARING</span>
+      </div>
+      <div className="pl-editor">
+        <span className="pl-gutter">{SKELINES.map((_, i) => <span key={i}>{i + 1}</span>)}</span>
+        <span className="pl-lines">
+          {SKELINES.map(([ind, w], i) => (
+            <span key={i} className="pl-skl" style={{ marginLeft: ind, width: `${w}%` }} />
+          ))}
+        </span>
+        {scan && <span className="pl-scan" />}
+        {overlay && (
+          <div className="pl-mini">
+            <div className="pl-gold" style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', marginBottom: 5 }}>You say</div>
+            <p className="pl-serif" style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--paper)', margin: 0 }}>
+              Start with the trade-offs, then the design…<span className="pl-caret" style={{ height: '.8em' }} />
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   </div>
 );
