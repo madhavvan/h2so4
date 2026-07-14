@@ -432,10 +432,9 @@ const CSS = `
   .pl-ultra-band{padding:20px 18px;border-radius:18px;}
   .pl-ultra-band ul{grid-template-columns:1fr !important;}
   /*
-   * GLOBE / PLATFORM STAGE — mobile reliability path
-   * Desktop: WebGL nebula orb. Mobile: pure CSS galaxy (WebGL skipped) because
-   * phones were showing a bright empty black disc when .pl-orb-live hid CSS
-   * layers after a partial WebGL init, and RAF pause froze spin.
+   * GLOBE / PLATFORM STAGE — same WebGL orb as desktop.
+   * Only layout/scale fixes on phones (620×420 stage + chip coords). Do NOT
+   * restyle the crystal or swap to a CSS-only galaxy look.
    */
   .pl-theater{
     height: calc(420px * var(--pl-stage-scale, 0.55) + 64px);
@@ -448,7 +447,7 @@ const CSS = `
     height: calc(260px * var(--pl-stage-scale, 0.55));
     opacity: .4;
   }
-  /* Fewer GPU layers on phones — dust motes are desktop theater dressing. */
+  /* Motes are pure decoration; drop on phones for GPU headroom for the orb. */
   .pl-theater-mote{display:none !important;}
   .pl-theater-echo{font-size:clamp(28px,11vw,48px) !important;}
   .pl-connect-stage{
@@ -459,58 +458,20 @@ const CSS = `
     --orb-float-y: -5px;
     animation-duration: 5s;
   }
-  /* Never allow WebGL live-mode styles to blank the CSS galaxy on phones. */
-  .pl-orb-live .pl-galaxy-core,
-  .pl-orb-live .pl-galaxy-depth,
-  .pl-orb-live .pl-galaxy-band,
-  .pl-orb-live .pl-galaxy-heart,
-  .pl-orb-live .pl-galaxy-stars,
-  .pl-orb-live .pl-glass-bounce,
-  .pl-orb-live .pl-glass-spec,
-  .pl-orb-live .pl-glass-spec2,
-  .pl-orb-live .pl-glass-crescent,
-  .pl-orb-live .pl-glass-rim,
-  .pl-orb-live .pl-glass-inner,
-  .pl-orb-live .pl-globe-shell{
+  /* Canvas must paint; never display:none the WebGL surface on mobile. */
+  .pl-orb-canvas{
     display:block !important;
+    width:100% !important;
+    height:100% !important;
   }
-  .pl-orb-live .pl-galaxy-sphere{
-    background:
-      radial-gradient(circle at 32% 28%, #100e24 0%, #07060f 55%, #010104 100%) !important;
-    overflow:hidden !important;
-  }
-  .pl-orb-canvas,.pl-orb-clip{display:none !important;}
+  .pl-orb-clip{display:block !important;}
 
-  /* Continuous, obvious rotation of the interior (shell is a sibling so
-     glass highlights stay fixed while the galaxy turns beneath). */
-  .pl-galaxy-sphere{
-    animation: pl-mobile-sphere-spin 32s linear infinite;
-    will-change: transform;
-  }
-  @keyframes pl-mobile-sphere-spin{
-    from{transform:rotate(0deg);}
-    to{transform:rotate(360deg);}
-  }
-  .pl-galaxy-core{animation-duration: 36s !important; opacity:1;}
-  .pl-galaxy-depth{animation-duration: 52s !important;}
-  .pl-galaxy-band-drift,
-  .pl-galaxy-stardrift{animation-duration: 22s !important;}
-  /* Richer interior so it never reads as a flat black disc. */
-  .pl-galaxy-heart{opacity:1; filter:blur(1.5px);}
-  .pl-galaxy-stars{opacity:1;}
-  .pl-globe-atmo{opacity:.85; animation-duration:6s;}
-  .pl-globe-caustic{opacity:.9;}
-  /* Shell stays put (sibling of spinning sphere) — bright glass rim. */
-  .pl-globe-shell{opacity:1;}
-
-  /* Chips stay readable after stage scale (~0.5 → ~30px marks). */
+  /* Chips/traces: stay visible even if reveal choreography is late. */
   .pl-chip-node{
     width:64px; height:64px; border-radius:18px;
-    /* Keep chips fully opaque even if chipfly hasn't fired yet. */
     opacity:1 !important;
   }
   .pl-chip-node svg{width:30px; height:30px;}
-  /* Traces always drawn on mobile (don't wait for pl-in choreography). */
   .pl-trace{stroke-dashoffset:0 !important; opacity:.9;}
   .pl-trace-pulse{opacity:.85 !important; animation: pl-pulseflow 2.4s linear infinite !important;}
 
@@ -528,15 +489,6 @@ const CSS = `
   .pl-price:hover,.pl-price-pop:hover{transform:none;}
   .pl-chip-node:hover{transform:none;}
   .pl-reveal{transition-duration:.55s;}
-}
-/* Reduced motion: keep the globe visible (no blank disc) but stop spinning. */
-@media (max-width:767px) and (prefers-reduced-motion:reduce){
-  .pl-galaxy-sphere,
-  .pl-galaxy-core,
-  .pl-galaxy-depth,
-  .pl-galaxy-band-drift,
-  .pl-galaxy-stardrift,
-  .pl-orb-float{animation:none !important;}
 }
 @media (prefers-reduced-motion:reduce){
   .pl-root *{animation:none !important;}
@@ -1641,34 +1593,41 @@ void main(){
   gl_FragColor = vec4(col*aa, aa);
 }`;
 
+// Same WebGL nebula orb on laptop AND phone. Mobile used to skip WebGL and
+// fall back to a different CSS look; that is gone. Hardening rules so phones
+// keep the *identical* shader path without the blank-disc / freeze bugs:
+//   1) CSS galaxy stays visible until N successful GPU frames paint
+//   2) .pl-orb-live only then (never hide CSS before the canvas has content)
+//   3) canvas sized to the real CSS box × dpr (not a hard-coded 480 that
+//      mismatches the scaled mobile stage)
+//   4) phones never pause RAF while the document is visible (IO pause was
+//      freezing spin mid-scroll); desktop still pauses when fully off-screen
+//   5) context-lost demotes to CSS (no blank disc) and remounts once to retry
 const NebulaOrbCanvas: React.FC = () => {
   const ref = useRef<HTMLCanvasElement>(null);
+  // Bump to remount after a context-lost recovery attempt.
+  const [boot, setBoot] = useState(0);
+
   useEffect(() => {
     const cv = ref.current;
     if (!cv) return;
 
-    // ── Mobile: skip WebGL entirely ──
-    // Phones were hitting a failure mode where we added .pl-orb-live (which
-    // HIDES the CSS galaxy stars/bands) and then the canvas drew a flat
-    // black/bright disc or the RAF loop paused — "dead crystal" with no
-    // rotation. CSS galaxy + continuous CSS spin is reliable on mobile GPU
-    // and battery; desktop keeps the full WebGL orb.
+    const globe = cv.closest('.pl-galaxy-globe');
     const isMobile = typeof window !== 'undefined'
       && !!window.matchMedia?.('(max-width: 767px)').matches;
-    if (isMobile) {
-      cv.style.display = 'none';
-      cv.closest('.pl-galaxy-globe')?.classList.remove('pl-orb-live');
-      return;
-    }
 
-    const globe = cv.closest('.pl-galaxy-globe');
+    // Restore canvas if a prior demote hid it.
+    cv.style.display = '';
+    globe?.classList.remove('pl-orb-live');
+
+    // Prefer default power on mobile — high-performance can be throttled or
+    // pre-empted more aggressively on iOS thermal/battery paths.
     const gl = cv.getContext('webgl', {
       alpha: true,
       antialias: false,
-      powerPreference: 'high-performance',
       premultipliedAlpha: true,
-      // Preserve so a single missed frame doesn't flash empty.
       preserveDrawingBuffer: false,
+      powerPreference: isMobile ? 'default' : 'high-performance',
     }) as WebGLRenderingContext | null;
     if (!gl || gl.isContextLost()) return;
 
@@ -1697,100 +1656,159 @@ const NebulaOrbCanvas: React.FC = () => {
     const aP = gl.getAttribLocation(prog, 'aP');
     gl.enableVertexAttribArray(aP);
     gl.vertexAttribPointer(aP, 2, gl.FLOAT, false, 0, 0);
-    cv.width = 480;
-    cv.height = 480;
-    gl.viewport(0, 0, cv.width, cv.height);
+
     const uRes = gl.getUniformLocation(prog, 'uRes');
     const uT = gl.getUniformLocation(prog, 'uT');
     const uSpin = gl.getUniformLocation(prog, 'uSpin');
     const uPhase = gl.getUniformLocation(prog, 'uPhase');
     const uDpr = gl.getUniformLocation(prog, 'uDpr');
-    gl.uniform2f(uRes, cv.width, cv.height);
     gl.uniform1f(uPhase, 0.37);
-    gl.uniform1f(uDpr, 2.0);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.clearColor(0, 0, 0, 0);
 
+    // Match the CSS orb box (240×240 desktop; scaled on mobile via stage).
+    // Hard-coded 480px ignored the real on-screen size and could look soft
+    // or blank under heavy stage scaling.
+    const syncSize = () => {
+      const r = cv.getBoundingClientRect();
+      const css = Math.max(120, Math.min(480, Math.round(Math.max(r.width, r.height) || 240)));
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const px = Math.max(180, Math.round(css * dpr));
+      if (cv.width !== px || cv.height !== px) {
+        cv.width = px;
+        cv.height = px;
+        gl.viewport(0, 0, px, px);
+        gl.uniform2f(uRes, px, px);
+        gl.uniform1f(uDpr, dpr);
+      }
+    };
+    syncSize();
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(syncSize) : null;
+    ro?.observe(cv);
+
+    // Exact same spin model as the original desktop orb.
     const reduce = prefersReduce();
     const spinBase = 0.18;
     const spinWave = 0.06;
     let raf = 0;
+    // Phones: keep spinning whenever the tab is visible. Desktop may pause
+    // when the theater is fully off-screen to save GPU.
     let visible = true;
-    let live = false; // only hide CSS after a real frame paints
+    let live = false;
+    let goodFrames = 0;
+    const PROMOTE_AFTER = 3; // never hide CSS on frame 0/1 blank
     const t0 = performance.now();
     let spin = 0;
     let last = t0;
+    let dead = false;
+    let retryTimer: ReturnType<typeof setTimeout> | 0 = 0;
 
-    const demoteToCss = () => {
-      // Restore CSS galaxy if GPU path dies mid-session (context lost,
-      // tab kill, driver reset) — never leave a blank bright disc.
+    const demoteToCss = (retry: boolean) => {
+      if (dead) return;
+      dead = true;
       live = false;
+      goodFrames = 0;
+      cancelAnimationFrame(raf);
       globe?.classList.remove('pl-orb-live');
-      cv.style.display = 'none';
+      // Keep canvas in DOM but transparent — CSS galaxy shows through.
+      cv.style.opacity = '0';
+      cv.style.pointerEvents = 'none';
+      if (retry && boot < 2) {
+        retryTimer = setTimeout(() => setBoot((b) => b + 1), 900);
+      }
     };
 
     const draw = (now: number) => {
-      if (gl.isContextLost()) {
-        demoteToCss();
+      if (dead || gl.isContextLost()) {
+        demoteToCss(true);
         return;
       }
-      const dt = Math.min(0.05, (now - last) / 1000);
+      // iOS can suspend RAF while the tab is still "visible" — clamp dt so
+      // spin doesn't jump, and keep going.
+      const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
       last = now;
       spin += dt * (spinBase + spinWave * Math.sin(now * 0.0004));
       gl.uniform1f(uT, (now - t0) / 1000 + 18);
       gl.uniform1f(uSpin, spin);
+      gl.clear(gl.COLOR_BUFFER_BIT);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
-      // Promote only after the first successful paint so a failed init
-      // never strips the CSS stars/bands.
+
       if (!live) {
-        live = true;
-        globe?.classList.add('pl-orb-live');
+        goodFrames += 1;
+        if (goodFrames >= PROMOTE_AFTER) {
+          live = true;
+          cv.style.opacity = '1';
+          globe?.classList.add('pl-orb-live');
+        }
       }
-      if (!reduce && visible) raf = requestAnimationFrame(draw);
+
+      const pageOk = !document.hidden;
+      // Mobile: ignore IntersectionObserver freezes — always spin if page open.
+      const shouldRun = !reduce && pageOk && (isMobile || visible);
+      if (shouldRun) raf = requestAnimationFrame(draw);
+    };
+
+    const kick = () => {
+      if (dead || reduce || gl.isContextLost()) return;
+      last = performance.now();
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(draw);
     };
 
     const onLost = (e: Event) => {
       e.preventDefault();
-      cancelAnimationFrame(raf);
-      demoteToCss();
+      demoteToCss(true);
+    };
+    const onRestored = () => {
+      // Full re-init via remount — getContext state after restore is messy.
+      setBoot((b) => b + 1);
     };
     cv.addEventListener('webglcontextlost', onLost, false);
+    cv.addEventListener('webglcontextrestored', onRestored, false);
 
-    // Pause off-screen to save GPU; generous margin so scrolling past the
-    // theater doesn't freeze the orb while it's still in view.
     const scrollRoot = cv.closest('.pl-root') as Element | null;
     const observeEl = (cv.closest('.pl-theater') as Element | null) || cv;
     const io = new IntersectionObserver(([e]) => {
+      if (isMobile) {
+        // Mobile keeps spinning; only track for optional future use.
+        visible = true;
+        return;
+      }
       const was = visible;
       visible = e.isIntersecting;
-      if (visible && !was && !reduce && live && !gl.isContextLost()) {
-        last = performance.now();
-        cancelAnimationFrame(raf);
-        raf = requestAnimationFrame(draw);
-      }
+      if (visible && !was) kick();
     }, scrollRoot
-      ? { root: scrollRoot, threshold: 0.01, rootMargin: '80px 0px' }
-      : { threshold: 0.01, rootMargin: '80px 0px' });
+      ? { root: scrollRoot, threshold: 0.01, rootMargin: '120px 0px' }
+      : { threshold: 0.01, rootMargin: '120px 0px' });
     io.observe(observeEl);
 
-    // Page visibility: iOS suspends RAF; resume cleanly when the tab returns.
     const onVis = () => {
-      if (document.hidden || reduce || !live || gl.isContextLost()) return;
-      last = performance.now();
-      cancelAnimationFrame(raf);
-      if (visible) raf = requestAnimationFrame(draw);
+      if (!document.hidden) kick();
     };
     document.addEventListener('visibilitychange', onVis);
+    // iOS Safari: visual viewport / bfcache resumes
+    window.addEventListener('pageshow', onVis);
+    window.addEventListener('focus', onVis);
 
-    raf = requestAnimationFrame(draw);
+    // Start transparent until promote — CSS galaxy is the safety backdrop.
+    cv.style.opacity = '0';
+    kick();
+
     return () => {
       io.disconnect();
+      ro?.disconnect();
       cancelAnimationFrame(raf);
+      if (retryTimer) clearTimeout(retryTimer);
       cv.removeEventListener('webglcontextlost', onLost);
+      cv.removeEventListener('webglcontextrestored', onRestored);
       document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('pageshow', onVis);
+      window.removeEventListener('focus', onVis);
       globe?.classList.remove('pl-orb-live');
     };
-  }, []);
+  }, [boot]);
+
   return <canvas ref={ref} className="pl-orb-canvas" aria-hidden="true" />;
 };
 
