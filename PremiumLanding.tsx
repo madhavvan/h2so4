@@ -431,9 +431,42 @@ const CSS = `
   .pl-passes{grid-template-columns:1fr;gap:12px;}
   .pl-ultra-band{padding:20px 18px;border-radius:18px;}
   .pl-ultra-band ul{grid-template-columns:1fr !important;}
-  .pl-theater{height:min(320px,52vh);overflow:hidden;}
-  .pl-theater-aperture{width:min(200px,48vw);height:min(200px,48vw);}
+  /*
+   * GLOBE / PLATFORM STAGE (desktop is 620×420 with absolute chip coords).
+   * Previous mobile polish set height:320px + overflow:hidden and replaced
+   * translate(-50%,-50%) with scale(.72) alone — that de-centered the stage
+   * and clipped Zoom/Meet/Teams/Webex chips off the sides. Fix:
+   *  1) keep center + scale via --pl-stage-scale (set in JS from viewport)
+   *  2) theater height tracks scaled stage so nothing is cut off
+   *  3) CSS galaxy rotates faster so motion is obvious on small screens
+   */
+  .pl-theater{
+    height: calc(420px * var(--pl-stage-scale, 0.55) + 56px);
+    min-height: 220px;
+    max-height: none;
+    overflow: hidden; /* safe once stage is scaled to fit */
+  }
+  .pl-theater-aperture{
+    width: calc(280px * var(--pl-stage-scale, 0.55));
+    height: calc(280px * var(--pl-stage-scale, 0.55));
+    opacity: .55;
+  }
   .pl-theater-echo{font-size:clamp(28px,11vw,48px) !important;}
+  /* Explicit: preserve centering (do NOT drop translate when scaling). */
+  .pl-connect-stage{
+    transform: translate(-50%, -50%) scale(var(--pl-stage-scale, 0.55));
+    transform-origin: center center;
+  }
+  /* Slightly snappier float so the orb still feels alive after scale-down. */
+  .pl-orb-float{
+    --orb-float-y: -6px;
+    animation-duration: 5.5s;
+  }
+  /* CSS fallback galaxy — faster spin so rotation is visible without WebGL. */
+  .pl-galaxy-core{animation-duration: 55s;}
+  .pl-galaxy-depth{animation-duration: 80s;}
+  .pl-galaxy-band-drift,
+  .pl-galaxy-stardrift{animation-duration: 70s;}
   .pl-ledger{grid-template-columns:1fr;column-gap:0;}
   .pl-toast{left:12px;right:12px;bottom:calc(16px + env(safe-area-inset-bottom));transform:none;max-width:none;}
   #pricing{padding:56px 18px 32px !important;}
@@ -448,10 +481,9 @@ const CSS = `
   /* Coarse pointer: skip transform-heavy hover sheens that stick mid-gesture. */
   .pl-cta:hover{transform:none;}
   .pl-price:hover,.pl-price-pop:hover{transform:none;}
+  .pl-chip-node:hover{transform:none;}
   /* Faster reveal transition so sections don't feel "stuck loading". */
   .pl-reveal{transition-duration:.55s;}
-  /* Theater stage is desktop-scale (620×420); scale down so chips aren't clipped. */
-  .pl-connect-stage{transform:scale(.72);transform-origin:center center;}
 }
 @media (prefers-reduced-motion:reduce){
   .pl-root *{animation:none !important;}
@@ -1033,9 +1065,13 @@ const CSS = `
   position: absolute;
   left: 50%;
   top: 50%;
+  /* Desktop design coordinate system: chips + SVG traces are authored in
+     620×420 px. Mobile scales this whole stage via --pl-stage-scale so
+     Meet/Teams/etc. stay on-screen instead of being clipped. */
   width: 620px;
   height: 420px;
-  transform: translate(-50%, -50%);
+  transform: translate(-50%, -50%) scale(var(--pl-stage-scale, 1));
+  transform-origin: center center;
 }
 .pl-traces { position: absolute; inset: 0; width: 100%; height: 100%; }
 .pl-trace {
@@ -1597,6 +1633,12 @@ const NebulaOrbCanvas: React.FC = () => {
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     const reduce = prefersReduce();
+    // Phones need a more obvious spin — the orb is scaled down ~0.5× so the
+    // desktop rate looks almost frozen. Keep desktop gentle.
+    const mobile = typeof window !== 'undefined'
+      && !!window.matchMedia?.('(max-width: 767px)').matches;
+    const spinBase = mobile ? 0.34 : 0.18;
+    const spinWave = mobile ? 0.10 : 0.06;
     let raf = 0;
     let visible = true;
     const t0 = performance.now();
@@ -1606,7 +1648,7 @@ const NebulaOrbCanvas: React.FC = () => {
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
       // Organic spin: gentle base rate + slow acceleration wave (x.ai uSpin)
-      spin += dt * (0.18 + 0.06 * Math.sin(now * 0.0004));
+      spin += dt * (spinBase + spinWave * Math.sin(now * 0.0004));
       gl.uniform1f(uT, (now - t0) / 1000 + 18);
       gl.uniform1f(uSpin, spin);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -1615,13 +1657,16 @@ const NebulaOrbCanvas: React.FC = () => {
     // Observe against .pl-root (fixed scroller), not the window — same bug as
     // section reveal: default-root IO is flaky when the page scrolls inside
     // a position:fixed overflow container (especially iOS).
+    // Prefer observing the theater block (larger target) so a partially
+    // visible globe still keeps spinning while the user scrolls past.
     const scrollRoot = cv.closest('.pl-root') as Element | null;
+    const observeEl = (cv.closest('.pl-theater') as Element | null) || cv;
     const io = new IntersectionObserver(([e]) => {
       const was = visible;
       visible = e.isIntersecting;
       if (visible && !was && !reduce) { last = performance.now(); cancelAnimationFrame(raf); raf = requestAnimationFrame(draw); }
-    }, scrollRoot ? { root: scrollRoot, threshold: 0.01 } : { threshold: 0.01 });
-    io.observe(cv);
+    }, scrollRoot ? { root: scrollRoot, threshold: 0.01, rootMargin: '40px 0px' } : { threshold: 0.01 });
+    io.observe(observeEl);
     raf = requestAnimationFrame(draw);
     return () => {
       io.disconnect();
@@ -1807,6 +1852,31 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
     }, 1450);
     return () => { clearTimeout(start); clearInterval(iv); };
   }, [reduce]);
+
+  // Fit the 620×420 platform stage (orb + Zoom/Meet/Teams chips) to the
+  // phone width. Without this the absolute-positioned chips sit past the
+  // viewport edge and get clipped by .pl-theater { overflow:hidden }.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const updateStageScale = () => {
+      const avail = Math.min(root.clientWidth || window.innerWidth, window.innerWidth) - 28;
+      // Floor keeps chips readable; ceiling is full desktop size.
+      const scale = Math.min(1, Math.max(0.42, avail / 620));
+      root.style.setProperty('--pl-stage-scale', scale.toFixed(4));
+    };
+    updateStageScale();
+    window.addEventListener('resize', updateStageScale);
+    window.addEventListener('orientationchange', updateStageScale);
+    // iOS address-bar show/hide changes visual viewport without a full resize.
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', updateStageScale);
+    return () => {
+      window.removeEventListener('resize', updateStageScale);
+      window.removeEventListener('orientationchange', updateStageScale);
+      vv?.removeEventListener('resize', updateStageScale);
+    };
+  }, []);
 
   // Subtle scroll-reveal (sections) + self-drawing hairlines.
   // CRITICAL: root MUST be .pl-root (the actual overflow scroller). The default
