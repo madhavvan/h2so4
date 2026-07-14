@@ -26,19 +26,20 @@ const REPO = 'madhavvan/h2so4';
 // Artifact filenames must match the patterns in package.json's
 // build.{win,mac,linux}.artifactName — keep them in sync.
 //
-// Mac ships as a Universal Binary (single .app bundle containing both
-// arm64 + x64 slices). One download for every Mac since 2009; macOS
-// picks the right slice at launch. The /mac-x64 and /mac-arm64
-// historical aliases are preserved as fallbacks so users with cached
-// old links still resolve, and so the picker page below can keep its
-// existing layout. All three URLs now redirect to the same Universal
-// DMG — the architecture distinction is no longer meaningful.
-const UNIVERSAL_MAC_DMG = 'InterviewCopilot-Mac.dmg';
+// Mac ships as PER-ARCH DMGs (InterviewCopilot-Mac-${arch}.dmg) since
+// commit 7353088 retired the Universal build. v4.0.9 was the first
+// release without InterviewCopilot-Mac.dmg, and this file still
+// redirected /mac to that name — every Mac download 404'd on GitHub,
+// which shows logged-out users a sign-in page (the 2026-07-14 incident).
+//
+// /mac can NOT auto-pick the right arch: Safari's UA reports Intel even
+// on Apple Silicon, so UA sniffing is useless for arm64-vs-x64. /mac
+// therefore serves a two-button picker; /mac-arm64 and /mac-x64 redirect
+// straight to their DMGs for links that already know the arch.
 const FILES = {
   'windows':    'InterviewCopilot-Setup.exe',
-  'mac':        UNIVERSAL_MAC_DMG,
-  'mac-x64':    UNIVERSAL_MAC_DMG,
-  'mac-arm64':  UNIVERSAL_MAC_DMG,
+  'mac-x64':    'InterviewCopilot-Mac-x64.dmg',
+  'mac-arm64':  'InterviewCopilot-Mac-arm64.dmg',
   'linux':      'InterviewCopilot-Linux.AppImage',
 };
 
@@ -82,8 +83,33 @@ router.get('/', (req, res) => {
 </div></body></html>`);
 });
 
+// Mac arch picker — served at /mac because the UA can't tell us the arch.
+// "Apple Silicon" first: every Mac sold since ~2021, i.e. most users.
+router.get('/mac', (_req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Download Interview Copilot for Mac</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#0a0a0d;color:#fff;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+  .card{max-width:480px;width:100%;text-align:center}
+  h1{font-size:22px;margin:0 0 8px;font-weight:700}
+  p{color:#888;font-size:14px;margin:0 0 24px}
+  .row{display:flex;flex-direction:column;gap:10px}
+  a{display:block;padding:14px 20px;border-radius:12px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;text-decoration:none;font-weight:600;font-size:14px}
+  a:hover{filter:brightness(1.1)}
+  .hint{color:#666;font-size:12px;margin-top:18px;line-height:1.5}
+</style></head><body><div class="card">
+  <h1>Download for Mac</h1>
+  <p>Pick your Mac's chip. Not sure? Apple menu &#8594; About This Mac.</p>
+  <div class="row">
+    <a href="/mac-arm64">Apple Silicon &middot; M1 / M2 / M3 / M4</a>
+    <a href="/mac-x64">Intel</a>
+  </div>
+  <p class="hint">Macs sold since 2021 are almost always Apple Silicon.<br>The Intel build also runs on Apple Silicon via Rosetta.</p>
+</div></body></html>`);
+});
+
 router.get('/windows',    redirectTo(FILES['windows']));
-router.get('/mac',        redirectTo(FILES['mac']));
 router.get('/mac-x64',    redirectTo(FILES['mac-x64']));
 router.get('/mac-arm64',  redirectTo(FILES['mac-arm64']));
 router.get('/linux',      redirectTo(FILES['linux']));
