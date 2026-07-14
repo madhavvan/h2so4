@@ -354,6 +354,11 @@ const CSS = `
 @keyframes pl-eq{0%,100%{height:3px;opacity:.5;}50%{height:20px;opacity:1;}}
 .pl-reveal{opacity:0;transform:translateY(24px);transition:opacity 1s cubic-bezier(.2,.8,.2,1),transform 1s cubic-bezier(.2,.8,.2,1);}
 .pl-reveal.pl-in{opacity:1;transform:none;}
+/* Shared content grids — desktop two-up; phones collapse without minmax(300px)
+   overflow that clipped copy on ~320–375px viewports. */
+.pl-moment{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:56px;align-items:center;padding:56px 0;}
+.pl-step-row{display:grid;grid-template-columns:auto 1fr auto;gap:clamp(20px,4vw,60px);align-items:center;padding-bottom:30px;}
+.pl-step-copy{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:20px;align-items:baseline;}
 .pl-price{background:linear-gradient(180deg,rgba(255,255,255,.022),rgba(255,255,255,0));
   border:1px solid var(--line);border-radius:18px;transition:border-color .35s,transform .4s cubic-bezier(.2,.9,.3,1),box-shadow .4s;}
 .pl-price:hover{transform:translateY(-4px);border-color:rgba(255,255,255,.14);}
@@ -426,12 +431,27 @@ const CSS = `
   .pl-passes{grid-template-columns:1fr;gap:12px;}
   .pl-ultra-band{padding:20px 18px;border-radius:18px;}
   .pl-ultra-band ul{grid-template-columns:1fr !important;}
-  .pl-theater{height:280px;}
-  .pl-theater-aperture{width:200px;height:200px;}
+  .pl-theater{height:min(320px,52vh);overflow:hidden;}
+  .pl-theater-aperture{width:min(200px,48vw);height:min(200px,48vw);}
   .pl-theater-echo{font-size:clamp(28px,11vw,48px) !important;}
   .pl-ledger{grid-template-columns:1fr;column-gap:0;}
   .pl-toast{left:12px;right:12px;bottom:calc(16px + env(safe-area-inset-bottom));transform:none;max-width:none;}
   #pricing{padding:56px 18px 32px !important;}
+  /* Grids used minmax(300px/330px) which overflow narrow phones and clip copy. */
+  .pl-ledger,.pl-passes,.pl-moment,.pl-step-row,.pl-step-copy{min-width:0;}
+  .pl-row{min-width:0;}
+  .pl-moment{gap:28px;padding:36px 0;}
+  .pl-step-row{grid-template-columns:auto 1fr;gap:16px 18px;padding-bottom:22px;}
+  .pl-step-copy{grid-template-columns:1fr;gap:10px;}
+  .pl-num{font-size:48px;}
+  #pl-top{padding-top:36px !important;padding-bottom:48px !important;}
+  /* Coarse pointer: skip transform-heavy hover sheens that stick mid-gesture. */
+  .pl-cta:hover{transform:none;}
+  .pl-price:hover,.pl-price-pop:hover{transform:none;}
+  /* Faster reveal transition so sections don't feel "stuck loading". */
+  .pl-reveal{transition-duration:.55s;}
+  /* Theater stage is desktop-scale (620×420); scale down so chips aren't clipped. */
+  .pl-connect-stage{transform:scale(.72);transform-origin:center center;}
 }
 @media (prefers-reduced-motion:reduce){
   .pl-root *{animation:none !important;}
@@ -1592,11 +1612,15 @@ const NebulaOrbCanvas: React.FC = () => {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       if (!reduce && visible) raf = requestAnimationFrame(draw);
     };
+    // Observe against .pl-root (fixed scroller), not the window — same bug as
+    // section reveal: default-root IO is flaky when the page scrolls inside
+    // a position:fixed overflow container (especially iOS).
+    const scrollRoot = cv.closest('.pl-root') as Element | null;
     const io = new IntersectionObserver(([e]) => {
       const was = visible;
       visible = e.isIntersecting;
       if (visible && !was && !reduce) { last = performance.now(); cancelAnimationFrame(raf); raf = requestAnimationFrame(draw); }
-    });
+    }, scrollRoot ? { root: scrollRoot, threshold: 0.01 } : { threshold: 0.01 });
     io.observe(cv);
     raf = requestAnimationFrame(draw);
     return () => {
@@ -1738,7 +1762,7 @@ const SilkStreamCanvas: React.FC = () => {
       const was = visible;
       visible = e.isIntersecting;
       if (visible && !was && !reduce) { cancelAnimationFrame(raf); raf = requestAnimationFrame(draw); }
-    });
+    }, root ? { root, threshold: 0.01 } : { threshold: 0.01 });
     io.observe(cv);
     raf = requestAnimationFrame(draw); // at least one frame, even reduced
     return () => {
@@ -1785,14 +1809,54 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
   }, [reduce]);
 
   // Subtle scroll-reveal (sections) + self-drawing hairlines.
+  // CRITICAL: root MUST be .pl-root (the actual overflow scroller). The default
+  // root is the browser viewport; with position:fixed + overflow-y:auto on
+  // .pl-root, iOS Safari and some Android browsers miss intersections — so
+  // .pl-reveal stays at opacity:0 forever ("content never loads" on mobile).
+  // Desktop often looked fine because more of the page is in the first paint
+  // and thresholds were easier to meet on a tall monitor.
   useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const targets = root.querySelectorAll('.pl-reveal, .pl-drawline');
+    if (targets.length === 0) return;
+
+    const reveal = (el: Element) => el.classList.add('pl-in');
+
+    // Reduced motion / no-IO environments: show everything immediately.
+    if (reduce || typeof IntersectionObserver === 'undefined') {
+      targets.forEach(reveal);
+      return;
+    }
+
     const io = new IntersectionObserver(
-      (es) => es.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('pl-in'); io.unobserve(e.target); } }),
-      { threshold: 0.14, rootMargin: '0px 0px -6% 0px' },
+      (es) => es.forEach((e) => {
+        if (e.isIntersecting) {
+          reveal(e.target);
+          io.unobserve(e.target);
+        }
+      }),
+      {
+        root, // ← the fixed scroll container, not the window
+        threshold: 0.02,
+        // Start reveal slightly before the block fully enters — mobile sticky
+        // nav + URL chrome eat vertical space and made 0.14/-6% miss too often.
+        rootMargin: '0px 0px 12% 0px',
+      },
     );
-    rootRef.current?.querySelectorAll('.pl-reveal, .pl-drawline').forEach((el) => io.observe(el));
-    return () => io.disconnect();
-  }, []);
+    targets.forEach((el) => io.observe(el));
+
+    // Safety net: anything still hidden after a short settle is forced visible.
+    // Covers flaky mobile IO (tab restore, address-bar resize, PiP, etc.).
+    const failSafe = window.setTimeout(() => {
+      root.querySelectorAll('.pl-reveal:not(.pl-in), .pl-drawline:not(.pl-in)').forEach(reveal);
+    }, 1800);
+
+    return () => {
+      io.disconnect();
+      window.clearTimeout(failSafe);
+    };
+  }, [reduce]);
 
   // The glass planet tracks the cursor the way real optics shift a highlight
   // as you move past them — ±9° tilt on the sphere; shell + ring ride along
@@ -2090,7 +2154,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       {/* ── Feature moments (editorial, spacious — not a card grid) ── */}
       <section id="why" className="pl-wrap" style={{ paddingTop: 40, paddingBottom: 40 }}>
         {/* Moment 1 — Invisible */}
-        <div className="pl-reveal" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(300px,1fr))', gap: 56, alignItems: 'center', padding: '56px 0' }}>
+        <div className="pl-reveal pl-moment">
           <div>
             <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Invisible by design</div>
             <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.025em', marginBottom: 20 }}>
@@ -2119,7 +2183,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         <div className="pl-goldline pl-drawline" />
 
         {/* Moment 2 — Five minds */}
-        <div className="pl-reveal" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(300px,1fr))', gap: 56, alignItems: 'center', padding: '56px 0' }}>
+        <div className="pl-reveal pl-moment">
           <div className="pl-hide-sm" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {MODELS.map((m, i) => (
               <div key={m} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '13px 18px', borderRadius: 12, border: `1px solid ${i === 0 ? 'var(--gold-line)' : 'var(--line)'}`, background: i === 0 ? 'linear-gradient(90deg,rgba(211,172,99,.07),transparent)' : 'transparent' }}>
@@ -2144,7 +2208,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         <div className="pl-goldline pl-drawline" />
 
         {/* Moment 3 — Auto-Type */}
-        <div className="pl-reveal" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(300px,1fr))', gap: 56, alignItems: 'center', padding: '56px 0' }}>
+        <div className="pl-reveal pl-moment">
           <div>
             <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Auto-Type · Ultra</div>
             <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.025em', marginBottom: 20 }}>
@@ -2334,9 +2398,9 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         {STEPS.map((s, idx) => (
           <div key={s.n} className="pl-reveal">
             <div className="pl-goldline" style={{ margin: '0 0 30px' }} />
-            <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 'clamp(20px,4vw,60px)', alignItems: 'center', paddingBottom: 30 }}>
+            <div className="pl-step-row">
               <span className="pl-serif pl-num">{s.n}</span>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(240px,1fr))', gap: 20, alignItems: 'baseline' }}>
+              <div className="pl-step-copy">
                 <h3 className="pl-serif" style={{ fontSize: 'clamp(22px,3vw,32px)', fontWeight: 500, letterSpacing: '-0.02em' }}>{s.t}</h3>
                 <p style={{ fontSize: 16, lineHeight: 1.6, color: 'var(--mut)' }}>{s.b}</p>
               </div>
@@ -2399,7 +2463,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
 
       {/* ── Privacy — the discretion pact ───────────────────── */}
       <section id="privacy" className="pl-wrap" style={{ paddingTop: 72, paddingBottom: 32 }}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(300px,1fr))', gap: 56, alignItems: 'start' }}>
+        <div className="pl-moment" style={{ alignItems: 'start', padding: 0 }}>
           <div className="pl-reveal">
             <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Discretion, engineered</div>
             <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.025em', marginBottom: 20 }}>
