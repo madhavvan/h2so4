@@ -561,10 +561,13 @@
          don't have to repeat the same bag of style overrides on every
          input across three nearly-identical views. */
 
-      /* Input focus state — the default focus:outline-none on auth inputs
-         strips the browser ring without a replacement, leaving keyboard
-         users with no signal of which field is active. We replace it with
-         an accent-colored border + soft halo. */
+      /* Input focus state — keep the glass look. The old rule swapped in a
+         bright accent border + 3px halo on focus, which read as a glowing
+         outline against the obsidian card (owner: "keep them plain, like
+         the glass input boxes"). Focus now only nudges the existing hairline
+         toward the ink color — barely brighter in dark, barely darker in
+         light — so keyboard users still get a signal without a bright line.
+         !important is required: the inputs set their border inline. */
       .auth-input {
         transition:
           border-color 200ms var(--ease-ios),
@@ -572,8 +575,8 @@
           background-color 200ms var(--ease-ios);
       }
       .auth-input:focus {
-        border-color: var(--accent) !important;
-        box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
+        border-color: color-mix(in oklab, var(--ink) 22%, var(--cream-line)) !important;
+        box-shadow: none;
         outline: none;
       }
       .auth-input::placeholder {

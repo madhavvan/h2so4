@@ -9758,7 +9758,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   //  LOGIN — cream-on-ink, editorial typography
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'login') {
-    if (isMobile) return renderAuthMobile('login');
+    // Auth unified on the obsidian card for all widths (2026-07): the old
+    // AuthMobile iOS sheet was the pre-redesign cream UI, so phones saw a
+    // stale interface after the landing unified on PremiumLanding. The card
+    // is max-w-[400px] + centered with px-4 gutters — it fits phones as-is.
+    // AuthMobile is kept below as dead code for instant fallback, same
+    // pattern as the retired cream landing.
     return (
       <div
         className="fixed inset-0 overflow-y-auto pl-auth-dark"
@@ -9930,7 +9935,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   //  FORGOT PASSWORD — cream theme, restrained
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'forgot_password') {
-    if (isMobile) return renderAuthMobile('forgot_password');
+    // Unified auth card at all widths — see the login view's note.
     return (
       <div
         className="fixed inset-0 overflow-y-auto pl-auth-dark"
@@ -10046,7 +10051,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   //  SIGNUP — cream-on-ink, editorial typography
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   if (view === 'signup') {
-    if (isMobile) return renderAuthMobile('signup');
+    // Unified auth card at all widths — see the login view's note.
     return (
       <div
         className="fixed inset-0 overflow-y-auto pl-auth-dark"
