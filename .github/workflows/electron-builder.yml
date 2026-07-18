@@ -100,12 +100,18 @@ jobs:
         run: echo "${{ secrets.APPLE_API_KEY_P8 }}" | openssl base64 -d -A > "$RUNNER_TEMP/AuthKey.p8"
         shell: bash
 
-      - name: Build + publish Electron app
-        # Both release and workflow_dispatch upload to the GitHub release that
-        # matches the version in package.json. workflow_dispatch is the path
-        # we use to backfill Mac/Linux on an existing release.
+      - name: Build Electron app (no publish — CI token can't reach the releases repo)
+        # package.json's publish is now an ARRAY (interviewcopilot-releases
+        # first, h2so4 second) so app-update.yml in every artifact points at
+        # the public releases repo. The default GITHUB_TOKEN can only write
+        # THIS repo, so `--publish always` would fail on the first (external)
+        # publisher and lose the build. Build only; the softprops step below
+        # attaches everything (including latest-*.yml) to the h2so4 release,
+        # and the releases-repo copy is synced from there. NOTE: this makes
+        # workflow_dispatch backfills upload nothing (softprops is gated to
+        # release events) — backfill by re-publishing the release instead.
         if: steps.gate.outputs.go == '1'
-        run: npx electron-builder ${{ matrix.platform }} --publish always
+        run: npx electron-builder ${{ matrix.platform }} --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # macOS code signing — Developer ID Application cert as a base64

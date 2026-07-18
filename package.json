@@ -1,7 +1,7 @@
 {
   "name": "interview-copilot-ai",
   "private": true,
-  "version": "4.0.9",
+  "version": "4.0.10",
   "description": "AI-powered real-time interview assistant",
   "author": {
     "name": "Interview Copilot",
@@ -36,7 +36,7 @@
         "provider": "github",
         "owner": "madhavvan",
         "repo": "interviewcopilot-releases",
-        "releaseType": "release"
+        "releaseType": "draft"
       },
       {
         "provider": "github",

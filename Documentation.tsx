@@ -27,7 +27,6 @@ import {
   ChevronRight,
   Shield,
   CreditCard,
-  ExternalLink,
   Github,
   ArrowUpRight,
   Hash,
@@ -185,7 +184,10 @@ function prettyAdminTitle(filename: string): string {
     .join('-');
 }
 
-const GITHUB_REPO = 'https://github.com/madhavvan/h2so4';
+// Public releases/issues repo — the app source lives in a private repo, so
+// user-facing links (doc feedback, issue reports) go here. Do NOT point this
+// at the source repo: it 404s for users once the source goes private.
+const GITHUB_REPO = 'https://github.com/madhavvan/interviewcopilot-releases';
 
 // ──────────────────────────────────────────────────────────────────
 // HELPERS
@@ -609,18 +611,6 @@ const TocRail: React.FC<TocRailProps> = ({ toc, activeAnchor, onJump, doc }) => 
             );
           })}
         </ul>
-        {/* Edit on GitHub */}
-        <div className="mt-6 pt-4 border-t border-black/10 dark:border-white/10">
-          <button
-            type="button"
-            onClick={() => openExternal(`${GITHUB_REPO}/blob/main/${doc.sourcePath}`)}
-            className="w-full flex items-center gap-1.5 text-[11px] text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 transition-colors"
-          >
-            <Github size={12} />
-            <span>Edit on GitHub</span>
-            <ArrowUpRight size={10} className="ml-auto opacity-70" />
-          </button>
-        </div>
       </div>
     </aside>
   );
@@ -1251,16 +1241,6 @@ const DocumentationLayer: React.FC<LayerProps> = ({
                 Documentation for <span className="font-mono">v{appVersion}</span>. Updated with every release.
               </div>
               <div className="flex items-center gap-3">
-                <button
-                  type="button"
-                  onClick={() => openExternal(`${GITHUB_REPO}/blob/main/${activeDoc.sourcePath}`)}
-                  className="inline-flex items-center gap-1.5 hover:text-gray-800 dark:hover:text-gray-200 transition-colors"
-                >
-                  <Github size={12} />
-                  <span>View source</span>
-                  <ExternalLink size={10} className="opacity-70" />
-                </button>
-                <span aria-hidden className="opacity-40">·</span>
                 <button
                   type="button"
                   onClick={() => openExternal(`${GITHUB_REPO}/issues/new?title=Doc%20feedback%3A%20${encodeURIComponent(activeDoc.title)}`)}
