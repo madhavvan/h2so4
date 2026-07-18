@@ -123,6 +123,11 @@ interface SubscriptionStatus {
   // an "Active" badge that's actually scheduled to end.
   cancel_at_period_end?: boolean;
   cancels_at?: number | null;
+  // 2026-07 model: whether the CURRENT tier is a recurring subscription
+  // (Ultra, or a legacy Pro/Max sub) vs a one-time interview pass. Gates
+  // the cancel/reactivate actions — /cancel-subscription 404s for a pass
+  // holder because there is no subscription to cancel; passes just expire.
+  is_recurring?: boolean;
 }
 
 interface ManageSubscriptionProps {
@@ -853,6 +858,32 @@ export function ManageSubscription({
   const isPaidProvider = provider === 'stripe' || provider === 'razorpay';
   const isStripe = provider === 'stripe';
   const isRazorpay = provider === 'razorpay';
+  // Active-subscription date labels. Ultra's license carries expires_at=-1
+  // BY DESIGN while the sub is nominal (Stripe owns the lifetime; a real
+  // date only lands when a cancellation pins the cycle end). formatExpiry
+  // renders -1 as "Never" — correct for comp licenses, but on the
+  // subscription surfaces it read as "Renews: Never" / "access until
+  // Never". These labels translate the sentinel into subscription truth.
+  const renewsLabel = expiresAt > 0
+    ? formatExpiry(expiresAt)
+    : (tier === 'ultra' ? 'Monthly — automatic on your billing date' : formatExpiry(expiresAt));
+  const accessUntilLabel = expiresAt > 0
+    ? formatExpiry(expiresAt)
+    : 'the end of your current billing cycle';
+  // Lapsed plan (pass past its 30-day window / sub ended / refunded…).
+  // Drives two things below: the purchase menu falls back to the FREE
+  // tier's full plan list (an expired Basic user's most likely purchase
+  // is another $30 Basic — keying UPGRADE_TARGETS on the raw tier hid
+  // exactly that option), and the extend/top-up surfaces hide (you
+  // extend a LIVE pass; a lapsed one gets re-bought).
+  const planLapsed = licenseService.isPlanLapsed(userLicense)
+    || ['expired', 'refunded', 'revoked'].includes(status);
+  // Subscription vs one-time pass (2026-07 model). The server computes this
+  // from the payments ledger; when talking to an older server that doesn't
+  // send the field, fall back to "Ultra is the only subscription" — exactly
+  // the model the pricing shipped with, so the fallback can't over-offer
+  // cancel to pass holders.
+  const isRecurring = typeof sub?.is_recurring === 'boolean' ? sub.is_recurring : tier === 'ultra';
 
   // Free-on-trial: light up the hero strip with a countdown so the user
   // feels the 30-min taste-test clock running. Without this, a Free user
@@ -957,44 +988,48 @@ export function ManageSubscription({
                     <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Pass expires</div>
                     <div className="font-semibold text-white">{userLicense?.credits_expire_at ? formatExpiry(userLicense.credits_expire_at) : '—'}</div>
                   </div>
+                  {!planLapsed && (
                   <div className="sm:col-span-2">
                     {(() => {
                       const packs = getExtensionPacks(userProfile?.country_code || 'US');
+                      // The charge button MUST name the pack that will
+                      // actually be charged (handleExtendNow sends
+                      // selectedExtPack) — the old label hardcoded the flat
+                      // +30 min · $25 unit, so picking "+3 hours" showed
+                      // "$25" on the button and charged $80.
+                      const sel = packs.find(p => p.id === selectedExtPack) || packs[0];
                       return (
-                        <div className="flex gap-1 mb-2">
-                          {packs.map(p => (
-                            <button key={p.id} onClick={() => setSelectedExtPack(p.id)}
-                              className={"px-2 py-1 rounded text-[10px] font-bold border transition-all " + (selectedExtPack === p.id ? "bg-emerald-500/25 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20")}>
-                              {p.label + " · " + p.currencySymbol + p.price}
-                            </button>
-                          ))}
-                        </div>
+                        <>
+                          <div className="flex gap-1 mb-2">
+                            {packs.map(p => (
+                              <button key={p.id} onClick={() => setSelectedExtPack(p.id)}
+                                className={"px-2 py-1 rounded text-[10px] font-bold border transition-all " + (selectedExtPack === p.id ? "bg-emerald-500/25 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20")}>
+                                {p.label + " · " + p.currencySymbol + p.price}
+                              </button>
+                            ))}
+                          </div>
+                          <button
+                            onClick={handleExtendNow}
+                            disabled={extendLoading}
+                            className="w-full sm:w-auto px-4 py-2 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold hover:bg-emerald-500/25 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
+                          >
+                            {extendLoading ? <Loader2 size={13} className="animate-spin" /> : <Zap size={13} />}
+                            {`Add ${sel.minutes} minutes · ${pricingService.formatPrice(sel.price, sel.currencySymbol, sel.currency)}`}
+                          </button>
+                        </>
                       );
                     })()}
-                    <button
-                      onClick={handleExtendNow}
-                      disabled={extendLoading}
-                      className="w-full sm:w-auto px-4 py-2 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold hover:bg-emerald-500/25 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
-                    >
-                      {extendLoading ? <Loader2 size={13} className="animate-spin" /> : <Zap size={13} />}
-                      {(() => {
-                        // Plan-specific top-up: Basic +30 min · $25, Pro/Max
-                        // +1 hour · $45 (server charges by the live license
-                        // tier — this label mirrors pricingService's table).
-                        const r = pricingService.getRenewalPrice(userProfile?.country_code || 'US', tier);
-                        return `Add ${r.minutes} minutes · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
-                      })()}
-                    </button>
                     <p className="text-[10px] text-white/40 mt-1.5">
                       One click on your card on file. Repeat as often as you need on your interview day.
                     </p>
                   </div>
+                  )}
                 </>
               ) : (
                 <>
                   <div>
                     <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Renews</div>
-                    <div className="font-semibold text-white">{formatExpiry(expiresAt)}</div>
+                    <div className="font-semibold text-white">{renewsLabel}</div>
                   </div>
                   <div>
                     <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Account email</div>
@@ -1121,7 +1156,7 @@ export function ManageSubscription({
               for Basic because it predates that strip. Label/price resolve
               through the same RENEWAL_BY_TIER mirror so the row can never
               disagree with what the server charges. */}
-          {tier === 'basic' && onRenewRequested && (() => {
+          {tier === 'basic' && !planLapsed && onRenewRequested && (() => {
             const r = pricingService.getRenewalPrice(userProfile?.country_code || 'US', tier);
             return (
               <button
@@ -1146,7 +1181,17 @@ export function ManageSubscription({
           {/* Purchase / upgrade — every option is a fresh checkout (2026-07 model):
               Basic/Pro/Max are one-time, Ultra is the monthly subscription.
               Ultra renders in amethyst; the rest in gold (see UpgradeRow). */}
-          {(UPGRADE_TARGETS[tier] || []).map(t => (
+          {/* Mid-pass heads-up: buying a different pass is a fresh purchase —
+              its clock REPLACES whatever remains on the current pass. Only
+              shown while a metered pass is live with time left, so the
+              exhausted/lapsed flows stay clean. */}
+          {!planLapsed && ['basic', 'pro', 'max'].includes(tier)
+            && (userLicense?.credits_remaining_seconds ?? 0) > 0 && (
+            <p className="text-[11px] text-zinc-500 dark:text-white/40 px-1">
+              Buying another pass starts its clock fresh and replaces the {formatCredits(userLicense?.credits_remaining_seconds)} left on your current pass. Just need more minutes? Use the extend packs above.
+            </p>
+          )}
+          {(UPGRADE_TARGETS[planLapsed ? 'free' : tier] || []).map(t => (
             <UpgradeRow
               key={t}
               target={t}
@@ -1161,42 +1206,27 @@ export function ManageSubscription({
               here assumed the pre-2026-07 subscription model (in-place Pro↔Max
               swap via /upgrade-tier, which 404s now that Pro/Max are one-time). */}
 
-          {/* === Max tier → switch back to Pro (downgrade in-place) ===
-              On Razorpay this schedules at cycle_end (server keeps Max
-              active until then). On Stripe it prorates next invoice. */}
-          {tier === 'max' && (
-            <button
-              onClick={() => handleUpgradeTier('pro')}
-              disabled={actionLoading === 'upgrade-pro'}
-              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/15 transition-colors disabled:opacity-50"
-            >
-              <div className="flex items-center gap-3">
-                <Crown size={18} className="text-blue-400" />
-                <div className="text-left">
-                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">Switch to Pro</div>
-                  <div className="text-xs text-zinc-600 dark:text-white/60">Removes Claude + Auto-Type + Train Model. {isRazorpay ? 'Effective at next renewal — keep Max access until then.' : 'Effective immediately, prorated credit next invoice.'}</div>
-                </div>
-              </div>
-              {actionLoading === 'upgrade-pro' ? <Loader2 size={16} className="animate-spin text-blue-400" /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
-            </button>
-          )}
+          {/* NOTE (2026-07 model): the old Max→"Switch to Pro" in-place swap
+              row is gone. Pro/Max are one-time passes — the server rejects
+              non-Ultra in-place swaps (/upgrade-tier 400s: a subscription
+              can't be swapped onto a one-time price), and for pass holders
+              there was never a subscription to swap. Buying a different
+              pass happens through the UPGRADE_TARGETS rows above. */}
 
-          {/* === Pro/Max → Switch to Basic (deep downgrade) ===
-              Provider-aware: real users with a Stripe/Razorpay sub go
-              through the cancel modal (with reason capture + the
-              save-attempt UX); admin grants (no payment provider on
-              file) call /upgrade-tier directly because there's no
-              subscription to cancel — server's grantAdminTier path
-              handles the DB-only tier flip in one round-trip.
-              Without this branch, admins clicked the button and
-              nothing visible happened (the cancel modal is gated on
-              `isPaidProvider` further down). */}
-          {(tier === 'pro' || tier === 'max') && (
+          {/* === Pro/Max LEGACY SUBSCRIBERS → Switch to Basic ===
+              Only meaningful when the tier is subscription-backed
+              (isRecurring — legacy Pro/Max subs): the flow is cancel-then-
+              repurchase, so it opens the cancel modal with the reason
+              prefilled. One-time pass holders never see this (their pass
+              simply expires; there is nothing to cancel — the server
+              would 404). Admin grants (no provider) flip instantly via
+              /upgrade-tier's grantAdminTier short-circuit. */}
+          {(tier === 'pro' || tier === 'max') && (isRecurring || !isPaidProvider) && (
             <button
               onClick={() => {
                 if (isPaidProvider) {
                   setCancelReason('switching_to_basic');
-                  setCancelReasonDetail('I want to downgrade to Basic ($25 one-time / 3 sessions). Please cancel my recurring subscription so I can purchase Basic after the current cycle ends.');
+                  setCancelReasonDetail('I want to switch to the Basic pass ($30 one-time · one 30-minute interview). Please cancel my recurring subscription so I can purchase Basic after the current cycle ends.');
                   setCancelConfirm(true);
                 } else {
                   // No payment provider → admin-grant path. Hits
@@ -1217,7 +1247,7 @@ export function ManageSubscription({
                 <div className="text-left">
                   <div className="font-semibold text-zinc-900 dark:text-white text-sm">Switch to Basic{!isPaidProvider && ' (admin)'}</div>
                   <div className="text-xs text-zinc-600 dark:text-white/60">{isPaidProvider
-                    ? '$25 one-time, 3 sessions, 14-day window. Basic isn\'t a subscription — your current sub cancels at cycle end, then you re-purchase Basic. Keeps your account intact.'
+                    ? '$30 one-time · one 30-minute interview · 30-day window. Basic isn\'t a subscription — your current sub cancels at cycle end, then you purchase the Basic pass. Keeps your account intact.'
                     : 'No payment provider on file — instant tier flip (admin grant).'
                   }</div>
                 </div>
@@ -1226,11 +1256,9 @@ export function ManageSubscription({
             </button>
           )}
 
-          {/* === Pro/Max → Switch to Free (cancel subscription) ===
-              Same provider-aware branch as Switch to Basic: real users
-              go through cancel modal; admin grants flip the tier
-              instantly. */}
-          {(tier === 'pro' || tier === 'max') && (
+          {/* === Pro/Max legacy subs → Switch to Free (cancel subscription) ===
+              Same subscription-only gating as Switch to Basic. */}
+          {(tier === 'pro' || tier === 'max') && (isRecurring || !isPaidProvider) && (
             <button
               onClick={() => {
                 if (isPaidProvider) {
@@ -1247,9 +1275,33 @@ export function ManageSubscription({
                 <div className="text-left">
                   <div className="font-semibold text-zinc-900 dark:text-white text-sm">Switch to Free{!isPaidProvider && ' (admin)'}</div>
                   <div className="text-xs text-zinc-600 dark:text-white/60">{isPaidProvider
-                    ? `Stop paying. You keep ${tierMeta.label} access until ${formatExpiry(expiresAt)}, then drop to Free (no interview time — pick a plan to start again).`
+                    ? `Stop paying. You keep ${tierMeta.label} access until ${accessUntilLabel}, then drop to Free (no interview time — pick a plan to start again).`
                     : 'No payment provider on file — instant tier flip to Free (admin grant).'
                   }</div>
+                </div>
+              </div>
+              <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />
+            </button>
+          )}
+
+          {/* === Pro/Max ONE-TIME PASS holders → nothing to cancel ===
+              Mirror of Basic's informational row: the pass doesn't renew,
+              so the only honest action is "know when it ends". Without
+              this, pass holders saw subscription-cancel buttons that hit
+              404 ("No active subscription found") server-side. */}
+          {(tier === 'pro' || tier === 'max') && isPaidProvider && !isRecurring && !planLapsed && (
+            <button
+              onClick={() => {
+                setSuccess(`Your ${tierMeta.label} pass doesn't auto-renew — nothing to cancel. Your remaining time is usable until ${formatExpiry(userLicense?.credits_expire_at || expiresAt)}, then your tier drops to Free automatically.`);
+              }}
+              disabled={!!actionLoading}
+              className="w-full flex items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-zinc-100 dark:bg-white/[0.06] transition-colors disabled:opacity-50"
+            >
+              <div className="flex items-center gap-3">
+                <Info size={18} className="text-white/60" />
+                <div className="text-left">
+                  <div className="font-semibold text-zinc-900 dark:text-white text-sm">One-time pass — no subscription, nothing to cancel</div>
+                  <div className="text-xs text-zinc-600 dark:text-white/60">Your {tierMeta.label} pass expires on {formatExpiry(userLicense?.credits_expire_at || expiresAt)}. It never bills again.</div>
                 </div>
               </div>
               <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />
@@ -1261,7 +1313,7 @@ export function ManageSubscription({
               no recurring sub to cancel. This button is informational
               — clicking it shows the expiry date and a note that no
               cancellation is needed. */}
-          {tier === 'basic' && (
+          {tier === 'basic' && !planLapsed && (
             <button
               onClick={() => {
                 setSuccess(`Basic doesn't auto-renew — your current credits expire on ${formatExpiry(expiresAt)} and your tier will drop to Free automatically. No cancellation needed.`);
@@ -1307,7 +1359,7 @@ export function ManageSubscription({
                   <div className="text-left">
                     <div className="font-semibold text-zinc-900 dark:text-white text-sm">Cancel Ultra{!isPaidProvider && ' (admin)'}</div>
                     <div className="text-xs text-zinc-600 dark:text-white/60">{isPaidProvider
-                      ? `Stop the monthly subscription. You keep unlimited access until ${formatExpiry(expiresAt)}, then drop to Free (no interview time — pick a plan to start again).`
+                      ? `Stop the monthly subscription. You keep unlimited access until ${accessUntilLabel}, then drop to Free (no interview time — pick a plan to start again).`
                       : 'No payment provider on file — instant tier flip to Free (admin grant).'
                     }</div>
                   </div>
@@ -1325,8 +1377,12 @@ export function ManageSubscription({
             Stripe paid users get the Customer Portal link (card / invoices /
             cancel are all there). Razorpay paid users get an inline cancel
             with confirm because Razorpay has no self-serve portal. Free
-            users see nothing here — there's no billing relationship yet. */}
-        {(tier === 'pro' || tier === 'max') && (
+            users see nothing here — there's no billing relationship yet.
+            ULTRA included (2026-07): it's the only true subscription, and
+            the old pro/max-only gate left Ultra with a "Cancel Ultra"
+            button whose confirm panel (below) never rendered — the
+            flagship tier literally could not cancel or reactivate in-app. */}
+        {(tier === 'pro' || tier === 'max' || tier === 'ultra') && isPaidProvider && (
           <div className="space-y-3">
             <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500 dark:text-white/50">Billing</h4>
 
@@ -1343,7 +1399,7 @@ export function ManageSubscription({
                   <div className="text-sm text-amber-100/90 leading-relaxed">
                     <div className="font-semibold mb-0.5">Cancellation scheduled</div>
                     <div className="text-amber-200/70 text-[13px]">
-                      You'll keep {tierMeta.label} access until {formatExpiry(expiresAt)}. After that the subscription stops renewing and your tier drops to Free. You can reverse this any time before then.
+                      You'll keep {tierMeta.label} access until {accessUntilLabel}. After that the subscription stops renewing and your tier drops to Free. You can reverse this any time before then.
                     </div>
                   </div>
                 </div>
@@ -1367,7 +1423,9 @@ export function ManageSubscription({
                   <ExternalLink size={18} className="text-white/70" />
                   <div className="text-left">
                     <div className="font-semibold text-zinc-900 dark:text-white text-sm">Manage billing in Stripe</div>
-                    <div className="text-xs text-zinc-600 dark:text-white/60">{status === 'canceling' ? 'Update card, view invoices, change billing cycle.' : 'Update card, view invoices, change billing cycle, or cancel subscription.'}</div>
+                    <div className="text-xs text-zinc-600 dark:text-white/60">{!isRecurring
+                      ? 'Update your saved card and view invoices/receipts.'
+                      : status === 'canceling' ? 'Update card, view invoices, change billing cycle.' : 'Update card, view invoices, change billing cycle, or cancel subscription.'}</div>
                   </div>
                 </div>
                 {actionLoading === 'portal' ? <Loader2 size={16} className="animate-spin text-white/70" /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
@@ -1378,9 +1436,12 @@ export function ManageSubscription({
                 while the sub is still active (status='active'). Suppressed
                 when status='canceling' because the Reactivate banner above
                 already shows the cancel state and offers the inverse CTA.
+                Gated on isRecurring: one-time pass holders have no sub to
+                cancel (the endpoint 404s) — they get the informational
+                "nothing to cancel" row in the plans section instead.
                 The unified server endpoint auto-detects provider, so the
                 same UI works for everyone. */}
-            {isPaidProvider && status === 'active' && (
+            {isPaidProvider && isRecurring && status === 'active' && (
               <>
                 {!cancelConfirm ? (
                   <button
@@ -1403,44 +1464,46 @@ export function ManageSubscription({
                       <div>
                         <div className="font-semibold text-red-200 text-sm">Cancel your {tierMeta.label} subscription?</div>
                         <div className="text-xs text-red-200/80 mt-1">
-                          You'll keep full {tierMeta.label} access until <strong>{formatExpiry(expiresAt)}</strong>, then drop to Free. No partial-period refund. Reactivate any time before then to keep going.
+                          You'll keep full {tierMeta.label} access until <strong>{accessUntilLabel}</strong>, then drop to Free. No partial-period refund. Reactivate any time before then to keep going.
                         </div>
                       </div>
                     </div>
 
-                    {/* Save attempt: offer a cheaper plan instead of full
+                    {/* Save attempt: offer an alternative to full
                         cancellation. Standard enterprise pattern (Notion,
                         Linear, Vercel all do this) — many users churn
-                        because they need less, not because they're done. */}
-                    {(tier === 'max' || tier === 'pro') && (
+                        because they need less, not because they're done.
+                        NOTE: the old "Switch to Pro instead" in-place swap
+                        is gone — Pro is a one-time pass now, the server
+                        rejects non-Ultra in-place swaps. The honest save
+                        offers are the one-time passes (post-cancel) and,
+                        on Stripe, pausing collection via the portal. */}
+                    {isStripe && (
                       <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 space-y-2">
                         <div className="flex items-center gap-2 text-amber-200">
                           <Sparkles size={13} />
-                          <span className="text-[12px] font-bold uppercase tracking-wider">Before you go — would a cheaper plan work?</span>
+                          <span className="text-[12px] font-bold uppercase tracking-wider">Before you go — need a break, not a breakup?</span>
                         </div>
                         <div className="flex flex-wrap gap-2">
-                          {tier === 'max' && (
-                            <button
-                              type="button"
-                              onClick={() => { setCancelConfirm(false); handleUpgradeTier('pro'); }}
-                              disabled={!!actionLoading}
-                              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30 border border-indigo-500/40 transition-colors disabled:opacity-50"
-                            >
-                              Switch to Pro instead
-                            </button>
-                          )}
-                          {(tier === 'max' || tier === 'pro') && isStripe && (
-                            <button
-                              type="button"
-                              onClick={() => { setCancelConfirm(false); window.open(`${API_BASE}/api/v1/payments/portal-redirect?token=${licenseService.getToken() || ''}`, '_blank'); }}
-                              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white/10 text-white/80 hover:bg-white/15 border border-white/15 transition-colors"
-                            >
-                              Pause via billing portal
-                            </button>
-                          )}
+                          <button
+                            type="button"
+                            // Goes through the POST /portal flow (server
+                            // mints a short-lived portal session URL).
+                            // The old href hit a nonexistent
+                            // /portal-redirect GET route — a guaranteed
+                            // 404 — and leaked the JWT into the URL bar,
+                            // browser history, and server request logs.
+                            onClick={() => { setCancelConfirm(false); void handleStripePortal(); }}
+                            disabled={!!actionLoading}
+                            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white/10 text-white/80 hover:bg-white/15 border border-white/15 transition-colors disabled:opacity-50"
+                          >
+                            Pause via billing portal
+                          </button>
                         </div>
                         <div className="text-[10.5px] text-amber-200/70 leading-relaxed">
-                          Pro is half the price and keeps all five models, Claude Sonnet 5 included — you'd just go from three interviews down to one.
+                          {tier === 'ultra'
+                            ? 'Interviewing on and off? After cancelling you can also buy one-time passes (Basic $30 / Pro $50 / Max $89) whenever an interview comes up — no monthly bill.'
+                            : 'One-time passes (Basic $30 / Pro $50 / Max $89) are available any time after your subscription ends — pay only when an interview comes up.'}
                         </div>
                       </div>
                     )}
@@ -1454,11 +1517,11 @@ export function ManageSubscription({
                       <div className="text-[11px] font-bold uppercase tracking-wider text-white/60">What you'll lose at {formatExpiry(expiresAt)}</div>
                       <ul className="text-[12px] text-white/80 space-y-1 ml-2 list-disc list-inside">
                         {/* Gate-accurate under 2026-07 pricing (mirrors FEATURE_GATES).
-                            This cancel panel only renders for Pro/Max — both include
-                            Claude + the four base models; Max alone adds reasoning-effort
-                            control. Auto-Type is Ultra-only, so it's never lost here. */}
+                            Renders for the subscription tiers — legacy Pro/Max subs
+                            and Ultra. Ultra alone loses Auto-Type + unlimited time. */}
+                        {tier === 'ultra' && <li>Unlimited interviews + Auto-Type</li>}
                         <li>Claude Sonnet 5 access</li>
-                        {tier === 'max' && <li>Reasoning effort control</li>}
+                        {(tier === 'max' || tier === 'ultra') && <li>Reasoning effort control + Train Model</li>}
                         <li>Gemini, Groq, GPT, and Grok models</li>
                         <li>Auto-Solve (screen-capture problem solving)</li>
                         <li>Pop-out window (screen-share invisible)</li>

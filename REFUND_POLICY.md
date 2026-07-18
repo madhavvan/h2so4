@@ -16,7 +16,7 @@ We aim to be fair: if you bought a plan you genuinely couldn't use, we'll refund
 | **Pro** ($50 / ₹4,199 · one-time · one 1-hour interview) | 14 days from purchase | Less than 2 hours of total session time |
 | **Max** ($89 / ₹7,399 · one-time · three 1-hour interviews) | 14 days from purchase | Less than 2 hours of total session time |
 | **Ultra** ($159/mo &nbsp;·&nbsp; ₹12,999/mo) | 14 days from the **first** charge | Less than 2 hours of total session time |
-| **Interview extension** ($25 / ₹2,099 top-up) | Not refundable once delivered | — |
+| **Interview extensions** (+30 min / +1 h / +3 h top-ups — $25–$80 / ₹2,099–₹6,799) | Not refundable once delivered | — |
 
 These windows apply to your **first** purchase of the Service. For repeat purchases, write to us anyway — we read every request and make fair exceptions.
 
@@ -26,7 +26,7 @@ Refund eligibility is determined by our session logs, which are immutable and ti
 
 ## 2. What is **not** refundable
 
-- Interview extension top-ups ($25 / ₹2,099) once they've been added to your balance, even if unused
+- Interview extension top-ups (+30 min / +1 h / +3 h — $25–$80 / ₹2,099–₹6,799) once they've been added to your balance, even if unused
 - Ultra billing cycles **after** the first — cancel any time to stop the next renewal, but charges already made are not refunded
 - Any plan after the eligibility window above has elapsed
 - Any plan where the usage threshold has been exceeded

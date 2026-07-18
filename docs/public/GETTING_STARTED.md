@@ -39,22 +39,22 @@ Microphone access is required so the app can capture system audio. Screen-captur
 Pick the right installer for your operating system:
 
 - **Windows** → [InterviewCopilot-Setup.exe](https://get.minicaai.com/windows)
-- **macOS** (Apple Silicon and Intel — single Universal Binary) → [InterviewCopilot-Mac.dmg](https://get.minicaai.com/mac)
-- **Linux (AppImage)** → [InterviewCopilot-Linux.AppImage](https://get.minicaai.com/linux)
-- **Linux (Debian / Ubuntu .deb)** → [InterviewCopilot-Linux.deb](https://get.minicaai.com/linux)
+- **macOS** → [get.minicaai.com/mac](https://get.minicaai.com/mac) — shows two native builds; pick **Apple Silicon** (M1/M2/M3/M4) or **Intel** to match your chip ( → About This Mac shows which you have)
+- **Linux (AppImage / .deb)** → [get.minicaai.com/linux](https://get.minicaai.com/linux)
 
-The Windows installer is signed by Azure Trusted Signing, so SmartScreen lets it run without a warning. The macOS build is currently delivered unsigned — on first launch, right-click the app and choose **Open** to bypass Gatekeeper, then **Open** again in the prompt. (Notarization is on the roadmap; once it's in place the right-click step goes away.)
+The Windows installer is signed by Azure Trusted Signing, so SmartScreen lets it run without a warning. The macOS builds are signed with an Apple Developer ID and notarized by Apple — Gatekeeper opens them normally, no right-click-Open workaround needed.
 
 ## 4. Sign in and pick a plan
 
-The first time you open the app you'll be asked to sign in. Use email + password or Google. Your account is bound to the device that activates it; you can sign out and sign back in on the same machine, but the license doesn't roam across multiple machines on the same plan.
+The first time you open the app you'll be asked to sign in. Use email + password or Google. Every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra); signing in past the allowance moves the seat off your oldest device.
 
-After sign-in you'll see a tier picker:
+After sign-in you'll see the plan picker. Basic, Pro, and Max are **one-time interview passes** (use within 30 days); Ultra is the only monthly subscription:
 
 - **Free** — one-time 10-minute trial (every model except Claude), one context file
-- **Basic** — Unlimited sessions, credit-gated time (3-hour starting bank, renewable), four models (Gemini, GPT, Grok, Groq), unlimited context files, pop-out, screen capture, Auto-Solve
-- **Pro** — Same as Basic plus unlimited time, no credit gating
-- **Max** — Adds Claude with web search, Auto-Type, Train Model, reasoning-effort knob
+- **Basic** — one 30-minute interview, four models (Gemini, GPT-5.5, Grok, Groq), unlimited context files, pop-out, screen capture, Auto-Solve — extendable on interview day (+30 min / +1 h / +3 h packs)
+- **Pro** — one 1-hour interview, all five models including Claude with web search
+- **Max** — three 1-hour interviews, all five models, plus Train Model and the reasoning-effort knob
+- **Ultra** — unlimited interviews billed monthly, everything in Max plus Auto-Type
 
 Pricing varies by region; the picker shows your local currency.
 
@@ -97,7 +97,7 @@ If you're typing into your code editor and the pop-out steals focus, click on th
 
 **The pop-out is missing / opened off-screen.** Click **External link** again to bring it back. The window will re-spawn at the center of your current display.
 
-**Auto-Solve doesn't capture anything.** Grant screen-capture permission in your OS settings (Privacy & Security → Screen Recording on macOS; Settings → Privacy → Screenshots on Windows). Restart the app afterward.
+**Auto-Solve doesn't capture anything.** On macOS, grant screen-capture permission (System Settings → Privacy & Security → Screen Recording), then restart the app. On Windows no extra permission is needed — if capture fails, restart the app and try again.
 
 **My subscription isn't showing.** Sign out and sign back in. The license refreshes from our servers on every fresh login.
 

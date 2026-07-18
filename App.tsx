@@ -595,7 +595,7 @@ const CodeBlock: React.FC<{
                             onClick={handleAutoType}
                             disabled={!canAutoType && atPhase === 'idle'}
                             className={`flex items-center gap-1.5 text-xs transition-colors ${canAutoType || atPhase !== 'idle' ? autoTypeClass : 'text-gray-600 cursor-not-allowed'}`}
-                            aria-label={canAutoType ? 'Types this code into the currently focused editor (HackerRank, CoderPad, etc.)' : 'Auto-Type — Max only'}
+                            aria-label={canAutoType ? 'Types this code into the currently focused editor (HackerRank, CoderPad, etc.)' : 'Auto-Type — Ultra only'}
                         >
                             {atPhase === 'done'
                                 ? <Check size={12} />
@@ -2214,6 +2214,9 @@ function useFeatureGate(license: LicenseData | null) {
     // for GPT. Server enforces tier-gating regardless (JWT check), so this
     // flag drives UI affordance only — no security weight on its own.
     canChooseReasoningEffort: gates.reasoningEffortControl,
+    // Train Model is the Max/Ultra differentiator — deliberately NOT
+    // derivable from Claude access (Pro has Claude but not the trainer).
+    canTrainModel: gates.trainModel,
     canPopout: gates.popout,
     maxContextFiles: gates.contextFiles,
     maxSessions: gates.sessionsPerMonth,
@@ -4672,6 +4675,11 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   }, [db.contextFiles, isAdmin]);
   const handleTrainModel = useCallback(() => {
       if (isTraining || db.contextFiles.length === 0) return;
+      // Tier guard, defense-in-depth behind the render gate: Train Model
+      // is Max/Ultra-only (FEATURE_GATES.trainModel). The card is hidden
+      // below that tier, but any future caller of this handler must not
+      // bypass the differentiator either.
+      if (!isAdmin && !gate.canTrainModel) return;
       // Non-admin: silently bail if there's a fresh cache. The button is
       // hidden in this case anyway, but defense-in-depth.
       if (!isAdmin && hasTrainedCache) return;
@@ -4681,7 +4689,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           return;
       }
       runTrainingNow();
-  }, [db.contextFiles.length, isTraining, hasTrainedCache, isAdmin, runTrainingNow]);
+  }, [db.contextFiles.length, isTraining, hasTrainedCache, isAdmin, gate.canTrainModel, runTrainingNow]);
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   //  SUPPORT AGENT BACKGROUND CHANNEL (admins only)
@@ -7217,6 +7225,47 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   // ── RENDER ──
   const isPopoutElectron = isElectron && isPopoutMode;
 
+  // ── One-time coach banners (2026-07 onboarding polish) ──
+  // Pop-out coach: the pop-out is the product's signature surface, hidden
+  // behind one unlabeled toolbar glyph. Show a single premium banner (per
+  // account) pointing at the EXACT gold ExternalLink icon, with a real
+  // "Open it now" action. Armed only after the tutorial closes, never in
+  // the pop-out itself, never while a live interview is running, and only
+  // when the plan actually includes the pop-out (don't tease a lock).
+  // (Declared here, after isPipMode/isListening/isPopoutElectron — earlier
+  // placement would read those consts inside their temporal dead zone.)
+  const popoutCoachKey = userProfile?.id ? `coach_popout_v1_${userProfile.id}` : null;
+  const [popoutCoachOpen, setPopoutCoachOpen] = useState(false);
+  useEffect(() => {
+    if (!popoutCoachKey || isPopoutElectron) { setPopoutCoachOpen(false); return; }
+    if (tutorialOpen || isPipMode || !gate.canPopout) return;
+    try {
+      if (localStorage.getItem(popoutCoachKey) !== 'true') setPopoutCoachOpen(true);
+    } catch { /* localStorage unavailable — skip the coach */ }
+  }, [popoutCoachKey, tutorialOpen, isPipMode, gate.canPopout, isPopoutElectron]);
+  const dismissPopoutCoach = useCallback(() => {
+    setPopoutCoachOpen(false);
+    try { if (popoutCoachKey) localStorage.setItem(popoutCoachKey, 'true'); } catch { /* non-fatal */ }
+  }, [popoutCoachKey]);
+
+  // Audio-share tip: "the copilot can't hear the interviewer" is the #1
+  // support issue (see docs/public/TROUBLESHOOTING §1) and its cause is
+  // one unchecked box in the share picker. Fire a single non-blocking
+  // toast the FIRST time the mic goes live for this account, then never
+  // again — the write happens immediately so a re-render can't re-arm it.
+  const audioTipKey = userProfile?.id ? `coach_audioshare_v1_${userProfile.id}` : null;
+  const [audioTipOpen, setAudioTipOpen] = useState(false);
+  useEffect(() => {
+    if (!isListening || !audioTipKey || isPopoutThinClient) return;
+    try {
+      if (localStorage.getItem(audioTipKey) === 'true') return;
+      localStorage.setItem(audioTipKey, 'true');
+    } catch { return; }
+    setAudioTipOpen(true);
+    const t = window.setTimeout(() => setAudioTipOpen(false), 16000);
+    return () => window.clearTimeout(t);
+  }, [isListening, audioTipKey, isPopoutThinClient]);
+
   // Full-screen admin dashboard for is_admin users. Rendered inside MainApp
   // (not App-level) so returning via onBack keeps chat/session state mounted.
   // Gated with the same isDeveloper helper SubscriptionGate used before the
@@ -8048,12 +8097,16 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                )}
            </div>
 
-           {/* ── Train Model — Max-tier only ──
+           {/* ── Train Model — Max & Ultra only ──
                Pre-researches every tech in resume + JD via parallel web_search,
                caches it for 24h, and injects into Claude's system prompt. Runtime
                version/pricing/comparison questions then answer in 2-3s instead
-               of triggering 12-25s live searches mid-interview. */}
-           {gate.canUseModel('claude') && (
+               of triggering 12-25s live searches mid-interview.
+               Gate is canTrainModel (FEATURE_GATES.trainModel), NOT Claude
+               access — the old canUseModel('claude') check leaked the Max
+               differentiator to every Pro user, gutting the $50→$89 upsell
+               (every pricing surface sells Train Model as "Max+"). */}
+           {gate.canTrainModel && (
                <div className="relative overflow-hidden rounded-xl border border-orange-500/25 bg-gradient-to-br from-orange-950/50 via-orange-900/25 to-amber-900/20 p-4">
                    {/* Top-edge accent glow */}
                    <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-orange-400/50 to-transparent" />
@@ -8162,6 +8215,35 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                        {db.contextFiles.length}{gate.maxContextFiles !== -1 ? ` / ${gate.maxContextFiles}` : ' files'}
                    </span>
                </div>
+
+               {/* Mic-live notice — the WHY behind the paused drop zone,
+                   visible instead of buried in a hover tooltip. Users who
+                   opened Files mid-interview clicked a dead zone and read
+                   it as a bug; this tells them exactly what's happening
+                   and the one action that unblocks it. */}
+               {_rawIsListening && (
+                   <div
+                       role="status"
+                       className="flex items-start gap-3 px-3.5 py-3 rounded-xl"
+                       style={{
+                           background: 'linear-gradient(180deg, rgba(211,172,99,0.10), rgba(211,172,99,0.04))',
+                           border: '1px solid rgba(211,172,99,0.35)',
+                       }}
+                   >
+                       <div
+                           className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
+                           style={{ background: 'rgba(211,172,99,0.15)', border: '1px solid rgba(211,172,99,0.3)' }}
+                       >
+                           <Mic size={14} className="text-[#d3ac63]" />
+                       </div>
+                       <div className="text-[11.5px] leading-relaxed text-gray-300 min-w-0">
+                           <span className="text-white font-semibold">The mic is live, so uploads are paused.</span>{' '}
+                           To add a file, click the <span className="inline-flex items-center align-middle mx-0.5 text-[#d3ac63]"><Mic size={11} /></span>{' '}
+                           <span className="text-[#f0d78a] font-semibold">mic button to stop listening</span> first, upload, then start it again.
+                           <span className="text-gray-500"> Why: the system file picker isn't covered by screen-share protection — your filenames would be visible to everyone on the call.</span>
+                       </div>
+                   </div>
+               )}
 
                {/* Drop zone — three input modes (drag, click, paste).
                    The mic-listening guard mirrors the prior "Add File"
@@ -8421,6 +8503,78 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           remainingSeconds={creditTimer.remaining}
           onDecision={creditTimer.acknowledgeHourBoundary}
         />
+      )}
+      {/* ── Pop-out coach — one-time, per account. Uses the EXACT toolbar
+             glyph (gold ExternalLink) so the user pattern-matches the real
+             button instantly. Bottom-right so it never collides with the
+             billing prompts anchored top-right; hidden the moment a live
+             interview starts. ── */}
+      {!isPopoutElectron && popoutCoachOpen && !isListening && !manageSubOpen && (
+        <div
+          role="status"
+          className="fixed bottom-6 right-6 z-[93] max-w-sm rounded-2xl p-4 backdrop-blur-md"
+          style={{
+            background: 'linear-gradient(180deg, rgba(20,17,12,0.97), rgba(10,9,8,0.97))',
+            border: '1px solid rgba(211,172,99,0.35)',
+            boxShadow: '0 24px 70px -22px rgba(0,0,0,0.9), 0 0 44px -18px rgba(211,172,99,0.4), inset 0 1px 0 rgba(255,255,255,0.06)',
+          }}
+        >
+          <div className="flex items-start gap-3">
+            <div
+              className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+              style={{ background: 'rgba(211,172,99,0.14)', border: '1px solid rgba(211,172,99,0.35)' }}
+            >
+              <ExternalLink size={18} className="text-[#d3ac63]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-bold text-white leading-tight">
+                This gold icon is your interview window
+              </div>
+              <p className="text-[11.5px] text-gray-400 mt-1 leading-relaxed">
+                Click <span className="inline-flex items-center align-middle mx-0.5 text-[#d3ac63]"><ExternalLink size={12} /></span> in the top toolbar to open the <span className="text-[#f0d78a] font-semibold">pop-out</span> — a small always-on-top panel that's <span className="text-gray-200 font-medium">invisible to screen-share</span>. Answers stream there during the call; resize it S / M / L and drag it next to your meeting window.
+              </p>
+              <div className="flex gap-2 mt-3">
+                <button
+                  onClick={() => { dismissPopoutCoach(); sharedProps.togglePip(); }}
+                  className="px-3 py-1.5 rounded-lg text-[11px] font-bold text-[#241b08] transition-transform active:scale-[0.98]"
+                  style={{ background: 'linear-gradient(180deg, #f0d78a 0%, #d3ac63 48%, #b8963f 100%)', boxShadow: '0 1px 0 rgba(255,255,255,0.35) inset, 0 4px 10px rgba(211,172,99,0.25)' }}
+                >
+                  Open it now
+                </button>
+                <button
+                  onClick={dismissPopoutCoach}
+                  className="px-3 py-1.5 rounded-lg text-[11px] font-semibold text-gray-400 hover:text-gray-200 border border-white/10 hover:bg-white/[0.05] transition-colors"
+                >
+                  Got it
+                </button>
+              </div>
+            </div>
+            <button onClick={dismissPopoutCoach} aria-label="Dismiss" className="text-gray-500 hover:text-gray-300 flex-shrink-0">
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+      )}
+      {/* ── First-mic audio-share tip — the #1 support issue, prevented at
+             the exact moment it can happen. Non-blocking, self-clears. ── */}
+      {!isPopoutElectron && audioTipOpen && (
+        <div
+          role="status"
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[93] max-w-md w-[calc(100%-3rem)] rounded-xl px-4 py-3 backdrop-blur-md flex items-start gap-3"
+          style={{
+            background: 'linear-gradient(180deg, rgba(20,17,12,0.97), rgba(10,9,8,0.97))',
+            border: '1px solid rgba(211,172,99,0.35)',
+            boxShadow: '0 20px 60px -20px rgba(0,0,0,0.9), 0 0 36px -16px rgba(211,172,99,0.35)',
+          }}
+        >
+          <Mic size={15} className="text-[#d3ac63] flex-shrink-0 mt-0.5" />
+          <p className="text-[11.5px] text-gray-300 leading-relaxed min-w-0">
+            <span className="text-white font-semibold">Listening.</span> If the interviewer's words don't appear: stop and restart the mic, pick the <span className="text-[#f0d78a] font-semibold">meeting tab or window</span>, and make sure <span className="text-[#f0d78a] font-semibold">"Also share tab audio"</span> (or the system-audio toggle) is checked — that box is the #1 reason nothing transcribes.
+          </p>
+          <button onClick={() => setAudioTipOpen(false)} aria-label="Dismiss" className="text-gray-500 hover:text-gray-300 flex-shrink-0">
+            <X size={14} />
+          </button>
+        </div>
       )}
       {!isPopoutElectron && creditTimer.lowWarning && (
         <LowWarningToast

@@ -125,7 +125,7 @@ export function RefundPolicy({ isOpen, onClose }: RefundPolicyProps) {
                   <td className="px-4 py-2.5 align-top">Less than 2 hours of total session time</td>
                 </tr>
                 <tr className="border-t border-white/5">
-                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Interview extension</strong><br /><span className="text-white/50 text-[11px]">$25 / ₹2,099 top-up</span></td>
+                  <td className="px-4 py-2.5 align-top"><strong className="text-white">Interview extensions</strong><br /><span className="text-white/50 text-[11px]">+30 min / +1 h / +3 h top-ups ($25–$80 / ₹2,099–₹6,799)</span></td>
                   <td className="px-4 py-2.5 align-top">Not refundable once delivered</td>
                   <td className="px-4 py-2.5 align-top">—</td>
                 </tr>
@@ -139,7 +139,7 @@ export function RefundPolicy({ isOpen, onClose }: RefundPolicyProps) {
 
         <Section title={<>2. What is <strong className="text-white">not</strong> refundable</>}>
           <ul className="list-disc pl-5 space-y-1.5">
-            <li>Interview extension top-ups ($25 / ₹2,099) once they&rsquo;ve been added to your balance, even if unused</li>
+            <li>Interview extension top-ups (+30 min / +1 h / +3 h — $25&ndash;$80 / ₹2,099&ndash;₹6,799) once they&rsquo;ve been added to your balance, even if unused</li>
             <li>Ultra billing cycles <strong className="text-white">after</strong> the first &mdash; cancel any time to stop the next renewal, but charges already made are not refunded</li>
             <li>Any plan after the eligibility window above has elapsed</li>
             <li>Any plan where the usage threshold has been exceeded</li>

@@ -40,7 +40,7 @@ For implementation specifics — how each claim is enforced in code — write to
 | Your résumé and the job description | On your machine only. They're sent to the AI model as part of the prompt for active calls; the model provider receives them transiently and doesn't retain them under their API terms. |
 | Your subscription state | On our server. A cached copy is on your machine so the app works briefly offline. |
 | Your payment details | Only with Stripe or Razorpay. We never see your card. |
-| Crash reports | If you opted in, on our server. Crash reports include version + platform metadata and a memory dump from the moment of the crash; no chat content. |
+| Crash reports | On your machine only — the app writes crash minidumps locally and uploading to our server is currently disabled. If we ever enable upload it will include only version + platform metadata and a memory dump; no chat content. |
 
 For a full data inventory and the legal basis under GDPR / India DPDP / CCPA, read our **[Privacy policy](./PRIVACY.md)**.
 
@@ -48,14 +48,14 @@ For a full data inventory and the legal basis under GDPR / India DPDP / CCPA, re
 
 - Built on Electron with a sandboxed renderer process. The renderer can't access your filesystem, spawn shells, or read other apps; it only reaches our app's main process via a small pre-defined set of allowlisted IPC channels.
 - External links inside the app open in your default browser; the app never navigates its own window to anything outside its bundle.
-- The macOS build is currently unsigned (we're in the process of obtaining an Apple Developer ID). On macOS, right-click the app and choose **Open** the first time. We expect to deliver signed builds for macOS by Q3 2026.
+- The macOS builds (Apple Silicon and Intel) are signed with an Apple Developer ID and notarized by Apple — Gatekeeper opens them without warnings, no right-click-Open workaround needed.
 - The Linux AppImage and `.deb` are unsigned in the manner Linux desktop apps typically are. Verify the SHA-256 from the GitHub release if you need a hash check.
 
 ## 5. Authentication and licensing
 
 - Sign-in supports email + password (bcrypt-hashed server-side) or Google OAuth.
 - After sign-in we issue a JWT that's stored in your app's local storage and used to authenticate every API call.
-- A license is bound to the device that first activates it. You can sign out and sign back in on the same machine — the license doesn't roam to multiple machines on the same plan.
+- A license carries a per-plan device allowance (2 devices on Free/Basic, 3 on Pro, 5 on Max, 10 on Ultra). Each device is fingerprint-registered on sign-in; going past the allowance automatically deactivates the oldest device, so one person can move freely between their own machines but a seat can't be farmed out.
 - If you suspect your account is compromised, write to **support@minicaai.com** and we'll force-revoke active sessions.
 
 ## 6. How we handle audio

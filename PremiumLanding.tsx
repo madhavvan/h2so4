@@ -107,6 +107,11 @@ const CSS = `
   font-synthesis:none;
 }
 .pl-root *{box-sizing:border-box;}
+/* Bar-less scrolling — the landing reads as a cinematic surface, not a
+   document. Wheel / touch / keys / programmatic scrollTo all still work;
+   only the visible scrollbar chrome goes. */
+.pl-root{scrollbar-width:none;-ms-overflow-style:none;}
+.pl-root::-webkit-scrollbar{width:0;height:0;display:none;}
 .pl-root ::selection{background:rgba(211,172,99,.3);color:#fff;}
 .pl-root :focus-visible{outline:2px solid var(--gold-2);outline-offset:3px;border-radius:4px;}
 .pl-serif{font-family:'Newsreader','Tiempos Headline',ui-serif,Georgia,serif;font-optical-sizing:auto;}
@@ -647,6 +652,365 @@ const CSS = `
 }
 .pl-step-caret{display:inline-block;width:1px;height:5px;background:var(--gold);margin-left:1px;animation:pl-blink 1s steps(2) infinite;}
 .pl-step-live{width:3px;height:3px;border-radius:50%;background:var(--gold);box-shadow:0 0 3px var(--gold-glow);animation:pl-pulse 1.6s infinite;}
+
+/* ═══════════════════════════════════════════════════════════════════
+   POP-OUT SHOWCASE — real premium glass (no purple cast, no neon rim).
+
+   STRUCTURE (matches Electron pop-out):
+     floating HEAD + clear frosted middle + floating FOOT shell.
+
+   MATERIAL — real glass, not sci-fi crystal:
+     • warm neutral fill only (obsidian + champagne gold)
+     • soft frosted backdrop-blur (true glass depth)
+     • single quiet hairline edge — NO multi-ring bright border
+     • soft top light-catch + gentle specular, not a glowing outline
+     • no violet / purple / blue color anywhere in this block
+   Decorative only.
+   ═══════════════════════════════════════════════════════════════════ */
+.pl-popout-stage{
+  position:relative;display:flex;align-items:center;justify-content:center;
+  min-height:460px;border-radius:22px;overflow:hidden;
+  border:1px solid rgba(255,255,255,.05);
+  /* warm dark stage — gold only, zero purple */
+  background:
+    radial-gradient(80% 70% at 50% 40%, rgba(211,172,99,.08), transparent 60%),
+    radial-gradient(70% 60% at 22% 18%, rgba(255,255,255,.035), transparent 50%),
+    radial-gradient(ellipse 70% 35% at 50% 100%, rgba(211,172,99,.05), transparent 55%),
+    linear-gradient(165deg,#121210 0%,#0c0c0b 52%,#080807 100%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.035), inset 0 -36px 70px -36px rgba(0,0,0,.55);
+}
+/* Meeting windows — warm neutral glass plates (not purple UI frames) */
+.pl-popout-ghost{position:absolute;border-radius:14px;pointer-events:none;
+  border:1px solid rgba(255,255,255,.08);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,.09) 0 28px, transparent 28px),
+    repeating-linear-gradient(180deg, rgba(255,255,255,.055) 0 2px, transparent 2px 22px),
+    linear-gradient(165deg, rgba(36,32,24,.50), rgba(16,14,12,.32));
+  background-position:0 0, 18px 40px, 0 0;
+  background-size:100% 100%, calc(100% - 36px) calc(100% - 52px), 100% 100%;
+  background-repeat:no-repeat;
+  box-shadow:0 22px 50px -26px rgba(0,0,0,.65), inset 0 1px 0 rgba(255,255,255,.06);}
+.pl-popout-tag{position:absolute;font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+  color:rgba(214,178,108,.36);font-weight:600;pointer-events:none;text-shadow:0 1px 8px rgba(0,0,0,.5);}
+
+/* Soft warm ambient behind the window — champagne only */
+.pl-pip-atmo{
+  position:absolute;left:50%;top:46%;width:560px;height:480px;
+  transform:translate(-50%,-50%);pointer-events:none;z-index:1;
+  background:
+    radial-gradient(closest-side, rgba(211,172,99,.12) 0%, rgba(180,150,90,.05) 42%, transparent 72%),
+    radial-gradient(circle at 36% 28%, rgba(255,248,230,.06) 0%, transparent 45%);
+  filter:blur(8px);
+  animation:pl-pip-atmo-breathe 9s ease-in-out infinite;
+}
+@keyframes pl-pip-atmo-breathe{
+  0%,100%{opacity:.55;transform:translate(-50%,-50%) scale(1);}
+  50%{opacity:.85;transform:translate(-50%,-50%) scale(1.04);}
+}
+/* Soft floor reflection under glass (warm, not colored) */
+.pl-pip-caustic{
+  position:absolute;left:50%;bottom:2.5%;width:52%;height:10%;
+  transform:translateX(-50%);pointer-events:none;z-index:1;
+  background:radial-gradient(ellipse at 50% 30%,
+    rgba(246,228,176,.22) 0%,
+    rgba(211,172,99,.10) 40%,
+    transparent 72%);
+  filter:blur(12px);
+  animation:pl-caustic-breathe 7.5s ease-in-out infinite;
+}
+/* Soft warm light behind glass so frost has something to smear —
+   white + champagne only (no purple / blue) */
+.pl-pip-backlight{
+  position:absolute;left:50%;top:46%;width:270px;height:290px;
+  transform:translate(-50%,-50%);pointer-events:none;z-index:1;
+  background:
+    linear-gradient(130deg, rgba(255,255,255,.14) 0%, transparent 50%),
+    linear-gradient(310deg, rgba(211,172,99,.28) 0%, rgba(180,140,80,.10) 40%, transparent 62%),
+    radial-gradient(circle at 30% 24%, rgba(255,250,235,.18), transparent 40%);
+  border-radius:28px;
+  filter:blur(18px);
+}
+
+/* Outer shell — quiet, almost invisible (no bright rim glow) */
+.pl-pip-shell{
+  position:absolute;inset:-8px;border-radius:24px;pointer-events:none;z-index:1;
+  background:radial-gradient(ellipse 80% 70% at 50% 40%, transparent 55%, rgba(255,255,255,.03) 100%);
+  opacity:.5;
+}
+
+/* Floating window chassis */
+.pl-pip{
+  position:relative;z-index:2;width:min(348px,88vw);
+  display:flex;flex-direction:column;gap:0;
+  border-radius:20px;
+  background:transparent;
+  /* soft real-world cast only — no gold/purple halo around the edge */
+  filter:drop-shadow(0 40px 56px rgba(0,0,0,.70)) drop-shadow(0 12px 24px rgba(0,0,0,.40));
+  animation:pl-pip-bob 8s ease-in-out infinite;
+}
+@keyframes pl-pip-bob{0%,100%{transform:translateY(0);}50%{transform:translateY(-6px);}}
+
+/* Real frosted glass face — premium, quiet edge, no neon border */
+.pl-pip-face{
+  position:relative;border-radius:20px;overflow:hidden;
+  display:flex;flex-direction:column;
+  background:
+    linear-gradient(165deg, rgba(255,255,255,.08) 0%, rgba(28,24,18,.16) 28%, rgba(12,11,9,.14) 70%, rgba(10,9,8,.18) 100%);
+  backdrop-filter:blur(28px) saturate(1.35);
+  -webkit-backdrop-filter:blur(28px) saturate(1.35);
+  box-shadow:
+    /* depth only — no multi-ring bright outline */
+    0 40px 80px -28px rgba(0,0,0,.88),
+    0 14px 32px -12px rgba(0,0,0,.50),
+    /* single soft hairline (real glass edge) */
+    0 0 0 1px rgba(255,255,255,.10),
+    /* soft top light-catch inside the pane */
+    inset 0 1px 0 rgba(255,255,255,.18),
+    inset 0 -18px 36px -20px rgba(0,0,0,.28);
+}
+/* Kill the old bright multi-color border ring entirely */
+.pl-pip-face::after{display:none;content:none;}
+
+/* Soft surface light — natural, not a product-photo pin-flare */
+.pl-pip-spec{
+  position:absolute;inset:0;border-radius:inherit;pointer-events:none;z-index:7;
+  background:
+    /* gentle top-left reflection */
+    radial-gradient(ellipse 55% 28% at 22% 0%, rgba(255,255,255,.22) 0%, transparent 58%),
+    /* soft top sheen band */
+    linear-gradient(180deg, rgba(255,255,255,.10) 0%, transparent 18%),
+    /* faint warm floor bounce */
+    radial-gradient(ellipse 60% 30% at 50% 100%, rgba(211,172,99,.08) 0%, transparent 60%);
+  mix-blend-mode:soft-light;
+  opacity:.85;
+}
+/* Slow soft sheen across the pane */
+.pl-pip-sheen{
+  position:absolute;inset:-40% -70%;pointer-events:none;z-index:6;
+  background:linear-gradient(118deg,
+    transparent 42%,
+    rgba(255,255,255,.03) 48%,
+    rgba(255,255,255,.09) 50.5%,
+    rgba(246,228,176,.04) 53%,
+    transparent 59%);
+  transform:translateX(-40%);
+  animation:pl-pip-sweep 12s cubic-bezier(.33,.1,.25,1) infinite;
+  mix-blend-mode:soft-light;
+}
+@keyframes pl-pip-sweep{
+  0%, 55%{transform:translateX(-42%);}
+  90%, 100%{transform:translateX(42%);}
+}
+@media (prefers-reduced-motion: reduce){
+  .pl-pip{animation:none;}
+  .pl-pip-sheen,.pl-pip-atmo,.pl-pip-caustic{animation:none;}
+}
+
+/* HEAD — Electron warm obsidian glass band */
+.pl-pip-head{
+  display:flex;align-items:center;gap:10px;
+  margin:5px 5px 0;padding:11px 12px 12px;
+  border-radius:18px 18px 12px 12px;position:relative;z-index:3;
+  background:linear-gradient(180deg, rgba(22,19,14,.80) 0%, rgba(12,11,8,.64) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.09),
+    0 8px 20px -14px rgba(0,0,0,.65);
+}
+.pl-pip-head::after{content:'';position:absolute;left:14px;right:14px;bottom:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(211,172,99,.36),transparent);pointer-events:none;}
+.pl-pip-ava{width:30px;height:30px;border-radius:50%;flex-shrink:0;
+  background:linear-gradient(145deg,#f6e4b0,#d9b874 52%,#b58f45);color:#231c0c;
+  display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.5),0 3px 10px -3px rgba(211,172,99,.45);}
+.pl-pip-title{flex:1;min-width:0;}
+.pl-pip-title h4{font-family:'Newsreader',ui-serif,Georgia,serif;font-size:14px;font-weight:500;margin:0;color:#fff;letter-spacing:-.01em;
+  text-shadow:0 1px 4px rgba(0,0,0,.5);}
+.pl-pip-title span{display:flex;align-items:center;gap:5px;font-size:11px;color:rgba(255,255,255,.56);
+  text-shadow:0 1px 4px rgba(0,0,0,.5);}
+.pl-pip-livedot{width:6px;height:6px;border-radius:50%;background:#d3ac63;box-shadow:0 0 6px rgba(211,172,99,.55);animation:pl-pulse 1.6s infinite;}
+.pl-pip-sizes{display:flex;gap:4px;}
+.pl-pip-size{width:20px;height:20px;border-radius:6px;border:none;
+  background:rgba(255,255,255,.035);color:rgba(255,255,255,.52);font-size:9px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.08);}
+.pl-pip-size.on{background:rgba(211,172,99,.20);color:#d3ac63;
+  box-shadow:inset 0 0 0 1px rgba(211,172,99,.40), inset 0 1px 0 rgba(255,255,255,.10);}
+
+/* MIDDLE — clear frosted pane over the call */
+.pl-pip-body{padding:14px 14px 12px;display:flex;flex-direction:column;gap:11px;position:relative;z-index:3;
+  background:linear-gradient(180deg, rgba(255,255,255,.03) 0%, transparent 30%, rgba(0,0,0,.04) 100%);
+  min-height:168px;}
+.pl-pip-msg{max-width:88%;display:flex;flex-direction:column;gap:5px;}
+.pl-pip-msg.ai{align-self:flex-start;}
+.pl-pip-msg.you{align-self:flex-end;align-items:flex-end;}
+.pl-pip-name{font-size:9.5px;letter-spacing:.04em;text-transform:uppercase;font-weight:600;color:rgba(214,178,108,.90);
+  text-shadow:0 1px 5px rgba(0,0,0,.5);}
+.pl-pip-bubble{padding:11px 13px;border-radius:13px;font-size:12.5px;line-height:1.5;}
+/* AI — Electron warm obsidian plate */
+.pl-pip-msg.ai .pl-pip-bubble{
+  background:linear-gradient(180deg, rgba(27,24,17,.80) 0%, rgba(13,12,9,.74) 100%);
+  color:#f4f0e8;border:none;border-bottom-left-radius:4px;
+  text-shadow:0 1px 4px rgba(0,0,0,.4);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.09),
+    0 10px 26px -12px rgba(0,0,0,.58);}
+/* YOU — solid gold plate */
+.pl-pip-msg.you .pl-pip-bubble{
+  background:linear-gradient(180deg, rgba(212,176,110,.96) 0%, rgba(186,148,83,.94) 100%);
+  color:#2a1f08;font-weight:500;border:none;border-bottom-right-radius:4px;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.45),
+    0 10px 26px -12px rgba(0,0,0,.48),
+    0 0 18px -10px rgba(211,172,99,.35);}
+.pl-pip-cursor{display:inline-block;width:2px;height:1.05em;margin-left:2px;vertical-align:-.15em;
+  background:#d3ac63;border-radius:1px;box-shadow:0 0 8px rgba(211,172,99,.45);animation:pl-blink 1.05s steps(2,start) infinite;}
+.pl-pip-model{align-self:flex-start;font-size:9.5px;color:#d6c396;display:flex;align-items:center;gap:5px;
+  padding:3px 10px;border-radius:999px;background:rgba(211,172,99,.12);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.10);text-shadow:0 1px 3px rgba(0,0,0,.35);}
+
+/* FOOT — floating glass composer */
+.pl-pip-foot{display:flex;align-items:center;gap:8px;
+  margin:4px 7px 7px;padding:8px;position:relative;z-index:3;
+  border-radius:20px;
+  background:linear-gradient(180deg, rgba(30,27,20,.82) 0%, rgba(14,12,9,.84) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.12),
+    inset 0 -14px 28px -18px rgba(0,0,0,.45),
+    0 14px 36px -20px rgba(0,0,0,.75);}
+/* Soft inner edge only — not a bright outer ring */
+.pl-pip-foot::after{content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;pointer-events:none;
+  background:linear-gradient(180deg, rgba(255,255,255,.12), transparent 55%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;
+  mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite:exclude;opacity:.7;}
+.pl-pip-input{flex:1;min-height:28px;display:flex;align-items:center;padding:4px 10px;font-size:11.5px;
+  color:rgba(255,255,255,.40);text-shadow:0 1px 3px rgba(0,0,0,.4);}
+.pl-pip-send{width:34px;height:34px;border-radius:50%;flex-shrink:0;border:none;
+  background:linear-gradient(145deg,#f6e4b0 0%,#d9b874 55%,#b58f45 100%);color:#231c0c;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 5px 14px -5px rgba(211,172,99,.50), inset 0 1px 0 rgba(255,255,255,.42);}
+
+.pl-pip-shieldrow{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:18px;
+  font-size:12.5px;color:var(--mut);}
+.pl-pip-shield{color:var(--gold);display:inline-flex;}
+
+/* Code answer plate — same gold family, monospace for coding rounds */
+.pl-pip-msg.you .pl-pip-bubble.pl-pip-code{
+  font-family:ui-monospace,'SF Mono','Cascadia Code','JetBrains Mono',Menlo,Consolas,monospace;
+  font-size:10.5px;line-height:1.55;letter-spacing:-.01em;font-weight:500;
+  /* overflow HIDDEN, not auto — the showcase is bar-less everywhere; the
+     snippet is sized to fit, and a decorative card must never grow a
+     scrollbar of its own */
+  text-align:left;white-space:pre;overflow:hidden;max-width:100%;
+  background:linear-gradient(180deg, rgba(28,24,16,.88) 0%, rgba(14,12,9,.90) 100%);
+  color:#e8d9b0;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.08),
+    inset 0 0 0 1px rgba(211,172,99,.14),
+    0 10px 26px -12px rgba(0,0,0,.55);
+  border-bottom-right-radius:4px;
+}
+.pl-pip-code .pl-kw{color:#f0d9a0;}
+.pl-pip-code .pl-fn{color:#f6e4b0;}
+.pl-pip-code .pl-cm{color:rgba(214,178,108,.55);}
+.pl-pip-code .pl-cn{color:#d9b874;}
+
+/* ═══════════════════════════════════════════════════════════════════
+   POP-OUT PORTAL — iOS / voice-portal scroll scrub
+   Tall track + sticky stage. Scroll forms Theory, then Coding.
+   BAR-LESS (2026-07-16): no HUD chips, no progress bar, no caption —
+   the two screens themselves are the narrative; the crossfade is a
+   single monotonic timeline (no snap clamps), and each card is
+   fit-scaled by JS so it always fits the stage it's assigned.
+   ⚠️ Never animate parent filter:blur — it kills child backdrop-filter
+   glass (cards go fully invisible). Motion = opacity + translate + scale
+   only, driven by JS inline styles (CSS vars are secondary).
+   Fallback without JS: Theory card fully visible.
+   ═══════════════════════════════════════════════════════════════════ */
+.pl-pip-portal{
+  position:relative;
+  /* Short soft runway: Theory is already on stage; scroll only reveals Coding */
+  height:132vh;
+  margin:0;
+}
+.pl-pip-portal-sticky{
+  position:sticky;
+  top:max(64px, 7vh);
+  min-height:min(82vh, 680px);
+  height:min(82vh, 680px);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  z-index:2;
+  /* sticky must not be clipped by ancestors with overflow:hidden */
+}
+.pl-popout-stage.pl-pip-portal-stage{
+  width:100%;
+  flex:1 1 auto;
+  min-height:min(64vh, 540px);
+  height:min(64vh, 540px);
+  max-height:min(64vh, 540px);
+  /* override base stage overflow — absolute layers must paint glass */
+  overflow:visible !important;
+  position:relative;
+  isolation:isolate;
+  opacity:1;
+}
+.pl-pip-layer{
+  position:absolute;inset:0;
+  display:flex;align-items:center;justify-content:center;
+  pointer-events:none;
+  /* JS writes opacity/transform; CSS fallback shows Theory so the stage
+     is never an empty black box if the scrubber fails to attach. */
+  will-change:transform, opacity;
+  /* NO filter property — backdrop-filter glass lives on .pl-pip-face */
+}
+/* Fallback (pre-JS / failed scrub): Theory visible, Coding hidden */
+.pl-pip-layer-a{
+  z-index:2;
+  opacity:1;
+  transform:translate3d(0,0,0) scale(1);
+}
+.pl-pip-layer-b{
+  z-index:3;
+  opacity:0;
+  transform:translate3d(0,36px,0) scale(.94);
+}
+/* Once JS owns the portal, hide both until scrub paints (avoids flash) —
+   but only if data-portal-ready is set AND we haven't painted yet.
+   Safer: JS always sets inline styles immediately on mount. */
+.pl-pip-portal[data-portal="live"] .pl-pip-layer-a,
+.pl-pip-portal[data-portal="live"] .pl-pip-layer-b{
+  /* inline styles from JS win over these; keep as soft defaults */
+}
+/* Portal cards: no idle bob — scroll is the motion language */
+.pl-pip-portal-stage .pl-pip{
+  animation:none !important;
+  filter:drop-shadow(0 36px 48px rgba(0,0,0,.68)) drop-shadow(0 10px 20px rgba(0,0,0,.38));
+  max-width:min(348px, 88vw);
+}
+.pl-pip-portal-stage .pl-pip-sheen{animation:none;opacity:.55;}
+@media (max-width:720px){
+  .pl-popout-stage{min-height:400px;}
+  .pl-popout-ghost,.pl-popout-tag,.pl-pip-shell{display:none;}
+  .pl-pip-backlight{width:230px;height:250px;filter:blur(14px);}
+  .pl-pip-portal{height:122vh;}
+  .pl-pip-portal-sticky{top:max(56px, 5vh);min-height:min(84vh, 620px);height:min(84vh, 620px);}
+  .pl-popout-stage.pl-pip-portal-stage{min-height:min(62vh, 460px);height:min(62vh, 460px);max-height:min(62vh, 460px);}
+  .pl-pip-msg.you .pl-pip-bubble.pl-pip-code{font-size:9.5px;padding:10px 11px;}
+}
+@media (prefers-reduced-motion:reduce){
+  .pl-pip-portal{height:auto !important;}
+  .pl-pip-portal-sticky{position:relative !important;top:auto !important;height:auto !important;min-height:0 !important;gap:28px;}
+  .pl-popout-stage.pl-pip-portal-stage{
+    height:auto !important;min-height:360px !important;max-height:none !important;
+    display:flex !important;flex-direction:column;align-items:center;gap:22px;overflow:visible !important;
+  }
+  .pl-pip-layer{
+    position:relative !important;inset:auto !important;
+    opacity:1 !important;transform:none !important;
+    margin:0 auto;
+  }
+}
 
 /* ═══════════════════════════════════════════════════════════════════
    GLASS GALAXY GLOBE — optical crystal, theater-lit
@@ -1342,7 +1706,9 @@ const FAQS = [
   { q: 'Is this cheating?', a: 'We don’t make that call for you. Modern interviews increasingly test recall of obscure trivia under pressure more than they test the actual job. We build the tool; how you use it is your decision.' },
   { q: 'Is my interview audio stored anywhere?', a: 'No. Audio streams to the transcription engine, comes back as text, and is discarded. Every provider we use runs on paid API tiers whose terms exclude your data from training.' },
   { q: 'What do I need to run it?', a: 'Windows 10 or later, macOS 12 Monterey or later (native on Apple Silicon), or Linux (Ubuntu 22.04+, Fedora 38+). It works with any interview platform that plays audio through your computer.' },
-  { q: 'Can I use one account on two machines?', a: 'A license binds to one device. Signing in on a new machine evicts the old one — so you can move any time, but two people can’t share a seat.' },
+  // Device counts mirror the server's per-tier limits (registerDevice in
+  // server/src/database.js: free/basic 2 · pro 3 · max 5 · ultra 10).
+  { q: 'Can I use one account on two machines?', a: 'Yes — every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra). Signing in past your allowance moves the seat off your oldest device, so you can switch machines any time — but seats can’t be farmed out.' },
   { q: 'What if it doesn’t work out?', a: 'There’s a 14-day window on your first purchase — under two hours of use gets a full refund. Cancel any time and keep access through the period you already paid for.' },
 ];
 
@@ -1687,6 +2053,14 @@ const NebulaOrbCanvas: React.FC = () => {
     // Match the CSS orb box (240×240 desktop; scaled on mobile via stage).
     // Hard-coded 480px ignored the real on-screen size and could look soft
     // or blank under heavy stage scaling.
+    //
+    // CRITICAL: always re-bind viewport + uRes/uDpr, not only when the buffer
+    // size changes. React 18 StrictMode (vite dev) mounts → cleans up → remounts
+    // on the same <canvas>. The first mount leaves width/height at e.g. 240; the
+    // second mount would skip the uniform writes, leaving uRes at (0,0). The
+    // fragment then does (gl_FragCoord*2 - uRes)/min(uRes) → div-by-zero →
+    // every pixel discarded → .pl-orb-live promotes over a pure black disc
+    // (CSS galaxy hidden). Production only mounts once, so live looked fine.
     const syncSize = () => {
       const r = cv.getBoundingClientRect();
       const css = Math.max(120, Math.min(480, Math.round(Math.max(r.width, r.height) || 240)));
@@ -1695,10 +2069,10 @@ const NebulaOrbCanvas: React.FC = () => {
       if (cv.width !== px || cv.height !== px) {
         cv.width = px;
         cv.height = px;
-        gl.viewport(0, 0, px, px);
-        gl.uniform2f(uRes, px, px);
-        gl.uniform1f(uDpr, dpr);
       }
+      gl.viewport(0, 0, px, px);
+      gl.uniform2f(uRes, px, px);
+      gl.uniform1f(uDpr, dpr);
     };
     syncSize();
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(syncSize) : null;
@@ -1989,6 +2363,8 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
   const rimRef = useRef<HTMLDivElement>(null);
   const sheenRef = useRef<HTMLDivElement>(null);
   const globeRef = useRef<HTMLDivElement>(null);
+  // Pop-out portal — scroll-scrubbed theory → coding crossfade (iOS/voice-portal).
+  const portalRef = useRef<HTMLDivElement>(null);
 
   // Signature: the second headline line types itself onto the screen the way
   // the product streams an answer. Starts after a beat so the page settles.
@@ -2030,6 +2406,198 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       vv?.removeEventListener('resize', updateStageScale);
     };
   }, []);
+
+  // Pop-out portal scroll scrub — Theory forms, then Coding crossfades.
+  // Critical reliability rules:
+  //  1) Drive layers with INLINE opacity/transform (not only CSS vars).
+  //  2) Never set filter:blur on the layer (kills child backdrop-filter glass).
+  //  3) Progress off .pl-root + continuous rAF while portal is on-screen.
+  //  4) Theory is visible as soon as the sticky stage is in view (not empty box).
+  useEffect(() => {
+    const root = rootRef.current;
+    const portal = portalRef.current;
+    if (!root || !portal) return;
+
+    const layerA = portal.querySelector('.pl-pip-layer-a') as HTMLElement | null;
+    const layerB = portal.querySelector('.pl-pip-layer-b') as HTMLElement | null;
+    const sticky = portal.querySelector('.pl-pip-portal-sticky') as HTMLElement | null;
+    const stage = portal.querySelector('.pl-pip-portal-stage') as HTMLElement | null;
+    const cardA = layerA?.querySelector('.pl-pip') as HTMLElement | null;
+    const cardB = layerB?.querySelector('.pl-pip') as HTMLElement | null;
+
+    const clamp01 = (n: number) => (n < 0 ? 0 : n > 1 ? 1 : n);
+    // Smootherstep — softer than smoothstep, no hard corners at 0/1
+    const soft = (t: number) => {
+      const x = clamp01(t);
+      return x * x * x * (x * (x * 6 - 15) + 10);
+    };
+
+    // ── Fit-to-stage scale ──
+    // Each card must FIT the stage it's assigned — the coding card (8-line
+    // snippet) is naturally taller than the theory card and used to spill
+    // past the stage on short viewports. Measure card vs stage and bake a
+    // per-layer fit factor into every painted scale. Cards are centered by
+    // the layer's flexbox, transform-origin center, so pure scale keeps
+    // them inside. Re-measured on resize/orientation (fonts settle before
+    // first scroll in practice; the resize hook covers late shifts).
+    let fitA = 1;
+    let fitB = 1;
+    const measureFit = () => {
+      const st = stage?.getBoundingClientRect();
+      if (!st || st.width === 0 || st.height === 0) return;
+      const fitOf = (card: HTMLElement | null) => {
+        if (!card) return 1;
+        const w = card.offsetWidth;
+        const h = card.offsetHeight;
+        if (!w || !h) return 1;
+        return Math.min(1, (st.width * 0.92) / w, (st.height * 0.94) / h);
+      };
+      fitA = fitOf(cardA);
+      fitB = fitOf(cardB);
+    };
+
+    const paintLayer = (el: HTMLElement | null, o: number, y: number, s: number, fit: number) => {
+      if (!el) return;
+      // visibility:hidden when fully gone — avoids empty hit targets; glass paints when o>0
+      el.style.opacity = String(o);
+      el.style.transform = `translate3d(0, ${y.toFixed(2)}px, 0) scale(${(s * fit).toFixed(4)})`;
+      el.style.visibility = o < 0.02 ? 'hidden' : 'visible';
+      // Explicitly clear any filter so glass backdrop-filter works
+      el.style.filter = 'none';
+    };
+
+    // ── Timeline: Theory is ALWAYS on at rest; scroll only reveals Coding ──
+    // p ≤ ~0.18  → Theory full, Coding hidden (no empty stage on arrival)
+    // p 0.18–0.72 → one soft crossfade (Theory out, Coding in)
+    // p ≥ ~0.72  → Coding full
+    // Progress is lerped in tick() so wheel/trackpad never step-jerk the glass.
+    const apply = (raw: number) => {
+      const p = clamp01(raw);
+      // Wide soft crossfade only — Theory does NOT "form in" from empty
+      const x = soft((p - 0.16) / 0.52);
+
+      // Theory: fully present until the handoff begins
+      const aO = 1 - x;
+      const aY = -x * 10;
+      const aS = 1 - x * 0.02;
+
+      // Coding: surfaces on scroll only
+      const bO = x;
+      const bY = (1 - x) * 14;
+      const bS = 0.98 + x * 0.02;
+
+      paintLayer(layerA, aO, aY, aS, fitA);
+      paintLayer(layerB, bO, bY, bS, fitB);
+    };
+
+    // Settled: both cards stacked (reduced motion / no scrub)
+    if (reduce) {
+      measureFit();
+      paintLayer(layerA, 1, 0, 1, fitA);
+      paintLayer(layerB, 1, 0, 1, fitB);
+      return;
+    }
+
+    portal.setAttribute('data-portal', 'live');
+
+    const progressFromLayout = () => {
+      const stickyH = sticky?.offsetHeight || Math.min(window.innerHeight * 0.82, 680);
+      const track = Math.max(80, portal.offsetHeight - stickyH);
+      // Match CSS: top: max(64px, 7vh)
+      const stickyTop = Math.max(64, window.innerHeight * 0.07);
+      // Portal top relative to the scrollport (.pl-root)
+      const rootRect = root.getBoundingClientRect();
+      const portalRect = portal.getBoundingClientRect();
+      const relTop = portalRect.top - rootRect.top;
+      // 0 when sticky engages, 1 when runway is consumed
+      return (stickyTop - relTop) / track;
+    };
+
+    // Soft follow — visual progress eases toward scroll (frame-rate aware).
+    // Start at 0 so Theory paints full immediately, even before pin.
+    let displayP = 0;
+    let raf = 0;
+    let looping = false;
+    let lastTs = 0;
+    // Lower = silkier (less wheel-notch step); still keeps up with the finger.
+    const FOLLOW = 7.2;
+
+    const tick = (ts?: number) => {
+      raf = 0;
+      const now = ts || performance.now();
+      const dt = lastTs ? Math.min(0.05, (now - lastTs) / 1000) : 0.016;
+      lastTs = now;
+
+      const target = progressFromLayout();
+      // Clamp visual progress: never go negative — Theory stays solid on approach
+      const targetClamped = Math.max(0, target);
+      const k = 1 - Math.exp(-FOLLOW * dt);
+      displayP += (targetClamped - displayP) * k;
+      if (Math.abs(targetClamped - displayP) < 0.00035) displayP = targetClamped;
+
+      apply(displayP);
+      if (looping || Math.abs(targetClamped - displayP) >= 0.00035) {
+        raf = requestAnimationFrame(tick);
+      }
+    };
+
+    const startLoop = () => {
+      if (looping) return;
+      looping = true;
+      lastTs = 0;
+      if (!raf) raf = requestAnimationFrame(tick);
+    };
+    const stopLoop = () => {
+      looping = false;
+      // drain remaining ease so we settle cleanly on the final pose
+      if (!raf) raf = requestAnimationFrame(tick);
+    };
+
+    // Theory on stage immediately — never an empty black box on first paint.
+    measureFit();
+    displayP = Math.max(0, progressFromLayout());
+    apply(displayP);
+
+    // rAF while the portal/sticky stage is near/on screen
+    let io: IntersectionObserver | null = null;
+    if (typeof IntersectionObserver !== 'undefined') {
+      io = new IntersectionObserver(
+        (entries) => {
+          const on = entries.some((e) => e.isIntersecting);
+          if (on) startLoop();
+          else stopLoop();
+        },
+        { root, rootMargin: '30% 0px 30% 0px', threshold: 0 },
+      );
+      io.observe(portal);
+      if (sticky) io.observe(sticky);
+    } else {
+      startLoop();
+    }
+
+    const onScroll = () => {
+      // ensure a frame runs even if IO hasn't fired yet
+      if (!raf) raf = requestAnimationFrame(tick);
+    };
+    const onResize = () => {
+      // stage/card geometry changed — refresh the fit factors first
+      measureFit();
+      onScroll();
+    };
+    root.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onResize, { passive: true });
+    window.addEventListener('orientationchange', onResize, { passive: true });
+
+    return () => {
+      looping = false;
+      root.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
+      io?.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+      portal.removeAttribute('data-portal');
+    };
+  }, [reduce]);
 
   // Subtle scroll-reveal (sections) + self-drawing hairlines.
   // CRITICAL: root MUST be .pl-root (the actual overflow scroller). The default
@@ -2192,7 +2760,18 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
     sheenRef.current?.style.setProperty('--sheeny', '18%');
   };
 
-  const scrollTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  const scrollTo = (id: string) => {
+    // Pop-out is a sticky portal: land on the stage itself so Theory is on-screen,
+    // not stuck above the runway where cards can read as "missing".
+    if (id === 'popout') {
+      const stage = document.querySelector('.pl-pip-portal-sticky') as HTMLElement | null;
+      if (stage) {
+        stage.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return;
+      }
+    }
+    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
   const tiers: PricingTier[] = (pricing?.tiers as PricingTier[]) || [];
 
   const priceBlock = (t: PricingTier) => {
@@ -2222,6 +2801,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           <Wordmark onClick={() => scrollTo('pl-top')} />
           <div className="pl-hide-sm" style={{ display: 'flex', gap: 34 }}>
             <button className="pl-navlink" onClick={() => scrollTo('why')}>Features</button>
+            <button className="pl-navlink" onClick={() => scrollTo('popout')}>Pop-out</button>
             <button className="pl-navlink" onClick={() => scrollTo('pricing')}>Pricing</button>
             <button className="pl-navlink" onClick={() => scrollTo('faq')}>FAQ</button>
             <button className="pl-navlink" onClick={() => setView('docs')}>Docs</button>
@@ -2687,6 +3267,130 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         ))}
       </section>
 
+      {/* ── Pop-out portal — scroll forms theory, then coding (same glass) ── */}
+      <section id="popout" className="pl-wrap" style={{ paddingTop: 40, paddingBottom: 56 }}>
+        <div className="pl-reveal" style={{ textAlign: 'center', marginBottom: 28, maxWidth: 660, marginLeft: 'auto', marginRight: 'auto' }}>
+          <div className="pl-eyebrow" style={{ marginBottom: 18 }}>The pop-out</div>
+          <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, letterSpacing: '-0.025em', marginBottom: 14 }}>
+            This is what floats over your <span className="pl-gold pl-foil">interview — and your meetings.</span>
+          </h2>
+          <p style={{ fontSize: 16, lineHeight: 1.6, color: 'var(--mut)' }}>
+            A small always-on-top window with the answer, in your voice. The systems answer is
+            already there — keep scrolling and the coding round surfaces. Invisible when you share your screen.
+          </p>
+        </div>
+
+        <div className="pl-pip-portal" ref={portalRef}>
+          <div className="pl-pip-portal-sticky">
+            <div className="pl-popout-stage pl-pip-portal-stage">
+              <div className="pl-popout-ghost" aria-hidden="true" style={{ left: '5%', top: '10%', width: '48%', height: '60%' }} />
+              <div className="pl-popout-ghost" aria-hidden="true" style={{ right: '6%', bottom: '9%', width: '40%', height: '48%' }} />
+              <span className="pl-popout-tag" aria-hidden="true" style={{ left: '8%', top: '6%' }}>Zoom · shared</span>
+              <span className="pl-popout-tag" aria-hidden="true" style={{ right: '9%', bottom: '5%' }}>your screen</span>
+              <i className="pl-pip-atmo" aria-hidden="true" />
+              <i className="pl-pip-backlight" aria-hidden="true" />
+              <i className="pl-pip-caustic" aria-hidden="true" />
+              <i className="pl-pip-shell" aria-hidden="true" />
+
+              {/* ── Layer A: theoretical / systems ── */}
+              <div className="pl-pip-layer pl-pip-layer-a">
+                <div className="pl-pip" role="img" aria-label="minicaai pop-out: systems design question with a spoken answer">
+                  <div className="pl-pip-face">
+                    <i className="pl-pip-spec" aria-hidden="true" />
+                    <i className="pl-pip-sheen" aria-hidden="true" />
+                    <div className="pl-pip-head">
+                      <div className="pl-pip-ava">m</div>
+                      <div className="pl-pip-title">
+                        <h4>minicaai</h4>
+                        <span><i className="pl-pip-livedot" /> listening</span>
+                      </div>
+                      <div className="pl-pip-sizes" aria-hidden="true">
+                        <span className="pl-pip-size">S</span>
+                        <span className="pl-pip-size on">M</span>
+                        <span className="pl-pip-size">L</span>
+                      </div>
+                    </div>
+                    <div className="pl-pip-body">
+                      <div className="pl-pip-msg ai">
+                        <span className="pl-pip-name">They ask</span>
+                        <div className="pl-pip-bubble">How would you keep a feature&apos;s data fresh without hammering the database on every request?</div>
+                      </div>
+                      <div className="pl-pip-msg you">
+                        <span className="pl-pip-name">You say</span>
+                        <div className="pl-pip-bubble">I&apos;d put a read-through cache in front with a short TTL, then refresh it in the background so reads stay fast and the DB only sees a miss occasionally<span className="pl-pip-cursor" /></div>
+                      </div>
+                      <div className="pl-pip-model" aria-hidden="true"><i className="pl-pip-livedot" style={{ background: '#d3ac63' }} /> Claude Sonnet 5</div>
+                    </div>
+                    <div className="pl-pip-foot" aria-hidden="true">
+                      <div className="pl-pip-input">Type a follow-up…</div>
+                      <div className="pl-pip-send">
+                        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M15 8 2 2l2.6 6L2 14z" /></svg>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* ── Layer B: coding round — same glass language ── */}
+              <div className="pl-pip-layer pl-pip-layer-b">
+                <div className="pl-pip" role="img" aria-label="minicaai pop-out: coding question with a live solution">
+                  <div className="pl-pip-face">
+                    <i className="pl-pip-spec" aria-hidden="true" />
+                    <i className="pl-pip-sheen" aria-hidden="true" />
+                    <div className="pl-pip-head">
+                      <div className="pl-pip-ava">m</div>
+                      <div className="pl-pip-title">
+                        <h4>minicaai</h4>
+                        <span><i className="pl-pip-livedot" /> coding</span>
+                      </div>
+                      <div className="pl-pip-sizes" aria-hidden="true">
+                        <span className="pl-pip-size">S</span>
+                        <span className="pl-pip-size on">M</span>
+                        <span className="pl-pip-size">L</span>
+                      </div>
+                    </div>
+                    <div className="pl-pip-body">
+                      <div className="pl-pip-msg ai">
+                        <span className="pl-pip-name">They ask</span>
+                        <div className="pl-pip-bubble">Write a function that returns the index of the first unique character. O(n) time, O(1) extra space if the alphabet is fixed.</div>
+                      </div>
+                      <div className="pl-pip-msg you">
+                        <span className="pl-pip-name">You say</span>
+                        <div className="pl-pip-bubble pl-pip-code">
+                          <span className="pl-kw">function</span> <span className="pl-fn">firstUnique</span>(s) {'{\n'}
+                          {'  '}<span className="pl-kw">const</span> freq = <span className="pl-kw">new</span> Map();{'\n'}
+                          {'  '}<span className="pl-kw">for</span> (<span className="pl-kw">const</span> c <span className="pl-kw">of</span> s){'\n'}
+                          {'    '}freq.set(c, (freq.get(c) || <span className="pl-cn">0</span>) + <span className="pl-cn">1</span>);{'\n'}
+                          {'  '}<span className="pl-kw">for</span> (<span className="pl-kw">let</span> i = <span className="pl-cn">0</span>; i {'<'} s.length; i++){'\n'}
+                          {'    '}<span className="pl-kw">if</span> (freq.get(s[i]) === <span className="pl-cn">1</span>) <span className="pl-kw">return</span> i;{'\n'}
+                          {'  '}<span className="pl-kw">return</span> <span className="pl-cn">-1</span>;{'\n'}
+                          {'}'}
+                          <span className="pl-pip-cursor" />
+                        </div>
+                      </div>
+                      <div className="pl-pip-model" aria-hidden="true"><i className="pl-pip-livedot" style={{ background: '#d3ac63' }} /> Claude Sonnet 5</div>
+                    </div>
+                    <div className="pl-pip-foot" aria-hidden="true">
+                      <div className="pl-pip-input">Walk me through the complexity…</div>
+                      <div className="pl-pip-send">
+                        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M15 8 2 2l2.6 6L2 14z" /></svg>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="pl-pip-shieldrow pl-reveal">
+          <span className="pl-pip-shield" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" /></svg>
+          </span>
+          Hidden from screen-share on macOS &amp; Windows — resize S / M / L, drag it anywhere, hide it instantly with a shortcut.
+        </div>
+      </section>
+
       {/* ── Privacy — the discretion pact ───────────────────── */}
       <section id="privacy" className="pl-wrap" style={{ paddingTop: 72, paddingBottom: 32 }}>
         <div className="pl-moment" style={{ alignItems: 'start', padding: 0 }}>
@@ -2827,8 +3531,14 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             </div>
           );
         })()}
+        {/* Payment-method line must promise only what checkout can deliver
+            TODAY: while the Razorpay account is pending (pricingService
+            INR_CHECKOUT_ENABLED=false + server RAZORPAY_ROUTING_ENABLED
+            unset), every region — India included — checks out via Stripe
+            in USD, so "Razorpay · UPI in India" would be a broken promise
+            at the payment sheet. Restore those words when the flags flip. */}
         <p className="pl-reveal" style={{ textAlign: 'center', fontSize: 12.5, color: 'var(--faint)', letterSpacing: '.02em', marginTop: 28 }}>
-          Stripe or Razorpay at checkout · Apple Pay · Google Pay · UPI in India ·{' '}
+          Secure checkout by Stripe · Apple Pay · Google Pay · all major cards ·{' '}
           <button className="pl-footnote-link" onClick={() => setShowRefund(true)}>14-day first-purchase refund window</button>
         </p>
       </section>

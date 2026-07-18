@@ -16,9 +16,9 @@
 //    Grok, Groq — NO Claude), stealth, Auto-Solve. No Auto-Type. Extend +30 min
 //    anytime. Time-gated by credits_remaining_seconds.
 //  - Pro ($50 one-time): ONE 1-hour interview, all five models incl. Claude
-//    Sonnet 5. No Auto-Type. Extend +1 hour anytime ($45).
+//    Sonnet 5. No Auto-Type. Extend anytime (+30 min $25 / +1 h $45 / +3 h $80 packs).
 //  - Max ($89 one-time): THREE 1-hour interviews, all five models, full
-//    reasoning control + Train Model. No Auto-Type. Extend +1 hour anytime ($45).
+//    reasoning control + Train Model. No Auto-Type. Same extension packs as Pro.
 //  - Ultra ($159/month): UNLIMITED interviews, all five models, Auto-Type +
 //    Train Model — the only recurring subscription.
 //  Admins bypass every gate (see isAdmin / getEffectiveTier) — full access,
@@ -113,10 +113,11 @@ export const FEATURE_GATES = {
     // both client-side (UI bar locked) and server-side (JWT tier check
     // in /chat/openai overrides anything they send).
     reasoningEffortControl: false,
+    trainModel: false,
   },
   basic: {
-    // Basic is the only paid tier WITHOUT Claude — Claude (hosted web_search
-    // + the "Train Model" pipeline) unlocks at Pro as the premium step-up.
+    // Basic is the only paid tier WITHOUT Claude — Claude (hosted web_search)
+    // unlocks at Pro as the premium step-up.
     models: ['gemini', 'groq', 'openai', 'xai'] as string[],
     screenCapture: true,
     autoSolve: true,
@@ -126,10 +127,13 @@ export const FEATURE_GATES = {
     sessionsPerMonth: -1, // session count isn't the gate — credit time is
     exportHistory: true,
     reasoningEffortControl: false,
+    trainModel: false,
   },
   pro: {
     // Pro unlocks Claude Sonnet 5 (all five models). Basic is the only paid
     // tier without Claude. Pro = one 1-hour interview (time-gated).
+    // Train Model stays Max+ — it's the Max upsell alongside the
+    // reasoning dial; Pro gets Claude + its web search, not the trainer.
     models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
     screenCapture: true,
     autoSolve: true,
@@ -139,6 +143,7 @@ export const FEATURE_GATES = {
     sessionsPerMonth: -1, // session count isn't the gate — credit time is
     exportHistory: true,
     reasoningEffortControl: false,
+    trainModel: false,
   },
   max: {
     // Max = three 1-hour interviews, all five models. No Auto-Type (Ultra-only).
@@ -152,6 +157,7 @@ export const FEATURE_GATES = {
     exportHistory: true,
     // Full reasoning bar (none/low/medium/high) on Max and Ultra.
     reasoningEffortControl: true,
+    trainModel: true,    // the Max differentiator (with the reasoning dial)
   },
   ultra: {
     // Ultra = unlimited interviews, all five models, + Auto-Type. Monthly sub.
@@ -164,6 +170,7 @@ export const FEATURE_GATES = {
     sessionsPerMonth: -1, // unlimited
     exportHistory: true,
     reasoningEffortControl: true,
+    trainModel: true,
   },
 } as const;
 
@@ -494,11 +501,33 @@ class LicenseService {
   isLicenseValid(license: LicenseData | null): boolean {
     if (!license) return false;
     if (license.status === 'revoked') return false;
-    if (license.status === 'expired') return false;
+    // One-time passes (Basic/Pro/Max) END in 'expired' BY DESIGN — every
+    // pass reaches it 30 days after purchase. That's the plan's normal
+    // terminal state, not an auth problem: restore the session and let the
+    // gates resolve the user to Free footing with renew/re-buy prompts
+    // (getEffectiveTier + isPlanLapsed already do; the server enforces
+    // regardless). Bouncing these users to the sign-in screen on every
+    // launch punished exactly the proven buyers most likely to purchase
+    // again. Anomalous terminal states (revoked above, refunded/disputed/
+    // paused below) still bounce — those aren't a pass's natural lifecycle.
+    const isPass = license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max';
+    if (license.status === 'expired') return isPass;
     if (license.status === 'paused') return false;
     if (license.status === 'refunded') return false;
     if (license.status === 'disputed') return false;
-    if (license.expires_at > 0 && Date.now() > license.expires_at) return false;
+    // Free carve-out — mirrors the server exactly (license.js /validate +
+    // middleware/tier.js, pinned by test/free-trial-gate-chain.test.js):
+    // a free license's 30-day expires_at is UI bookkeeping, NOT an access
+    // boundary — the one-time trial bucket is the free tier's real wall.
+    // Without this, every saved free session went "invalid" 30 days after
+    // signup and the user was bounced to the sign-in screen on EVERY app
+    // launch forever — maximum friction on exactly the audience we want
+    // frictionlessly returning to the paywall.
+    if (license.tier === 'free') return true;
+    // Calendar-lapsed pass (expires_at passed but the status flip hasn't
+    // landed yet — /validate stamps 'expired' on its next touch): same
+    // reasoning as the 'expired' branch above.
+    if (license.expires_at > 0 && Date.now() > license.expires_at) return isPass;
     return true;
   }
 

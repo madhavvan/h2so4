@@ -28,7 +28,7 @@ import {
 } from '@phosphor-icons/react';
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import { geoService, GeoData } from './services/geoService';
-import { pricingService, RegionPricing, PricingTier, getExtensionPacks } from './services/pricingService';
+import { pricingService, RegionPricing, PricingTier, getExtensionPacks, EXTENSION_PACKS } from './services/pricingService';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
 // Same component the Electron desktop chat-header uses. On the web post-
 // auth download surface we render it as a modal so paid users have full
@@ -37,6 +37,7 @@ import { licenseService, UserProfile, LicenseData } from './services/licenseServ
 // either bounce out to the Stripe portal or wait until they install
 // the desktop binary.
 import { ManageSubscription as ManageSubscriptionModal } from './ManageSubscription';
+import { DownloadGuide } from './DownloadGuide';
 // Public docs surface — same component the landing nav links to.
 // Renders the contents of /docs (markdown bundled at build via Vite ?raw)
 // in a Stripe-style three-column layout. Theme-aware so it adopts the
@@ -4928,7 +4929,7 @@ interface DownloadMobileProps {
   handleManageSubscription: () => Promise<void> | void;
   handleCancelSubscription: () => Promise<void> | void;
   initiateRenewal: () => Promise<void> | void;
-  initiateCheckout: (tier?: 'basic' | 'pro' | 'max') => Promise<void> | void;
+  initiateCheckout: (tier?: 'basic' | 'pro' | 'max' | 'ultra') => Promise<void> | void;
   basicExpiryLabel: (expiresAt: number | undefined | null) => string | null;
   // Opens Documentation as a modal layer OVER the mobile profile sheet
   // so closing docs returns to the still-open profile. Lifted to
@@ -5195,6 +5196,9 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
             </a>
           ))}
         </div>
+        {/* Browser-warning walkthrough — the dark gold card reads as a
+            deliberate "spotlight" block on the cream mobile surface. */}
+        <DownloadGuide className="mt-4" />
       </section>
 
       {/* Tier-aware action */}
@@ -6192,7 +6196,7 @@ interface PlanSheetMobileProps {
   paymentLoading: boolean;
   paymentError: string | null;
   paymentSuccess: string | null;
-  initiateCheckout: (tier?: 'basic' | 'pro' | 'max') => Promise<void> | void;
+  initiateCheckout: (tier?: 'basic' | 'pro' | 'max' | 'ultra') => Promise<void> | void;
   initiateRenewal: () => Promise<void> | void;
   handleManageSubscription: () => Promise<void> | void;
   onRequestCancel: () => void;
@@ -6287,7 +6291,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
   // Effective tier resolution — admin always renders as Max so the sheet
   // shows the same buttons / state ManageSubscription does for admins.
   const isAdminUser = !!currentUser && licenseService.isDeveloper(currentUser.email);
-  const tier = (isAdminUser ? 'max' : (currentLicense?.tier || 'free')) as 'free' | 'basic' | 'pro' | 'max';
+  const tier = (isAdminUser ? 'max' : (currentLicense?.tier || 'free')) as 'free' | 'basic' | 'pro' | 'max' | 'ultra';
   const status = currentLicense?.status || 'none';
 
   // Provider — server is authoritative; geo is a fallback during the brief
@@ -6302,12 +6306,26 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
 
   // Resolve display price for a given tier from the regional pricing payload.
   // Returns null if pricing hasn't loaded — rows guard against null below.
-  const findTierPrice = (id: 'basic' | 'pro' | 'max'): string | null => {
+  const findTierPrice = (id: 'basic' | 'pro' | 'max' | 'ultra'): string | null => {
     const t = pricing?.tiers.find(x => x.id === id);
     if (!t) return null;
     const period = t.period === 'month' ? '/mo' : t.period === 'year' ? '/yr' : '';
     return pricingService.formatPrice(t.price, t.currencySymbol, t.currency) + period;
   };
+
+  // Shared "Go Ultra" row — the monthly unlimited subscription must be
+  // purchasable from every non-Ultra tier. It was missing from this sheet
+  // entirely (only the landing pricing cards sold it), so in-app users had
+  // no path to the flagship plan.
+  const ultraRow = (variant?: 'primary'): PlanRow => ({
+    key: 'upgrade-ultra',
+    Icon: Star, iconBg: 'rgba(139, 92, 246, 0.12)', iconColor: '#7c3aed',
+    title: 'Go Ultra',
+    subtitle: 'Unlimited interviews · Auto-Type · all 5 models · billed monthly',
+    price: findTierPrice('ultra') || undefined,
+    variant,
+    onClick: wrapAction('upgrade-ultra', () => initiateCheckout('ultra')),
+  });
 
   const renewalPriceLabel = (() => {
     if (!geo) return null;
@@ -6362,6 +6380,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
         onClick: wrapAction('upgrade-basic', () => initiateCheckout('basic')),
       });
     }
+    actions.push(ultraRow());
   }
 
   if (tier === 'basic') {
@@ -6392,31 +6411,33 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
       price: findTierPrice('max') || undefined,
       onClick: wrapAction('upgrade-max', () => initiateCheckout('max')),
     });
+    actions.push(ultraRow());
   }
 
   if (tier === 'pro' && !isAdminUser) {
     actions.push({
       key: 'upgrade-max',
       Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309',
-      title: 'Upgrade to Max',
-      subtitle: 'Adds Claude + Auto-Type + Train Model',
+      title: 'Get Max',
+      subtitle: 'Fresh pass: three 1-hour interviews · adds Train Model',
       price: findTierPrice('max') || undefined,
-      effective: 'Effective immediately · prorated diff next invoice',
+      // One-time pass, not a subscription swap — the full pass price is
+      // charged today and the 3-hour clock starts fresh. The old copy
+      // promised Stripe proration that one-time purchases never had.
+      effective: 'New pass · charged today · 3-hour clock starts fresh',
       variant: 'primary',
       onClick: wrapAction('upgrade-max', () => initiateCheckout('max')),
     });
+    actions.push(ultraRow());
   }
 
   if (tier === 'max' && !isAdminUser) {
-    actions.push({
-      key: 'downgrade-pro',
-      Icon: Crown, iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb',
-      title: 'Switch to Pro',
-      subtitle: 'Removes Claude + Auto-Type + Train Model',
-      price: findTierPrice('pro') || undefined,
-      effective: 'Effective at next renewal · keep Max access until then',
-      onClick: wrapAction('downgrade-pro', () => initiateCheckout('pro')),
-    });
+    // 2026-07 model: no in-place "Switch to Pro" — Max is a one-time pass,
+    // and buying a Pro pass mid-Max would charge $50 today AND replace the
+    // remaining Max time with Pro's 1-hour clock (the old row even promised
+    // "effective at next renewal", which a fresh checkout never honors).
+    // The only sensible move UP from Max is the Ultra subscription.
+    actions.push(ultraRow('primary'));
   }
 
   // Admin actions — admin users can instant-grant themselves any tier
@@ -6430,7 +6451,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
   // initiateCheckout falls through to /create-checkout, which doesn't
   // accept those targets. /upgrade-tier with admin bypass handles all
   // four targets in one round-trip.
-  const adminGrant = async (target: 'pro' | 'max' | 'basic' | 'free') => {
+  const adminGrant = async (target: 'ultra' | 'pro' | 'max' | 'basic' | 'free') => {
     const token = licenseService.getToken();
     if (!token) return;
     try {
@@ -6465,11 +6486,12 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
   };
 
   if (isAdminUser) {
-    const adminTargets: Array<{ key: 'pro' | 'max' | 'basic' | 'free'; title: string; subtitle: string; Icon: any; iconBg: string; iconColor: string }> = [
-      { key: 'max',   title: 'Switch to Max (admin)',   subtitle: 'Claude + Auto-Type + Train Model. Instant grant, no checkout.',                       Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309' },
-      { key: 'pro',   title: 'Switch to Pro (admin)',   subtitle: 'Unlimited time + 4 models (no Claude). Instant grant, no checkout.',                 Icon: Crown,     iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb' },
-      { key: 'basic', title: 'Switch to Basic (admin)', subtitle: '3 sessions / 14 days. Instant grant, no checkout — admin override.',                  Icon: Zap,       iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857' },
-      { key: 'free',  title: 'Switch to Free (admin)',  subtitle: 'Drop to Free with 5 sessions/month default. Instant grant, no checkout.',             Icon: Sparkles,  iconBg: 'var(--cream-soft)',        iconColor: 'var(--ink-muted)' },
+    const adminTargets: Array<{ key: 'ultra' | 'pro' | 'max' | 'basic' | 'free'; title: string; subtitle: string; Icon: any; iconBg: string; iconColor: string }> = [
+      { key: 'ultra', title: 'Switch to Ultra (admin)', subtitle: 'Unlimited + Auto-Type + all 5 models. Instant grant, no checkout.',                    Icon: Star,      iconBg: 'rgba(139, 92, 246, 0.12)', iconColor: '#7c3aed' },
+      { key: 'max',   title: 'Switch to Max (admin)',   subtitle: 'Three 1-hour interviews · Claude + Train Model. Instant grant, no checkout.',          Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309' },
+      { key: 'pro',   title: 'Switch to Pro (admin)',   subtitle: 'One 1-hour interview · all 5 models incl. Claude. Instant grant, no checkout.',        Icon: Crown,     iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb' },
+      { key: 'basic', title: 'Switch to Basic (admin)', subtitle: 'One 30-min interview · 4 models (no Claude). Instant grant — admin override.',         Icon: Zap,       iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857' },
+      { key: 'free',  title: 'Switch to Free (admin)',  subtitle: 'Drop to Free with 5 sessions/month default. Instant grant, no checkout.',              Icon: Sparkles,  iconBg: 'var(--cream-soft)',        iconColor: 'var(--ink-muted)' },
     ];
     for (const a of adminTargets) {
       actions.push({
@@ -6482,9 +6504,11 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
     }
   }
 
-  // Manage section — Stripe portal vs Razorpay cancel.
-  const showStripeManage = (tier === 'pro' || tier === 'max') && !isAdminUser && isStripe;
-  const showRazorpayCancel = (tier === 'pro' || tier === 'max') && !isAdminUser && isRazorpay;
+  // Manage section — Stripe portal vs Razorpay cancel. ULTRA included: it's
+  // the only true subscription in the 2026-07 model, and the old pro/max-only
+  // gate left Ultra subscribers with no billing-portal/cancel surface here.
+  const showStripeManage = (tier === 'pro' || tier === 'max' || tier === 'ultra') && !isAdminUser && isStripe;
+  const showRazorpayCancel = (tier === 'pro' || tier === 'max' || tier === 'ultra') && !isAdminUser && isRazorpay;
 
   return (
     <>
@@ -7477,18 +7501,37 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           // Renewal banners don't advertise "3 credits / 14 days" — they
           // name the plan's top-up unit instead (welcomeForRenewal).
           const isRenewal = urlParams.get('mode') === 'renewal';
-          // Client-side renewal credit grant. Keyed by Stripe session_id so
-          // a refresh of the success URL can't grant the same credit twice.
-          // Has to happen AFTER validateWithServer (which picks up the
-          // server-bumped license.expires_at) so credits_expire_at lines up
-          // with the new license window.
+          // Client-side renewal credit grant — OPTIMISTIC ONLY. Keyed by
+          // Stripe session_id so a refresh of the success URL can't grant
+          // the same credit twice. Has to happen AFTER validateWithServer
+          // (which picks up the server-bumped license.expires_at) so
+          // credits_expire_at lines up with the new license window.
+          //
+          // Server-already-granted guard: the checkout.session.completed
+          // webhook usually lands BEFORE the user's redirect completes, so
+          // validateWithServer returns the ALREADY-topped-up balance. Piling
+          // grantRenewalCredit on top of that double-counted the pack in the
+          // local ledger (server 60 min + local +30 → "90 min" shown) until
+          // the next revalidation snapped it back. Only grant locally when
+          // the server balance shows no increase vs the pre-checkout cache
+          // (i.e., the webhook genuinely hasn't landed yet).
           if (isRenewal && validated) {
             const sessionId = urlParams.get('session_id') || '';
             const appliedKey = sessionId ? `mc_renewal_applied_${sessionId}` : '';
             let alreadyApplied = false;
             try { alreadyApplied = !!appliedKey && !!localStorage.getItem(appliedKey); } catch {}
-            if (!alreadyApplied) {
-              validated = licenseService.grantRenewalCredit(validated);
+            const cachedBal = typeof saved.license?.credits_remaining_seconds === 'number'
+              ? saved.license.credits_remaining_seconds : null;
+            const serverBal = typeof validated.credits_remaining_seconds === 'number'
+              ? validated.credits_remaining_seconds : null;
+            const serverAlreadyGranted = cachedBal != null && serverBal != null && serverBal > cachedBal;
+            if (!alreadyApplied && !serverAlreadyGranted) {
+              // Pack-aware: /create-renewal stamps ?pack= on the success URL.
+              // The old call defaulted to the +30-min unit, undercrediting a
+              // +1 h / +3 h purchase until the webhook reconciled.
+              const packId = urlParams.get('pack') || '';
+              const packSeconds = EXTENSION_PACKS.find(p => p.id === packId)?.seconds;
+              validated = licenseService.grantRenewalCredit(validated, packSeconds);
               if (appliedKey) {
                 try { localStorage.setItem(appliedKey, String(Date.now())); } catch {}
               }
@@ -7850,11 +7893,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             ? { ...(data.license as LicenseData), last_validated: Date.now() }
             : { ...(saved.license || currentLicense)!, tier: grantedTier as LicenseData['tier'], last_validated: Date.now() };
           // Admin-grant + in-place upgrades DO flip tier to 'basic' in some
-          // flows (admin self-test, legacy downgrade paths). The server
-          // doesn't echo credit fields (Option A ledger), so seed them via
-          // validateWithServer's normalize path. Without this, an admin
-          // granting themselves Basic would see 0 credits and immediately
-          // fall through to Free gating even though tier='basic'.
+          // flows (admin self-test, legacy downgrade paths). The server now
+          // echoes credit fields on every grant path, so this only fires
+          // against an OLDER server; re-pull via validateWithServer, and
+          // only if that fails seed the 2026-07 Basic unit locally
+          // (30 min — the old 3×3600 here was the retired 3-credit model).
           if (grantedTier === 'basic' && updatedLicense.credits_remaining_seconds == null) {
             const revalidated = await licenseService.validateWithServer();
             if (revalidated && revalidated.tier === 'basic') {
@@ -7863,7 +7906,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               const fallbackExpiry = Date.now() + 14 * 24 * 60 * 60 * 1000;
               updatedLicense = {
                 ...updatedLicense,
-                credits_remaining_seconds: 3 * 3600,
+                credits_remaining_seconds: 30 * 60,
                 credits_expire_at: updatedLicense.expires_at > 0 ? updatedLicense.expires_at : fallbackExpiry,
               };
             }
@@ -8148,35 +8191,33 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                         ? { ...currentLicense, tier: grantedTier, status: 'active' as const }
                         : null);
                 if (newLicense) {
-                  // Basic-tier needs the client-side credit ledger seeded
-                  // (first purchase) or topped up (renewal). The server
-                  // updates tier + expires_at + sessions_limit but has no
-                  // credits_remaining_seconds column (Option A), so the
-                  // client handles credits here before saving.
+                  // Credits on the local license. The verify endpoint grants
+                  // INSIDE its own transaction and echoes the POST-GRANT
+                  // license — when verifyData.license is present the top-up
+                  // is already in the numbers, and re-applying it locally
+                  // double-counted the pack until the next revalidation.
                   if (isRenewal) {
-                    // Idempotency: keyed by razorpay_payment_id so a retried
-                    // verify call (double-click, webhook race) doesn't grant
-                    // two credits for one payment.
+                    // Local optimistic grant ONLY for older servers that
+                    // didn't echo a license. Idempotency: keyed by
+                    // razorpay_payment_id so a retried verify call
+                    // (double-click, webhook race) doesn't grant twice.
                     const paymentId = response?.razorpay_payment_id || '';
                     const appliedKey = paymentId ? `mc_renewal_applied_${paymentId}` : '';
                     let alreadyApplied = false;
                     try { alreadyApplied = !!appliedKey && !!localStorage.getItem(appliedKey); } catch {}
-                    if (!alreadyApplied) {
+                    if (!verifyData.license && !alreadyApplied) {
                       newLicense = licenseService.grantRenewalCredit(newLicense as LicenseData);
                       if (appliedKey) {
                         try { localStorage.setItem(appliedKey, String(Date.now())); } catch {}
                       }
                     }
                   } else if (grantedTier === 'basic') {
-                    // First-time Basic purchase — saveAuth + reload of state
-                    // below needs credit fields populated. grantRenewalCredit
-                    // adds exactly one credit (1h) which would shortchange a
-                    // first-time buyer expecting 3h. Call validateWithServer
-                    // to re-run the normalize path which seeds 3 credits on
-                    // tierChanged (the server-side webhook may have flipped
-                    // the tier already, or the local tier swap we're doing
-                    // now is the trigger). Fall back to manual seed if
-                    // validateWithServer came back null (offline/unreachable).
+                    // First-time Basic purchase. The server now seeds +
+                    // echoes the credit fields on the verify response and
+                    // on /validate, so this re-pull is belt-and-braces;
+                    // the manual seed below only fires fully offline and
+                    // uses the 2026-07 Basic unit (30 min — the old
+                    // 3×3600 here was the retired 3-credit model).
                     const revalidated = await licenseService.validateWithServer();
                     if (revalidated && revalidated.tier === 'basic') {
                       newLicense = revalidated;
@@ -8186,7 +8227,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                       const fallbackExpiry = Date.now() + 14 * 24 * 60 * 60 * 1000;
                       newLicense = {
                         ...base,
-                        credits_remaining_seconds: 3 * 3600,
+                        credits_remaining_seconds: 30 * 60,
                         credits_expire_at: base.expires_at > 0 ? base.expires_at : fallbackExpiry,
                       } as LicenseData;
                     }
@@ -8299,7 +8340,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     const serverUrl = viteEnv.PROD
       ? 'https://api.minicaai.com'
       : (viteEnv.VITE_SERVER_URL || 'https://api.minicaai.com');
-    const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}`;
+    // country_code rides along so the server creates first-time Google
+    // signups with their REAL region (pricing/trial/region policy) instead
+    // of the old hardcoded US. Server validates the shape; omitted when geo
+    // hasn't resolved yet (server falls back to US).
+    const geoCountry = /^[A-Za-z]{2}$/.test(geo?.country_code || '') ? `&country_code=${geo!.country_code.toUpperCase()}` : '';
+    const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}${geoCountry}`;
 
     // Open Google sign-in in system browser. We MUST await + catch here —
     // the original fire-and-forget pattern silently swallowed shell errors
@@ -9064,6 +9110,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             </a>
           </div>
 
+          {/* What-the-browser-will-say walkthrough — sits DIRECTLY under the
+              buttons so nobody bails at SmartScreen / "isn't commonly
+              downloaded" thinking the download is broken. */}
+          <DownloadGuide className="max-w-md mx-auto mb-12 text-left" />
+
           {/* After download instructions */}
           <div className="max-w-md mx-auto text-left space-y-4 mb-12">
             <h3 className="text-sm font-bold text-white flex items-center gap-2">
@@ -9213,13 +9264,17 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                         onClick={initiateRenewal}
                         disabled={paymentLoading}
                         className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white text-sm font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center gap-2 disabled:opacity-50"
-                        aria-label="Extend interview time (+30 minutes)"
+                        aria-label="Extend interview time"
                       >
                         {paymentLoading ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
                         {(() => {
-                          // Basic's plan-specific unit: +30 min (2026-07).
-                          const r = pricingService.getRenewalPrice(geo?.country_code || 'US', 'basic');
-                          return `Extend ${r.label} · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`;
+                          // The charge button must name the SELECTED pack —
+                          // initiateRenewal sends selectedRenewalPack, so a
+                          // hardcoded "+30 min · $25" label over an $80 +3 h
+                          // charge would misstate the amount at click time.
+                          const packs = getExtensionPacks(geo?.country_code || 'US');
+                          const sel = packs.find(p => p.id === selectedRenewalPack) || packs[0];
+                          return `Extend ${sel.label} · ${pricingService.formatPrice(sel.price, sel.currencySymbol, sel.currency)}`;
                         })()}
                       </button>
                     )}

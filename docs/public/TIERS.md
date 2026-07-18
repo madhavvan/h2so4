@@ -6,7 +6,7 @@ For the customer-facing **[Refund Policy](https://minicaai.com/refund-policy)** 
 
 ## Contents
 
-1. [The four tiers](#1-the-four-tiers)
+1. [The five tiers](#1-the-five-tiers)
 2. [What each tier unlocks](#2-what-each-tier-unlocks)
 3. [Trial mechanics](#3-trial-mechanics)
 4. [Pricing and regions](#4-pricing-and-regions)
@@ -74,11 +74,12 @@ Indian customers must have an active paid subscription to access the AI features
 
 ## 5. Switching tiers
 
-You can upgrade or downgrade at any time from the **Manage Subscription** dialog inside the app, or by emailing **support@minicaai.com**.
+Everything happens from the **Manage Subscription** dialog inside the app (or email **support@minicaai.com**). Under the 2026-07 model:
 
-- **Upgrades** take effect immediately. Stripe charges the prorated difference for the remainder of your current cycle.
-- **Downgrades** take effect at the end of your current billing cycle. You keep the higher tier's features until then; on renewal, the new lower tier kicks in.
-- **Switching from Pro to Basic mid-cycle** preserves the unused time as a credit on your account, applied to your next renewal.
+- **Buying a bigger pass** (e.g. Basic → Max): a fresh checkout, charged today. The new pass's full interview clock replaces whatever remained on your old pass, and its 30-day window starts fresh.
+- **Need more minutes on the pass you already have?** Use the interview-day extensions instead (+30 min $25 / +1 h $45 / +3 h $80) — they stack onto your existing clock without replacing it.
+- **Going Ultra**: starts the monthly subscription immediately at checkout.
+- **Leaving Ultra for passes**: cancel Ultra (you keep unlimited access until the cycle ends), then buy passes whenever an interview comes up. There is no in-place swap between Ultra and the one-time passes.
 
 ## 6. Refunds
 
@@ -88,45 +89,45 @@ Our refund policy is documented in full at **[minicaai.com/refund-policy](https:
 |---|---|
 | Within 14 days of first paid charge, fewer than 2 hours used | Yes — full refund |
 | Within 14 days of first paid charge, more than 2 hours used | At our discretion (typically pro-rated) |
-| Past 14 days of first paid charge | No — subscriptions don't include retroactive refunds beyond the trial window |
-| Renewal charge for an existing subscription | No — renewals are not refundable; cancel before renewal date to avoid the charge |
-| Service fully unavailable for >24 hours due to our outage | Pro-rated credit on next renewal |
-| You disputed a charge with your bank without contacting us first | No — chargeback eligibility is independent of our refund policy |
+| Past 14 days of first paid charge | No — the refund window has closed |
+| Ultra renewal charges after the first, or interview extension top-ups | No — not refundable; cancel Ultra before the renewal date to avoid the next charge |
+| Service fully unavailable for more than 48 consecutive hours due to our outage | Ultra: pro-rated credit on next renewal · Pass holders: refund or replacement interview credits |
+| You disputed a charge with your bank without contacting us first | No — and chargebacks result in account termination (see the full policy) |
 
 To request a refund, email **support@minicaai.com** with your account email and the approximate purchase date. We respond within 2 business days.
 
 ## 7. Cancellation
 
-You can cancel from inside the app's **Manage Subscription** dialog. Cancellation:
+Cancellation applies to the **Ultra** subscription — the one-time passes (Basic/Pro/Max) never bill again, so there's nothing to cancel; they simply expire. From the app's **Manage Subscription** dialog, cancelling Ultra:
 
-- Takes effect at the **end of your current billing cycle** (you keep access until then)
-- Is reversible up until the cycle end — click **Reactivate** in the same dialog
+- Takes effect at the **end of your current billing cycle** (you keep unlimited access until then)
+- Is reversible up until the cycle end — click **Resume — keep my subscription** in the same dialog
 
-Stripe customers can also cancel through their bank's customer portal if needed. Razorpay customers cancel through the in-app dialog only.
+Stripe customers can also manage or cancel through the Stripe billing portal (**Manage billing in Stripe** in the same dialog). Razorpay customers cancel through the in-app dialog only.
 
 After your subscription ends:
 
-- You retain read-only access to your conversation history for **180 days**
-- You can re-subscribe at any time with the same email; your conversation history reattaches
+- Your conversation history stays attached to your account — nothing is deleted on cancellation
+- You can re-subscribe or buy a one-time pass at any time with the same email; everything picks up where you left off
 - Your résumé and JD files stay on your local machine regardless of subscription state
 
 ## 8. License binding
 
-A subscription is bound to the device that activates it. Practical effects:
+Every plan includes a device allowance — how many machines the license can be active on at once:
 
-- You can sign out and sign back in on the same machine — that's fine
-- You cannot sign in to one license on two different machines simultaneously — the second sign-in evicts the first
-- Switching devices (new laptop) requires emailing **support@minicaai.com** so we can release the old binding. This is a one-day turnaround typically
+- **Free / Basic**: 2 devices · **Pro**: 3 · **Max**: 5 · **Ultra**: 10
+- Each device registers automatically when you sign in; no support ticket needed to switch machines
+- Signing in past your allowance automatically deactivates your **oldest** device — so you can always move to a new laptop instantly, but a seat can't be farmed out to other people
 
 ## 9. Renewals and lapsed subscriptions
 
-- Subscriptions auto-renew at the end of each billing cycle. The card on file is charged 24 hours before renewal.
-- A failed renewal puts your account into a **past_due** state. We retry up to 3 times over 7 days. During this window you keep access; after the third failure the subscription transitions to **expired** and access is revoked at cycle end.
-- An expired subscription can be renewed at any time by signing in and re-subscribing through the **Manage Subscription** dialog. Your conversation history reattaches automatically.
+- **Ultra** renews automatically on your billing-cycle date (the one-time passes never renew — their remaining time simply expires at the end of the 30-day window).
+- A failed Ultra renewal puts your account into a **past_due** state while the payment provider retries over roughly the following week. You keep access during the retries; if they exhaust, the subscription ends and your tier drops to Free.
+- A lapsed account can come back any time: sign in and buy a pass or restart Ultra from the **Manage Subscription** dialog. Your conversation history is still attached to the account.
 
 ## 10. Frequently asked questions
 
-**Can I share one license with a friend?** No. The license is device-bound and licensed for one user. Sharing is a violation of our terms.
+**Can I share one license with a friend?** No. The license is for one person — the device allowance exists so *you* can move between your own machines. Sharing credentials violates our terms and can get the account revoked.
 
 **Do I need to pay tax?** Stripe and Razorpay handle tax computation automatically based on your billing address (US sales tax, India GST, EU VAT, etc.).
 
@@ -136,7 +137,7 @@ A subscription is bound to the device that activates it. Practical effects:
 
 **Can I pay by invoice / wire transfer?** Not for individual subscriptions. For team or enterprise licenses (5+ seats), email **sales@minicaai.com**.
 
-**What happens to my conversations when I cancel?** Your local conversation database stays on your machine indefinitely. The server-side mirror is retained for 180 days after cancellation, then deleted.
+**What happens to my conversations when I cancel?** Nothing — your local conversation database stays on your machine, and the server-side mirror stays attached to your account. Only deleting the account removes the server copy (immediately and permanently).
 
 ---
 

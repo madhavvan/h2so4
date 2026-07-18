@@ -7,7 +7,7 @@ Step-by-step fixes for the issues we hear about most. If your problem isn't here
 1. [The interviewer's voice isn't being heard](#1-the-interviewers-voice-isnt-being-heard)
 2. [The pop-out window is missing or off-screen](#2-the-pop-out-window-is-missing-or-off-screen)
 3. [Auto-Solve doesn't capture the screen](#3-auto-solve-doesnt-capture-the-screen)
-4. [Auto-Type doesn't type anything (Max)](#4-auto-type-doesnt-type-anything-max)
+4. [Auto-Type doesn't type anything (Ultra)](#4-auto-type-doesnt-type-anything-ultra)
 5. [Sign-in failures](#5-sign-in-failures)
 6. [My license is stuck on another machine](#6-my-license-is-stuck-on-another-machine)
 7. [My subscription doesn't show up](#7-my-subscription-doesnt-show-up)
@@ -17,7 +17,7 @@ Step-by-step fixes for the issues we hear about most. If your problem isn't here
 11. [Linux: AppImage won't run](#11-linux-appimage-wont-run)
 12. [The AI is slow to respond](#12-the-ai-is-slow-to-respond)
 13. [Web search isn't working](#13-web-search-isnt-working)
-14. [Voice mode is silent](#14-voice-mode-is-silent)
+14. [Transcription stops mid-interview](#14-transcription-stops-mid-interview)
 15. [Payment failed but the bank shows the charge](#15-payment-failed-but-the-bank-shows-the-charge)
 16. [The app crashes on launch](#16-the-app-crashes-on-launch)
 17. [I want to delete my account and data](#17-i-want-to-delete-my-account-and-data)
@@ -51,12 +51,12 @@ If it still doesn't appear, close the entire app from your system tray ("Quit"),
 You need to grant screen-capture permission to the app.
 
 - **macOS** — Open **System Settings → Privacy & Security → Screen & System Audio Recording**, toggle **Interview Copilot** on, then **quit and restart the app**.
-- **Windows** — Settings → Privacy → Screenshots → make sure the app is allowed. Restart the app.
+- **Windows** — no OS permission is needed for desktop apps; if capture fails, quit the app from the system tray and re-launch.
 - **Linux** — varies by distro; most desktop environments grant screen capture by default once the app requests it.
 
 After granting, test Auto-Solve once with a non-interview screen first to confirm it works.
 
-## 4. Auto-Type doesn't type anything (Max)
+## 4. Auto-Type doesn't type anything (Ultra)
 
 Auto-Type uses OS-level accessibility APIs to type into other applications.
 
@@ -77,13 +77,9 @@ If none of these work, email **support@minicaai.com** with the account email and
 
 ## 6. My license is stuck on another machine
 
-The license is bound to the device that first activates it. To move it:
+It isn't — just sign in on the new machine. Every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra), and signing in past the allowance automatically deactivates your **oldest** device. There is no binding to release and no support ticket needed, even if the old machine is lost, broken, or sold.
 
-1. Email **support@minicaai.com** from your account email
-2. Include your old device (the one you can't use anymore) and what you want to move to
-3. We release the old binding within one business day; you sign in on the new machine after that
-
-If the old machine is no longer accessible (lost, broken, sold), we can release the binding without verification from the old device. Just say so in the email.
+If a sign-in on a new machine reports a device-limit error anyway, email **support@minicaai.com** from your account email and we'll look at the device list server-side.
 
 ## 7. My subscription doesn't show up
 
@@ -108,17 +104,13 @@ If the update still doesn't install, download the latest installer directly from
 
 ## 9. macOS: Gatekeeper "Cannot be opened" warning
 
-The macOS build is currently unsigned (we're in the process of getting an Apple Developer ID; expect signed builds by Q3 2026).
+You shouldn't see this — the macOS builds are signed with an Apple Developer ID and notarized by Apple, so Gatekeeper opens them without a warning.
 
-To open the app the first time:
+If you do see it:
 
-1. Right-click the app in your Applications folder
-2. Pick **Open** from the context menu
-3. Click **Open** again in the system prompt that appears
-
-After the first launch, subsequent opens don't need this step.
-
-If even the right-click → Open step fails ("malicious software" wording), open **System Settings → Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the Interview Copilot entry.
+1. You're probably running an old download from before the builds were notarized — download the current installer from **get.minicaai.com/mac** and install that instead.
+2. Make sure you moved the app out of the mounted DMG into **Applications** before launching.
+3. As a last resort, open **System Settings → Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the Interview Copilot entry.
 
 ## 10. Windows: SmartScreen blocks the installer
 
@@ -169,27 +161,27 @@ If a specific model is slower than usual for you:
 
 1. Switch to a different model temporarily — the picker is at the top of the chat
 2. Check your internet connection (the app needs ~50 KB/s of bandwidth for streaming)
-3. Try toggling the reasoning-effort knob (Max) down to **None** — it slows responses significantly
+3. Try toggling the reasoning-effort knob (Max & Ultra) down to **None** — it slows responses significantly
 
 If everything is slow, our provider is likely having a regional outage. Check our status (we'll post on the marketing site banner if there's a known issue) or write to **support@minicaai.com**.
 
 ## 13. Web search isn't working
 
-Web search is a **Max-tier feature** specific to **Claude**. It won't fire on other models. Check:
+Web search comes with **Claude**, which unlocks at **Pro** and above. It won't fire on other models. Check:
 
-- You're on the Max plan (account menu → **Manage Subscription** shows your tier)
+- You're on Pro, Max, or Ultra (account menu → **Manage Subscription** shows your tier)
 - You've selected **Claude** in the model picker
 - Your question is the kind where web search helps — current-state info, recent changes, specific product features. The model decides whether to search; not every Claude call searches.
 
-If you're on Max + Claude + asking a clearly time-sensitive question and don't see "Checking the web…" status, write to **support@minicaai.com**.
+If you're on Pro or above with Claude selected and asking a clearly time-sensitive question and don't see "Checking the web…" status, write to **support@minicaai.com**.
 
-## 14. Voice mode is silent
+## 14. Transcription stops mid-interview
 
-If you've enabled voice mode and aren't hearing anything:
+Answers arrive as streaming **text** you read from the screen — the app never speaks out loud. If the live transcription stops appearing mid-session:
 
-- Voice mode generates spoken answers via TTS. Make sure your system audio output is enabled and the volume is up.
-- Check that nothing is muted in your OS volume mixer (Windows Sound Mixer, macOS Audio MIDI Setup).
-- Restart the app — TTS audio routing sometimes wedges and a fresh launch resolves it.
+- Check the mic indicator: if it flipped to **MIC OFF**, the capture ended (the shared tab/window may have closed) — click it and re-pick the source with **Also share tab audio** checked.
+- A brief network drop breaks the transcription socket; the app reconnects automatically within a few seconds. If it doesn't, stop and restart the mic.
+- If the indicator says **LIVE** but nothing transcribes, the shared source has no audio — confirm the interviewer's audio actually plays through the tab/window you shared.
 
 ## 15. Payment failed but the bank shows the charge
 
@@ -199,19 +191,19 @@ You won't see a refund line item — the bank just drops the hold and your avail
 
 ## 16. The app crashes on launch
 
-Open the **opt-in crash reporter** dialog (the app shows it on first launch). Sending us the crash dump is the fastest way to diagnose.
+Crash minidumps are written locally on your machine (they never upload automatically). If you contact support we may ask you to attach one — they contain no chat content.
 
-In the meantime, common causes:
+Common causes:
 
 - **Old config file** — close the app, delete the app's user-data folder (Windows: `%APPDATA%\interview-copilot-ai`; macOS: `~/Library/Application Support/interview-copilot-ai`; Linux: `~/.config/interview-copilot-ai`), then re-launch. You'll need to sign in again, but settings reset to defaults.
 - **Outdated GPU drivers** — Electron uses Chromium, which is sensitive to old GPU drivers. Update yours and retry.
 - **macOS Gatekeeper quarantine** — see the Gatekeeper section above.
 
-If the crash persists, email **support@minicaai.com** with your OS version, app version (visible on the **About** screen), and the crash-reporter ID.
+If the crash persists, email **support@minicaai.com** with your OS version and app version.
 
 ## 17. I want to delete my account and data
 
-In the app: **Account menu → Manage Subscription → Delete account** (at the bottom). You'll be asked to confirm.
+In the app: ask **Minica** (the support chat) to delete your account — it asks you to confirm with an explicit phrase, then deletes the account, license, devices, and conversation history immediately and permanently.
 
 Or by email: write to **privacy@minicaai.com** from your account email. We respond within 30 days, but typical turnaround is 1 business day.
 

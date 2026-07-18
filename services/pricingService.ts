@@ -67,6 +67,17 @@ const EXCHANGE_RATES: Record<string, { rate: number; symbol: string; code: strin
 // Eurozone countries
 const EUROZONE = ['AT', 'BE', 'CY', 'EE', 'FI', 'FR', 'DE', 'GR', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PT', 'SK', 'SI', 'ES'];
 
+// ── INR checkout kill-switch (2026-07-16) ──────────────────────────────
+// The Razorpay merchant account is PENDING approval, so the SERVER routes
+// every charge — India included — to Stripe in USD (payments.js
+// getPaymentProvider, RAZORPAY_ROUTING_ENABLED env). While that's the case,
+// the client must DISPLAY USD for India too: showing ₹2,499 and then
+// charging $30 on the Stripe page is exactly the price-mismatch class the
+// server-side validators exist to prevent. Flip this to true together with
+// RAZORPAY_ROUTING_ENABLED=true on the server when the Razorpay account
+// clears — the INR tables below are kept intact for that day.
+const INR_CHECKOUT_ENABLED = false;
+
 const BASE_FEATURES_FREE = [
   '10-minute free trial — all models except Claude',
   'Gemini · GPT-5.5 · Grok · Groq during your trial',
@@ -80,7 +91,7 @@ const BASE_FEATURES_FREE = [
 // Ultra is the monthly unlimited subscription.
 const BASE_FEATURES_BASIC = [
   'One 30-minute interview',
-  'Extend +30 min anytime',
+  'Extend anytime (+30 min / +1 h / +3 h packs)',
   'Four AI models (Gemini · GPT-5.5 · Grok · Groq)',
   'Pop-out stealth mode',
   'Auto-solve with screen analysis',
@@ -96,7 +107,7 @@ const BASE_FEATURES_BASIC = [
 // resolve the exact figure per-region via getRenewalPrice().
 const BASE_FEATURES_PRO = [
   'One 1-hour interview',
-  'Extend +1 hour anytime',
+  'Extend anytime (+30 min / +1 h / +3 h packs)',
   'All five AI models — incl. Claude Sonnet 5',
   'Pop-out stealth mode',
   'Auto-solve with screen analysis',
@@ -106,7 +117,7 @@ const BASE_FEATURES_PRO = [
 
 const BASE_FEATURES_MAX = [
   'Three 1-hour interviews',
-  'Extend +1 hour anytime',
+  'Extend anytime (+30 min / +1 h / +3 h packs)',
   'All five AI models — incl. Claude Sonnet 5',
   'Full reasoning-effort control',
   'Train Model — pre-research the role',
@@ -196,7 +207,8 @@ export interface ExtensionPackDisplay {
 }
 
 export function getExtensionPacks(countryCode: string): ExtensionPackDisplay[] {
-  const isIN = (countryCode || 'US').toUpperCase() === 'IN';
+  // INR display only when INR checkout is live — see INR_CHECKOUT_ENABLED.
+  const isIN = (countryCode || 'US').toUpperCase() === 'IN' && INR_CHECKOUT_ENABLED;
   return EXTENSION_PACKS.map(p => ({
     id:             p.id,
     label:          p.label,
@@ -213,8 +225,10 @@ class PricingService {
   getPricing(countryCode: string): RegionPricing {
     const cc = countryCode.toUpperCase();
 
-    // Special pricing: India (hand-tuned for market)
-    if (cc === 'IN') {
+    // Special pricing: India (hand-tuned for market). Gated on the INR
+    // kill-switch — while Razorpay is pending, India sees the USD table
+    // (the currency Stripe will actually charge).
+    if (cc === 'IN' && INR_CHECKOUT_ENABLED) {
       return {
         country_code: 'IN',
         country_name: 'India',
@@ -351,12 +365,12 @@ class PricingService {
   }
 
   // ── Plan-specific renewal price (2026-07) ──
-  // The extension/top-up price + granted time for the given tier, in the
-  // actual charge currency. Basic +30 min · $25/₹2099; Pro/Max +1 hour ·
-  // $45/₹3799. Unknown tiers (free/expired reactivating via a top-up)
-  // resolve to the Basic unit — mirrors the server's renewalConfigForTier
-  // and grantTimeExtension legacy behavior. Ultra never calls this (it is
-  // exempt from all top-up UI).
+  // The BASE extension unit for every metered tier is the same flat
+  // +30 min · $25/₹2099 (RENEWAL_BY_TIER above — larger +1h/+3h packs are
+  // the graduated EXTENSION_PACKS the user picks explicitly). Unknown
+  // tiers (free/expired reactivating via a top-up) resolve to the Basic
+  // unit — mirrors the server's grantTimeExtension legacy behavior. Ultra
+  // never calls this (it is exempt from all top-up UI).
   //
   // India goes through Razorpay in INR. Everywhere else the server
   // creates a Stripe charge with `currency:'usd'` at the tier's usd_cents
@@ -364,7 +378,9 @@ class PricingService {
   getRenewalPrice(countryCode: string, tier: string): RenewalPricing {
     const cfg = RENEWAL_BY_TIER[tier as 'basic' | 'pro' | 'max'] || RENEWAL_BY_TIER.basic;
     const cc = (countryCode || 'US').toUpperCase();
-    const base = cc === 'IN'
+    // INR only while INR checkout is live (see INR_CHECKOUT_ENABLED) —
+    // otherwise the top-up pill must show the USD amount Stripe charges.
+    const base = cc === 'IN' && INR_CHECKOUT_ENABLED
       ? { price: cfg.inr, currency: 'INR', currencySymbol: '₹' }
       : { price: cfg.usd, currency: 'USD', currencySymbol: '$' };
     return { ...base, seconds: cfg.seconds, minutes: Math.round(cfg.seconds / 60), label: cfg.label };

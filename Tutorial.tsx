@@ -21,14 +21,54 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
     X, Crown, Cpu, Mic, Camera, Keyboard, Monitor, FileText,
     EyeOff, Sparkles, ChevronLeft, ChevronRight, Check, ScreenShare, Download,
+    Command, Clock, MousePointerClick, ExternalLink,
 } from 'lucide-react';
 import { WizardHat } from './WizardHat';
 
-const TUTORIAL_VERSION = 'v1';
+// Bumped v1 → v2 (2026-07-16): the desktop walkthrough is now OS-aware and
+// spoon-feeds pop-out click-by-click + adds the "save your minutes" and
+// per-OS hide/restore precautions. Existing users see the refreshed tour once.
+const TUTORIAL_VERSION = 'v2';
 const WEB_ONBOARDING_VERSION = 'v1';
 
 const isElectronEnv = () =>
     typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
+
+// ── OS detection (desktop walkthrough) ──
+// The hide/restore shortcut and the tray wording differ per platform, and the
+// owner wants Mac / Windows / Linux users each told the RIGHT keys. Mirrors
+// licenseService.getPlatform() but kept local so Tutorial has no service dep.
+type DesktopOS = 'mac' | 'windows' | 'linux' | 'other';
+function detectOS(): DesktopOS {
+    if (typeof navigator === 'undefined') return 'other';
+    const ua = (navigator.userAgent || '').toLowerCase();
+    const plat = ((navigator as any).platform || '').toLowerCase();
+    if (/mac/.test(plat) || /mac os x/.test(ua)) return 'mac';
+    if (/win/.test(plat) || /windows/.test(ua)) return 'windows';
+    if (/linux/.test(plat) || /linux/.test(ua)) return 'linux';
+    return 'other';
+}
+
+/** The global hide/restore chord, per OS — matches electron/main.cjs TOGGLE_ACCELERATOR. */
+function toggleChord(os: DesktopOS): string {
+    return os === 'mac' ? 'Cmd + Alt + Space' : 'Ctrl + Alt + Space';
+}
+
+/** Where the app lives after you close its window, per OS. */
+function trayLocationLabel(os: DesktopOS): string {
+    if (os === 'mac') return 'menu bar (top-right of your screen, near the clock)';
+    if (os === 'linux') return 'system tray / top bar (varies by desktop environment)';
+    return 'system tray (bottom-right, near the clock)';
+}
+
+/** A small monospace keycap. */
+function Kbd({ children }: { children: React.ReactNode }) {
+    return (
+        <span className="font-mono text-[11px] font-semibold px-1.5 py-0.5 rounded bg-white/10 border border-white/15 text-white whitespace-nowrap">
+            {children}
+        </span>
+    );
+}
 
 export function tutorialKey(userId: string | null | undefined): string | null {
     if (!userId) return null;
@@ -110,16 +150,18 @@ interface TutorialStep {
     body: React.ReactNode;
 }
 
-const STEPS: TutorialStep[] = [
+function buildDesktopSteps(os: DesktopOS): TutorialStep[] {
+  const chord = toggleChord(os);
+  return [
     {
         icon: Sparkles,
         accent: 'from-blue-500 to-purple-500',
         title: 'Welcome to minicaai',
         body: (
             <>
-                Your real-time AI interview copilot. It listens to the interviewer through your mic,
-                suggests answers in your voice, and stays <span className="text-purple-300 font-semibold">invisible to screen-share</span> so
-                the interviewer never knows it's there.
+                Your real-time AI copilot for <span className="text-purple-300 font-semibold">interviews and meetings</span>. It listens
+                through your mic, suggests answers in your voice, and stays <span className="text-purple-300 font-semibold">invisible to screen-share</span> so
+                no one on the call knows it's there.
                 <div className="mt-3 text-xs text-gray-400">
                     Quick tour — about 2 minutes. You can replay this anytime from Settings → Help.
                 </div>
@@ -134,9 +176,8 @@ const STEPS: TutorialStep[] = [
             <>
                 Switch models from the dropdown in the top-right. Each model has different strengths:
                 <ul className="mt-2 text-sm space-y-1 list-disc list-inside text-gray-300">
-                    <li><span className="font-semibold text-white">Gemini</span> — fast, free for everyone</li>
-                    <li><span className="font-semibold text-white">GPT, Grok, Groq</span> — Pro tier (more depth)</li>
-                    <li><span className="font-semibold text-orange-400">Claude (Max only)</span> — smartest, web-search-aware, most human-sounding</li>
+                    <li><span className="font-semibold text-white">Gemini, GPT-5.5, Grok, Groq</span> — on every plan (your free trial includes all four)</li>
+                    <li><span className="font-semibold text-orange-400">Claude (Pro & up)</span> — smartest, web-search-aware, most human-sounding</li>
                 </ul>
             </>
         ),
@@ -144,7 +185,7 @@ const STEPS: TutorialStep[] = [
     {
         icon: WizardHat,
         accent: 'from-orange-400 to-amber-500',
-        title: 'Train Claude (Max only)',
+        title: 'Train Claude (Max & Ultra)',
         body: (
             <>
                 Open the <span className="font-semibold">Knowledge Base</span> (file icon in the toolbar), upload your
@@ -193,22 +234,38 @@ const STEPS: TutorialStep[] = [
                 A 3-second countdown starts — switch to your editor window, and the answer types itself in
                 naturally, character by character.
                 <div className="mt-2 text-xs text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded px-2 py-1">
-                    Max-tier feature. Click into your editor before the countdown ends.
+                    Ultra-exclusive feature. Click into your editor before the countdown ends.
                 </div>
             </>
         ),
     },
     {
-        icon: Monitor,
+        icon: ExternalLink,
         accent: 'from-cyan-500 to-blue-500',
-        title: 'Pop-out window — invisible to screen-share',
+        title: 'Pop-out — the floating answer window',
         body: (
             <>
-                Click the <span className="font-semibold">pop-out icon</span> in the toolbar to open a small floating window.
-                It stays on top of everything, can be resized (S/M/L), and is <span className="font-bold text-cyan-300">completely
-                invisible during screen-share</span> — meeting attendees don't see it.
-                <div className="mt-2 text-xs text-gray-400">
-                    The main window also stays invisible to screen-share. Both windows use Windows content protection.
+                The pop-out is the small floating panel you'll actually watch during a live call. Here's exactly how to use it:
+                <ol className="mt-3 space-y-2 text-sm text-gray-200">
+                    <li className="flex gap-2.5">
+                        <span className="flex-shrink-0 w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-300 text-[11px] font-bold flex items-center justify-center">1</span>
+                        <span>Click the <span className="inline-flex items-center gap-1 font-semibold text-[#d3ac63]"><ExternalLink size={13} /> pop-out icon</span> in the toolbar (the gold arrow-out-of-a-box — exactly this glyph). A small always-on-top window appears.</span>
+                    </li>
+                    <li className="flex gap-2.5">
+                        <span className="flex-shrink-0 w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-300 text-[11px] font-bold flex items-center justify-center">2</span>
+                        <span>Drag it by its <span className="font-semibold text-white">top bar</span> to a corner near your video window, so your eyes barely move.</span>
+                    </li>
+                    <li className="flex gap-2.5">
+                        <span className="flex-shrink-0 w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-300 text-[11px] font-bold flex items-center justify-center">3</span>
+                        <span>Resize with the <span className="font-semibold text-white">S / M / L</span> buttons in its header — S for a discreet glance, L to read long code.</span>
+                    </li>
+                    <li className="flex gap-2.5">
+                        <span className="flex-shrink-0 w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-300 text-[11px] font-bold flex items-center justify-center">4</span>
+                        <span>Answers stream in live — the <span className="text-[#d3ac63] font-semibold">gold bubble</span> is your suggested reply; just read it in your own words.</span>
+                    </li>
+                </ol>
+                <div className="mt-3 text-xs text-cyan-200/90 bg-cyan-500/10 border border-cyan-500/30 rounded-lg px-2.5 py-2">
+                    <span className="font-bold">Invisible on screen-share.</span> When you share your screen, the pop-out (and the main window) don't appear in the shared image — content-protection hides them from the capture.
                 </div>
             </>
         ),
@@ -226,23 +283,54 @@ const STEPS: TutorialStep[] = [
         ),
     },
     {
-        icon: EyeOff,
+        icon: os === 'mac' ? Command : EyeOff,
         accent: 'from-slate-500 to-gray-600',
-        title: 'Hiding the app from view',
+        title: 'Hide & bring it back instantly',
         body: (
             <>
-                When you close the main window, the app stays running in the <span className="font-semibold">system tray</span>
-                {' '}(bottom-right corner of your screen, near the clock). Right-click that area to bring it back or quit.
-                <div className="mt-3 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg text-sm">
-                    <div className="font-bold text-blue-300 mb-1">Pro tip — fully hide the icon:</div>
-                    <ol className="space-y-1 text-xs text-gray-300 list-decimal list-inside">
-                        <li>Click the up-arrow <span className="font-mono bg-gray-700 px-1 rounded">^</span> in your taskbar</li>
-                        <li>Drag the minicaai icon into the overflow popup (the small window that opens)</li>
-                        <li>The icon disappears from the always-visible tray strip — but right-click in the overflow still works</li>
-                    </ol>
-                    <div className="mt-2 text-[10px] text-gray-400">
-                        Keeps minicaai out of view during screen-share even when your taskbar is shared.
-                    </div>
+                If someone walks over or asks you to share your whole screen, hide the app in one keystroke:
+                <div className="mt-3 flex items-center justify-center gap-2 py-3 rounded-lg bg-white/[0.04] border border-white/10">
+                    <MousePointerClick size={15} className="text-slate-300" />
+                    <span className="text-sm text-gray-200">Press</span>
+                    <Kbd>{chord}</Kbd>
+                    <span className="text-sm text-gray-200">to hide — press it again to bring it back.</span>
+                </div>
+                <div className="mt-2 text-xs text-gray-400">
+                    Same chord on {os === 'mac' ? 'macOS' : os === 'linux' ? 'Linux' : 'Windows'}: {os === 'mac'
+                        ? <>hold <Kbd>Cmd</Kbd> <Kbd>Alt</Kbd> and tap <Kbd>Space</Kbd>.</>
+                        : <>hold <Kbd>Ctrl</Kbd> <Kbd>Alt</Kbd> and tap <Kbd>Space</Kbd>.</>}
+                </div>
+                <div className="mt-3 p-3 bg-slate-500/10 border border-slate-400/25 rounded-lg text-xs text-gray-300">
+                    Closing the window doesn't quit — the app keeps running in your <span className="font-semibold text-white">{trayLocationLabel(os)}</span>.
+                    {os === 'mac'
+                        ? ' Click the menu-bar icon to reopen it, or right-click it to quit.'
+                        : os === 'linux'
+                            ? ' Click the tray icon to reopen, or right-click to quit (if your desktop shows tray icons).'
+                            : ' Click the tray icon to reopen it, or right-click to quit. Tip: drag the icon into the ^ overflow to hide it from the always-visible strip.'}
+                </div>
+            </>
+        ),
+    },
+    {
+        icon: Clock,
+        accent: 'from-amber-500 to-yellow-500',
+        title: 'When the interview ends — save your minutes',
+        body: (
+            <>
+                Your interview time is metered <span className="font-semibold text-white">only while the mic is listening</span>. The moment
+                your call is over:
+                <ol className="mt-3 space-y-2 text-sm text-gray-200">
+                    <li className="flex gap-2.5">
+                        <span className="flex-shrink-0 w-5 h-5 rounded-full bg-amber-500/20 text-amber-300 text-[11px] font-bold flex items-center justify-center">1</span>
+                        <span>Click the <span className="inline-flex items-center gap-1 font-semibold text-white"><Mic size={13} /> mic icon</span> to <span className="font-semibold text-amber-300">stop listening</span>. The clock stops within a few seconds and your remaining minutes are kept.</span>
+                    </li>
+                    <li className="flex gap-2.5">
+                        <span className="flex-shrink-0 w-5 h-5 rounded-full bg-amber-500/20 text-amber-300 text-[11px] font-bold flex items-center justify-center">2</span>
+                        <span>Your balance lives on your account — it's the <span className="font-semibold text-white">same across every device</span> you sign in on, so it's safe if you close the app or switch machines.</span>
+                    </li>
+                </ol>
+                <div className="mt-3 text-xs text-amber-200/90 bg-amber-500/10 border border-amber-500/30 rounded-lg px-2.5 py-2">
+                    Leaving the mic on after the call keeps burning time. If you forget, we auto-settle a stalled session shortly after your last activity — but stopping the mic is the clean way to bank what's left. See your balance any time in <span className="font-semibold">Settings → Usage</span>.
                 </div>
             </>
         ),
@@ -256,16 +344,18 @@ const STEPS: TutorialStep[] = [
                 That's the tour. A few last things:
                 <ul className="mt-3 text-sm space-y-2 text-gray-300">
                     <li className="flex gap-2"><span className="text-emerald-400">→</span> <span><span className="font-semibold text-white">Replay this tutorial</span> any time from Settings → Help</span></li>
-                    <li className="flex gap-2"><span className="text-emerald-400">→</span> <span><span className="font-semibold text-white">Switch tiers</span> from the Upgrade button to unlock Claude + Auto-Type</span></li>
-                    <li className="flex gap-2"><span className="text-emerald-400">→</span> <span>Need help? Hit the <span className="font-semibold text-white">Help icon</span> for support</span></li>
+                    <li className="flex gap-2"><span className="text-emerald-400">→</span> <span>Hide/show instantly with <Kbd>{chord}</Kbd></span></li>
+                    <li className="flex gap-2"><span className="text-emerald-400">→</span> <span><span className="font-semibold text-white">Stop the mic</span> when you're done to save your minutes</span></li>
+                    <li className="flex gap-2"><span className="text-emerald-400">→</span> <span>Works for <span className="font-semibold text-white">interviews and meetings</span> alike</span></li>
                 </ul>
                 <div className="mt-4 text-xs text-gray-400 italic">
-                    Good luck — go nail your interview.
+                    Good luck — go nail it.
                 </div>
             </>
         ),
     },
-];
+  ];
+}
 
 /** Web-only walkthrough — tab audio, never microphone; ends with desktop upsell. */
 function buildWebSteps(onOpenDownload?: () => void): TutorialStep[] {
@@ -349,7 +439,10 @@ export function Tutorial({
     const [step, setStep] = useState(0);
     const dialogRef = useRef<HTMLDivElement | null>(null);
     const inElectron = isElectronEnv();
-    const steps = inElectron ? STEPS : buildWebSteps(onOpenDownload);
+    // Detect OS once per mount — the desktop walkthrough shows the right
+    // hide/restore chord + tray wording for Mac / Windows / Linux.
+    const osRef = useRef<DesktopOS>(detectOS());
+    const steps = inElectron ? buildDesktopSteps(osRef.current) : buildWebSteps(onOpenDownload);
 
     // Reset to step 0 every time the tutorial opens — so a re-launch from
     // Settings starts fresh, not at wherever the user left off.

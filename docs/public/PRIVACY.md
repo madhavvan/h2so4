@@ -50,7 +50,7 @@ We split data into two categories: what you give us directly, and what the app g
 | Subscription state | Your tier, billing cycle, region, sessions used. Stored on our server |
 | Device fingerprint | A hash of your screen resolution, timezone, browser user-agent, and a few other browser-reported values. Used to bind your license to one device |
 | Login logs | Each sign-in attempt: timestamp, IP address, country (derived from IP), success or failure reason. Used for fraud and account-security investigations |
-| Crash reports | If you opted in, a memory dump of the desktop app at the moment of a crash, plus the app version and OS. No chat content. |
+| Crash reports | Written locally on your machine only (a memory dump plus app version and OS — no chat content). Uploading crash reports to our server is currently disabled. |
 
 We do **not** collect: keystrokes outside the app, content from other windows, your contact list, your browser history, or anything else that isn't explicitly listed above.
 
@@ -60,7 +60,7 @@ We use the categories above to:
 
 - **Run the product**: send your prompts to the AI provider and return the response, transcribe your audio in real time, sync your conversation history across reinstalls
 - **Bill you**: process payments via Stripe or Razorpay, manage subscription renewals, issue refunds
-- **Enforce the terms**: device-bound licensing prevents one license from being used on multiple machines; region pricing prevents VPN-based price arbitrage
+- **Enforce the terms**: per-plan device allowances cap how many machines a license can be active on at once; region pricing prevents VPN-based price arbitrage
 - **Keep the product secure**: detect compromised accounts, investigate fraudulent payments, debug crashes
 - **Improve the product**: aggregate usage stats (e.g. "what % of users hit Auto-Solve") at a level that doesn't identify you personally. We do not train models on your data and do not sell your data
 
@@ -77,14 +77,14 @@ These are the only third parties that ever see any part of your data, and only t
 | **Brave Search** | Anonymized keyword queries derived from your interview transcript | Web search context for technical answers. The query carries no personal identifier |
 | **Stripe** (US, EU, ROW customers) | Your email, the subscription tier, the transaction amount, and your card details | Payment processing |
 | **Razorpay** (India customers) | Same as Stripe but for INR transactions | Payment processing |
-| **GitHub** | Crash reports if you opted in | Where we host the auto-update feed and read crash reports for debugging |
+| **GitHub** | Your IP address when the app checks for updates (standard web request metadata; nothing from your account) | GitHub Releases hosts the app's auto-update feed and installers |
 | **Resend** | Your email address only, transient | Sending password-reset and account emails |
 | **Railway** | Server hosting | The infrastructure our backend runs on |
 
 ## 5. Where your data is stored
 
 - **On your machine**: a local SQLite database in your user-data directory. Holds your conversation history, your résumé and job description, your custom instructions, and your settings.
-- **On our server (US-East)**: subscription state, conversation mirror, login logs, audit log, and crash reports if opted in. The database is hosted on Railway with daily backups.
+- **On our server (US-East)**: subscription state, conversation mirror, login logs, and the audit log. The database is hosted on Railway with daily backups.
 - **With third-party processors**: only the data listed in the table above, only for the duration each processor needs to do its job.
 
 We do not transfer data outside our US-East server other than to the named processors. Stripe and Razorpay may store payment information in their own jurisdictions per their respective policies.
@@ -95,8 +95,8 @@ We do not transfer data outside our US-East server other than to the named proce
 |---|---|
 | Conversation history (server mirror) | While your account is active. Deleted within 30 days of account deletion |
 | Login logs | 12 months |
-| Audit log (admin actions affecting your account) | 24 months |
-| Crash reports | 90 days |
+| Audit log (admin actions affecting your account) | 24 months; entries that document a payment, refund, or dispute are kept with the payment records below |
+| Crash reports | Stored locally on your machine only — server upload is currently disabled |
 | Payment records | 7 years (legally required for tax) |
 | Subscription state | While your account is active |
 
@@ -107,11 +107,11 @@ When you delete your account, the data above (except payment records, which we'r
 Depending on where you live, you have the following rights over your data:
 
 - **Right to access**: ask for a copy of everything we have about you. Email **privacy@minicaai.com**; we respond within 30 days.
-- **Right to rectification**: ask us to correct anything inaccurate. Most fields you can also edit yourself in the app's account settings.
-- **Right to erasure**: ask us to delete your account and the associated data. Email **privacy@minicaai.com** or click **Delete account** in the app's settings.
+- **Right to rectification**: ask us to correct anything inaccurate. Your display name is editable in the app (Manage subscription → Account); for email or region changes, write to us.
+- **Right to erasure**: ask us to delete your account and the associated data. Ask **Minica** (the in-app support chat) to delete your account — it confirms, then deletes immediately — or email **privacy@minicaai.com**.
 - **Right to restrict processing**: ask us to stop processing your data while we resolve a dispute.
 - **Right to portability**: ask for your conversation history in a portable JSON format.
-- **Right to object**: object to specific uses of your data (you can decline crash-report opt-in at install).
+- **Right to object**: object to specific uses of your data by writing to **privacy@minicaai.com**. (Crash reports never leave your machine today — server upload is disabled.)
 - **Right to withdraw consent**: withdraw any consent you've given us. The app and its data deletion routines respect this.
 
 We don't make automated decisions that produce legal effects against you.
