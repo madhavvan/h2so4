@@ -6332,6 +6332,39 @@ app.whenReady().then(() => {
     }
   }
 
+  // ── Downgrade self-heal high-water mark ──────────────────────────
+  // 2026-07-18 field forensics: a stale 3.4.9 installer (old download,
+  // double-clicked) executed on a user machine and silently downgraded a
+  // 4.0.13 install. Old installer artifacts predate the 4.0.12 downgrade
+  // guard and can never be retrofitted — the app itself is the only
+  // surviving layer. So: record the highest version this PROFILE has
+  // ever run in userData (installers never touch it); if we ever boot
+  // BELOW that mark, treat it as a resurrection — log loudly, hold the
+  // boot window, and force an immediate update-check + auto-install so
+  // the machine heals to latest in about a minute with zero user action.
+  // Fail-open at every step: any IO error just disables the heuristic.
+  let selfHealDowngrade = false;
+  try {
+    const fsHw = require('fs');
+    const hwPath = require('path').join(app.getPath('userData'), 'version-highwater.json');
+    const curVer = app.getVersion();
+    const cmpVer = (a, b) => {
+      const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
+      const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
+      for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0); }
+      return 0;
+    };
+    let highWater = null;
+    try { highWater = JSON.parse(fsHw.readFileSync(hwPath, 'utf8')).version || null; } catch { /* first run */ }
+    if (highWater && cmpVer(curVer, highWater) < 0) {
+      selfHealDowngrade = true;
+      electronLog.error(`[self-heal] running ${curVer} but this profile has run ${highWater} — a stale installer downgraded the app; forcing update to latest`);
+    }
+    if (!highWater || cmpVer(curVer, highWater) > 0) {
+      try { fsHw.writeFileSync(hwPath, JSON.stringify({ version: curVer, at: new Date().toISOString() })); } catch { /* non-fatal */ }
+    }
+  } catch (e) { /* fail-open */ }
+
   // ── Launch-blink gate (Windows) ──────────────────────────────────
   // If the previous session ended without installing a downloaded update
   // (crash / force-kill skipped the quit-time install), the old flow
@@ -6362,8 +6395,8 @@ app.whenReady().then(() => {
       holdForPendingUpdate = false;
     }
   }
-  if (holdForPendingUpdate) {
-    electronLog.info('[updater] pending update present at boot — holding window for the launch install');
+  if (holdForPendingUpdate || selfHealDowngrade) {
+    electronLog.info(`[updater] holding window at boot (pending=${holdForPendingUpdate} selfHeal=${selfHealDowngrade})`);
     setTimeout(showBootWindow, 6000);
   } else {
     showBootWindow();
@@ -6624,10 +6657,15 @@ app.whenReady().then(() => {
         installPendingUpdate = () => performInstall(false);
         sendUpdateStatus('ready', { version: incoming });
 
-        if (launchInstallActive) {
+        // Self-heal: when this boot was flagged as a downgrade
+        // resurrection, install the moment the download lands even if it
+        // took longer than the launch window (a full download does) —
+        // waiting for a user click would leave the resurrected old
+        // version in front of them.
+        if (launchInstallActive || selfHealDowngrade) {
           launchInstallActive = false;
           clearTimeout(launchInstallTimer);
-          electronLog.info(`[updater] cached update ${incoming} found at launch — installing (non-silent)`);
+          electronLog.info(`[updater] update ${incoming} ready at launch (selfHeal=${selfHealDowngrade}) — installing (non-silent)`);
           // Tiny defer so the renderer can flush the 'ready' status; not
           // strictly necessary but avoids a hard-cut transition for users
           // who happen to see the brief flash before relaunch.
