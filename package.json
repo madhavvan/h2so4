@@ -31,12 +31,20 @@
       "dist/**/*",
       "electron/**/*"
     ],
-    "publish": {
-      "provider": "github",
-      "owner": "madhavvan",
-      "repo": "h2so4",
-      "releaseType": "release"
-    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "madhavvan",
+        "repo": "interviewcopilot-releases",
+        "releaseType": "release"
+      },
+      {
+        "provider": "github",
+        "owner": "madhavvan",
+        "repo": "h2so4",
+        "releaseType": "release"
+      }
+    ],
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "build/icon.icns",
