@@ -60,6 +60,7 @@ build/*
 !build/icon.ico
 !build/icon.icns
 !build/icon.png
+!build/installer.nsh
 *.exe
 *.dmg
 *.AppImage
