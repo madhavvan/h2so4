@@ -444,14 +444,28 @@ function getDB() {
   // Defense-in-depth against the /verify-razorpay ↔ payment.captured race:
   // both paths grant the same payment if they both see "no row yet" between
   // their dedup check and their transaction. The in-transaction re-check
-  // (added below in payments.js + webhooks.js) closes the window functionally;
-  // this UNIQUE index ensures a stray double-INSERT also fails at the DB
-  // layer. Partial index on NOT NULL because legitimate cancel/subscription-
-  // delete events record null provider_payment_id and shouldn't collide.
+  // (in payments.js + webhooks.js) closes the window functionally; this
+  // UNIQUE index ensures a stray double-INSERT also fails at the DB layer.
+  //
+  // SCOPE: status='completed' ONLY. The first version covered every row
+  // with a provider_payment_id — but refunds, dispute rows, dunning
+  // failures, and a success-after-failure all legitimately reuse the
+  // ORIGINAL payment id. Under the broad index: charge.refunded threw and
+  // the refunded user's tier was never revoked; the admin refund endpoint
+  // 500'd AFTER the provider refund succeeded; the second dunning failure
+  // (Stripe reuses one PaymentIntent per invoice) put the webhook into a
+  // permanent 500-retry loop; and a returning customer whose card declined
+  // once inside Checkout then succeeded was CHARGED but never granted
+  // (payment_intent.payment_failed row blocked checkout.session.completed).
+  // Narrowing to completed keeps the one guarantee that matters — the same
+  // provider payment can never GRANT twice — while letting bookkeeping rows
+  // coexist. The old broad index is dropped in place; the narrowed one is
+  // strictly weaker, so existing data can never violate it.
+  db.exec('DROP INDEX IF EXISTS idx_payments_provider_id');
   db.exec(
-    'CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_provider_id ' +
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_provider_completed ' +
     'ON payments(provider, provider_payment_id) ' +
-    'WHERE provider_payment_id IS NOT NULL'
+    "WHERE provider_payment_id IS NOT NULL AND status = 'completed'"
   );
 
   // Same field on the per-attempt login_logs row so the admin can see
@@ -1425,6 +1439,40 @@ function isPaymentAlreadyRecorded(userId, providerPaymentId) {
       AND status = 'completed'
     LIMIT 1
   `).get(userId, providerPaymentId);
+  return !!row;
+}
+
+// Have we already recorded a refund row carrying this exact provider REFUND
+// id? The correct dedup key for refunds is the refund id (Stripe re_… /
+// Razorpay rfnd_…), NOT the payment id — one payment can have several
+// distinct partial refunds, each a legitimate separate row. Two writes
+// race for the SAME refund id, though:
+//   • admin console refund → recordAdminRefund writes a compensating row,
+//     THEN Stripe/Razorpay fire charge.refunded / refund.processed and the
+//     webhook would write a second row for the same refund;
+//   • Razorpay fires BOTH refund.created and refund.processed for one refund
+//     — distinct synthetic event ids, so the webhook-event dedup lets both
+//     through.
+// Without this guard those become duplicate refunded rows: double-counted
+// refund totals in the admin books and a duplicate line in the customer's
+// receipts. Both the admin path (metadata.refund_id) and the webhooks
+// (now) stamp refund_id, so this LIKE finds either writer's row.
+function hasRefundBeenRecorded(provider, providerRefundId) {
+  if (!provider || !providerRefundId) return false;
+  // Escape LIKE wildcards — provider refund ids ALWAYS contain '_' (re_…,
+  // rfnd_…), which LIKE treats as a single-char wildcard. Unescaped, one
+  // refund id could match a different one and we'd wrongly skip recording a
+  // legitimate distinct refund. Strip quotes first so the id can't break out
+  // of the JSON-fragment match. Bound as a parameter (no SQL injection).
+  const safeId = String(providerRefundId).replace(/"/g, '').replace(/[\\%_]/g, '\\$&');
+  const needle = `%"refund_id":"${safeId}"%`;
+  const row = getDB().prepare(`
+    SELECT id FROM payments
+    WHERE provider = ?
+      AND status IN ('refunded', 'partially_refunded')
+      AND metadata LIKE ? ESCAPE '\\'
+    LIMIT 1
+  `).get(provider, needle);
   return !!row;
 }
 
@@ -2970,7 +3018,7 @@ module.exports = {
   getPaymentById, hasPaymentBeenRefunded, recordAdminRefund, recordCompPayment, queryPayments,
   // Webhook idempotency
   recordWebhookEventOnce, clearWebhookEvent, isRenewalPaymentProcessed,
-  isPaymentAlreadyRecorded, gateAndRecordEventForUser,
+  isPaymentAlreadyRecorded, hasRefundBeenRecorded, gateAndRecordEventForUser,
   // AI quotas
   incrementAndCheckGeminiQuota,
   // Login logs

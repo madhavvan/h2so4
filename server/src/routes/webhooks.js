@@ -98,10 +98,30 @@ function grantConfigForTier(tier) {
 // Built lazily so missing env vars at import time don't crash the module.
 function tierForRazorpayPlan(planId) {
   if (!planId) return null;
+  // Ultra FIRST — it was missing entirely, so after an /upgrade-tier plan
+  // swap to Ultra every subsequent subscription.charged fell back to the
+  // stale creation-time notes.tier and re-granted the OLD tier while
+  // billing the Ultra price.
+  if (planId === process.env.RAZORPAY_PLAN_ID_ULTRA) return 'ultra';
   if (planId === process.env.RAZORPAY_PLAN_ID_MAX) return 'max';
   if (planId === process.env.RAZORPAY_PLAN_ID_PRO) return 'pro';
   if (planId === process.env.RAZORPAY_PLAN_ID) return 'pro'; // legacy alias
   return null;
+}
+
+// ── Credits policy for grant writes (2026-07) ───────────────────────────
+// One-time PURCHASES (checkout.session.completed non-renewal, Razorpay
+// payment.captured non-renewal, /verify-razorpay tier grants) seed the full
+// per-tier interview clock — a purchase starts a fresh plan window.
+// SUBSCRIPTION-LIFECYCLE events (charged/updated/resumed/reactivate) pass
+// credits ONLY for Ultra (the -1 unlimited sentinel): legacy Pro/Max
+// SUBSCRIBERS carry a migration-era -1 unlimited balance, and re-seeding
+// them from the 2026-07 one-time config would shrink an unlimited legacy
+// sub to a 1-hour clock on its next billing tick.
+function creditsForLifecycleGrant(grant) {
+  return grant.tier === 'ultra'
+    ? { credits_remaining_seconds: grant.credits_remaining_seconds, credits_expire_at: grant.credits_expire_at }
+    : {};
 }
 
 // ─── Out-of-order delivery gate helper ───────────────────────────────
@@ -370,6 +390,7 @@ async function handleStripeEvent(event) {
             status: 'canceling',
             expires_at: periodEndMs > 0 ? periodEndMs : grant.expires_at,
             sessions_limit: grant.sessions_limit,
+            ...creditsForLifecycleGrant(grant),
           });
         })();
       } else if (isActiveOrTrialing) {
@@ -384,6 +405,9 @@ async function handleStripeEvent(event) {
             status: 'active',
             expires_at: grant.expires_at,
             sessions_limit: grant.sessions_limit,
+            // Ultra-only (-1 sentinel); legacy Pro/Max subs keep their
+            // migration-era unlimited balance untouched on renewal ticks.
+            ...creditsForLifecycleGrant(grant),
           });
         })();
       } else if (subscription.status === 'past_due') {
@@ -487,6 +511,7 @@ async function handleStripeEvent(event) {
           status: 'active',
           expires_at: grant.expires_at,
           sessions_limit: grant.sessions_limit,
+          ...creditsForLifecycleGrant(grant),
         });
       })();
       console.log('[WEBHOOK] customer.subscription.resumed for:', user.email, 'restored tier:', grant.tier);
@@ -599,8 +624,18 @@ async function handleStripeEvent(event) {
       // A refund was issued. Full refund = revoke the paid tier and free
       // them. Partial refund = keep tier, record for bookkeeping.
       const charge = event.data.object;
+      // amount_refunded is CUMULATIVE across every refund on the charge —
+      // right for the full-refund decision, wrong for the row amount: on a
+      // second partial refund it would re-book the first refund's money too.
+      // charge.refunds.data is most-recent-first, so [0] is THIS refund.
       const refundAmount = charge.amount_refunded || 0;
       const fullRefund = charge.refunded === true && refundAmount >= charge.amount;
+      // The provider refund id is the dedup key (see hasRefundBeenRecorded).
+      // An admin-initiated refund already wrote a compensating row before
+      // Stripe fired this event; without the guard we'd double-record.
+      const latestRefund = charge.refunds?.data?.[0] || null;
+      const refundId = latestRefund?.id || null;
+      const rowAmount = (typeof latestRefund?.amount === 'number') ? latestRefund.amount : refundAmount;
 
       const d = db.getDB();
       const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(charge.customer);
@@ -609,23 +644,33 @@ async function handleStripeEvent(event) {
         return;
       }
 
-      db.recordPayment({
-        user_id: user.id,
-        email: user.email,
-        provider: 'stripe',
-        provider_payment_id: charge.payment_intent || charge.id,
-        provider_subscription_id: null,
-        amount: -refundAmount, // negative so revenue sums stay correct
-        currency: (charge.currency || 'usd').toUpperCase(),
-        status: 'refunded',
-        tier_granted: null,
-        metadata: {
-          charge_id: charge.id,
-          original_amount: charge.amount,
-          full_refund: fullRefund,
-          reason: charge.refunds?.data?.[0]?.reason || null,
-        },
-      });
+      // Record the refund row only if no writer (admin console or a prior
+      // delivery) already logged this refund id. The tier downgrade below
+      // still runs either way — it's idempotent, and the admin path
+      // deliberately does NOT downgrade, leaving that to this handler.
+      if (!refundId || !db.hasRefundBeenRecorded('stripe', refundId)) {
+        db.recordPayment({
+          user_id: user.id,
+          email: user.email,
+          provider: 'stripe',
+          provider_payment_id: charge.payment_intent || charge.id,
+          provider_subscription_id: null,
+          amount: -rowAmount, // THIS refund only, negative so revenue sums stay correct
+          currency: (charge.currency || 'usd').toUpperCase(),
+          status: 'refunded',
+          tier_granted: null,
+          metadata: {
+            charge_id: charge.id,
+            refund_id: refundId,       // dedup key — also stamped by recordAdminRefund
+            original_amount: charge.amount,
+            total_refunded: refundAmount, // cumulative, for support triage
+            full_refund: fullRefund,
+            reason: latestRefund?.reason || null,
+          },
+        });
+      } else {
+        console.log('[WEBHOOK] charge.refunded already recorded (admin/prior) — skipping duplicate row:', refundId);
+      }
 
       if (fullRefund) {
         if (!gateOutOfOrder(user.id, event.created, 'charge.refunded.full')) return;
@@ -771,6 +816,11 @@ async function handleStripeEvent(event) {
           status: 'active',
           expires_at: grant.expires_at,
           sessions_limit: grant.sessions_limit,
+          // Full re-seed: the dispute revocation zeroed the license, so the
+          // restore must bring the interview clock back too (one-time tiers
+          // get a fresh window; Ultra gets its -1 sentinel).
+          credits_remaining_seconds: grant.credits_remaining_seconds,
+          credits_expire_at: grant.credits_expire_at,
         });
       })();
       console.log('[WEBHOOK] Dispute won — restored tier for:', user.email, 'tier:', restoredTier);
@@ -970,6 +1020,10 @@ async function handleRazorpayEvent(body) {
           status: 'active',
           expires_at: grant.expires_at,
           sessions_limit: grant.sessions_limit,
+          // Ultra-only credits (see creditsForLifecycleGrant): first charge
+          // of an Ultra sub must land the -1 unlimited sentinel or the
+          // subscriber has a tier and 0 seconds.
+          ...creditsForLifecycleGrant(grant),
         });
         // Legacy: prefix-marker in stripe_customer_id for provider detection
         // (still used by reads that haven't migrated to razorpay_subscription_id).
@@ -1122,6 +1176,11 @@ async function handleRazorpayEvent(body) {
             status: 'active',
             expires_at: grant.expires_at,
             sessions_limit: grant.sessions_limit,
+            // One-time purchase → seed the full interview clock. Omitting
+            // these left every Razorpay buyer with a tier but 0 seconds:
+            // paid, yet every usage/model gate said "time used up".
+            credits_remaining_seconds: grant.credits_remaining_seconds,
+            credits_expire_at: grant.credits_expire_at,
           });
         }
         sqlite.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
@@ -1206,8 +1265,12 @@ async function handleRazorpayEvent(body) {
     case 'refund.created':
     case 'refund.processed': {
       // Razorpay fires refund.created when initiated and refund.processed
-      // when funds move. Treat both the same — the webhook_events dedup
-      // lets a later event replay safely on the same refund id.
+      // when funds move — TWO events for one refund, and (on older accounts)
+      // with distinct synthetic event ids, so the webhook-event dedup lets
+      // both through. Plus an admin-console refund already wrote a
+      // compensating row. Dedup on the refund id (hasRefundBeenRecorded)
+      // so exactly one refunded row exists per refund; the downgrade stays
+      // idempotent and runs regardless.
       const refund = payload.refund?.entity;
       const paymentEntity = payload.payment?.entity;
       const paymentId = refund?.payment_id || paymentEntity?.id;
@@ -1229,25 +1292,42 @@ async function handleRazorpayEvent(body) {
       if (!user) return;
       if (!gateOutOfOrder(user.id, body.created_at, `rzp.${event}`)) return;
       const refundAmount = refund?.amount || 0;
-      const fullRefund = refundAmount >= priorPayment.amount;
+      const alreadyRecorded = refund?.id && db.hasRefundBeenRecorded('razorpay', refund.id);
+      // Full-refund detection must be CUMULATIVE across partial refunds —
+      // Razorpay events carry only this refund's amount (unlike Stripe's
+      // charge.amount_refunded), so two 50% partials would each read
+      // "partial" and the fully-refunded user would keep their paid tier
+      // forever. Sum the refund rows already booked for this payment and
+      // add the current one (unless it's the same refund id we already
+      // recorded, in which case it's inside the sum).
+      const priorRefundedPaise = d.prepare(`
+        SELECT COALESCE(SUM(-amount), 0) AS s FROM payments
+        WHERE provider = 'razorpay' AND provider_payment_id = ?
+          AND status IN ('refunded', 'partially_refunded') AND amount < 0
+      `).get(paymentId).s;
+      const cumulativeRefunded = priorRefundedPaise + (alreadyRecorded ? 0 : refundAmount);
+      const fullRefund = cumulativeRefunded >= priorPayment.amount;
       d.transaction(() => {
-        db.recordPayment({
-          user_id: user.id,
-          email: user.email,
-          provider: 'razorpay',
-          provider_payment_id: paymentId,
-          provider_subscription_id: priorPayment.provider_subscription_id,
-          amount: -refundAmount,
-          currency: (refund?.currency || priorPayment.currency || 'INR').toUpperCase(),
-          status: 'refunded',
-          tier_granted: null,
-          metadata: {
-            refund_id: refund?.id,
-            event,
-            full_refund: fullRefund,
-            original_payment_id: paymentId,
-          },
-        });
+        if (!alreadyRecorded) {
+          db.recordPayment({
+            user_id: user.id,
+            email: user.email,
+            provider: 'razorpay',
+            provider_payment_id: paymentId,
+            provider_subscription_id: priorPayment.provider_subscription_id,
+            amount: -refundAmount,
+            currency: (refund?.currency || priorPayment.currency || 'INR').toUpperCase(),
+            status: 'refunded',
+            tier_granted: null,
+            metadata: {
+              refund_id: refund?.id,
+              event,
+              full_refund: fullRefund,
+              cumulative_refunded: cumulativeRefunded, // paise, across all partials
+              original_payment_id: paymentId,
+            },
+          });
+        }
         if (fullRefund) {
           db.updateUserTier(user.id, 'free');
           db.updateLicenseOnPayment(user.id, {
@@ -1268,9 +1348,9 @@ async function handleRazorpayEvent(body) {
 
     case 'subscription.completed': {
       // Razorpay fires this when a subscription naturally completes its
-      // total_count of cycles (we set total_count: 12 at creation, so this
-      // fires after 12 successful charges — i.e. after a full year on
-      // monthly billing). The subscription enters status='completed' on
+      // total_count of cycles (creation now uses total_count: 120 ≈ 10
+      // years; legacy subs created with 12 complete after a year). The
+      // subscription enters status='completed' on
       // Razorpay's side; our license must mirror that or the user keeps
       // Pro/Max for free indefinitely. (P1-B from the audit.)
       const subscription = payload.subscription?.entity;
@@ -1342,6 +1422,10 @@ async function handleRazorpayEvent(body) {
         status: license.status === 'past_due' ? 'past_due' : 'active',
         expires_at: license.expires_at,
         sessions_limit: grant.sessions_limit,
+        // A swap TO Ultra must land the -1 unlimited sentinel immediately —
+        // the user is billed Ultra from this cycle. Pro/Max swaps leave the
+        // balance alone (legacy subs carry migration-era -1).
+        ...creditsForLifecycleGrant(grant),
       });
       console.log('[RZP WEBHOOK] Subscription plan swap applied:', email, license.tier, '→', grant.tier);
       return;
@@ -1387,6 +1471,7 @@ async function handleRazorpayEvent(body) {
         status: 'active',
         expires_at: grant.expires_at,
         sessions_limit: grant.sessions_limit,
+        ...creditsForLifecycleGrant(grant),
       });
       return;
     }
@@ -1419,5 +1504,6 @@ module.exports._test = {
   tierForRazorpayPlan,
   resolveTier,
   grantConfigForTier,
+  creditsForLifecycleGrant,
   VALID_TIERS,
 };

@@ -39,8 +39,20 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
 }
 
 // ── Route: which provider for which country ──
+// 2026-07-16: the Razorpay merchant account is PENDING approval, so ALL new
+// charges — India included — route to Stripe. Razorpay code (verify, webhooks,
+// cancel, legacy subscriptions) stays intact so in-flight/legacy Razorpay
+// state keeps reconciling. When the account clears, set
+// RAZORPAY_ROUTING_ENABLED=true on the server and India routes back to
+// Razorpay INR with no code change. Read at CALL time (not module load) so
+// ops can flip the flag with a restart and tests can toggle it.
+//
+// NOTE for re-enable: the client currently DISPLAYS USD for every region
+// (services/pricingService.ts INR_CHECKOUT_ENABLED=false) so the pill always
+// matches the Stripe charge. Flip that flag together with this one.
 function getPaymentProvider(countryCode) {
-  if (countryCode === 'IN') return 'razorpay';
+  const razorpayRoutingEnabled = process.env.RAZORPAY_ROUTING_ENABLED === 'true';
+  if (razorpayRoutingEnabled && razorpay && countryCode === 'IN') return 'razorpay';
   return 'stripe';
 }
 
@@ -50,8 +62,11 @@ function getPaymentProvider(countryCode) {
 // interview clock (credits_remaining_seconds) with a 30-day window to use it:
 //   Basic  = one 30-minute interview      (1 session, 1800s)
 //   Pro    = one 1-hour interview          (1 session, 3600s)
-//   Max    = three 1-hour interviews       (3 sessions, 10800s; per-session
-//            60-min cap enforced by the client/server timer)
+//   Max    = three 1-hour interviews       (marketed as 3×1h; enforced as a
+//            single 10,800s pool — NOTHING implements a per-session 60-min
+//            cutoff, and sessions_limit=3 is bookkeeping no gate reads. A
+//            Max buyer can run one 3-hour interview; deliberately more
+//            generous than the copy, never less.)
 //   Ultra  = unlimited                     (-1 sentinels; subscription)
 // NOTE: this is the CUSTOMER config. Admin grants are unlimited-until-revoked
 // and use grantAdminTier() / recordCompPayment() instead (never this).
@@ -87,6 +102,13 @@ function grantConfigForTier(tier) {
 const VALID_TIERS = ['free', 'basic', 'pro', 'max', 'ultra'];
 function normalizeTier(t) {
   return VALID_TIERS.includes(t) ? t : 'pro';
+}
+
+// Ladder order for upgrade/downgrade direction decisions (in-place plan
+// swaps). Higher rank = more expensive/more access.
+const TIER_RANK = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4 };
+function isTierUpgrade(fromTier, toTier) {
+  return (TIER_RANK[toTier] ?? -1) > (TIER_RANK[fromTier] ?? -1);
 }
 
 // ── GRADUATED TOP-UP PACKS — SINGLE SOURCE OF TRUTH (2026-07) ──────────
@@ -250,6 +272,57 @@ async function assertRazorpayPlanMatches(razorpayClient, planId, tier) {
 // ~$30 USD) — direct revenue arbitrage. Now we use ONLY the server-
 // stored country_code from the JWT (set at signup, updatable via
 // /profile with proper validation). Body field is ignored.
+// ── Live-subscription checkout conflict (2026-07-16) ──────────────────
+// A FRESH checkout while a recurring plan is live is never what the user
+// wants, and Stripe will happily oblige into real money harm:
+//   · active Ultra buying Ultra again → a SECOND $159/mo subscription
+//     billing in parallel (Stripe allows N subs per customer);
+//   · active Ultra buying a one-time pass → pays for the pass AND the
+//     grant webhook overwrites tier ultra→basic/pro/max while the $159
+//     subscription keeps billing — paying twice, downgraded;
+//   · CANCELING Ultra re-buying before cycle end → a duplicate sub when a
+//     free reactivation was the right move;
+//   · legacy Pro/Max SUBSCRIBER buying Ultra → second sub instead of the
+//     in-place proration upgrade (/upgrade-tier).
+// Every one of these is reachable from the signed-in web landing, whose
+// tier cards call /create-checkout directly. Pure decision function so
+// the matrix is unit-testable; the route wires the verdicts.
+//
+// `hasRecurringPlan` = isSubscriptionBackedTier(...) — Ultra always, legacy
+// Pro/Max subs by payment history. Pass holders and free users return null
+// here and check out normally. Comp'd Ultra (admin gift) also lands in
+// 'already_subscribed' — correct: there is genuinely nothing to buy.
+function checkoutConflictFor(license, hasRecurringPlan, targetTier) {
+  if (!license || !hasRecurringPlan) return null;
+  if (!['active', 'canceling', 'past_due'].includes(license.status)) return null;
+  if (targetTier === 'ultra') {
+    if (license.tier === 'ultra') {
+      return license.status === 'canceling'
+        ? {
+            code: 'already_subscribed',
+            httpStatus: 409,
+            suggested_action: 'reactivate-subscription',
+            message: 'You\'re still on Ultra — your cancellation only takes effect at the end of the billing cycle. Reactivate it from Manage subscription (no new charge today) instead of starting a second subscription.',
+          }
+        : {
+            code: 'already_subscribed',
+            httpStatus: 409,
+            suggested_action: null,
+            message: 'You\'re already on the Ultra subscription — it includes everything, so there\'s nothing more to buy.',
+          };
+    }
+    // Legacy Pro/Max subscriber going Ultra: the right move is the
+    // in-place plan swap (prorated), never a parallel subscription.
+    return { code: 'upgrade_in_place' };
+  }
+  return {
+    code: 'subscription_active',
+    httpStatus: 400,
+    suggested_action: 'cancel-subscription',
+    message: `You're on the ${String(license.tier).toUpperCase()} subscription — buying a one-time pass now would leave you paying for both at once. Cancel the subscription first (you keep full access until the end of the billing cycle), then buy passes whenever an interview comes up.`,
+  };
+}
+
 router.post('/create-checkout', authMiddleware, async (req, res) => {
   try {
     const tier = normalizeTier(req.body.tier);
@@ -262,6 +335,37 @@ router.post('/create-checkout', authMiddleware, async (req, res) => {
     // card would land on a real Stripe page and have to abort.
     if (isAdminEmail(req.user.email)) {
       return await grantAdminTier(req, res, tier);
+    }
+
+    // ── Live-subscription conflict guard — see checkoutConflictFor ──
+    const currentLicense = db.getLicenseByUserId(req.user.id);
+    const conflict = checkoutConflictFor(
+      currentLicense,
+      currentLicense ? isSubscriptionBackedTier(req.user.id, currentLicense.tier) : false,
+      tier,
+    );
+    if (conflict) {
+      if (conflict.code === 'upgrade_in_place') {
+        // Delegate a legacy subscriber's Ultra purchase to the in-place
+        // swap so the landing's "Go Ultra" click Just Works as a prorated
+        // upgrade. Provider from the customer-id prefix, same convention
+        // as /upgrade-tier; no provider on file → fall through to a fresh
+        // checkout (nothing live to double-bill).
+        const user = db.getUserById(req.user.id);
+        const customerId = user?.stripe_customer_id || '';
+        if (customerId.startsWith('rzp_')) {
+          return await upgradeRazorpaySubscription(req, res, { user, currentTier: currentLicense.tier, targetTier: tier });
+        }
+        if (customerId.startsWith('cus_')) {
+          return await upgradeStripeSubscription(req, res, { user, currentTier: currentLicense.tier, targetTier: tier });
+        }
+      } else {
+        return res.status(conflict.httpStatus).json({
+          error: conflict.message,
+          code: conflict.code,
+          suggested_action: conflict.suggested_action,
+        });
+      }
     }
 
     // SECURITY: country_code is server-controlled — read from the user's
@@ -300,6 +404,12 @@ async function grantAdminTier(req, res, tier) {
     status: 'active',
     expires_at: cfg.expires_at,
     sessions_limit: cfg.sessions_limit,
+    // Seed the interview clock like a real purchase would (Basic 30 min /
+    // Pro 1 h / Max 3 h / Ultra -1). Admins bypass the time gate by email
+    // anyway, but the self-grant exists to TEST the customer experience —
+    // without the seed the granted tier shows 0 seconds remaining.
+    credits_remaining_seconds: cfg.credits_remaining_seconds,
+    credits_expire_at: cfg.credits_expire_at,
   });
   try {
     db.logAdminAction(
@@ -350,7 +460,7 @@ router.post('/upgrade-tier', authMiddleware, async (req, res) => {
 
     if (targetTier === 'basic') {
       return res.status(400).json({
-        error: 'Switching to Basic from a paid subscription is not supported. Cancel your current subscription first — at cycle end you\'ll be on Free, and you can then purchase Basic ($25 one-time) from the Manage Subscription screen.',
+        error: 'Switching to Basic from a paid subscription is not supported. Cancel your current subscription first — at cycle end you\'ll be on Free, and you can then purchase Basic ($30 one-time) from the Manage Subscription screen.',
         suggested_action: 'cancel-subscription',
       });
     }
@@ -390,6 +500,23 @@ router.post('/upgrade-tier', authMiddleware, async (req, res) => {
     const customerId = user.stripe_customer_id || '';
     const isRazorpay = customerId.startsWith('rzp_');
     const isStripe = customerId.startsWith('cus_');
+
+    // ── 2026-07 model: ULTRA is the only subscription plan ──
+    // An in-place swap rewires an EXISTING subscription, so the target must
+    // itself be a recurring plan. Pro/Max are one-time passes now: putting a
+    // one-time Price on a Stripe subscription item is rejected by Stripe's
+    // API (the old code 500'd mid-flow), and "swapping" a sub to a pass is
+    // the wrong billing shape anyway. Legacy Pro/Max SUBSCRIBERS who want a
+    // pass instead: cancel (access continues to cycle end), then buy the
+    // pass from the plans screen. Checked only when a provider is on file —
+    // the no-provider fall-through below still routes pro/max targets to a
+    // fresh checkout, and admins were already granted above.
+    if ((isRazorpay || isStripe) && targetTier !== 'ultra') {
+      return res.status(400).json({
+        error: `${targetTier.toUpperCase()} is a one-time interview pass now, not a subscription plan — so there's nothing to swap in place. Cancel your current subscription first (you keep access until the end of the billing cycle), then buy the ${targetTier.toUpperCase()} pass from the plans screen.`,
+        suggested_action: 'cancel-subscription',
+      });
+    }
 
     if (isRazorpay) {
       return await upgradeRazorpaySubscription(req, res, { user, currentTier, targetTier });
@@ -494,6 +621,10 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
   // Optimistic local update so the UI flips immediately. The webhook will
   // confirm seconds later; if anything goes wrong server-side, the next
   // /subscription poll will re-sync from Stripe via the webhook history.
+  // Credits: pass the sentinel ONLY for Ultra (-1 unlimited). Legacy Pro/Max
+  // SUBSCRIBERS keep their migration-era -1 balance — re-seeding them with
+  // the 2026-07 one-time config (3600s) would shrink an unlimited legacy
+  // sub to a 1-hour clock mid-cycle.
   const grant = grantConfigForTier(targetTier);
   db.updateUserTier(user.id, grant.tier);
   db.updateLicenseOnPayment(user.id, {
@@ -501,6 +632,10 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
     status: 'active',
     expires_at: grant.expires_at,
     sessions_limit: grant.sessions_limit,
+    ...(grant.tier === 'ultra' ? {
+      credits_remaining_seconds: grant.credits_remaining_seconds,
+      credits_expire_at: grant.credits_expire_at,
+    } : {}),
   });
   const license = db.getLicenseByUserId(user.id);
 
@@ -587,10 +722,13 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
     });
   }
 
-  // Upgrade now (charge the diff today, give Max access immediately).
+  // Upgrade now (charge the diff today, give the higher tier immediately).
   // Downgrade waits for cycle_end so the user keeps the tier they paid
-  // for through the rest of the billing cycle.
-  const isUpgrade = (currentTier === 'pro' && targetTier === 'max');
+  // for through the rest of the billing cycle. Rank-based so EVERY
+  // higher-tier move counts as an upgrade — the old `pro→max` equality
+  // check silently treated pro→ultra / max→ultra as cycle-end downgrades,
+  // deferring the user's paid Ultra access by up to a month.
+  const isUpgrade = isTierUpgrade(currentTier, targetTier);
   await razorpay.subscriptions.update(subId, {
     plan_id: newPlanId,
     schedule_change_at: isUpgrade ? 'now' : 'cycle_end',
@@ -601,6 +739,9 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
   // will reconcile the next billing cycle. For downgrades we keep the
   // current tier in DB — webhook will downgrade when the new cycle starts.
   if (isUpgrade) {
+    // Same ultra-only credits rule as the Stripe upgrade path: seed the -1
+    // unlimited sentinel for Ultra; never clobber a legacy Pro/Max sub's
+    // migration-era unlimited balance with the one-time-tier config.
     const grant = grantConfigForTier(targetTier);
     db.updateUserTier(user.id, grant.tier);
     db.updateLicenseOnPayment(user.id, {
@@ -608,6 +749,10 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
       status: 'active',
       expires_at: grant.expires_at,
       sessions_limit: grant.sessions_limit,
+      ...(grant.tier === 'ultra' ? {
+        credits_remaining_seconds: grant.credits_remaining_seconds,
+        credits_expire_at: grant.credits_expire_at,
+      } : {}),
     });
   }
   const license = db.getLicenseByUserId(user.id);
@@ -1512,6 +1657,12 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
     let grantedAmount = null;
     let isRenewal = false;
     let lookupFailed = false;
+    // Hoisted so the grant transaction below can read the top-up pack /
+    // amount off the fetched order. This was previously an UNDECLARED
+    // identifier at the two read sites — every verified top-up threw
+    // ReferenceError inside the transaction and the route 500'd AFTER the
+    // user had already paid in the Razorpay sheet.
+    let fetchedOrder = null;
     try {
       if (razorpay_subscription_id) {
         const sub = await razorpay.subscriptions.fetch(razorpay_subscription_id);
@@ -1520,6 +1671,7 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
         // Subscriptions are never renewals — skip the notes.mode check.
       } else if (razorpay_order_id) {
         const order = await razorpay.orders.fetch(razorpay_order_id);
+        fetchedOrder = order;
         const t = order && order.notes && order.notes.tier;
         if (VALID_TIERS.includes(t)) grantedTier = t;
         if (typeof order?.amount === 'number') grantedAmount = order.amount;
@@ -1626,6 +1778,13 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
             status: 'active',
             expires_at: grant.expires_at,
             sessions_limit: grant.sessions_limit,
+            // Seed the interview clock (Basic 30 min / Pro 1 h / Max 3 h /
+            // Ultra -1). Omitting these left every Razorpay-verified buyer
+            // with tier=X and credits_remaining_seconds=0 — paid, but every
+            // usage/model gate said "time used up" and they could never
+            // start an interview.
+            credits_remaining_seconds: grant.credits_remaining_seconds,
+            credits_expire_at: grant.credits_expire_at,
           });
         }
 
@@ -1696,6 +1855,31 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  GET SUBSCRIPTION STATUS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Is the user's CURRENT paid tier subscription-backed (recurring), as
+// opposed to a one-time interview pass? Drives which billing actions the
+// client renders: cancel/reactivate only make sense against a subscription
+// (/cancel-subscription 404s for a pass holder — there is no sub to cancel);
+// a pass instead shows "expires on <date>, no cancellation needed".
+//   · Ultra is ALWAYS a subscription (2026-07 model; the Razorpay checkout
+//     refuses to sell Ultra as a one-time order for exactly this reason).
+//   · Pro/Max are one-time passes UNLESS the user is a legacy subscriber.
+//     Detectable from the payments ledger: subscription-cycle rows
+//     (checkout subscription mode, invoice.payment_succeeded,
+//     subscription.charged) always carry provider_subscription_id; one-time
+//     orders never do. We look at the LATEST tier-granting row so a legacy
+//     subscriber who lapsed and later bought a pass reads as one-time.
+function isSubscriptionBackedTier(userId, tier) {
+  if (tier === 'ultra') return true;
+  if (tier !== 'pro' && tier !== 'max') return false;
+  const row = db.getDB().prepare(`
+    SELECT provider_subscription_id FROM payments
+    WHERE user_id = ? AND status = 'completed' AND tier_granted IN ('pro', 'max')
+    ORDER BY created_at DESC LIMIT 1
+  `).get(userId);
+  return !!(row && row.provider_subscription_id);
+}
+
 router.get('/subscription', authMiddleware, async (req, res) => {
   try {
     const user = db.getUserById(req.user.id);
@@ -1726,6 +1910,9 @@ router.get('/subscription', authMiddleware, async (req, res) => {
       sessions_limit: license.sessions_limit,
       cancel_at_period_end: isCancelPending,
       cancels_at: isCancelPending ? license.expires_at : null,
+      // Whether the current tier is a recurring subscription (Ultra, or a
+      // legacy Pro/Max sub) vs a one-time pass — see isSubscriptionBackedTier.
+      is_recurring: isSubscriptionBackedTier(user.id, license.tier),
     });
   } catch (err) {
     console.error('Subscription status error:', err.message);
@@ -1842,12 +2029,19 @@ router.post('/reactivate-subscription', authMiddleware, async (req, res) => {
       const safeTier = (t) => VALID_TIERS.includes(t) ? t : null;
       const tier = safeTier(candidate.metadata?.tier) || safeTier(db.getLicenseByUserId(user.id)?.tier);
       if (tier) {
+        // Ultra-only credits, same rule as the upgrade paths: re-affirm the
+        // -1 unlimited sentinel for Ultra; leave a legacy Pro/Max sub's
+        // balance untouched (reactivation isn't a fresh purchase).
         const grant = grantConfigForTier(tier);
         db.updateLicenseOnPayment(user.id, {
           tier: grant.tier,
           status: 'active',
           expires_at: grant.expires_at,
           sessions_limit: grant.sessions_limit,
+          ...(grant.tier === 'ultra' ? {
+            credits_remaining_seconds: grant.credits_remaining_seconds,
+            credits_expire_at: grant.credits_expire_at,
+          } : {}),
         });
       }
       // Audit trail
@@ -2272,4 +2466,13 @@ module.exports._test = {
   // Extension pack tests
   EXTENSION_PACKS,
   resolveExtensionPack,
+  // Provider routing + upgrade-direction tests
+  getPaymentProvider,
+  isTierUpgrade,
+  TIER_RANK,
+  grantConfigForTier,
+  // Subscription-vs-pass detection (/subscription is_recurring)
+  isSubscriptionBackedTier,
+  // Double-billing guard on /create-checkout
+  checkoutConflictFor,
 };

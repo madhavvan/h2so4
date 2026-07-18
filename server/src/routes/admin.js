@@ -731,9 +731,14 @@ router.post('/users/:id/cancel-subscription', authMiddleware, adminOnly, stepUpO
       if (!razorpay) return res.status(503).json({ error: 'Razorpay not configured' });
       const subId = db.getLatestRazorpaySubscriptionId(user.id);
       if (!subId) return res.status(404).json({ error: 'No Razorpay subscription found for user' });
-      // cancel_at_cycle_end=false → Razorpay keeps access until period end
-      // (counter-intuitive naming in their API).
-      await razorpay.subscriptions.cancel(subId, false);
+      // { cancel_at_cycle_end: true } = keep access until period end. The
+      // SDK takes an OPTIONS OBJECT — the previous positional `false` was
+      // both the wrong shape and the wrong value (false/omitted = cancel
+      // IMMEDIATELY), so this admin route killed access on the spot while
+      // reporting "cancels at end of billing period". Matches the fixed
+      // user-facing routes in payments.js (/cancel-razorpay,
+      // /cancel-subscription).
+      await razorpay.subscriptions.cancel(subId, { cancel_at_cycle_end: true });
       writeAudit(req, 'cancel-subscription', user, { provider: 'razorpay', subscription_id: subId });
       return res.json({
         success: true,
@@ -810,7 +815,19 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
     // is logged in the audit trail for compliance review.
     const { computeRefundEligibility } = require('../services/refundEligibility');
     const license = db.getLicenseByUserId(payment.user_id);
-    const eligibility = computeRefundEligibility(payment, license);
+    // Pass the PRECISE session-time total from the usage ledger — the same
+    // immutable log the published policy (§1) says eligibility is judged
+    // by. Without it the service falls back to a coarse sessions-count
+    // proxy that can block legitimate refunds the policy allows.
+    let usageStats;
+    try {
+      const totals = db.getUsageTotals(payment.user_id);
+      usageStats = {
+        totalSessionSeconds: totals.lifetime_used_seconds,
+        sessionsUsed: license?.sessions_used,
+      };
+    } catch { /* stats unavailable — service falls back to the proxy */ }
+    const eligibility = computeRefundEligibility(payment, license, usageStats);
     if (!eligibility.eligible && !override_reason) {
       return res.status(400).json({
         error: 'refund_ineligible',

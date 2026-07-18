@@ -15,25 +15,31 @@
 //  the audit trail. That keeps legitimate exceptions (support
 //  goodwill, retention saves) possible while preventing accidents.
 //
-//  Policy (2026-07 pricing):
+//  ⚠️ THE PUBLISHED POLICY GOVERNS. REFUND_POLICY.md (mirrored verbatim
+//  in RefundPolicy.tsx and promised on the landing FAQ) is what users
+//  agree to at purchase — enforcement here must never be STRICTER than
+//  that text, or support ends up blocked from honoring the company's
+//  own published terms (an earlier draft of this file enforced
+//  7-day / <60-min rules the published policy never had).
+//
+//  Published policy (REFUND_POLICY.md, effective 2026-07-07):
 //    Basic ($30 / ₹2,499 · one 30-min interview):
-//      • 14 days from purchase
-//      • Zero of the interview credit used
+//      • 14 days from purchase · < 2 hours total session time
 //    Pro ($50 / ₹4,199 · one 1-hour interview):
-//      • 7 days from purchase
-//      • < 60 min total session time
+//      • 14 days from purchase · < 2 hours total session time
 //    Max ($89 / ₹7,399 · three 1-hour interviews):
-//      • 7 days from purchase
-//      • < 60 min total session time
+//      • 14 days from purchase · < 2 hours total session time
 //    Ultra ($159/mo / ₹12,999/mo · unlimited subscription):
-//      • 7 days from first charge
-//      • < 60 min total session time
-//    +30 min extension ($25 / ₹2,099):
+//      • 14 days from the FIRST charge · < 2 hours total session time
+//      (the admin refunds the first-charge payment row, so the window
+//       keys off that payment's created_at)
+//    Extension top-ups ($25–$80 / ₹2,099–₹6,799):
 //      • NEVER refundable once delivered
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-const SIXTY_MIN_SECONDS = 60 * 60;
+const REFUND_WINDOW_DAYS = 14;
+const USAGE_CAP_SECONDS = 2 * 60 * 60; // "< 2 hours of total session time"
 
 // Returns:
 //   { eligible: true, reason: <human-readable> }
@@ -59,68 +65,53 @@ function computeRefundEligibility(payment, license, usageStats) {
 
   const ageMs = Date.now() - (payment.created_at || 0);
 
-  // Renewal top-ups: never refundable once captured (per policy §2).
+  // Top-ups: never refundable once captured (per policy §2). Two metadata
+  // spellings exist for the same product — 'renewal' (legacy /create-renewal
+  // + all webhook-granted top-ups) and 'extension' (the one-click
+  // /extend-now direct grant). Both must match or /extend-now purchases
+  // slip into the ordinary per-tier refund windows.
   let isRenewal = false;
   try {
     const meta = typeof payment.metadata === 'string' ? JSON.parse(payment.metadata) : payment.metadata;
-    isRenewal = meta?.mode === 'renewal';
+    isRenewal = meta?.mode === 'renewal' || meta?.mode === 'extension';
   } catch (_) { /* malformed metadata → treat as non-renewal */ }
   if (isRenewal) {
-    return { eligible: false, code: 'renewal_nonrefundable', reason: 'Renewal credits are not refundable once delivered.' };
+    return { eligible: false, code: 'renewal_nonrefundable', reason: 'Time top-ups are not refundable once delivered.' };
   }
 
   const tier = payment.tier_granted || license?.tier || 'unknown';
 
-  // Basic: 14-day window + zero credit usage
-  if (tier === 'basic') {
-    if (ageMs > 14 * ONE_DAY_MS) {
-      return { eligible: false, code: 'window_expired', reason: `Basic refund window is 14 days; this payment is ${Math.round(ageMs / ONE_DAY_MS)} days old.` };
+  // Every plan — Basic/Pro/Max one-time passes and the Ultra subscription —
+  // shares the SAME published terms: 14 days from the payment being
+  // refunded (Ultra: the first charge) + under 2 hours of total session
+  // time. One rule, straight from the REFUND_POLICY.md table.
+  if (tier === 'basic' || tier === 'pro' || tier === 'max' || tier === 'ultra') {
+    if (ageMs > REFUND_WINDOW_DAYS * ONE_DAY_MS) {
+      return { eligible: false, code: 'window_expired', reason: `The ${tier} refund window is ${REFUND_WINDOW_DAYS} days (published policy §1); this payment is ${Math.round(ageMs / ONE_DAY_MS)} days old.` };
     }
-    // Initial Basic grant = one 30-min interview = 1800 s (2026-07). If
-    // credits_remaining_seconds is less than that (or sessions_used > 0),
-    // they have used some. MUST match grantConfigForTier('basic') in
-    // payments.js / webhooks.js — a stale value here silently blocks
-    // legitimate refunds (this was 3*3600 from the pre-2026-07 3-credit model).
-    const initialSeconds = 30 * 60;
-    const remaining = license?.credits_remaining_seconds;
-    const sessionsUsed = (usageStats && Number.isFinite(usageStats.sessionsUsed))
-      ? usageStats.sessionsUsed
-      : (license?.sessions_used || 0);
-    if (sessionsUsed > 0) {
-      return { eligible: false, code: 'usage_exceeded', reason: `Basic refund requires zero credits used; user has used ${sessionsUsed} session(s).` };
-    }
-    if (Number.isFinite(remaining) && remaining < initialSeconds) {
-      return { eligible: false, code: 'usage_exceeded', reason: `Basic refund requires zero credits used; user has consumed ${initialSeconds - remaining} seconds.` };
-    }
-    return { eligible: true, reason: 'Within 14-day window with zero usage.' };
-  }
-
-  // Pro / Max / Ultra: 7-day window + < 60 min total session time.
-  // (Pro/Max are one-time interviews; Ultra is the monthly subscription —
-  // same satisfaction window and usage cap apply.)
-  if (tier === 'pro' || tier === 'max' || tier === 'ultra') {
-    if (ageMs > 7 * ONE_DAY_MS) {
-      return { eligible: false, code: 'window_expired', reason: `${tier} refund window is 7 days from first charge; this payment is ${Math.round(ageMs / ONE_DAY_MS)} days old.` };
-    }
-    // Use precise session-time stats if we have them; fall back to the
-    // license sessions_used counter as a coarse proxy (each session is
-    // capped at typical interview length, ~45-60 min, so 1 session
-    // approximately equals the threshold — be conservative).
+    // Use precise session-time stats when the caller has them (the admin
+    // endpoint passes the usage_sessions lifetime total — the same
+    // immutable log the published policy §1 says eligibility is
+    // determined by). Fall back to the license sessions counter as a
+    // coarse proxy only when stats are unavailable.
     if (usageStats && Number.isFinite(usageStats.totalSessionSeconds)) {
-      if (usageStats.totalSessionSeconds >= SIXTY_MIN_SECONDS) {
+      if (usageStats.totalSessionSeconds >= USAGE_CAP_SECONDS) {
         const mins = Math.round(usageStats.totalSessionSeconds / 60);
-        return { eligible: false, code: 'usage_exceeded', reason: `${tier} refund requires <60 min total session time; user has used ${mins} min.` };
+        return { eligible: false, code: 'usage_exceeded', reason: `The published policy requires under 2 hours of total session time; user has used ${mins} min.` };
       }
     } else {
-      // Coarse fallback: more than 1 completed session is a strong signal
-      // they've used >60 min. We don't reject on 1 session — it could be
-      // any length. Caller should pass usageStats whenever available.
-      const sessionsUsed = license?.sessions_used || 0;
-      if (sessionsUsed > 1) {
-        return { eligible: false, code: 'usage_exceeded_proxy', reason: `${tier} refund requires <60 min total session time; user has run ${sessionsUsed} sessions (precise minute counter unavailable, blocking by proxy).` };
+      // Coarse fallback: 3+ completed sessions strongly implies ≥2 h of
+      // use on any plan (sessions run 30–60 min). 1–2 sessions could sum
+      // to well under the cap, so we don't block on those — the caller
+      // should pass usageStats whenever available for the precise answer.
+      const sessionsUsed = (usageStats && Number.isFinite(usageStats.sessionsUsed))
+        ? usageStats.sessionsUsed
+        : (license?.sessions_used || 0);
+      if (sessionsUsed > 2) {
+        return { eligible: false, code: 'usage_exceeded_proxy', reason: `The published policy requires under 2 hours of total session time; user has run ${sessionsUsed} sessions (precise minute counter unavailable, blocking by proxy).` };
       }
     }
-    return { eligible: true, reason: `Within 7-day window with <60 min usage (${tier}).` };
+    return { eligible: true, reason: `Within the ${REFUND_WINDOW_DAYS}-day window with under 2 hours of use (${tier}).` };
   }
 
   // Unknown tier — refuse by default. Operator can use override_reason

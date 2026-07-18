@@ -54,7 +54,10 @@ const { writeAudit, ADMIN_EMAILS, STEP_UP_TTL_MS } = require('../middleware/admi
 // produce a "Done" message with no visible effect.
 const CLIENT_MODELS_BY_TIER = {
   anonymous: ['gemini'],
-  free: ['gemini'],
+  // Free = the one-time 10-min trial: four models, no Claude (matches the
+  // server tier gate's TRIAL_MODELS). Post-trial the time gate blocks live
+  // use anyway — this list only governs which preference can be set.
+  free: ['gemini', 'groq', 'openai', 'xai'],
   basic: ['gemini', 'groq', 'openai', 'xai'],
   pro: ['gemini', 'groq', 'openai', 'xai', 'claude'],
   max: ['gemini', 'groq', 'openai', 'xai', 'claude'],
@@ -716,7 +719,7 @@ const USER_SERVER_TOOLS = [
       properties: {
         target_tier: {
           type: 'string',
-          enum: ['free', 'basic', 'pro', 'max'],
+          enum: ['free', 'basic', 'pro', 'max', 'ultra'],
           description: 'The tier the user is considering switching to.',
         },
       },
@@ -737,19 +740,26 @@ const USER_SERVER_TOOLS = [
           };
         }
 
-        // Mirror of FEATURE_GATES in services/licenseService.ts. Kept
-        // in sync manually — the bot lives server-side so it can't
-        // import the frontend module. If gates drift, update both.
+        // Mirror of FEATURE_GATES in services/licenseService.ts (2026-07
+        // model: Basic/Pro/Max = one-time passes, Ultra = the monthly
+        // unlimited subscription; Claude at Pro+, Train Model + reasoning
+        // at Max+, Auto-Type Ultra-only). Kept in sync manually — the bot
+        // lives server-side so it can't import the frontend module. If
+        // gates drift, update both. `free` here = post-trial free (the
+        // state a downgrade actually lands in — the one-time trial can't
+        // be re-entered).
         const FEATURES = {
-          free:  { models: ['Gemini'],                                    autoSolve: false, autoType: false, popout: false, reasoning: false },
-          basic: { models: ['Gemini','Groq','GPT','Grok'],                autoSolve: true,  autoType: false, popout: true,  reasoning: false },
-          pro:   { models: ['Gemini','Groq','GPT','Grok'],                autoSolve: true,  autoType: false, popout: true,  reasoning: false },
-          max:   { models: ['Gemini','Groq','GPT','Grok','Claude'],       autoSolve: true,  autoType: true,  popout: true,  reasoning: true  },
+          free:  { time: 'nothing usable after the one-time 10-min trial', models: [],                                autoSolve: false, autoType: false, popout: false, reasoning: false, trainModel: false },
+          basic: { time: 'one 30-minute interview',                        models: ['Gemini','GPT','Grok','Groq'],    autoSolve: true,  autoType: false, popout: true,  reasoning: false, trainModel: false },
+          pro:   { time: 'one 1-hour interview',                           models: ['Gemini','GPT','Grok','Groq','Claude'], autoSolve: true, autoType: false, popout: true, reasoning: false, trainModel: false },
+          max:   { time: 'three 1-hour interviews',                        models: ['Gemini','GPT','Grok','Groq','Claude'], autoSolve: true, autoType: false, popout: true, reasoning: true,  trainModel: true },
+          ultra: { time: 'unlimited interviews',                           models: ['Gemini','GPT','Grok','Groq','Claude'], autoSolve: true, autoType: true,  popout: true, reasoning: true,  trainModel: true },
         };
         const cur = FEATURES[currentTier] || FEATURES.free;
         const tgt = FEATURES[target_tier] || FEATURES.free;
         const gained = [];
         const lost = [];
+        if (tgt.time !== cur.time) gained.push(`interview time: ${tgt.time} (currently ${cur.time})`);
         for (const m of tgt.models) if (!cur.models.includes(m)) gained.push(`${m} model access`);
         for (const m of cur.models) if (!tgt.models.includes(m)) lost.push(`${m} model access`);
         if (tgt.autoType && !cur.autoType) gained.push('Auto-Type (typing into the editor for you)');
@@ -758,10 +768,12 @@ const USER_SERVER_TOOLS = [
         if (cur.autoSolve && !tgt.autoSolve) lost.push('Auto-Solve');
         if (tgt.popout && !cur.popout) gained.push('Pop-out (screen-share-invisible window)');
         if (cur.popout && !tgt.popout) lost.push('Pop-out');
-        if (tgt.reasoning && !cur.reasoning) gained.push('Reasoning effort control (GPT depth knob)');
+        if (tgt.trainModel && !cur.trainModel) gained.push('Train Model (résumé + role pre-research)');
+        if (cur.trainModel && !tgt.trainModel) lost.push('Train Model');
+        if (tgt.reasoning && !cur.reasoning) gained.push('Reasoning effort control');
         if (cur.reasoning && !tgt.reasoning) lost.push('Reasoning effort control');
 
-        const tierRank = { free: 0, basic: 1, pro: 2, max: 3 };
+        const tierRank = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4 };
         const isDowngrade = tierRank[target_tier] < tierRank[currentTier];
         const isUpgrade = tierRank[target_tier] > tierRank[currentTier];
 
@@ -773,31 +785,34 @@ const USER_SERVER_TOOLS = [
         const isRazorpay = !!user?.razorpay_subscription_id;
         const provider = isStripe ? 'stripe' : (isRazorpay ? 'razorpay' : 'none');
 
-        // Effective-date semantics differ by provider + direction.
+        // Effective-date semantics under the 2026-07 model: Basic/Pro/Max
+        // are ONE-TIME passes (a "switch" between them is a fresh pass
+        // purchase charged today — the new pass's clock replaces what's
+        // left of the old one); Ultra is the only subscription (cancel =
+        // access until cycle end, then Free).
+        const cycleEnd = license.expires_at && license.expires_at > 0
+          ? new Date(license.expires_at).toISOString().slice(0, 10)
+          : 'the end of your current cycle';
         let effective;
-        if (provider === 'stripe') {
-          effective = isUpgrade
-            ? 'immediate — Stripe charges a prorated difference on your next invoice'
-            : isDowngrade
-              ? 'immediate plan switch; the unused portion of your current cycle is credited against the next invoice'
-              : 'immediate';
-        } else if (provider === 'razorpay') {
-          effective = isUpgrade
-            ? 'immediate — Razorpay swaps the plan and bills the prorated difference'
-            : isDowngrade
-              ? 'at the end of your current billing cycle (' + (license.expires_at && license.expires_at > 0 ? new Date(license.expires_at).toISOString().slice(0,10) : 'unknown date') + ') — you keep ' + currentTier + ' until then'
-              : 'immediate';
+        if (target_tier === 'ultra') {
+          effective = 'immediate after checkout — Ultra is the monthly subscription, billed from today';
+        } else if (target_tier === 'free') {
+          effective = currentTier === 'ultra'
+            ? `cancel any time — you keep Ultra access until ${cycleEnd}, then drop to Free`
+            : 'your pass simply expires on its own — there is nothing to cancel and no ongoing billing';
+        } else if (currentTier === 'ultra') {
+          effective = `passes are one-time purchases — cancel Ultra first (access until ${cycleEnd}), then buy the ${target_tier} pass whenever the next interview comes up`;
         } else {
-          effective = isUpgrade
-            ? 'immediate after checkout — the new plan replaces your current one'
-            : 'at the end of your current period';
+          effective = `immediate after checkout — a fresh ${target_tier} pass is charged today and its full interview clock replaces whatever remains on your current pass`;
         }
 
         let suggested_alternative = null;
-        if (target_tier === 'free' && currentTier !== 'free') {
+        if (target_tier === 'free' && currentTier === 'ultra') {
           suggested_alternative = isStripe
-            ? 'If cost is the concern, you could pause the subscription instead of canceling. Pause keeps your data and lets you resume in a month without losing your seat.'
-            : 'If you\'re unsure, downgrading to a cheaper tier (Basic or Pro) keeps the core features and is cheaper than re-upgrading later from scratch.';
+            ? 'If cost is the concern, you could pause the subscription from the Stripe billing portal instead of canceling — or switch to one-time passes (Basic $30 / Pro $50 / Max $89) after the cycle ends and pay only when an interview comes up.'
+            : 'After your cycle ends you can use one-time passes (Basic / Pro / Max) instead — pay only when an interview comes up, no monthly bill.';
+        } else if (isDowngrade && currentTier !== 'ultra' && target_tier !== 'free') {
+          suggested_alternative = 'Heads up: buying a smaller pass replaces the time left on your current one. If you just need more minutes on the pass you already have, the +30 min / +1 h / +3 h extensions are usually the better deal.';
         }
 
         return {
@@ -822,19 +837,26 @@ const USER_SERVER_TOOLS = [
 
   // ── Request a refund on the caller's most recent paid invoice ──
   // User-initiated refunds work like every enterprise billing portal
-  // (Notion, Linear, Vercel): if within the policy window (7 days
-  // from charge, configurable), auto-process via the original provider
-  // (Stripe / Razorpay refunds API). If outside the window, file an
-  // admin-review row in audit_log and respond "we'll get back to you" —
-  // admin sees it in the bot's get_audit_log output and can manually
-  // refund_payment from there.
+  // (Notion, Linear, Vercel): if the PUBLISHED policy allows it
+  // (REFUND_POLICY.md — 14 days from charge + under 2 hours of session
+  // time; extension top-ups never refundable), auto-process via the
+  // original provider (Stripe / Razorpay refunds API). Otherwise file
+  // an admin-review row in audit_log and respond "we'll get back to
+  // you" — admin sees it in the bot's get_audit_log output and can
+  // manually refund_payment from there.
+  //
+  // ⚠️ computeRefundEligibility is the ONLY gate for the auto-refund. An
+  // earlier version ran its own 7-day age check and IGNORED the
+  // eligibility result it computed — auto-refunding heavy users and even
+  // non-refundable top-ups, while queuing day-8–14 requests the policy
+  // says are automatic.
   //
   // This complements the admin-side refund_payment tool: that's for
   // admin acting on behalf of others; this is users acting on their
   // own bill.
   {
     name: 'request_refund',
-    description: 'File a refund request for the caller\'s most recent paid invoice. Auto-approves if within 7 days of charge (returns refund_processed=true); otherwise queues an admin review (returns queued=true). The caller does not need to specify which payment — we always target the most recent.',
+    description: 'File a refund request for the caller\'s most recent paid invoice. Auto-approves when the published refund policy allows it (14 days from charge + under 2 hours of use; top-ups are never auto-refunded) — returns refund_processed=true. Otherwise queues an admin review (returns queued=true). The caller does not need to specify which payment — we always target the most recent.',
     parameters: {
       type: 'object',
       properties: {
@@ -862,8 +884,23 @@ const USER_SERVER_TOOLS = [
           };
         }
         const ageMs = Date.now() - (lastPaid.created_at || 0);
-        const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-        const withinPolicy = ageMs <= SEVEN_DAYS_MS;
+
+        // THE published-policy engine is the single gate for auto-refunds
+        // (same service the admin endpoint enforces): 14 days + <2 h of
+        // session time, top-ups never refundable. Pass the precise usage
+        // meter so the decision matches what the policy actually promises.
+        const { computeRefundEligibility } = require('./refundEligibility');
+        const license = db.getLicenseByUserId(ctx.user.id);
+        let usageStats;
+        try {
+          const totals = db.getUsageTotals(ctx.user.id);
+          usageStats = {
+            totalSessionSeconds: totals.lifetime_used_seconds,
+            sessionsUsed: license?.sessions_used,
+          };
+        } catch { /* stats unavailable — the service falls back to its proxy */ }
+        const eligibility = computeRefundEligibility(lastPaid, license, usageStats);
+        const withinPolicy = !!eligibility?.eligible;
 
         // Always log to audit so admin has a paper trail. Distinguishes
         // auto-processed vs queued by the action name.
@@ -872,31 +909,29 @@ const USER_SERVER_TOOLS = [
           amount: lastPaid.amount,
           currency: lastPaid.currency,
           age_days: Math.floor(ageMs / (24 * 60 * 60 * 1000)),
+          eligibility_code: eligibility?.code || null,
           reason: reasonText,
         });
 
         if (!withinPolicy) {
-          // Out of policy → queue for admin review. We don't reject —
-          // many enterprise refund-eligibility-policies have soft edges
-          // that humans handle case-by-case (genuinely unhappy customer,
-          // billing error, etc.). Admin sees this in the audit log and
-          // can refund_payment manually.
+          // Outside the published policy → queue for admin review. We
+          // don't reject — refund policies have soft edges that humans
+          // handle case-by-case (genuinely unhappy customer, billing
+          // error, etc.). Admin sees this in the audit log and can
+          // refund_payment manually (with override_reason).
           return {
             ok: true,
             queued: true,
             payment_age_days: Math.floor(ageMs / (24 * 60 * 60 * 1000)),
-            policy_window_days: 7,
-            message: 'Refund request filed. Outside the 7-day automatic-refund window, so a human will review and respond within 24 hours.',
+            policy_window_days: 14,
+            policy_reason: eligibility?.reason || null,
+            message: 'Refund request filed. It falls outside the automatic window (14 days from charge with under 2 hours of use; top-ups aren\'t auto-refunded), so a human will review and respond within 24 hours.',
           };
         }
 
         // Within policy → process refund through the provider. Reuses
         // the same path the admin refund_payment tool uses for
         // consistency.
-        const eligibilityResult = require('./refundEligibility');
-        const { computeRefundEligibility } = eligibilityResult;
-        const license = db.getLicenseByUserId(ctx.user.id);
-        const eligibility = computeRefundEligibility(lastPaid, license);
 
         let providerRefundId = null;
         try {
@@ -1101,7 +1136,7 @@ const USER_SERVER_TOOLS = [
   // confirmation because deletion is irreversible.
   {
     name: 'delete_my_account',
-    description: 'PERMANENTLY delete the caller\'s account, license, conversations, and payment history. Required by privacy law (GDPR Article 17 / CCPA right to delete) — every user must be able to self-serve this. Irreversible. Requires explicit user confirmation with the literal string "I understand this is permanent" passed as confirmation_phrase.',
+    description: 'PERMANENTLY delete the caller\'s account, license, devices, and conversation history (payment records are retained for financial-compliance bookkeeping, as the privacy policy states). Required by privacy law (GDPR Article 17 / CCPA right to delete) — every user must be able to self-serve this. Irreversible. Requires explicit user confirmation with the literal string "I understand this is permanent" passed as confirmation_phrase.',
     parameters: {
       type: 'object',
       properties: {

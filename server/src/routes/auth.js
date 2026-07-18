@@ -375,8 +375,15 @@ router.get('/google/start', (req, res) => {
     return res.status(503).send('Google Sign-In not configured on server. Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET.');
   }
 
-  // Store pending session
-  pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'pending' });
+  // Store pending session. country_code rides along from the client (which
+  // geo-detects before opening the browser) so the callback can create the
+  // user/license with their REAL region instead of the old hardcoded 'US'
+  // — that hardcode gave every Google-signup the US pricing/trial policy
+  // regardless of where they actually are. Strictly validated; anything
+  // else falls back to US at consumption time.
+  const rawCountry = String(req.query.country_code || '').toUpperCase();
+  const countryCode = /^[A-Z]{2}$/.test(rawCountry) ? rawCountry : null;
+  pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'pending', country_code: countryCode });
 
   // Build the Google OAuth URL
   const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
@@ -466,6 +473,12 @@ router.get('/google/callback', async (req, res) => {
         isNewUser = true;
         const userId = uuidv4();
         const now = Date.now();
+        // Real region from the client's geo-detect, stashed on the pending
+        // session at /google/start. Falls back to US only when the client
+        // sent nothing (older app builds). The old hardcoded 'US' gave
+        // every Google signup US pricing + the free trial and skipped the
+        // India paid-only region policy.
+        const signupCountry = pendingGoogleSessions.get(session_id)?.country_code || 'US';
 
         user = db.createUser({
           id: userId,
@@ -473,7 +486,7 @@ router.get('/google/callback', async (req, res) => {
           name: name || email.split('@')[0],
           password: null,
           tier: isDev ? 'pro' : 'free',
-          country_code: 'US',
+          country_code: signupCountry,
           google_id: googleId,
           oauth_provider: 'google',
           avatar_url: picture,
@@ -486,7 +499,7 @@ router.get('/google/callback', async (req, res) => {
           email: email.toLowerCase(),
           tier: isDev ? 'pro' : 'free',
           status: isDev ? 'active' : 'trial',
-          country_code: 'US',
+          country_code: signupCountry,
           expires_at: isDev ? -1 : now + (30 * 24 * 60 * 60 * 1000),
           sessions_limit: isDev ? -1 : 5,
         });

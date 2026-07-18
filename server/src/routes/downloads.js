@@ -72,6 +72,12 @@ router.get('/', (req, res) => {
   .row{display:flex;flex-direction:column;gap:10px}
   a{display:block;padding:14px 20px;border-radius:12px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;text-decoration:none;font-weight:600;font-size:14px}
   a:hover{filter:brightness(1.1)}
+  .guide{margin-top:26px;text-align:left;border:1px solid rgba(211,172,99,.28);background:linear-gradient(180deg,rgba(211,172,99,.06),rgba(255,255,255,.015));border-radius:14px;padding:14px 16px}
+  .guide h2{font-size:13px;margin:0 0 6px;color:#fff}
+  .guide p{font-size:11.5px;color:#9d968a;margin:0 0 10px;line-height:1.55}
+  .guide ul{margin:0;padding:0;list-style:none;font-size:11.5px;color:#c9c2b4;line-height:1.6}
+  .guide li{margin:0 0 7px}
+  .k{display:inline-block;padding:1px 6px;border-radius:6px;background:rgba(211,172,99,.16);border:1px solid rgba(211,172,99,.3);color:#f0d78a;font-weight:700;font-size:10.5px;white-space:nowrap}
 </style></head><body><div class="card">
   <h1>Download Interview Copilot</h1>
   <p>Pick the build for your operating system.</p>
@@ -79,6 +85,17 @@ router.get('/', (req, res) => {
     <a href="/windows">Windows · Setup.exe</a>
     <a href="/mac">macOS · DMG (Apple Silicon + Intel)</a>
     <a href="/linux">Linux · AppImage</a>
+  </div>
+  <div class="guide">
+    <h2>Your browser may double-check the download — that's normal</h2>
+    <p>The installer is code-signed (Azure Trusted Signing on Windows; Apple-notarized on macOS). Newer apps just get a one-time reputation prompt. Here's exactly what to click:</p>
+    <ul>
+      <li><strong style="color:#fff">Windows SmartScreen</strong> (blue "Windows protected your PC" screen): click <span class="k">More info</span>, then <span class="k">Run anyway</span>.</li>
+      <li><strong style="color:#fff">Edge</strong> ("isn't commonly downloaded"): hover the download → click the <span class="k">⋯ three dots</span> → <span class="k">Keep</span> → <span class="k">Show more</span> → <span class="k">Keep anyway</span>.</li>
+      <li><strong style="color:#fff">Chrome</strong>: open the downloads bubble → <span class="k">⋯</span> on the file → <span class="k">Keep</span> (then <span class="k">Keep anyway</span> if asked). Already dismissed it? Press <span class="k">Ctrl + J</span>, find the file, <span class="k">⋯</span> → Keep.</li>
+      <li><strong style="color:#fff">Firefox</strong>: downloads arrow → right-click the file → <span class="k">Allow download</span>.</li>
+      <li><strong style="color:#fff">macOS</strong>: notarized — just drag to Applications and click <span class="k">Open</span>.</li>
+    </ul>
   </div>
 </div></body></html>`);
 });
@@ -106,6 +123,10 @@ router.get('/mac', (_req, res) => {
     <a href="/mac-x64">Intel</a>
   </div>
   <p class="hint">Macs sold since 2021 are almost always Apple Silicon.<br>The Intel build also runs on Apple Silicon via Rosetta.</p>
+  <p class="hint" style="border:1px solid rgba(211,172,99,.28);border-radius:12px;padding:10px 14px;background:rgba(211,172,99,.05);color:#9d968a">
+    <strong style="color:#fff">Installing:</strong> open the DMG, drag Interview Copilot into <strong style="color:#f0d78a">Applications</strong>, then click <strong style="color:#f0d78a">Open</strong> on the standard "downloaded from the internet" note.
+    The builds are Apple-notarized, so Gatekeeper opens them without warnings.
+  </p>
 </div></body></html>`);
 });
 

@@ -1,7 +1,13 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  Refund eligibility — pin REFUND_POLICY.md as enforceable code
 //
-//  Each test mirrors a row of the policy table. Future policy
+//  Each test mirrors a row of the PUBLISHED policy table (effective
+//  2026-07-07): every plan gets 14 days from the refunded payment
+//  (Ultra: the first charge) + under 2 hours of total session time;
+//  extension top-ups are never refundable. An earlier draft of the
+//  service enforced 7-day / <60-min rules the published policy never
+//  had — these tests exist so enforcement can never drift STRICTER
+//  than the text users agreed to at purchase again. Future policy
 //  revisions update the tests AND REFUND_POLICY.md in the same
 //  commit (per the markdown's own "keep these in sync" comment).
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -20,7 +26,7 @@ function makePayment(overrides = {}) {
     email: 'u@test',
     provider: 'stripe',
     provider_payment_id: 'pi_test_1',
-    amount: 2900,
+    amount: 5000,
     currency: 'USD',
     status: 'completed',
     tier_granted: 'pro',
@@ -41,53 +47,68 @@ function makeLicense(overrides = {}) {
   };
 }
 
-describe('computeRefundEligibility — Pro tier', () => {
+describe('computeRefundEligibility — Pro tier (14 days · <2 h, per published policy)', () => {
   it('eligible: 2 days old, 0 sessions used', () => {
     const r = computeRefundEligibility(makePayment(), makeLicense());
     expect(r.eligible).toBe(true);
   });
 
-  it('ineligible: 8 days old (window expired)', () => {
+  it('eligible: 8 days old — INSIDE the published 14-day window (the old 7-day draft wrongly blocked this)', () => {
     const r = computeRefundEligibility(makePayment({ created_at: daysAgo(8) }), makeLicense());
+    expect(r.eligible).toBe(true);
+  });
+
+  it('ineligible: 15 days old (window expired)', () => {
+    const r = computeRefundEligibility(makePayment({ created_at: daysAgo(15) }), makeLicense());
     expect(r.eligible).toBe(false);
     expect(r.code).toBe('window_expired');
   });
 
-  it('ineligible: 2 sessions used (proxy for >60 min)', () => {
-    const r = computeRefundEligibility(makePayment(), makeLicense({ sessions_used: 2 }));
-    expect(r.eligible).toBe(false);
-    expect(r.code).toBe('usage_exceeded_proxy');
+  it('eligible: 90 min used — under the published 2-hour cap (the old 60-min draft wrongly blocked this)', () => {
+    const r = computeRefundEligibility(
+      makePayment(),
+      makeLicense({ sessions_used: 2 }),
+      { totalSessionSeconds: 90 * 60 }
+    );
+    expect(r.eligible).toBe(true);
   });
 
-  it('ineligible: usageStats says 70 min used', () => {
+  it('ineligible: usageStats says 130 min used (over the 2-hour cap)', () => {
     const r = computeRefundEligibility(
       makePayment(),
       makeLicense(),
-      { totalSessionSeconds: 70 * 60 }
+      { totalSessionSeconds: 130 * 60 }
     );
     expect(r.eligible).toBe(false);
     expect(r.code).toBe('usage_exceeded');
   });
 
-  it('eligible: usageStats says 30 min used (within threshold)', () => {
-    const r = computeRefundEligibility(
-      makePayment(),
-      makeLicense({ sessions_used: 1 }),
-      { totalSessionSeconds: 30 * 60 }
-    );
-    expect(r.eligible).toBe(true);
+  it('proxy fallback (no usageStats): 2 sessions do NOT block; 3 sessions block', () => {
+    const two = computeRefundEligibility(makePayment(), makeLicense({ sessions_used: 2 }));
+    expect(two.eligible).toBe(true);
+    const three = computeRefundEligibility(makePayment(), makeLicense({ sessions_used: 3 }));
+    expect(three.eligible).toBe(false);
+    expect(three.code).toBe('usage_exceeded_proxy');
   });
 });
 
 describe('computeRefundEligibility — Max tier', () => {
   it('eligible: 1 day old, no usage', () => {
-    const r = computeRefundEligibility(makePayment({ tier_granted: 'max', amount: 6900 }), makeLicense({ tier: 'max' }));
+    const r = computeRefundEligibility(makePayment({ tier_granted: 'max', amount: 8900 }), makeLicense({ tier: 'max' }));
     expect(r.eligible).toBe(true);
   });
 
-  it('ineligible: 14 days old', () => {
+  it('eligible: one minute inside the 14-day boundary', () => {
     const r = computeRefundEligibility(
-      makePayment({ tier_granted: 'max', amount: 6900, created_at: daysAgo(14) }),
+      makePayment({ tier_granted: 'max', amount: 8900, created_at: daysAgo(14) + 60 * 1000 }),
+      makeLicense({ tier: 'max' })
+    );
+    expect(r.eligible).toBe(true);
+  });
+
+  it('ineligible: 15 days old', () => {
+    const r = computeRefundEligibility(
+      makePayment({ tier_granted: 'max', amount: 8900, created_at: daysAgo(15) }),
       makeLicense({ tier: 'max' })
     );
     expect(r.eligible).toBe(false);
@@ -95,37 +116,38 @@ describe('computeRefundEligibility — Max tier', () => {
   });
 });
 
-describe('computeRefundEligibility — Basic tier', () => {
-  it('eligible: 5 days old, zero credits used', () => {
+describe('computeRefundEligibility — Basic tier (same published rule as every plan)', () => {
+  it('eligible: 5 days old, pass untouched', () => {
     const r = computeRefundEligibility(
-      makePayment({ tier_granted: 'basic', amount: 2500 }),
+      makePayment({ tier_granted: 'basic', amount: 3000 }),
       makeLicense({ tier: 'basic', credits_remaining_seconds: 30 * 60, sessions_used: 0 })
+    );
+    expect(r.eligible).toBe(true);
+  });
+
+  it('eligible: pass partially used but under 2 h — the published policy has no zero-usage rule for Basic', () => {
+    const r = computeRefundEligibility(
+      makePayment({ tier_granted: 'basic', amount: 3000 }),
+      makeLicense({ tier: 'basic', sessions_used: 1, credits_remaining_seconds: 30 * 60 - 100 }),
+      { totalSessionSeconds: 100 }
     );
     expect(r.eligible).toBe(true);
   });
 
   it('ineligible: 15 days old (window expired)', () => {
     const r = computeRefundEligibility(
-      makePayment({ tier_granted: 'basic', amount: 2500, created_at: daysAgo(15) }),
-      makeLicense({ tier: 'basic', credits_remaining_seconds: 3 * 3600 })
+      makePayment({ tier_granted: 'basic', amount: 3000, created_at: daysAgo(15) }),
+      makeLicense({ tier: 'basic', credits_remaining_seconds: 30 * 60 })
     );
     expect(r.eligible).toBe(false);
     expect(r.code).toBe('window_expired');
   });
 
-  it('ineligible: 1 session used', () => {
+  it('ineligible: over 2 h of session time (heavy extension use)', () => {
     const r = computeRefundEligibility(
-      makePayment({ tier_granted: 'basic', amount: 2500 }),
-      makeLicense({ tier: 'basic', sessions_used: 1 })
-    );
-    expect(r.eligible).toBe(false);
-    expect(r.code).toBe('usage_exceeded');
-  });
-
-  it('ineligible: credits remaining < initial 30 min (silent usage)', () => {
-    const r = computeRefundEligibility(
-      makePayment({ tier_granted: 'basic', amount: 2500 }),
-      makeLicense({ tier: 'basic', sessions_used: 0, credits_remaining_seconds: 30 * 60 - 100 })
+      makePayment({ tier_granted: 'basic', amount: 3000 }),
+      makeLicense({ tier: 'basic', sessions_used: 2 }),
+      { totalSessionSeconds: 125 * 60 }
     );
     expect(r.eligible).toBe(false);
     expect(r.code).toBe('usage_exceeded');
@@ -133,7 +155,7 @@ describe('computeRefundEligibility — Basic tier', () => {
 });
 
 describe('computeRefundEligibility — Ultra tier (monthly subscription)', () => {
-  it('eligible: 2 days old, <60 min usage', () => {
+  it('eligible: 2 days after first charge, 20 min used', () => {
     const r = computeRefundEligibility(
       makePayment({ tier_granted: 'ultra', amount: 15900 }),
       makeLicense({ tier: 'ultra', credits_remaining_seconds: -1, sessions_used: 0 }),
@@ -142,37 +164,55 @@ describe('computeRefundEligibility — Ultra tier (monthly subscription)', () =>
     expect(r.eligible).toBe(true);
   });
 
-  it('ineligible: 8 days old (window expired)', () => {
+  it('eligible: 10 days after first charge — inside the published 14-day window', () => {
     const r = computeRefundEligibility(
-      makePayment({ tier_granted: 'ultra', amount: 15900, created_at: daysAgo(8) }),
+      makePayment({ tier_granted: 'ultra', amount: 15900, created_at: daysAgo(10) }),
+      makeLicense({ tier: 'ultra', credits_remaining_seconds: -1 }),
+      { totalSessionSeconds: 45 * 60 }
+    );
+    expect(r.eligible).toBe(true);
+  });
+
+  it('ineligible: 16 days after first charge (window expired)', () => {
+    const r = computeRefundEligibility(
+      makePayment({ tier_granted: 'ultra', amount: 15900, created_at: daysAgo(16) }),
       makeLicense({ tier: 'ultra', credits_remaining_seconds: -1 })
     );
     expect(r.eligible).toBe(false);
     expect(r.code).toBe('window_expired');
   });
 
-  it('ineligible: 70 min used', () => {
+  it('ineligible: 3 h used', () => {
     const r = computeRefundEligibility(
       makePayment({ tier_granted: 'ultra', amount: 15900 }),
       makeLicense({ tier: 'ultra', credits_remaining_seconds: -1 }),
-      { totalSessionSeconds: 70 * 60 }
+      { totalSessionSeconds: 180 * 60 }
     );
     expect(r.eligible).toBe(false);
     expect(r.code).toBe('usage_exceeded');
   });
 });
 
-describe('computeRefundEligibility — Renewal top-up', () => {
+describe('computeRefundEligibility — Extension top-ups (never refundable, policy §2)', () => {
   it('ineligible: renewal mode is never refundable', () => {
     const r = computeRefundEligibility(
-      makePayment({ tier_granted: 'basic', amount: 699, metadata: JSON.stringify({ mode: 'renewal' }) }),
+      makePayment({ tier_granted: 'basic', amount: 2500, metadata: JSON.stringify({ mode: 'renewal' }) }),
       makeLicense({ tier: 'basic' })
     );
     expect(r.eligible).toBe(false);
     expect(r.code).toBe('renewal_nonrefundable');
   });
 
-  it('renewal block applies even within 14-day window', () => {
+  it("extension mode (the one-click /extend-now spelling) is equally non-refundable", () => {
+    const r = computeRefundEligibility(
+      makePayment({ tier_granted: 'pro', amount: 4500, metadata: JSON.stringify({ mode: 'extension' }) }),
+      makeLicense({ tier: 'pro' })
+    );
+    expect(r.eligible).toBe(false);
+    expect(r.code).toBe('renewal_nonrefundable');
+  });
+
+  it('renewal block applies even within the 14-day window with zero usage', () => {
     const r = computeRefundEligibility(
       makePayment({ tier_granted: 'basic', metadata: JSON.stringify({ mode: 'renewal' }), created_at: daysAgo(1) }),
       makeLicense({ tier: 'basic', sessions_used: 0 })

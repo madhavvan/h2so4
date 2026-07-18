@@ -648,6 +648,30 @@ async function runCycleEndSweep() {
 runCycleEndSweep();
 setInterval(runCycleEndSweep, CYCLE_END_SWEEP_INTERVAL_MS).unref();
 
+// ── Login-log retention sweeper ──
+// The published privacy policy (docs/public/PRIVACY.md §6) promises
+// login logs are kept 12 months. That promise had no enforcement —
+// rows accumulated forever. Purge anything older than 365 days, at
+// boot and daily after. login_logs has no dependents (deleteUser
+// already removes a user's rows outright), and the admin UI reads
+// only recent entries, so this is purely the compliance trim.
+const LOGIN_LOG_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
+function runLoginLogRetentionSweep() {
+  try {
+    const cutoff = Date.now() - LOGIN_LOG_RETENTION_MS;
+    const info = database.getDB()
+      .prepare('DELETE FROM login_logs WHERE created_at < ?')
+      .run(cutoff);
+    if (info.changes > 0) {
+      console.log(`[retention-sweep] purged ${info.changes} login-log rows older than 12 months`);
+    }
+  } catch (err) {
+    console.warn('[retention-sweep] login-log purge failed:', err && err.message);
+  }
+}
+runLoginLogRetentionSweep();
+setInterval(runLoginLogRetentionSweep, 24 * 60 * 60 * 1000).unref();
+
 // ── Stale usage-session sweeper ──
 // A client that crashed (or lost network) mid-interview stops
 // heartbeating; its open usage_session would otherwise dangle forever.
