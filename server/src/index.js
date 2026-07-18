@@ -425,7 +425,7 @@ app.get('/stealth-test', (req, res) => {
 //
 // Download filenames MUST match electron-builder's artifactName entries
 // in package.json → build → {win,mac,linux}.
-const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/h2so4/releases/latest';
+const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/interviewcopilot-releases/releases/latest';
 const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 // Offline fallback ONLY — the GitHub Releases fetch above is the live

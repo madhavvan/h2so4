@@ -8,10 +8,11 @@
 //  Railway would add bandwidth cost on every download and slow the
 //  user's first connection.
 //
-//  The repo name lives ONLY in this file — it's the codename we don't
-//  want leaking into the user-facing React app or into any URL the user
-//  might paste into a browser. If the repo is ever renamed, this is the
-//  one constant to update.
+//  The repo name lives ONLY in this file. Since 4.0.10 this points at the
+//  PUBLIC releases-only repo (binaries + update feeds); the app source
+//  lives in a separate private repo, and nothing user-facing references
+//  it. If the releases repo is ever renamed, this is the one constant to
+//  update.
 //
 //  Routes are explicit (one handler per platform) instead of /:platform
 //  with a lookup table — this keeps the router from swallowing every
@@ -21,7 +22,7 @@
 const express = require('express');
 const router = express.Router();
 
-const REPO = 'madhavvan/h2so4';
+const REPO = 'madhavvan/interviewcopilot-releases';
 
 // Artifact filenames must match the patterns in package.json's
 // build.{win,mac,linux}.artifactName — keep them in sync.
