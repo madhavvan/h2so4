@@ -116,6 +116,15 @@ async function main() {
   await writeFile(path.join(PUBLIC, 'tray-icon@2x.png'), pngs[32]);
   console.log('  ✓ public/tray-icon.png, tray-icon@2x.png');
 
+  // The RUNTIME tray asset. electron/main.cjs loadTrayIcon() reads
+  // electron/tray-icon.png (shipped inside app.asar beside main.cjs) —
+  // NOT the public/ copies above. This split caused the 2026-07-18
+  // "new icon everywhere except the tray" bug: the pipeline refreshed
+  // public/ while the tray kept loading a stale electron/ file forever.
+  // 32px: matches the file main.cjs documents; Electron scales per-DPI.
+  await writeFile(path.join(root, 'electron', 'tray-icon.png'), pngs[32]);
+  console.log('  ✓ electron/tray-icon.png (the one the tray actually loads)');
+
   console.log('\nDone.');
 }
 
