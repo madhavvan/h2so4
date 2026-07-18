@@ -6435,6 +6435,13 @@ app.whenReady().then(() => {
       // so there is exactly one install owner at quit.
       autoUpdater.autoInstallOnAppQuit = false;
 
+      // We ship full NSIS installers only — never the nsis-web target. With
+      // this unset, electron-updater's web-installer machinery stays armed
+      // and its cache pathway (installer.exe in the updater dir) is exactly
+      // where the 2026-07-18 stale-3.4.9-downgrade landmine lived. Disable
+      // the whole class; the 4.0.12+ installer also purges those artifacts.
+      autoUpdater.disableWebInstaller = true;
+
       // ── Force FULL downloads — no differential/blockmap ──
       // Differential downloads reconstruct the new installer locally from a
       // cached baseline + a downloaded .blockmap. When that reconstruction

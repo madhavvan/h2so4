@@ -1,39 +1,58 @@
 ; ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-;  customInit — make SILENT updates safe against file-lock races.
+;  customInit — three protections, in this order:
 ;
-;  Clients on v4.0.7/v4.0.8 run this installer with /S from their
-;  quit-time updater, which tears the app down IN PARALLEL with the
-;  installer. Stock NSIS oneClick in silent mode does not wait for the
-;  dying process to release its locks on the installed .exe/.dll/.asar;
-;  when the copy section hits locked files it leaves the old files in
-;  place, and electron-updater's isForceRunAfter then relaunches the
-;  OLD binary — the "updated to 4.0.9, reopened, it's 4.0.7 again"
-;  field report. The updater code already in the field can't be fixed
-;  remotely, but every update executes THIS installer, so the installer
-;  now guarantees its own preconditions:
-;    1. force-kill every process of the app image (main/renderer/gpu
-;       all share the image name; the installer has a different image
-;       name, so it never matches itself — deliberately NO /T, because
-;       the installer is a child of the app process it is replacing)
-;    2. poll the installed exe with a write-open until Windows has
-;       actually released the image locks (AV scans and handle teardown
-;       outlive process death), capped at ~20s so a wedged machine
-;       still proceeds instead of hanging the update forever.
+;  1. DOWNGRADE GUARD. On 2026-07-18 a 3.4.9-era `installer.exe` left in
+;     %LOCALAPPDATA%\interview-copilot-ai-updater\ by the old differential
+;     downloader was executed on a machine running 4.0.11 and silently
+;     downgraded the entire install (registry + binaries) — the app then
+;     reported v3.4.9 with "update available". Any stale installer — the
+;     updater cache copy, an old Setup.exe in Downloads — can do this,
+;     because NSIS happily installs over a newer version. Now: read the
+;     installed DisplayVersion (written by the stock installer to
+;     SHELL_CONTEXT UNINSTALL_REGISTRY_KEY); if it is NEWER than this
+;     installer's ${VERSION}, a silent run ABORTS (silent downgrades are
+;     always a bug, never an intent) and an interactive run must confirm.
+;     The guard runs FIRST so an aborted downgrade never kills the app.
+;
+;  2. FILE-LOCK-SAFE KILL. Clients on v4.0.7/v4.0.8 run this installer
+;     with /S in parallel with their own teardown; stock NSIS checks for
+;     the running PROCESS but never for FILE LOCKS (which outlive it —
+;     handle teardown, AV scans), and on locked files it leaves the old
+;     binaries in place while --force-run relaunches the OLD app. So:
+;     force-kill the app image (absolute $SYSDIR path — System32 is not
+;     reliably on PATH on every machine; no /T because this installer is
+;     a child of the app process it replaces), then poll the installed
+;     exe with a write-open until Windows actually releases the locks
+;     (500ms x 40, ~20s cap). Skipped on fresh installs (no locks, and
+;     the append-mode probe would create a stray file).
+;
+;  3. CACHE-LANDMINE PURGE. Delete the differential-era artifacts
+;     (installer.exe, current.blockmap) from the updater cache so the
+;     class of bug in (1) is removed machine-by-machine as the fleet
+;     updates. pending\ is left alone — the running update executes from
+;     there. Runs only when an install is actually proceeding.
 ;
 ;  $INSTDIR is not reliably resolved this early in oneClick .onInit, so
-;  the path is derived from $LOCALAPPDATA + the package name — pinned
-;  by build config (oneClick, per-user, no dir choice) and stable
-;  across every release ever shipped.
-;
-;  The IfFileExists guard skips all of this on a FRESH install: the
-;  write-open probe uses append mode, which would otherwise create a
-;  stray empty file, and a fresh install has no locks to wait out.
+;  paths are derived from $LOCALAPPDATA + the package name — pinned by
+;  build config (oneClick, per-user, no dir choice) since the first
+;  release.
 ; ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+!include "WordFunc.nsh"
+
 !macro customInit
+  ; ── 1. downgrade guard ──
+  ReadRegStr $R6 SHCTX "${UNINSTALL_REGISTRY_KEY}" "DisplayVersion"
+  StrCmp $R6 "" icGuardDone
+  ${VersionCompare} "$R6" "${VERSION}" $R5
+  StrCmp $R5 "1" 0 icGuardDone
+  IfSilent 0 +2
+    Quit
+  MessageBox MB_YESNO|MB_ICONEXCLAMATION "The installed version ($R6) is newer than this installer (${VERSION}).$\r$\nInstall the older version anyway?" /SD IDNO IDYES icGuardDone
+  Quit
+  icGuardDone:
+
+  ; ── 2. kill + wait for file locks (updates only) ──
   IfFileExists "$LOCALAPPDATA\Programs\interview-copilot-ai\Interview Copilot.exe" 0 icInitDone
-  ; Absolute path — System32 is not reliably on PATH on every machine
-  ; (observed in the field), and the stock templates use $SYSDIR for the
-  ; same reason.
   nsExec::Exec '"$SYSDIR\taskkill.exe" /f /im "Interview Copilot.exe"'
   Pop $R7
   StrCpy $R9 0
@@ -48,4 +67,29 @@
     IntOp $R9 $R9 + 1
     IntCmp $R9 40 icInitDone icWaitUnlock icInitDone
   icInitDone:
+
+  ; ── 3. purge differential-era cache landmines ──
+  !ifdef APP_INSTALLER_STORE_FILE
+    Delete "$LOCALAPPDATA\${APP_INSTALLER_STORE_FILE}"
+  !else
+    Delete "$LOCALAPPDATA\interview-copilot-ai-updater\installer.exe"
+  !endif
+  Delete "$LOCALAPPDATA\interview-copilot-ai-updater\current.blockmap"
+!macroend
+
+; The stock install section RE-PLANTS the landmine the macro above just
+; removed: include/installer.nsh copies the running installer to
+; $LOCALAPPDATA\${APP_INSTALLER_STORE_FILE} ("<name>-updater\installer.exe")
+; as the baseline for differential downloads. We publish no blockmaps
+; (nsis.differentialPackage=false) and the app disables differential +
+; web-installer paths, so the 150 MB self-copy is pure waste that ages
+; into exactly the stale-installer hazard the downgrade guard exists for.
+; customInstall runs at the END of the install section — after the stock
+; copy — so deleting here keeps the cache permanently clean.
+!macro customInstall
+  !ifdef APP_INSTALLER_STORE_FILE
+    Delete "$LOCALAPPDATA\${APP_INSTALLER_STORE_FILE}"
+  !else
+    Delete "$LOCALAPPDATA\interview-copilot-ai-updater\installer.exe"
+  !endif
 !macroend
