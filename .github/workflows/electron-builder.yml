@@ -1,20 +1,22 @@
 name: Build and Release Desktop App
 
 # Trigger matrix:
-#   release: created    — fires when a release is created in PUBLISHED state
-#                         (the historical default for `gh release create` flows)
-#   release: published  — fires when a draft release is flipped to published.
-#                         electron-builder's GitHub publish path always creates
-#                         the release as draft first, then we PATCH it to non-
-#                         draft. Without this trigger, the workflow never ran
-#                         for releases shipped via `npm run electron:publish`,
-#                         so Mac/Linux artifacts never made it into those tags.
-#   workflow_dispatch   — manual trigger from the Actions tab. Useful for
-#                         backfilling missing artifacts on an existing release
-#                         without cutting a new tag.
+#   release: published  — the ONLY release trigger. GitHub emits `published`
+#                         both when a draft flips to published (the
+#                         electron-builder local-publish flow) and when a
+#                         release is created directly in published state
+#                         (`gh release create`), so the old additional
+#                         `created` trigger only ever produced a DUPLICATE
+#                         run — whose parallel upload step raced this one's
+#                         (v4.0.12 lost latest-linux.yml to exactly that
+#                         race) and doubled CI minutes per release.
+#   workflow_dispatch   — manual trigger from the Actions tab. Note: with
+#                         `--publish never`, dispatch runs upload nothing
+#                         (the upload step is gated to release events) —
+#                         backfill by re-publishing the release instead.
 on:
   release:
-    types: [created, published]
+    types: [published]
   workflow_dispatch:
 
 permissions:

@@ -21,7 +21,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
     X, Crown, Cpu, Mic, Camera, Keyboard, Monitor, FileText,
     EyeOff, Sparkles, ChevronLeft, ChevronRight, Check, ScreenShare, Download,
-    Command, Clock, MousePointerClick, ExternalLink,
+    Command, Clock, MousePointerClick, ExternalLink, MessageCircle,
 } from 'lucide-react';
 import { WizardHat } from './WizardHat';
 
@@ -160,7 +160,7 @@ function buildDesktopSteps(os: DesktopOS): TutorialStep[] {
         body: (
             <>
                 Your real-time AI copilot for <span className="text-purple-300 font-semibold">interviews and meetings</span>. It listens
-                through your mic, suggests answers in your voice, and stays <span className="text-purple-300 font-semibold">invisible to screen-share</span> so
+                to your interview through system audio, suggests answers in your voice, and stays <span className="text-purple-300 font-semibold">invisible to screen-share</span> so
                 no one on the call knows it's there.
                 <div className="mt-3 text-xs text-gray-400">
                     Quick tour — about 2 minutes. You can replay this anytime from Settings → Help.
@@ -332,6 +332,33 @@ function buildDesktopSteps(os: DesktopOS): TutorialStep[] {
                 <div className="mt-3 text-xs text-amber-200/90 bg-amber-500/10 border border-amber-500/30 rounded-lg px-2.5 py-2">
                     Leaving the mic on after the call keeps burning time. If you forget, we auto-settle a stalled session shortly after your last activity — but stopping the mic is the clean way to bank what's left. See your balance any time in <span className="font-semibold">Settings → Usage</span>.
                 </div>
+            </>
+        ),
+    },
+    {
+        icon: Crown,
+        accent: 'from-rose-500 to-pink-500',
+        title: 'Extensions, history & the reasoning dial',
+        body: (
+            <>
+                Three power tools people miss:
+                <ul className="mt-3 text-sm space-y-2 text-gray-300">
+                    <li className="flex gap-2"><span className="text-rose-400">→</span> <span><span className="font-semibold text-white">Running low mid-interview?</span> Top up from Settings → Manage plan — +30 min / +1 h / +3 h packs apply instantly, no restart.</span></li>
+                    <li className="flex gap-2"><span className="text-rose-400">→</span> <span>Every session's transcript and answers save to your <span className="font-semibold text-white">History</span> — review or export them after the call.</span></li>
+                    <li className="flex gap-2"><span className="text-rose-400">→</span> <span>On <span className="font-semibold text-white">Max &amp; Ultra</span>, the GPT-5.5 <span className="font-semibold text-white">reasoning dial</span> trades answer speed for depth, per question.</span></li>
+                </ul>
+            </>
+        ),
+    },
+    {
+        icon: MessageCircle,
+        accent: 'from-sky-500 to-blue-500',
+        title: 'Stuck? Ask Minica',
+        body: (
+            <>
+                The built-in assistant handles <span className="font-semibold text-white">billing, refunds, troubleshooting and how-tos</span> —
+                click the chat bubble any time, before or during an interview. Full written guides live under
+                <span className="font-semibold text-white"> Documentation</span>, and every doc page has a feedback button if something's unclear.
             </>
         ),
     },

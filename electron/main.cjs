@@ -6332,7 +6332,42 @@ app.whenReady().then(() => {
     }
   }
 
-  createMainWindow();
+  // ── Launch-blink gate (Windows) ──────────────────────────────────
+  // If the previous session ended without installing a downloaded update
+  // (crash / force-kill skipped the quit-time install), the old flow
+  // painted the OLD app first, then the launch window installed the
+  // cached update and relaunched — a jarring old-version "blink". When
+  // (and only when) a pending package exists, hold the window back so
+  // the cached install applies BEFORE any UI paints; the relaunch then
+  // opens straight on the new version. Every normal launch (empty
+  // cache) shows the window immediately, exactly as before. Fail-open
+  // by design: a stale/refused cache, an updater error, a no-update
+  // result, and a hard 6s cap all fall through to showing the window.
+  let bootWindowShown = false;
+  function showBootWindow() {
+    if (bootWindowShown) return;
+    bootWindowShown = true;
+    if (!mainWindow || mainWindow.isDestroyed()) createMainWindow();
+  }
+  let holdForPendingUpdate = false;
+  if (!isDev && process.platform === 'win32') {
+    try {
+      const fsBoot = require('fs');
+      const pendingDir = require('path').join(process.env.LOCALAPPDATA || '', 'interview-copilot-ai-updater', 'pending');
+      holdForPendingUpdate =
+        !!process.env.LOCALAPPDATA &&
+        fsBoot.existsSync(pendingDir) &&
+        fsBoot.readdirSync(pendingDir).some((f) => f.toLowerCase().endsWith('.exe'));
+    } catch (e) {
+      holdForPendingUpdate = false;
+    }
+  }
+  if (holdForPendingUpdate) {
+    electronLog.info('[updater] pending update present at boot — holding window for the launch install');
+    setTimeout(showBootWindow, 6000);
+  } else {
+    showBootWindow();
+  }
   createTray();
 
   // ── Tray reliability watchdog ───────────────────────────────────────
@@ -6545,6 +6580,8 @@ app.whenReady().then(() => {
         sendUpdateStatus('up-to-date', {});
         launchInstallActive = false;
         clearTimeout(launchInstallTimer);
+        // Launch-blink gate: nothing to install — paint the window now.
+        showBootWindow();
       });
 
       autoUpdater.on('download-progress', (progress) => {
@@ -6574,6 +6611,8 @@ app.whenReady().then(() => {
           // so before-quit / X-close / tray Quit don't try to install the
           // stale cache either. Treat the app as up-to-date for the UI.
           sendUpdateStatus('up-to-date', {});
+          // Launch-blink gate: the pending cache was stale — show the window.
+          showBootWindow();
           return;
         }
 
@@ -6601,6 +6640,9 @@ app.whenReady().then(() => {
         sendUpdateStatus('error', { message: err && err.message });
         launchInstallActive = false;
         clearTimeout(launchInstallTimer);
+        // Launch-blink gate: check failed (offline etc.) — never keep the
+        // user staring at nothing; show the window.
+        showBootWindow();
       });
 
       // User clicks "Restart & Update" in Settings — show the installer

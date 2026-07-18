@@ -25,6 +25,7 @@ import { useDatabase, SessionSummary } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
 import { SubscriptionGate, AdminDashboard } from './SubscriptionGate';
 import { Tutorial, shouldShowTutorial, markTutorialCompleted, clearTutorialCompletion } from './Tutorial';
+import { DownloadGuide } from './DownloadGuide';
 import { ManageSubscription } from './ManageSubscription';
 import { licenseService, UserProfile, LicenseData, TIME_CONSTANTS, fetchUsageSummary, UsageSummary } from './services/licenseService';
 import { creditTimerService } from './services/creditTimerService';
@@ -7266,6 +7267,35 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     return () => window.clearTimeout(t);
   }, [isListening, audioTipKey, isPopoutThinClient]);
 
+  // Knowledge-Base coach: the third onboarding nudge — answers only sound
+  // like the USER once a résumé + JD are attached, and brand-new accounts
+  // routinely skip that step. One-time per account; armed only after the
+  // tutorial AND the pop-out coach are out of the way (they share the
+  // bottom-right anchor), only while the Knowledge Base is still EMPTY,
+  // never mid-interview. Completes silently if the user uploads files on
+  // their own while it's visible.
+  const kbCoachKey = userProfile?.id ? `coach_kbfiles_v1_${userProfile.id}` : null;
+  const [kbCoachOpen, setKbCoachOpen] = useState(false);
+  useEffect(() => {
+    if (!kbCoachKey || isPopoutElectron) { setKbCoachOpen(false); return; }
+    if (tutorialOpen || isPipMode || popoutCoachOpen) return;
+    if (db.contextFiles.length > 0) {
+      if (kbCoachOpen) {
+        setKbCoachOpen(false);
+        try { localStorage.setItem(kbCoachKey, 'true'); } catch { /* non-fatal */ }
+      }
+      return;
+    }
+    try {
+      const popoutSeen = !popoutCoachKey || localStorage.getItem(popoutCoachKey) === 'true';
+      if (popoutSeen && localStorage.getItem(kbCoachKey) !== 'true') setKbCoachOpen(true);
+    } catch { /* localStorage unavailable — skip the coach */ }
+  }, [kbCoachKey, popoutCoachKey, tutorialOpen, isPipMode, popoutCoachOpen, kbCoachOpen, db.contextFiles.length, isPopoutElectron]);
+  const dismissKbCoach = useCallback(() => {
+    setKbCoachOpen(false);
+    try { if (kbCoachKey) localStorage.setItem(kbCoachKey, 'true'); } catch { /* non-fatal */ }
+  }, [kbCoachKey]);
+
   // Full-screen admin dashboard for is_admin users. Rendered inside MainApp
   // (not App-level) so returning via onBack keeps chat/session state mounted.
   // Gated with the same isDeveloper helper SubscriptionGate used before the
@@ -8473,7 +8503,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                             </div>
                             <div className="text-left">
                                 <div className="font-bold text-text group-hover:text-purple-400 transition-colors">Download for Mac</div>
-                                <div className="text-xs text-gray-500">macOS 10.15+ (.dmg)</div>
+                                <div className="text-xs text-gray-500">macOS 12+ (.dmg)</div>
                             </div>
                         </div>
                         <Download size={18} className="text-gray-500 group-hover:text-purple-500 transition-colors" />
@@ -8492,6 +8522,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                         <Download size={18} className="text-gray-500 group-hover:text-orange-500 transition-colors" />
                     </a>
                 </div>
+
+                {/* What the browser may ask after the click — per-OS, click-by-click */}
+                <DownloadGuide className="text-left" />
             </div>
         </Modal>
       )}
@@ -8550,6 +8583,55 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
               </div>
             </div>
             <button onClick={dismissPopoutCoach} aria-label="Dismiss" className="text-gray-500 hover:text-gray-300 flex-shrink-0">
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+      )}
+      {/* ── Knowledge-Base coach — one-time, per account, after the pop-out
+             coach. An empty KB means generic answers; this nudges the
+             résumé + JD upload at the exact toolbar icon that does it. ── */}
+      {!isPopoutElectron && kbCoachOpen && !isListening && !manageSubOpen && (
+        <div
+          role="status"
+          className="fixed bottom-6 right-6 z-[93] max-w-sm rounded-2xl p-4 backdrop-blur-md"
+          style={{
+            background: 'linear-gradient(180deg, rgba(20,17,12,0.97), rgba(10,9,8,0.97))',
+            border: '1px solid rgba(211,172,99,0.35)',
+            boxShadow: '0 24px 70px -22px rgba(0,0,0,0.9), 0 0 44px -18px rgba(211,172,99,0.4), inset 0 1px 0 rgba(255,255,255,0.06)',
+          }}
+        >
+          <div className="flex items-start gap-3">
+            <div
+              className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+              style={{ background: 'rgba(211,172,99,0.14)', border: '1px solid rgba(211,172,99,0.35)' }}
+            >
+              <FileText size={18} className="text-[#d3ac63]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-bold text-white leading-tight">
+                Make the answers sound like YOU
+              </div>
+              <p className="text-[11.5px] text-gray-400 mt-1 leading-relaxed">
+                Your Knowledge Base is empty, so answers stay generic. Click the <span className="inline-flex items-center align-middle mx-0.5 text-[#d3ac63]"><FileText size={12} /></span> file icon in the toolbar and add your <span className="text-[#f0d78a] font-semibold">résumé + the job description</span> — the AI then answers with <span className="text-gray-200 font-medium">your experience, in your voice</span>.
+              </p>
+              <div className="flex gap-2 mt-3">
+                <button
+                  onClick={() => { dismissKbCoach(); setShowContext(true); }}
+                  className="px-3 py-1.5 rounded-lg text-[11px] font-bold text-[#241b08] transition-transform active:scale-[0.98]"
+                  style={{ background: 'linear-gradient(180deg, #f0d78a 0%, #d3ac63 48%, #b8963f 100%)', boxShadow: '0 1px 0 rgba(255,255,255,0.35) inset, 0 4px 10px rgba(211,172,99,0.25)' }}
+                >
+                  Add files now
+                </button>
+                <button
+                  onClick={dismissKbCoach}
+                  className="px-3 py-1.5 rounded-lg text-[11px] font-semibold text-gray-400 hover:text-gray-200 border border-white/10 hover:bg-white/[0.05] transition-colors"
+                >
+                  Later
+                </button>
+              </div>
+            </div>
+            <button onClick={dismissKbCoach} aria-label="Dismiss" className="text-gray-500 hover:text-gray-300 flex-shrink-0">
               <X size={14} />
             </button>
           </div>

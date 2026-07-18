@@ -68,6 +68,13 @@ build/*
 *.deb
 *.rpm
 
+# ── One-off local probe scripts + captures (dev-only, never shipped) ──
+/probe-*.mjs
+/portal-shot.mjs
+/scroll-shot.mjs
+/globe-parity-out/
+/NaNportal-*.png
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

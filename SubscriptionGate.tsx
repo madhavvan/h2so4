@@ -4942,7 +4942,7 @@ interface DownloadMobileProps {
 
 const DOWNLOAD_PLATFORMS = [
   { name: 'Windows', sub: 'Windows 10+ (.exe)',     href: 'https://get.minicaai.com/windows', Icon: Monitor    },
-  { name: 'macOS',   sub: 'macOS 10.15+ (.dmg)',    href: 'https://get.minicaai.com/mac',   Icon: Cpu        },
+  { name: 'macOS',   sub: 'macOS 12+ (.dmg)',       href: 'https://get.minicaai.com/mac',   Icon: Cpu        },
   { name: 'Linux',   sub: 'Any distro (.AppImage)', href: 'https://get.minicaai.com/linux', Icon: Headphones },
 ] as const;
 
@@ -9089,7 +9089,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 </div>
                 <div className="text-left">
                   <div className="font-semibold text-white text-sm">macOS</div>
-                  <div className="text-[11px] text-gray-500">macOS 10.15+ (.dmg)</div>
+                  <div className="text-[11px] text-gray-500">macOS 12+ (.dmg)</div>
                 </div>
               </div>
               <Download size={16} className="text-gray-600 group-hover:text-purple-400 transition-colors" />

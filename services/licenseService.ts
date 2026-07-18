@@ -121,7 +121,7 @@ export const FEATURE_GATES = {
     models: ['gemini', 'groq', 'openai', 'xai'] as string[],
     screenCapture: true,
     autoSolve: true,
-    autoType: false,     // Auto-Type is Max-exclusive
+    autoType: false,     // Auto-Type is Ultra-exclusive (2026-07 pricing)
     popout: true,
     contextFiles: -1,    // unlimited
     sessionsPerMonth: -1, // session count isn't the gate — credit time is

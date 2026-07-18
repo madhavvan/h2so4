@@ -133,7 +133,7 @@ Hotkey: `Ctrl+Alt+Space` (Windows/Linux) or `Cmd+Alt+Space` (macOS) brings the m
 
 - **Node 20+** (the server's `package.json` engines pins this).
 - **npm** — the lockfile is npm-shaped; pnpm/yarn will work but produce a divergent lockfile.
-- **Windows 10+ / macOS 10.15+ / any modern Linux** for the desktop side.
+- **Windows 10+ / macOS 12+ / any modern Linux** for the desktop side.
 - **PowerShell** on Windows — used by the Auto-Type UIA bridge; ships with the OS.
 - **Visual Studio Build Tools** with the "Desktop development with C++" workload, only if you'll be code-signing Windows builds locally (provides `signtool.exe`).
 
