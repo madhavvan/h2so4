@@ -27,7 +27,7 @@ import {
   ChevronRight,
   Shield,
   CreditCard,
-  Github,
+  Mail,
   ArrowUpRight,
   Hash,
   Menu,
@@ -74,7 +74,7 @@ interface DocEntry {
   category: DocCategory;
   icon: React.ReactNode;
   raw: string;
-  /** Source file path on disk — drives the Edit-on-GitHub link. */
+  /** Source file path on disk. Informational only — not rendered. */
   sourcePath: string;
   /** Admin-only: this doc came from /api/v1/support/admin-docs and is
    *  decrypted server-side. Visible only when admin is authenticated.
@@ -184,10 +184,15 @@ function prettyAdminTitle(filename: string): string {
     .join('-');
 }
 
-// Public releases/issues repo — the app source lives in a private repo, so
-// user-facing links (doc feedback, issue reports) go here. Do NOT point this
-// at the source repo: it 404s for users once the source goes private.
-const GITHUB_REPO = 'https://github.com/madhavvan/interviewcopilot-releases';
+// Doc feedback goes to support, NOT to a GitHub issue tracker.
+//
+// The docs viewer used to link "Report a doc issue" and "Was this helpful?"
+// straight at github.com/<owner>/<repo>/issues/new, which published the
+// repository — and the account behind it — to every reader of the docs.
+// Support is the correct channel anyway: it reaches a person, it does not
+// require the reader to hold a GitHub account, and it keeps our repository
+// layout out of the product.
+const SUPPORT_EMAIL = 'support@minicaai.com';
 
 // ──────────────────────────────────────────────────────────────────
 // HELPERS
@@ -284,9 +289,9 @@ type LinkTarget =
 
 // Cross-doc filename → slug map. Only the four public docs are listed;
 // any link in the markdown to one of the internal engineering files
-// (ARCHITECTURE.md, AUTO_TYPE.md, etc.) will fall through to the GitHub
-// source-link branch in resolveLink and open the file on github.com
-// rather than try to render it inside the public viewer.
+// (ARCHITECTURE.md, AUTO_TYPE.md, etc.) resolve to nothing — resolveLink
+// treats repo-relative links as inert so the docs never point a reader at
+// our repository.
 const SLUG_BY_FILENAME: Record<string, string> = {
   'GETTING_STARTED.md': 'getting-started',
   'SECURITY.md': 'security',
@@ -306,14 +311,14 @@ function resolveLink(href: string): LinkTarget {
     const anchor = m[2];
     const slug = SLUG_BY_FILENAME[filename];
     if (slug) return { kind: 'doc', slug, anchor };
-    // Unknown .md (shouldn't happen), fall through to GitHub.
+    // Unknown .md (shouldn't happen) — falls through to the inert branch.
   }
-  // Repo-relative source link (e.g. ../services/aiProxyService.ts) — open
-  // the file on GitHub. We're not going to render TS in the doc viewer.
-  if (/^\.\.\//.test(href)) {
-    const cleaned = href.replace(/^\.\.\//, '');
-    return { kind: 'external', url: `${GITHUB_REPO}/blob/main/${cleaned}` };
-  }
+  // Repo-relative source link (e.g. ../services/aiProxyService.ts).
+  // This used to open the file on github.com, which leaked the repository
+  // to anyone who clicked a stray relative link in the docs — and it would
+  // 404 regardless, since the releases repo carries no source. Treat it as
+  // inert: nothing to render, nothing to reveal.
+  if (/^\.\.\//.test(href)) return { kind: 'noop' };
   // mailto / tel / data — let the OS handle.
   if (/^(mailto:|tel:|data:)/.test(href)) return { kind: 'external', url: href };
   // Absolute URL.
@@ -554,15 +559,16 @@ const Sidebar: React.FC<SidebarProps> = ({ activeSlug, onSelect, collapsed, onCo
           );
         })}
 
-        {/* Footer — contribute / report */}
+        {/* Footer — doc feedback, routed to support rather than a public
+            issue tracker (see SUPPORT_EMAIL). */}
         <div className="mt-6 pt-4 border-t border-black/10 dark:border-white/10 px-2">
           <button
             type="button"
-            onClick={() => openExternal(`${GITHUB_REPO}/issues/new`)}
+            onClick={() => openExternal(`mailto:${SUPPORT_EMAIL}?subject=${encodeURIComponent('Documentation feedback')}`)}
             className="w-full flex items-center gap-2 text-[12px] text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors py-1"
           >
-            <Github size={13} />
-            <span>Report a doc issue</span>
+            <Mail size={13} />
+            <span>Something wrong in the docs?</span>
             <ArrowUpRight size={11} className="ml-auto opacity-60" />
           </button>
         </div>
@@ -1243,7 +1249,7 @@ const DocumentationLayer: React.FC<LayerProps> = ({
               <div className="flex items-center gap-3">
                 <button
                   type="button"
-                  onClick={() => openExternal(`${GITHUB_REPO}/issues/new?title=Doc%20feedback%3A%20${encodeURIComponent(activeDoc.title)}`)}
+                  onClick={() => openExternal(`mailto:${SUPPORT_EMAIL}?subject=${encodeURIComponent(`Doc feedback: ${activeDoc.title}`)}`)}
                   className="inline-flex items-center gap-1.5 hover:text-gray-800 dark:hover:text-gray-200 transition-colors"
                 >
                   <span>Was this helpful?</span>

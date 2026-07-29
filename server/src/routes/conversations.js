@@ -50,6 +50,15 @@ router.post('/', (req, res) => {
       name: name || 'Interview ' + new Date().toLocaleDateString(),
     });
 
+    // createConversation is idempotent (INSERT OR IGNORE), so a duplicate
+    // id returns the EXISTING row rather than throwing. Ids are client-
+    // chosen timestamps and therefore guessable, so that row may belong to
+    // someone else — returning it unchecked would leak another user's
+    // conversation name. Verify the owner before echoing anything back.
+    if (!conv || conv.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
     res.status(201).json(conv);
   } catch (err) {
     console.error('Create conversation error:', err);
@@ -118,15 +127,21 @@ router.post('/:id/messages', (req, res) => {
 // ── Bulk sync messages (batch upload from client) ──
 router.post('/:id/sync', (req, res) => {
   try {
-    const conv = db.getConversationById(req.params.id);
+    let conv = db.getConversationById(req.params.id);
     if (!conv) {
-      // Auto-create conversation if it doesn't exist
-      db.createConversation({
+      // Auto-create if missing. createConversation is idempotent — see the
+      // comment on it in database.js for why (defence against a future
+      // async refactor or multi-process deploy opening a create race here;
+      // it is provably not racy today).
+      conv = db.createConversation({
         id: req.params.id,
         user_id: req.user.id,
         name: req.body.name || 'Interview ' + new Date().toLocaleDateString(),
       });
-    } else if (conv.user_id !== req.user.id) {
+    }
+    // Single owner check covering both paths — a row we just lost the race
+    // to create may belong to another user, since ids are client-supplied.
+    if (!conv || conv.user_id !== req.user.id) {
       return res.status(403).json({ error: 'Access denied' });
     }
 

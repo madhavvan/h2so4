@@ -2,6 +2,10 @@ const express = require('express');
 const { authMiddleware, generateToken } = require('../middleware/auth');
 const { adminOnly, stepUpOnly, writeAudit, ADMIN_EMAILS } = require('../middleware/admin');
 const db = require('../database');
+// Shared access predicate (active | canceling | past_due) — the same one
+// middleware/tier.js and regionGate.js use, so /validate's lapse handling
+// can never drift from what the gates actually enforce.
+const { hasAccess } = require('../services/subscriptionStates');
 
 const router = express.Router();
 
@@ -65,6 +69,30 @@ router.post('/validate', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'license_revoked', message: 'License revoked.' });
     }
 
+    // ── Repair: a 'canceling' license with no real cycle-end date ──
+    // The three cancel writers now guarantee a positive expires_at
+    // (subscriptionStates.resolveCancelPeriodEnd), but rows written BEFORE
+    // that fix — a canceled Ultra pinned at the -1 unlimited sentinel —
+    // terminate through no path at all: the cycle-end sweeper filters
+    // expires_at > 0, the auto-transition below does too, and requireTier
+    // reads -1 as "never expires". Left alone they serve unlimited Ultra
+    // forever on a subscription that is canceled at the provider.
+    //
+    // Bounding the window is safe in both directions: a monthly cycle end
+    // is at most ~31 days out so it can never cut a paying customer short,
+    // and no comp/lifetime grant can land here (recordCompPayment writes
+    // status='active', never 'canceling' — the only three writers of this
+    // status are the two cancel routes and the cancel-at-period-end
+    // webhook). Repairing on validate means the next time the user's app
+    // checks in, the row rejoins the normal lifecycle.
+    if (license.status === 'canceling' && !(license.expires_at > 0)) {
+      const repaired = db.repairCancelWindow(license.user_id);
+      if (repaired) {
+        console.warn(`[license/validate] repaired canceling license with no cycle end: user=${license.user_id} tier=${license.tier} expires_at=${license.expires_at} → +31d`);
+        license = db.getLicenseByKey(key);
+      }
+    }
+
     // ── Auto-transition: 'canceling' past its expires_at → 'free' ──
     // The cycle-end sweeper (server/src/index.js) and webhook handlers
     // are the primary paths for this transition. /validate is the
@@ -107,9 +135,82 @@ router.post('/validate', authMiddleware, async (req, res) => {
       }
     }
 
-    if (license.status === 'expired' || (license.expires_at > 0 && Date.now() > license.expires_at && license.tier !== 'free')) {
-      db.updateLicenseStatus(key, 'expired');
-      return res.status(403).json({ error: 'license_expired', message: 'License expired. Please renew.' });
+    // ── Lapse handling: answer 200 with the FREE row, never 403 ──────────
+    // Two states used to fall into one blanket 403 here, and the 403 was
+    // the problem in both:
+    //
+    //   (a) A paid plan past its expires_at. For the one-time passes this
+    //       is the moment the product PROMISES ("then your tier drops to
+    //       Free automatically" — ManageSubscription + TIERS.md §9), and
+    //       nothing implemented the drop: the cycle-end sweeper only scans
+    //       status='canceling', so the row sat at tier='pro' indefinitely
+    //       and only requireTier's expiry check kept the user out.
+    //
+    //   (b) A license the terminal webhooks ALREADY downgraded to free.
+    //       customer.subscription.deleted, subscription.updated(canceled|
+    //       unpaid), and the Razorpay cancelled/halted/completed handlers
+    //       all write tier='free', status='expired' — so EVERY completed
+    //       cancellation landed here. That one was the damaging case:
+    //       licenseService.validateWithServer deliberately never degrades
+    //       on a non-OK response (a failed revalidation must not disrupt a
+    //       live interview), so the client kept serving the STALE PAID
+    //       tier out of cache. Cancel Ultra and the header badge still
+    //       said Ultra — forever, until the user happened to log out —
+    //       while Manage Subscription (which reads /payments/subscription)
+    //       correctly said free. The client can only learn about a
+    //       downgrade from a 200.
+    //
+    // Revoked/suspended licenses are unaffected — they return 403 above.
+    //
+    // Deliberately NOT transitioned: 'paused'. Both pause handlers pin
+    // expires_at to Date.now() while PRESERVING the tier on the license
+    // precisely so customer.subscription.resumed can restore from the same
+    // row — a "past its expires_at" test alone would read a paused sub as
+    // lapsed and burn the tier the resume path needs. Same reasoning keeps
+    // 'refunded' and 'disputed' out: those are already tier='free' and
+    // their status carries accounting/fraud meaning worth preserving. So
+    // the predicate is "terminal, or an ACCESS status whose clock ran out".
+    const lapsedPaidPlan = license.tier !== 'free'
+      && (license.status === 'expired'
+        || (hasAccess(license.status) && license.expires_at > 0 && Date.now() > license.expires_at));
+    if (lapsedPaidPlan) {
+      try {
+        const transitioned = db.transitionLicenseToFree(license.user_id, { reason: 'validate-lapsed' });
+        if (transitioned && transitioned.transitioned) {
+          console.log(`[license/validate] lapsed-plan transition: user=${license.user_id} ${transitioned.from.tier} → free`);
+          // Same once-only email as the sweeper — transitionLicenseToFree is
+          // synchronous and idempotent, so whichever path catches the lapse
+          // first is the only one that reports transitioned:true.
+          try {
+            const { sendMail, renderAccessEndedEmail } = require('../email');
+            const u = db.getUserById(license.user_id);
+            if (u && typeof renderAccessEndedEmail === 'function') {
+              const buyBasicUrl = (process.env.FRONTEND_URL || 'https://minicaai.com') + '/#pricing';
+              const signInUrl = process.env.FRONTEND_URL || 'https://minicaai.com';
+              const { subject, html, text } = renderAccessEndedEmail({
+                name: u.name, previousTier: transitioned.from.tier, buyBasicUrl, signInUrl,
+              });
+              sendMail({ to: u.email, subject, html, text }).catch(() => { /* mail outage non-fatal */ });
+            }
+          } catch { /* email module unavailable */ }
+        }
+      } catch (lapseErr) {
+        console.warn('[license/validate] lapsed-plan transition failed:', lapseErr.message);
+      }
+      license = db.getLicenseByKey(key);
+    } else if (license.tier === 'free' && license.status === 'expired') {
+      // Case (b) once the tier is already free — the exact row every
+      // terminal cancellation webhook writes. Purely a status/window
+      // normalize: no entitlement changes hands, so no access-ended email
+      // is owed here (the cancel path sends its own confirmation, and the
+      // paid→free transition above owns the goodbye). Kept OUT of
+      // transitionLicenseToFree so that function's `transitioned` flag —
+      // which gates that email — keeps meaning "a paid plan just ended".
+      // Scoped to 'expired' only: a fresh free signup sits at 'trial' and
+      // must stay there, and 'refunded'/'disputed' are meaningful states
+      // that already answer 200.
+      db.normalizeFreeLicenseRow(license.user_id);
+      license = db.getLicenseByKey(key);
     }
 
     // Check user is not banned

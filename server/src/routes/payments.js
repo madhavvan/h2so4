@@ -7,6 +7,10 @@ const express = require('express');
 const { authMiddleware } = require('../middleware/auth');
 const { writeAudit } = require('../middleware/admin');
 const db = require('../database');
+// A 'canceling' license must always carry a positive expires_at — it is
+// the only lifecycle state whose termination is driven by a timestamp
+// rather than an event. See subscriptionStates.resolveCancelPeriodEnd.
+const { resolveCancelPeriodEnd } = require('../services/subscriptionStates');
 
 const router = express.Router();
 
@@ -21,12 +25,17 @@ function isAdminEmail(email) {
 }
 
 // ── Initialize payment providers (graceful if keys missing) ──
+const { createStripeClient, STRIPE_API_VERSION, subscriptionPeriodEnd } = require('../services/stripeClient');
 let stripe = null;
 let razorpay = null;
 
-if (process.env.STRIPE_SECRET_KEY) {
-  stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-  console.log('[Payments] Stripe initialized');
+// Pinned API version — an unpinned client follows the ACCOUNT's default,
+// and several fields this file reads (subscription.current_period_end on
+// the cancel path, charge/invoice shapes) were removed in 2025-03-31.basil.
+// See services/stripeClient.js.
+stripe = createStripeClient();
+if (stripe) {
+  console.log(`[Payments] Stripe initialized (API ${STRIPE_API_VERSION})`);
 }
 
 if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
@@ -102,6 +111,46 @@ function grantConfigForTier(tier) {
 const VALID_TIERS = ['free', 'basic', 'pro', 'max', 'ultra'];
 function normalizeTier(t) {
   return VALID_TIERS.includes(t) ? t : 'pro';
+}
+
+// ── Which provider owns this user's EXISTING subscription? ────────────
+// Provider used to be read straight off the `stripe_customer_id` prefix
+// (`cus_` → Stripe, `rzp_` → Razorpay), which worked only because the
+// Razorpay grant paths clobbered the column. Now that a Stripe `cus_…`
+// survives a later Razorpay grant (database.js setPaymentProviderMarker —
+// it has to, or the saved card, /portal and /payment-method all break), a
+// user can legitimately carry BOTH markers. The tie-break is "who granted
+// the tier they're on right now", because that's whose subscription the
+// cancel/reactivate/swap actions are about.
+//
+// Single-provider users resolve exactly as before. Returns null when
+// there's nothing on file at all.
+function resolveUserProvider(user) {
+  if (!user) return null;
+  const marker = user.stripe_customer_id || '';
+  const hasStripe = marker.startsWith('cus_');
+  const hasRazorpay = marker.startsWith('rzp_') || !!db.getLatestRazorpaySubscriptionId(user.id);
+  if (hasStripe && hasRazorpay) {
+    // rowid breaks the tie, and it has to. created_at is milliseconds, so
+    // two grants recorded in the same millisecond — a webhook and a
+    // verify landing together, an upgrade applied in one transaction —
+    // leave the ORDER BY undefined, and SQLite is then free to return the
+    // OLDER provider as "the one that granted the current tier". That
+    // decides which provider's cancel/upgrade endpoints the user is sent
+    // to, so getting it wrong points a paying customer at the wrong
+    // billing system. rowid is monotonic per insert, so it is exactly the
+    // "which came second" the timestamp cannot express.
+    const row = db.getDB().prepare(`
+      SELECT provider FROM payments
+      WHERE user_id = ? AND status = 'completed'
+        AND tier_granted IS NOT NULL AND tier_granted != 'free'
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get(user.id);
+    return row?.provider === 'razorpay' ? 'razorpay' : 'stripe';
+  }
+  if (hasStripe) return 'stripe';
+  if (hasRazorpay) return 'razorpay';
+  return null;
 }
 
 // Ladder order for upgrade/downgrade direction decisions (in-place plan
@@ -292,24 +341,105 @@ async function assertRazorpayPlanMatches(razorpayClient, planId, tier) {
 // Pro/Max subs by payment history. Pass holders and free users return null
 // here and check out normally. Comp'd Ultra (admin gift) also lands in
 // 'already_subscribed' — correct: there is genuinely nothing to buy.
+// ── Live one-time pass: refuse a SAME-or-LOWER repurchase (2026-07) ───
+// A pass grant is a REPLACEMENT, not an addition — updateLicenseOnPayment
+// sets credits_remaining_seconds absolutely. That is the documented rule
+// (TIERS.md §5) and it is fine in the direction it was designed for:
+// buying UP, which ManageSubscription warns about inline before the click
+// and whose UPGRADE_TARGETS map only ever offers higher tiers.
+//
+// The signed-in PRICING CARDS have no such map. They call
+// initiateCheckout(tier) for every tier including the one the user is
+// already on, and a pass holder never trips the recurring-plan guards
+// below (a pass is not subscription-backed), so the checkout went
+// straight through:
+//   · Max with 3h left buys Max again → charged $89, balance reset to
+//     10,800s. The second $89 buys literally nothing.
+//   · Max with 2h left buys Basic     → charged $30, balance overwritten
+//     to 1,800s. They pay to destroy 1.5 hours they already own.
+// Both are pure loss, and both are the natural "I need more interview
+// time" click. Extensions are the product that actually stacks, so that
+// is where this points them.
+//
+// Upgrades are deliberately left alone: they are documented, warned about
+// at the point of sale, and the user gets strictly more time than they
+// gave up. Pure function, like its caller — the license row carries
+// everything the decision needs.
+const PASS_TIERS = ['basic', 'pro', 'max'];
+function passRepurchaseConflictFor(license, targetTier) {
+  if (!PASS_TIERS.includes(license.tier)) return null;
+  if (!['active', 'canceling', 'past_due'].includes(license.status)) return null;
+  if (!PASS_TIERS.includes(targetTier) && targetTier !== 'free') return null; // Ultra is a real upgrade
+
+  // "Has time left" with the same semantics as db.resolveTimeBucket:
+  // -1 anywhere is the legacy unlimited sentinel; otherwise a positive
+  // balance inside an unexpired window.
+  const remaining = Number(license.credits_remaining_seconds ?? 0);
+  const windowEnd = Number(license.credits_expire_at ?? 0);
+  const unlimited = remaining === -1 || windowEnd === -1 || license.expires_at === -1;
+  const windowOpen = windowEnd <= 0 || Date.now() < windowEnd;
+  if (!unlimited && !(remaining > 0 && windowOpen)) return null; // spent or lapsed — let them re-buy anything
+
+  if (isTierUpgrade(license.tier, targetTier)) return null; // buying UP is allowed (and warned about client-side)
+
+  const label = String(license.tier).toUpperCase();
+  const leftLabel = unlimited
+    ? 'unlimited time'
+    : `${Math.max(1, Math.round(remaining / 60))} minutes`;
+  return {
+    code: 'pass_active',
+    httpStatus: 409,
+    suggested_action: 'extend-pass',
+    message: license.tier === targetTier
+      ? `You're already on the ${label} pass with ${leftLabel} left, and buying it again would just reset that same clock — not add to it. Use an extension pack instead (+30 min / +1 h / +3 h); those stack onto the time you already have.`
+      : `Buying the ${String(targetTier).toUpperCase()} pass would REPLACE the ${leftLabel} left on your ${label} pass with a smaller one — you'd pay and end up with less time. Use an extension pack instead (+30 min / +1 h / +3 h); those stack onto your existing clock.`,
+  };
+}
+
 function checkoutConflictFor(license, hasRecurringPlan, targetTier) {
-  if (!license || !hasRecurringPlan) return null;
+  if (!license) return null;
+  // Pass holders are not subscription-backed, so they fall through every
+  // guard below — their case is decided first. Gated on !hasRecurringPlan
+  // so a LEGACY Pro/Max subscriber (who also sits on a pro/max tier, with a
+  // migration-era unlimited balance) still gets the accurate
+  // 'subscription_active' verdict below instead of pass copy.
+  if (!hasRecurringPlan) {
+    const passConflict = passRepurchaseConflictFor(license, targetTier);
+    if (passConflict) return passConflict;
+    return null;
+  }
   if (!['active', 'canceling', 'past_due'].includes(license.status)) return null;
   if (targetTier === 'ultra') {
     if (license.tier === 'ultra') {
-      return license.status === 'canceling'
-        ? {
-            code: 'already_subscribed',
-            httpStatus: 409,
-            suggested_action: 'reactivate-subscription',
-            message: 'You\'re still on Ultra — your cancellation only takes effect at the end of the billing cycle. Reactivate it from Manage subscription (no new charge today) instead of starting a second subscription.',
-          }
-        : {
-            code: 'already_subscribed',
-            httpStatus: 409,
-            suggested_action: null,
-            message: 'You\'re already on the Ultra subscription — it includes everything, so there\'s nothing more to buy.',
-          };
+      if (license.status === 'canceling') {
+        return {
+          code: 'already_subscribed',
+          httpStatus: 409,
+          suggested_action: 'reactivate-subscription',
+          message: 'You\'re still on Ultra — your cancellation only takes effect at the end of the billing cycle. Reactivate it from Manage subscription (no new charge today) instead of starting a second subscription.',
+        };
+      }
+      // past_due is a DEAD CARD, not a healthy subscription. Answering it
+      // with "nothing more to buy" was the worst possible copy: this user
+      // is trying to pay us, dunning is counting down to cancellation, and
+      // we told them everything was fine and gave them no next step. What
+      // they need is the card-update flow — starting a second subscription
+      // still isn't the answer, so the refusal stands; only the reason and
+      // the action change.
+      if (license.status === 'past_due') {
+        return {
+          code: 'payment_method_required',
+          httpStatus: 409,
+          suggested_action: 'update-payment-method',
+          message: 'Your Ultra subscription is still active, but the last payment didn\'t go through — starting a second subscription won\'t fix that. Update your card from Manage subscription and we\'ll retry the outstanding charge automatically.',
+        };
+      }
+      return {
+        code: 'already_subscribed',
+        httpStatus: 409,
+        suggested_action: null,
+        message: 'You\'re already on the Ultra subscription — it includes everything, so there\'s nothing more to buy.',
+      };
     }
     // Legacy Pro/Max subscriber going Ultra: the right move is the
     // in-place plan swap (prorated), never a parallel subscription.
@@ -352,11 +482,11 @@ router.post('/create-checkout', authMiddleware, async (req, res) => {
         // as /upgrade-tier; no provider on file → fall through to a fresh
         // checkout (nothing live to double-bill).
         const user = db.getUserById(req.user.id);
-        const customerId = user?.stripe_customer_id || '';
-        if (customerId.startsWith('rzp_')) {
+        const inPlaceProvider = resolveUserProvider(user);
+        if (inPlaceProvider === 'razorpay') {
           return await upgradeRazorpaySubscription(req, res, { user, currentTier: currentLicense.tier, targetTier: tier });
         }
-        if (customerId.startsWith('cus_')) {
+        if (inPlaceProvider === 'stripe') {
           return await upgradeStripeSubscription(req, res, { user, currentTier: currentLicense.tier, targetTier: tier });
         }
       } else {
@@ -495,11 +625,13 @@ router.post('/upgrade-tier', authMiddleware, async (req, res) => {
       });
     }
 
-    // Provider is encoded in the stripe_customer_id prefix. We don't
-    // store provider explicitly — same convention as /subscription.
+    // Which provider owns the live subscription — see resolveUserProvider.
+    // (Was a bare prefix test on stripe_customer_id, which mis-answers for
+    // users who now legitimately carry both markers.)
     const customerId = user.stripe_customer_id || '';
-    const isRazorpay = customerId.startsWith('rzp_');
-    const isStripe = customerId.startsWith('cus_');
+    const subProvider = resolveUserProvider(user);
+    const isRazorpay = subProvider === 'razorpay';
+    const isStripe = subProvider === 'stripe';
 
     // ── 2026-07 model: ULTRA is the only subscription plan ──
     // An in-place swap rewires an EXISTING subscription, so the target must
@@ -807,6 +939,40 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
   });
 }
 
+// ── Interview-day eligibility — ONE rule, both top-up routes ──────────
+// The product rule (owner-confirmed) is that top-ups repeat without limit
+// but only while the pass is actually in use: an open usage session
+// (mid-interview, the primary case) or activity within the last 12 hours
+// (the interviewer called back for another round the same day). A
+// week-old pass can't be topped up — buy a fresh interview instead.
+//
+// This lived inline in /extend-now only, so /create-renewal — a public,
+// authenticated route that reaches the very same grant — enforced nothing.
+// Any client could top up on any day by calling the older endpoint. It
+// leaked in the revenue-POSITIVE direction, which is exactly why it could
+// sit there unnoticed: nobody complains about being allowed to pay. But a
+// rule enforced on one of two doors is not a rule, and the day the policy
+// changes to something restrictive the second door is still open.
+//
+// Returns null when eligible, or the {status, body} to send when not.
+// Admins are exempt (they are unlimited and never charged).
+const EXTENSION_ELIGIBLE_WINDOW_MS = 12 * 60 * 60 * 1000;
+function interviewDayDenial(userId) {
+  const recentActivity = db.getDB().prepare(`
+    SELECT id FROM usage_sessions
+    WHERE user_id = ? AND (ended_at IS NULL OR last_heartbeat_at > ?)
+    LIMIT 1
+  `).get(userId, Date.now() - EXTENSION_ELIGIBLE_WINDOW_MS);
+  if (recentActivity) return null;
+  return {
+    status: 403,
+    body: {
+      error: 'not_interview_day',
+      message: 'Top-ups are available during your interview day. Start your interview first, or buy a new interview pass.',
+    },
+  };
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  CREATE RENEWAL — +30 min top-up (browser-checkout fallback)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -832,6 +998,17 @@ router.post('/create-renewal', authMiddleware, async (req, res) => {
         error: 'Top-ups extend the Basic, Pro, and Max interview passes. Buy a pass to start.',
       });
     }
+    // ── Interview-day gate — the SAME rule /extend-now applies ──
+    // This route is /extend-now's browser fallback, but it is also a live
+    // endpoint any client can call directly, and it used to enforce
+    // nothing. Note /extend-now's degraded paths call createStripeRenewal
+    // as a FUNCTION, not through this route, so they are gated once (at
+    // /extend-now) and never double-gated here.
+    if (!isAdminEmail(req.user.email)) {
+      const denial = interviewDayDenial(req.user.id);
+      if (denial) return res.status(denial.status).json(denial.body);
+    }
+
     // SECURITY: Same currency-injection mitigation as /create-checkout.
     // country_code is server-controlled — read from the user's DB row (set
     // at signup; /profile can't change it). The JWT carries no country_code
@@ -879,7 +1056,8 @@ router.post('/create-renewal', authMiddleware, async (req, res) => {
 // in-tx dedup make client retries idempotent. The Stripe idempotencyKey
 // (from the client's attempt_id) makes double-clicks safe at the charge
 // layer too — same key returns the same PaymentIntent, not a second charge.
-const EXTENSION_ELIGIBLE_WINDOW_MS = 12 * 60 * 60 * 1000;
+// (Eligibility windowing now lives in interviewDayDenial above, shared with
+// /create-renewal so the rule can't hold on one route and not the other.)
 
 router.post('/extend-now', authMiddleware, async (req, res) => {
   try {
@@ -899,24 +1077,9 @@ router.post('/extend-now', authMiddleware, async (req, res) => {
       return res.json({ success: true, already_unlimited: true });
     }
 
-    // ── Interview-day gate ──
-    // Unlimited repeats, but only while the pass is actually in use: an
-    // open usage session (mid-interview — the primary case) or activity
-    // in the last 12 hours (interviewer called back for another round
-    // the same day). A week-old pass can't be topped up — buy a fresh
-    // interview instead.
-    const d = db.getDB();
-    const recentActivity = d.prepare(`
-      SELECT id FROM usage_sessions
-      WHERE user_id = ? AND (ended_at IS NULL OR last_heartbeat_at > ?)
-      LIMIT 1
-    `).get(req.user.id, Date.now() - EXTENSION_ELIGIBLE_WINDOW_MS);
-    if (!recentActivity) {
-      return res.status(403).json({
-        error: 'not_interview_day',
-        message: 'Top-ups are available during your interview day. Start your interview first, or buy a new interview pass.',
-      });
-    }
+    // ── Interview-day gate — shared with /create-renewal ──
+    const denial = interviewDayDenial(req.user.id);
+    if (denial) return res.status(denial.status).json(denial.body);
 
     const attemptId = String(req.body?.attempt_id || '').slice(0, 64);
     const extPack = resolveExtensionPack(req.body?.pack);
@@ -1095,7 +1258,7 @@ const STRIPE_PRICE_DATA = {
     currency: 'usd',
     product_data: {
       name: 'minicaai Basic',
-      description: 'One 30-minute interview · Gemini · GPT-5.5 · Grok · Groq',
+      description: 'One 30-minute interview · Gemini · GPT-5.6 · Grok · Groq',
     },
     unit_amount: 3000,
     // No `recurring` — one-time interview.
@@ -1319,7 +1482,7 @@ const RAZORPAY_TIER_CONFIG = {
   basic: {
     amountPaise: 249900, // ₹2499 one-time · one 30-min interview
     name: 'minicaai Basic',
-    description: 'One 30-minute interview · Gemini · GPT-5.5 · Grok · Groq',
+    description: 'One 30-minute interview · Gemini · GPT-5.6 · Grok · Groq',
   },
   pro: {
     amountPaise: 419900, // ₹4199 one-time · one 1-hour interview
@@ -1478,7 +1641,12 @@ async function createStripeRenewal(req, res) {
     : null;
   const sessionParams = {
     mode: 'payment',
-    payment_method_types: ['card'],
+    // No explicit payment_method_types — same reasoning as /create-checkout:
+    // pinning ['card'] here silently disabled Apple Pay, Google Pay and every
+    // local method the Dashboard offers, on the surface users hit MID-INTERVIEW
+    // where friction costs the most. Stripe filters the list down to methods
+    // compatible with setup_future_usage on its own, so the saved-card path
+    // that powers one-click top-ups still works.
     line_items: [{
       price_data: {
         currency: 'usd',
@@ -1503,6 +1671,14 @@ async function createStripeRenewal(req, res) {
       pack: renewalPack.id,
     },
     billing_address_collection: 'required',
+    // Tax parity with /create-checkout. Without this the $30–$159 plans
+    // were taxed and the $25–$80 top-ups were not — so in any jurisdiction
+    // where the merchant is registered, VAT/GST/sales tax on the entire
+    // top-up revenue line went uncollected and the liability fell on us.
+    // Same safe default as the plan checkout: if Stripe Tax isn't set up,
+    // tax computes to zero and the session still completes.
+    automatic_tax: { enabled: true },
+    customer_update: reuseCustomerId ? { address: 'auto' } : undefined,
     // Save the card for off-session reuse (the one-click /extend-now path).
     payment_intent_data: { setup_future_usage: 'off_session', metadata: { pack: renewalPack.id } },
   };
@@ -1792,8 +1968,10 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
         // for provider detection; new dedicated column razorpay_subscription_id
         // for the actual stable subscription pointer (only set when this is
         // a recurring sub, not a one-time order).
-        sqlite.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
-          .run(`rzp_${razorpay_subscription_id || razorpay_payment_id}`, Date.now(), user.id);
+        // Never clobbers an existing Stripe `cus_…` marker (the saved card,
+        // /portal and provider detection all hang off it) — the Razorpay
+        // pointer lives in users.razorpay_subscription_id below.
+        db.setPaymentProviderMarker(user.id, `rzp_${razorpay_subscription_id || razorpay_payment_id}`);
         if (razorpay_subscription_id) {
           db.setRazorpaySubscriptionId(user.id, razorpay_subscription_id);
         }
@@ -1853,6 +2031,192 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  VERIFY STRIPE CHECKOUT (client-side callback — webhook fallback)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Razorpay always had /verify-razorpay: the client confirms the payment
+// and the grant lands even if the webhook never arrives. Stripe had
+// NOTHING equivalent — the webhook was the single path from "customer
+// paid" to "customer provisioned". If STRIPE_WEBHOOK_SECRET is rotated,
+// the dashboard endpoint is misconfigured, or delivery fails past
+// Stripe's 3-day retry window, the money is taken and the account is
+// never upgraded, with no automatic recovery. Since Stripe now carries
+// 100% of traffic (India included, while Razorpay is pending), that was
+// the largest single point of failure in the payment system.
+//
+// This closes it. The client already holds `session_id` — /create-checkout
+// returns it, and it also rides on the success URL — so it can ask the
+// server to confirm at any point.
+//
+// Safety properties, all of which mirror the webhook:
+//   · Stripe is the source of truth — we retrieve the session server-side
+//     and read payment_status; a client can't assert that it paid.
+//   · Ownership is checked against the metadata WE stamped at creation,
+//     so one user can't redeem another's session id.
+//   · The tier comes from that same server-stamped metadata, never the
+//     request body.
+//   · The grant is idempotent: in-transaction dedup on the payment id,
+//     backed by the UNIQUE(provider, provider_payment_id) index. Racing
+//     the webhook is a no-op, not a double grant.
+router.post('/verify-stripe', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
+    }
+    const sessionId = String(req.body?.session_id || '').trim().slice(0, 128);
+    if (!sessionId.startsWith('cs_')) {
+      return res.status(400).json({ error: 'A Stripe checkout session id is required.' });
+    }
+
+    let session;
+    try {
+      session = await stripe.checkout.sessions.retrieve(sessionId);
+    } catch (lookupErr) {
+      console.warn('[verify-stripe] session lookup failed:', sessionId, lookupErr.message);
+      return res.status(404).json({ error: 'Checkout session not found.' });
+    }
+
+    // ── Ownership ──
+    // metadata.user_id / user_email are stamped server-side at session
+    // creation and can't be influenced by the client. Without this check
+    // any authenticated user who learned a session id could redeem
+    // someone else's purchase onto their own account.
+    const ownerId = String(session.metadata?.user_id || '');
+    const ownerEmail = String(session.metadata?.user_email || '').toLowerCase();
+    const callerEmail = String(req.user.email || '').toLowerCase();
+    if (ownerId !== String(req.user.id) && (!ownerEmail || ownerEmail !== callerEmail)) {
+      console.warn('[verify-stripe] ownership mismatch — session', sessionId, 'belongs to', ownerId || ownerEmail, 'caller', req.user.id);
+      return res.status(403).json({ error: 'This checkout session belongs to a different account.' });
+    }
+
+    // ── Did the money actually land? ──
+    // Same gate the webhook applies. A delayed-notification method (SEPA,
+    // boleto, OXXO…) reports 'unpaid' here for days — tell the client to
+    // keep waiting rather than granting on an unsettled payment.
+    const paid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+    if (!paid) {
+      return res.status(202).json({
+        success: true,
+        pending: true,
+        payment_status: session.payment_status || 'unknown',
+        message: 'Payment is still processing with your bank. Your plan activates automatically as soon as it clears.',
+      });
+    }
+
+    const isRenewal = session.metadata?.mode === 'renewal' || session.metadata?.mode === 'extension';
+    const rawTier = session.metadata?.tier;
+    const tier = VALID_TIERS.includes(rawTier) && rawTier !== 'free' ? rawTier : null;
+    if (!isRenewal && !tier) {
+      // A paid session with no resolvable tier is a configuration bug, not
+      // a customer problem. Never guess a tier — the webhook records the
+      // same case as 'failed' for triage.
+      console.error('[verify-stripe] paid session with no resolvable tier:', sessionId, session.metadata);
+      return res.status(202).json({
+        success: true,
+        pending: true,
+        message: 'Payment received. Your account will activate momentarily.',
+      });
+    }
+
+    const user = db.getUserById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const paymentRef = session.payment_intent || session.id;
+    const sqlite = db.getDB();
+    let grantedTier = null;
+    let alreadyGranted = false;
+
+    sqlite.transaction(() => {
+      const dup = sqlite.prepare(
+        "SELECT id, tier_granted FROM payments WHERE provider = 'stripe' AND provider_payment_id = ? AND status = 'completed' LIMIT 1"
+      ).get(paymentRef);
+      if (dup) {
+        alreadyGranted = true;
+        grantedTier = dup.tier_granted;
+        return;
+      }
+
+      if (isRenewal) {
+        const pack = resolveExtensionPack(session.metadata?.pack);
+        const updated = db.grantTimeExtension(user.id, pack.seconds);
+        grantedTier = (updated && updated.tier) || 'basic';
+      } else {
+        const grant = grantConfigForTier(tier);
+        grantedTier = grant.tier;
+        db.updateUserTier(user.id, grant.tier);
+        db.updateLicenseOnPayment(user.id, {
+          tier: grant.tier,
+          status: 'active',
+          expires_at: grant.expires_at,
+          sessions_limit: grant.sessions_limit,
+          credits_remaining_seconds: grant.credits_remaining_seconds,
+          credits_expire_at: grant.credits_expire_at,
+        });
+      }
+
+      if (session.customer) {
+        db.setPaymentProviderMarker(user.id, session.customer);
+      }
+      db.recordPayment({
+        user_id: user.id,
+        email: user.email,
+        provider: 'stripe',
+        provider_payment_id: paymentRef,
+        provider_subscription_id: session.subscription || null,
+        amount: session.amount_total || 0,
+        currency: (session.currency || 'usd').toUpperCase(),
+        status: 'completed',
+        tier_granted: grantedTier,
+        metadata: {
+          checkout_session_id: session.id,
+          customer_id: session.customer,
+          tier: grantedTier,
+          mode: isRenewal ? 'renewal' : 'tier',
+          settled_via: 'verify-stripe',
+          verified_client_side: true,
+        },
+      });
+    })();
+
+    const license = db.getLicenseByUserId(req.user.id);
+    if (!alreadyGranted) {
+      console.log('[verify-stripe] grant applied (webhook had not landed):', user.email, grantedTier, paymentRef);
+      // Receipt only on the path that actually granted — the webhook sends
+      // its own when it wins the race.
+      try {
+        const { sendMail, renderPurchaseReceiptEmail } = require('../email');
+        if (typeof renderPurchaseReceiptEmail === 'function') {
+          const { subject, html, text } = renderPurchaseReceiptEmail({
+            name: user.name || user.email,
+            tier: grantedTier,
+            isTopUp: isRenewal,
+            amount: session.amount_total || 0,
+            currency: (session.currency || 'usd').toUpperCase(),
+            manageUrl: process.env.FRONTEND_URL || 'https://minicaai.com',
+          });
+          sendMail({ to: user.email, subject, html, text }).catch(() => { /* mail outage */ });
+        }
+      } catch { /* email module unavailable — non-fatal */ }
+    }
+
+    return res.json({
+      success: true,
+      duplicate: alreadyGranted,
+      tier: grantedTier,
+      mode: isRenewal ? 'renewal' : 'tier',
+      license: license ? { ...license, last_validated: Date.now() } : null,
+      message: alreadyGranted
+        ? 'Payment already applied.'
+        : (isRenewal
+            ? 'Top-up confirmed — the extra time is on your clock.'
+            : `Payment confirmed. Your ${String(grantedTier).toUpperCase()} plan is active.`),
+    });
+  } catch (err) {
+    console.error('[verify-stripe] error:', err.message, err.stack);
+    res.status(500).json({ error: 'Could not verify the payment. If you were charged, it will land automatically.' });
+  }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  GET SUBSCRIPTION STATUS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1869,13 +2233,23 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
 //     subscription.charged) always carry provider_subscription_id; one-time
 //     orders never do. We look at the LATEST tier-granting row so a legacy
 //     subscriber who lapsed and later bought a pass reads as one-time.
+//
+// The `rowid DESC` tiebreak is the same one resolveUserProvider needs and
+// for the same reason: created_at is milliseconds, so a lapsed subscriber
+// who re-buys a pass — or any two grants landing in the same millisecond
+// (a webhook and a /verify racing, an upgrade applied in one transaction)
+// — leaves the ordering undefined, and SQLite is then free to return the
+// OLDER row. Getting it wrong flips is_recurring, which decides whether
+// the client offers Cancel (404s for a pass holder) or "expires on <date>".
+// rowid is monotonic per insert, so it expresses the "which came second"
+// that the timestamp cannot.
 function isSubscriptionBackedTier(userId, tier) {
   if (tier === 'ultra') return true;
   if (tier !== 'pro' && tier !== 'max') return false;
   const row = db.getDB().prepare(`
     SELECT provider_subscription_id FROM payments
     WHERE user_id = ? AND status = 'completed' AND tier_granted IN ('pro', 'max')
-    ORDER BY created_at DESC LIMIT 1
+    ORDER BY created_at DESC, rowid DESC LIMIT 1
   `).get(userId);
   return !!(row && row.provider_subscription_id);
 }
@@ -1889,9 +2263,9 @@ router.get('/subscription', authMiddleware, async (req, res) => {
       return res.json({ status: 'none', tier: 'free', provider: null });
     }
 
-    // Check if paid via Razorpay or Stripe
-    const customerId = user.stripe_customer_id || '';
-    const provider = customerId.startsWith('rzp_') ? 'razorpay' : customerId.startsWith('cus_') ? 'stripe' : null;
+    // Which provider owns the live subscription (resolveUserProvider —
+    // handles users carrying both a Stripe cus_ and a Razorpay pointer).
+    const provider = resolveUserProvider(user);
 
     // Derive cancel-pending state from the canonical license.status the
     // webhook handler sets ('canceling' = cancel_at_period_end=true and
@@ -1900,6 +2274,19 @@ router.get('/subscription', authMiddleware, async (req, res) => {
     // scheduled — access until <date>" banner and a Reactivate CTA without
     // having to round-trip Stripe on every page load.
     const isCancelPending = license.status === 'canceling';
+
+    // ── Can this account top up RIGHT NOW? ──
+    // The interview-day rule is enforced server-side on both top-up routes,
+    // but the Billing Hub rendered an inviting "Add 30 minutes · $25" button
+    // unconditionally — so opening Manage Subscription on a non-interview
+    // day offered a purchase that could only ever fail. Surfacing the same
+    // predicate the routes use lets the button disable itself and say why,
+    // instead of the user clicking a paid CTA into a 403. One source of
+    // truth: this reads interviewDayDenial, so the affordance can never
+    // disagree with the gate.
+    const isMeteredPass = ['basic', 'pro', 'max'].includes(license.tier);
+    const isAdmin = isAdminEmail(req.user.email);
+    const extendDenial = (isMeteredPass && !isAdmin) ? interviewDayDenial(user.id) : null;
 
     res.json({
       status: license.status,
@@ -1913,6 +2300,12 @@ router.get('/subscription', authMiddleware, async (req, res) => {
       // Whether the current tier is a recurring subscription (Ultra, or a
       // legacy Pro/Max sub) vs a one-time pass — see isSubscriptionBackedTier.
       is_recurring: isSubscriptionBackedTier(user.id, license.tier),
+      // Top-up affordance state. can_extend is false only for a metered
+      // pass outside its interview day; Ultra/free simply don't show the
+      // control, and admins are unlimited.
+      can_extend: isMeteredPass ? !extendDenial : false,
+      extend_blocked_reason: extendDenial ? extendDenial.body.error : null,
+      extend_blocked_message: extendDenial ? extendDenial.body.message : null,
     });
   } catch (err) {
     console.error('Subscription status error:', err.message);
@@ -2008,8 +2401,9 @@ router.post('/reactivate-subscription', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const customerId = user.stripe_customer_id || '';
-    const isRazorpay = customerId.startsWith('rzp_');
-    const isStripe = customerId.startsWith('cus_');
+    const provider = resolveUserProvider(user);
+    const isRazorpay = provider === 'razorpay';
+    const isStripe = provider === 'stripe';
 
     if (!isRazorpay && !isStripe) {
       return res.status(400).json({
@@ -2255,13 +2649,19 @@ router.post('/cancel-razorpay', authMiddleware, async (req, res) => {
     // correct it on its own tick.
     const license = db.getLicenseByUserId(req.user.id);
     if (license) {
+      // resolveCancelPeriodEnd, not `periodEndMs || license.expires_at`:
+      // that fallback pinned a canceled Ultra at expires_at = -1 whenever
+      // the fetch above blipped, and -1 is invisible to BOTH the cycle-end
+      // sweeper and /validate's auto-transition. See subscriptionStates.
+      const cancelEnd = resolveCancelPeriodEnd(periodEndMs, license.expires_at);
       db.updateLicenseOnPayment(req.user.id, {
         tier: license.tier,                              // unchanged — user keeps access through cycle
         status: 'canceling',                             // matches /cancel-subscription unified route
-        expires_at: periodEndMs || license.expires_at,   // preserve existing if fetch blipped
+        expires_at: cancelEnd,
         sessions_limit: license.sessions_limit,
       });
       updatedLicense = db.getLicenseByUserId(req.user.id);
+      if (!periodEndMs) periodEndMs = cancelEnd; // report the window we actually persisted
     }
     // Advance the out-of-order gate so any stray pre-cancel events
     // (subscription.charged, payment.captured) that arrive AFTER the
@@ -2318,8 +2718,9 @@ router.post('/cancel-subscription', authMiddleware, async (req, res) => {
     const reasonDetail = String(req.body?.reason_detail || '').trim().slice(0, 500);
 
     const customerId = user.stripe_customer_id || '';
-    const isRazorpay = customerId.startsWith('rzp_');
-    const isStripe = customerId.startsWith('cus_');
+    const provider = resolveUserProvider(user);
+    const isRazorpay = provider === 'razorpay';
+    const isStripe = provider === 'stripe';
     if (!isRazorpay && !isStripe) {
       return res.status(400).json({
         error: 'No active subscription on file. If you signed up but never paid, there is nothing to cancel.',
@@ -2343,8 +2744,14 @@ router.post('/cancel-subscription', authMiddleware, async (req, res) => {
       let latestPeriodEnd = 0;
       for (const sub of subs.data) {
         const updated = await stripe.subscriptions.update(sub.id, { cancel_at_period_end: true });
-        if (updated.current_period_end && updated.current_period_end > latestPeriodEnd) {
-          latestPeriodEnd = updated.current_period_end;
+        // Compat read: current_period_end moved onto subscription items in
+        // 2025-03-31.basil. This client is pinned to 2023-10-16 so the direct
+        // field is normally present — but reading it through the accessor
+        // means the cancel date survives an unpinning too, and that date is
+        // what the whole canceling→free lifecycle hangs on.
+        const subEnd = subscriptionPeriodEnd(updated);
+        if (subEnd && subEnd > latestPeriodEnd) {
+          latestPeriodEnd = subEnd;
         }
         subscriptionId = sub.id; // last one wins, used purely for receipt/log
       }
@@ -2379,13 +2786,20 @@ router.post('/cancel-subscription', authMiddleware, async (req, res) => {
     let updatedLicense = null;
     const license = db.getLicenseByUserId(user.id);
     if (license) {
+      // Same guarantee as /cancel-razorpay: a 'canceling' row without a
+      // positive expires_at terminates through no path at all. Ultra is
+      // granted at -1, so the old `periodEndMs || license.expires_at`
+      // produced exactly that whenever the provider lookup came back
+      // empty. See resolveCancelPeriodEnd in subscriptionStates.
+      const cancelEnd = resolveCancelPeriodEnd(periodEndMs, license.expires_at);
       db.updateLicenseOnPayment(user.id, {
         tier: license.tier,
         status: 'canceling',
-        expires_at: periodEndMs || license.expires_at,
+        expires_at: cancelEnd,
         sessions_limit: license.sessions_limit,
       });
       updatedLicense = db.getLicenseByUserId(user.id);
+      if (!periodEndMs) periodEndMs = cancelEnd; // the response must name the window we persisted
     }
     // Anchor the out-of-order gate to the cancel moment — same reasoning
     // as the legacy /cancel-razorpay route. (P1-G from the audit.)
@@ -2475,4 +2889,11 @@ module.exports._test = {
   isSubscriptionBackedTier,
   // Double-billing guard on /create-checkout
   checkoutConflictFor,
+  // Same-or-lower pass repurchase guard (value-destroying re-buys)
+  passRepurchaseConflictFor,
+  // Interview-day eligibility, shared by /extend-now and /create-renewal
+  interviewDayDenial,
+  EXTENSION_ELIGIBLE_WINDOW_MS,
+  // Provider ownership for existing subscriptions (cancel/reactivate/swap)
+  resolveUserProvider,
 };

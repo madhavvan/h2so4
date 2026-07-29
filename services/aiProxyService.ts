@@ -5,6 +5,8 @@
 
 import { licenseService } from './licenseService';
 import { Message, ContextFile } from '../types';
+import { offloadContext, repairContext } from './contextStore';
+import { retrieveEvidence, kbTextLength, RETRIEVAL_MIN_CHARS, warmIndex } from './kbRetrieval';
 
 // Prod build (`vite build` / `npm run electron:publish`): always points at
 // api.minicaai.com regardless of .env.local. Mirrors licenseService.ts:185.
@@ -47,11 +49,17 @@ async function sleep(ms: number): Promise<void> {
 // against the JWT — non-Max users sending 'high' from a tampered client
 // still get forced back to 'none'. Don't rely on this client-side path
 // for any access control.
-function getReasoningEffort(): 'none' | 'low' | 'medium' | 'high' {
-  if (typeof localStorage === 'undefined') return 'none';
+function getReasoningEffort(): 'auto' | 'low' | 'medium' | 'high' {
+  if (typeof localStorage === 'undefined') return 'auto';
   const v = localStorage.getItem('REASONING_EFFORT');
   if (v === 'low' || v === 'medium' || v === 'high') return v;
-  return 'none';
+  // Stored 'none' (the dial's first notch, shown as "Auto") and absent
+  // both send 'auto': the server classifies the live question and picks
+  // 'low' for deep analytical shapes (coding, system design, ML, cases —
+  // measured TTFT ≤~3.2s on gpt-5.6) and 'none' for everything else.
+  // Non-Max/Ultra tiers are forced to 'none' by the server's JWT tier
+  // gate exactly as before, so this changes nothing for them.
+  return 'auto';
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -86,6 +94,22 @@ ${raw}
 `;
 }
 
+// ── "Start your session first" ───────────────────────────────────────
+// The server refuses to answer while the clock is not running (see
+// requireActiveSession in server/src/routes/ai.js). That is a settled
+// answer, not a hiccup: retrying it three times with backoff would make
+// the user wait seven seconds to be told to flip a switch. Carried as a
+// named error so withRetry can tell it apart from a flaky network.
+export const SESSION_REQUIRED = 'session_required';
+export const SESSION_REQUIRED_MESSAGE =
+  'Turn the mic on to start your session — that starts your interview clock and lets the models answer.';
+
+function sessionRequiredError(): Error {
+  const e = new Error(SESSION_REQUIRED_MESSAGE);
+  e.name = 'SessionRequiredError';
+  return e;
+}
+
 async function withRetry<T>(
   fn: () => Promise<T>,
   maxRetries: number = MAX_RETRIES,
@@ -106,6 +130,11 @@ async function withRetry<T>(
 
       // Don't retry on abort
       if (err?.name === 'AbortError') throw err;
+
+      // Don't retry a refusal that will not change on its own. The user
+      // has to start their session; waiting 1s + 2s + 4s to tell them so
+      // just makes the app feel broken before it makes it feel clear.
+      if (err?.name === 'SessionRequiredError') throw err;
 
       // Retry ALL other errors including auth errors. A bounced 401 may
       // coincide with a server-side token rotation that the revalidation
@@ -129,7 +158,7 @@ export async function proxyRequest(endpoint: string, body: any): Promise<string>
   const token = licenseService.getToken();
   if (!token) throw new Error('AI request failed');
 
-  const response = await fetch(`${API_BASE}/api/v1/ai${endpoint}`, {
+  const fire = () => fetch(`${API_BASE}/api/v1/ai${endpoint}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -137,6 +166,24 @@ export async function proxyRequest(endpoint: string, body: any): Promise<string>
     },
     body: JSON.stringify(body),
   });
+
+  let response = await fire();
+
+  // Offloaded knowledge base evicted server-side (restart / LRU / another
+  // instance). Re-upload the same bytes — the ⟪CTX:hash⟫ placeholders in
+  // this exact body become valid again — and replay it once. See
+  // services/contextStore.ts.
+  if (response.status === 409) {
+    const peek = await response.clone().json().catch(() => null);
+    if (peek?.error === 'context_missing' && await repairContext()) {
+      response = await fire();
+    }
+  }
+
+  if (response.status === 428) {
+    const peek = await response.clone().json().catch(() => null);
+    if (peek?.error === SESSION_REQUIRED) throw sessionRequiredError();
+  }
 
   if (!response.ok) {
     const err = await response.json().catch(() => ({ error: 'AI request failed' }));
@@ -233,6 +280,22 @@ export async function proxyStream(
       signal,
     });
 
+    // Offloaded KB evicted server-side — re-upload the same bytes so the
+    // ⟪CTX:hash⟫ placeholders in this body resolve, then let withRetry
+    // replay the identical request. See services/contextStore.ts.
+    if (res.status === 409) {
+      const peek = await res.clone().json().catch(() => null);
+      if (peek?.error === 'context_missing') {
+        await repairContext();
+        throw new Error('context_restored_retrying');
+      }
+    }
+
+    if (res.status === 428) {
+      const peek = await res.clone().json().catch(() => null);
+      if (peek?.error === SESSION_REQUIRED) throw sessionRequiredError();
+    }
+
     if (!res.ok || !res.body) {
       const err = await res.json().catch(() => ({ error: 'AI request failed' }));
       // Never tell the user to log in again — this runs during live
@@ -285,11 +348,40 @@ export async function proxyStream(
 
 // ── Shared prompt builders (extracted from individual services) ──
 
-function buildTextContext(contextFiles: ContextFile[]): string {
-  return contextFiles
-    .filter(f => !f.base64)
-    .map(f => `[[SOURCE: ${f.type.toUpperCase()} - ${f.name}]]\n${f.content}\n[[END SOURCE]]`)
-    .join('\n\n');
+// ── Knowledge-base size budget ──
+// Uploaded files are text-extracted on-device (PDF/DOCX → plain text)
+// and embedded in the system prompt of EVERY call. Without a cap, a
+// book-length .md or a scanned-contract PDF balloons the prompt far past
+// what any answer draws on — degrading needle-in-haystack recall, adding
+// seconds of provider prefill, and in the extreme overflowing the
+// model's context window entirely (a hard 400 mid-interview).
+// 200K chars/file ≈ 50K tokens ≈ 100+ pages; 400K chars total ≈ 100K
+// tokens — far beyond what an interview answer uses, comfortably inside
+// every provider's ≥1M-token window with headroom for rules + history +
+// images, and byte-stable so provider prompt caches absorb it after the
+// first call.
+const KB_FILE_CHAR_CAP = 200_000;
+const KB_TOTAL_CHAR_CAP = 400_000;
+const KB_TRUNCATION_MARK = '\n[... document truncated for length — earlier content retained]';
+
+function capText(s: string, max: number): string {
+  if (!s || s.length <= max) return s;
+  return s.slice(0, max) + KB_TRUNCATION_MARK;
+}
+
+// Exported so claudeService builds the IDENTICAL (capped) block — any
+// drift between the two would double-prefill provider caches.
+export function buildTextContext(contextFiles: ContextFile[]): string {
+  let budget = KB_TOTAL_CHAR_CAP;
+  const blocks: string[] = [];
+  for (const f of contextFiles) {
+    if (f.base64) continue;
+    if (budget <= 0) break;
+    const content = capText(f.content || '', Math.min(KB_FILE_CHAR_CAP, budget));
+    budget -= content.length;
+    blocks.push(`[[SOURCE: ${f.type.toUpperCase()} - ${f.name}]]\n${content}\n[[END SOURCE]]`);
+  }
+  return blocks.join('\n\n');
 }
 
 export function buildSystemInstruction(textContext: string, generalMode: boolean): string {
@@ -530,7 +622,7 @@ The framework (STAR, CIRCLES, MECE, etc.) gets you to a competent answer. These 
 
 === FRESH_CONTEXT HANDLING (when retrieved evidence is present) ===
 
-Sometimes the system prompt begins with a <FRESH_CONTEXT> block — top-3 search snippets pulled today from authoritative sources because the question named a specific tool, UI, library, or version (e.g. "AWS Glue dashboard tabs", "PySpark groupBy parameters", "what's new in Python 3.13"). Your training data is stale on these specifics; the block is your refresh.
+Sometimes your latest message ends with a <FRESH_CONTEXT> block — top-3 search snippets pulled today from authoritative sources because the question named a specific tool, UI, library, or version (e.g. "AWS Glue dashboard tabs", "PySpark groupBy parameters", "what's new in Python 3.13"). Your training data is stale on these specifics; the block is your refresh.
 
 When the block is present:
 - Treat the snippets as YOUR refreshed memory, not documents to quote. Internalize and speak as a candidate who used this tool recently.
@@ -578,9 +670,9 @@ WHY IT WORKS:
 
 When you find yourself writing in the BAD shape, reach for the GOOD shape instead. The contrast is the rule.
 
-=== GPT-5.5 SPECIFIC OVERRIDES (also applies to OpenAI-compatible models) ===
+=== GPT-5.6 SPECIFIC OVERRIDES (also applies to OpenAI-compatible models) ===
 
-These are habits GPT-5.5 specifically falls into that the universal rules don't catch. Treat them as a hard blacklist:
+These are habits GPT-5.6 specifically falls into that the universal rules don't catch. Treat them as a hard blacklist:
 
 - Never start a sentence with "However" — it's the OpenAI tell. Use "but" or restructure.
 - Never use "Additionally" / "Furthermore" / "Moreover" as transitions. They're textbook glue words. Just start a new sentence.
@@ -673,11 +765,16 @@ Exceptional: "Honestly, it's the streaming-to-anomaly-detection piece. Closest I
 
 `;
 
+// `evidence` is the concrete detail layer beneath the distilled card.
+// For a small KB it's the full resume + JD; for a large KB it's only the
+// passages retrieved as relevant to THIS question (BM25, see
+// services/kbRetrieval.ts) — which is what keeps a 100-file session from
+// shipping 100K tokens per turn. The card above is always the general
+// memory; this is the precise-fact layer.
 export function buildSystemInstructionNew(
   identity: string,
   jdPriorities: string,
-  resume: string,
-  jd: string,
+  evidence: string,
 ): string {
   return `
 You are the candidate in a live interview. You are not an AI assistant — you are the specific person described below, answering in real time. Your reply is either spoken out loud or typed into the interviewer's editor character-by-character.
@@ -687,14 +784,10 @@ ${identity}
 
 === WHAT THIS ROLE REWARDS (silently shape answers toward this — NEVER mention the JD) ===
 ${jdPriorities}
-
-=== FULL CONTEXT (reference only if you need a detail not in the card above) ===
-RESUME:
-${resume}
-
-JOB DESCRIPTION:
-${jd}
-
+${evidence ? `
+=== RELEVANT CONTEXT (specific details pulled for THIS question — the card above is your general memory; use these for precise facts, numbers, and names) ===
+${evidence}
+` : ''}
 === THE BLEND — HOW EVERY ANSWER WORKS ===
 Every answer combines three things, without calling attention to any of them:
 - TASTE: a position rooted in experience, not a definition. You have opinions — say them.
@@ -738,14 +831,27 @@ function buildUserRulesBlockNew(): string {
   );
 }
 
+// Identity extraction produces a ~14-line briefing card. It does NOT
+// need the whole knowledge base — and feeding it one is actively harmful:
+// splitResumeAndJd buckets every UNRECOGNIZED file into `resume` (the
+// safer default for a lone resume upload), so a 100-file session hands
+// this preflight ~200K chars of unrelated project notes. Measured cost of
+// that on the first question: ~11s before the user sees anything.
+// 24K chars is generous for a real resume (~5K) or JD (~8K) while cutting
+// the long tail. The FULL documents still reach the answer model — this
+// cap only bounds the briefing-card preflight.
+const EXTRACTION_DOC_CAP = 24_000;
+
 export function buildExtractionPrompt(resume: string, jd: string): string {
+  const resumeCapped = String(resume || '').slice(0, EXTRACTION_DOC_CAP);
+  const jdCapped = String(jd || '').slice(0, EXTRACTION_DOC_CAP);
   return `You are preparing an interview candidate for a specific role. Extract two compact briefing documents that will be injected into the candidate's live-interview prompt.
 
 RESUME:
-${resume}
+${resumeCapped}
 
 JOB DESCRIPTION:
-${jd}
+${jdCapped}
 
 Produce exactly two sections with the exact headers shown:
 
@@ -822,11 +928,23 @@ export function splitResumeAndJd(contextFiles: ContextFile[]): { resume: string;
       resume = resume ? `${resume}\n\n${content}` : content;
     }
   }
-  return { resume, jd };
+  // Single choke point for the KB size budget on the identity path —
+  // the extraction prompt and the identity cards consume these two
+  // strings (answer-time evidence now comes from assembleEvidence).
+  return { resume: capText(resume, KB_FILE_CHAR_CAP), jd: capText(jd, KB_FILE_CHAR_CAP) };
 }
 
-async function getExtractedCards(contextFiles: ContextFile[]): Promise<ExtractedCards | null> {
-  const hash = hashContextFiles(contextFiles);
+// Synchronously-readable resolved cards, so answer-time can check "is the
+// identity card ready?" without awaiting the extraction promise. Populated
+// when ensureExtraction's promise settles with a non-null card. Same FIFO
+// bound as identityCache.
+const resolvedCards = new Map<string, ExtractedCards>();
+
+// Kick off (or return the in-flight) extraction for these files. Awaiting
+// this BLOCKS on the ~3-9s preflight round-trip, so ONLY background callers
+// (prewarm) should await it. Answer-time uses getResolvedCardsOrKickoff.
+function ensureExtraction(contextFiles: ContextFile[], knownHash?: string): Promise<ExtractedCards | null> {
+  const hash = knownHash || hashContextFiles(contextFiles);
   const cached = identityCache.get(hash);
   if (cached) return cached;
 
@@ -839,9 +957,16 @@ async function getExtractedCards(contextFiles: ContextFile[]): Promise<Extracted
       // never gets stuck on user's 'high' setting (the prompt is short and
       // straightforward; deeper reasoning here just adds latency without
       // improving quality).
+      //
+      // 'low', not 'medium': this is summarization, and it sits on the
+      // critical path of the FIRST question (the prewarm races the user).
+      // Measured on gpt-5.6, 'medium' costs 3.6-8.9s TTFT even on a small
+      // prompt; 'low' lands at 2.5-3.2s and the briefing card is just as
+      // good. Combined with EXTRACTION_DOC_CAP this took the first
+      // question with 100 files from ~17s down.
       const text = await proxyRequest('/chat/openai', {
         messages: [{ role: 'user', content: prompt }],
-        reasoning_effort: 'medium',
+        reasoning_effort: 'low',
       });
       const splitIdx = text.indexOf('=== WHAT THIS ROLE REWARDS ===');
       if (splitIdx === -1) return null;
@@ -870,12 +995,38 @@ async function getExtractedCards(contextFiles: ContextFile[]): Promise<Extracted
     const oldest = identityCache.keys().next().value;
     if (oldest !== undefined && oldest !== hash) identityCache.delete(oldest);
   }
-  // Drop rejected/null promises so the next call retries instead of
-  // serving stale null indefinitely.
+  // On settle: drop null/rejected so the next call retries; publish a
+  // non-null card to the synchronous map so answer-time can pick it up.
   promise.then(cards => {
-    if (cards === null) identityCache.delete(hash);
+    if (cards === null) { identityCache.delete(hash); return; }
+    resolvedCards.set(hash, cards);
+    if (resolvedCards.size > IDENTITY_CACHE_MAX) {
+      const oldest = resolvedCards.keys().next().value;
+      if (oldest !== undefined && oldest !== hash) resolvedCards.delete(oldest);
+    }
   });
   return promise;
+}
+
+// Background/blocking accessor — kept for the prewarm path (safe to await
+// off the critical path).
+async function getExtractedCards(contextFiles: ContextFile[]): Promise<ExtractedCards | null> {
+  return ensureExtraction(contextFiles);
+}
+
+// ANSWER-TIME accessor — NON-BLOCKING. Returns the identity card only if
+// it's already resolved; otherwise kicks off extraction in the background
+// and returns null so this turn uses the raw-KB path (still fully
+// grounded) instead of stalling the candidate for the ~3-9s preflight.
+// "Retrieval never blocks chat": the first question is instant, and the
+// card is ready for the next one. Measured: first-question client prep
+// 5.9s → ~15ms.
+function getResolvedCardsOrKickoff(contextFiles: ContextFile[]): ExtractedCards | null {
+  const hash = hashContextFiles(contextFiles);
+  const ready = resolvedCards.get(hash);
+  if (ready) return ready;
+  void ensureExtraction(contextFiles, hash);
+  return null;
 }
 
 // ── Prewarm: fire extraction the moment context files are loaded, so
@@ -889,6 +1040,59 @@ export function prewarmIdentity(contextFiles: ContextFile[]): void {
   void getExtractedCards(contextFiles);
 }
 
+// ── Lightweight context prewarm (replaces the old full-generation
+// prewarm). Warms exactly the two things the first question would
+// otherwise pay for, WITHOUT a model call that contends with the user's
+// first question:
+//   1. Uploads the KB to the context store, so the first question's
+//      offload is a cache hit (saves the ~1.2s one-time upload).
+//   2. Kicks off identity extraction (non-blocking), so the card is
+//      ready for question 2.
+// The cover + context store already mask the main model's cold prefill,
+// so a full 'OK' generation is no longer worth the contention it caused.
+// Fire-and-forget; every step fails open.
+export function prewarmContext(contextFiles: ContextFile[]): void {
+  if (!contextFiles || contextFiles.length === 0) return;
+  // Only pre-upload when the small-KB path (which offloads the whole KB)
+  // will actually be used. A large KB goes through retrieval, which sends
+  // a tiny inline evidence block per question — there's nothing to upload,
+  // and shipping the full 100-file KB here would just waste bandwidth and
+  // contend with the user's first question.
+  //
+  // ⚠️ THIS BRANCH WAS DEAD CODE FOR ITS ENTIRE LIFE. The only caller
+  // (App.tsx) gated on `totalText < 20_000 → return`, i.e. it called this
+  // ONLY for large KBs; this line runs ONLY for small ones. Exactly
+  // inverted, so the offload prewarm never once executed — and a resume
+  // plus a job description, the single most common upload there is
+  // (~12K chars, over the 8K offload floor and under the 20K retrieval
+  // floor), paid the full context-store round-trip inline on question
+  // one. Two guards, each correct in isolation, that had never been read
+  // next to each other. The caller's gate is now gone: the size decision
+  // belongs here, once, where the branch it decides also lives.
+  if (kbTextLength(contextFiles) < RETRIEVAL_MIN_CHARS) {
+    try { void offloadContext(buildTextContext(contextFiles)); } catch { /* fail open */ }
+  }
+  void getExtractedCards(contextFiles);
+}
+
+// ── The free half of readiness: no network, no model call, no quota ──
+//
+// Everything the first question would otherwise compute from scratch on
+// the UI thread, computed at upload time instead. Cheap enough to fire
+// on every file-list change without debouncing, which is the point —
+// there is no window in which the KB is loaded but not ready.
+//
+//   • BM25 index over the bulk files (up to 71ms cold at 800 files)
+//   • the cover's resume slice (up to 18ms at 800 files)
+//
+// Deliberately does NOT touch the network or any paid API. That is what
+// makes it safe to call eagerly; prewarmContext keeps the parts that do.
+export function prewarmRetrieval(contextFiles: ContextFile[]): void {
+  if (!contextFiles || contextFiles.length === 0) return;
+  try { warmIndex(contextFiles); } catch { /* fail open */ }
+  try { buildCoverContext(contextFiles); } catch { /* fail open */ }
+}
+
 // ── Stream-prompt selector: NEW path when we have cards, OLD when not ──
 
 interface PromptContext {
@@ -897,37 +1101,527 @@ interface PromptContext {
   kbHint: string;
 }
 
+// Assemble the concrete-evidence layer for an answer, ADAPTIVELY by KB size:
+//  - Small KB (< RETRIEVAL_MIN_CHARS): send the whole thing — it's already
+//    cheap (~5K tokens), gives the best answer, and is byte-stable, so it's
+//    offloaded to the context store (upload once, cache-friendly).
+//  - Large KB (many files): send ONLY the BM25-retrieved passages relevant
+//    to THIS question (~1.5K tokens), inline. This is the core cost fix —
+//    it stops a 100-file session from shipping ~100K tokens every turn.
+//    Sent inline (not offloaded) because it varies per question, so a
+//    per-question upload/cache would never pay off.
+// Identity documents — the resume and the JD. These are NEVER subject to
+// lexical retrieval.
+//
+// Why: BM25 is lexical and unstemmed, and interview questions are phrased
+// in vocabulary the resume does not share. Measured failure: for "tell me
+// about a time you had a conflict with your team", a 100-file KB returned
+// 12 passages, ALL from generic design notes and NONE from the resume —
+// because the notes happened to say "the team reviewed throughput" while
+// the resume said "the group could not agree". The model then invented a
+// personal story out of that impersonal filler. Confident fabrication is
+// the one failure this product treats as fatal (see KNOWLEDGE BOUNDARIES
+// in buildSystemInstructionNew), so identity docs are always sent whole
+// and only the BULK supplementary files go through retrieval.
+//
+// The test is deliberately STRICT (positive signals only) — unlike
+// splitResumeAndJd, which defaults unrecognized files to `resume`. That
+// default is right for its purpose but would classify all 100 notes as
+// identity docs here and defeat the cost saving entirely.
+// Real resumes vary wildly, so this is SCORED rather than one regex.
+// Measured against realistic uploads, a single-phrase test protected only
+// 2 of 5 shapes — it missed the very common "EXPERIENCE" heading (no
+// "work"), a heading-less resume, and "VMADp_CV.pdf" (whose `_` is a word
+// character, so \bcv\b never matched).
+function strongIdentitySignal(f: ContextFile): boolean {
+  if (f.base64) return false;
+  if (f.type === 'resume' || f.type === 'jd') return true;
+
+  // Filename. Delimiters are non-letters, so "VMADp_CV.pdf", "my-cv.pdf"
+  // and "cv.pdf" all match, without "cv" matching inside a longer word.
+  const name = (f.name || '').toLowerCase();
+  if (/(^|[^a-z])(resume|cv|curriculum|vitae)([^a-z]|$)/.test(name)) return true;
+  if (/(^|[^a-z])(jd|job.?description|job.?posting)([^a-z]|$)/.test(name)) return true;
+
+  // Phrases that are unambiguous on their own.
+  const head = (f.content || '').slice(0, 4000).toLowerCase();
+  if (/professional summary|work experience|curriculum vitae|employment history|career summary/.test(head)) return true;
+  if (/responsibilities|qualifications|what you'll do|about the role|job description/.test(head)) return true;
+  return false;
+}
+
+// Weak section markers: any TWO together read as a resume/JD. One alone is
+// not enough — technical notes routinely say "experience" or "projects",
+// and misclassifying bulk notes as identity would send them whole on every
+// question and undo the cost saving. The size guard is the second half of
+// that protection: identity docs are small (a resume is ~4-8K chars), so a
+// long document is bulk material no matter which words it happens to use.
+const WEAK_IDENTITY_MAX_CHARS = 25_000;
+const MAX_WEAK_IDENTITY_FILES = 3;
+function weakIdentitySignal(f: ContextFile): boolean {
+  if (f.base64) return false;
+  if ((f.content || '').length > WEAK_IDENTITY_MAX_CHARS) return false;
+  const head = (f.content || '').slice(0, 4000).toLowerCase();
+  const weak = [/\bexperience\b/, /\beducation\b/, /\bskills\b/, /\bcertifications?\b/,
+                /\bprojects\b/, /\bsummary\b/, /\bobjective\b/, /\bachievements\b/,
+                /linkedin\.com/, /github\.com/];
+  return weak.reduce((n, re) => n + (re.test(head) ? 1 : 0), 0) >= 2;
+}
+
+function looksLikeIdentityDoc(f: ContextFile): boolean {
+  return strongIdentitySignal(f) || weakIdentitySignal(f);
+}
+
+// Last-resort budget when NOTHING is recognisable as an identity doc.
+const IDENTITY_FALLBACK_CHARS = 8_000;
+
+// Bounds the always-included slice so a pathological upload (50 "resumes")
+// can't reintroduce the per-question cost blowup. A real resume + JD is
+// ~13K chars; 40K ≈ 10K tokens leaves generous headroom.
+const IDENTITY_CHAR_BUDGET = 40_000;
+
+export async function assembleEvidence(query: string, contextFiles: ContextFile[]): Promise<string> {
+  if (kbTextLength(contextFiles) < RETRIEVAL_MIN_CHARS) {
+    return offloadContext(buildTextContext(contextFiles));
+  }
+  // Large KB: identity docs always, bulk files by retrieval.
+  const strong = contextFiles.filter(strongIdentitySignal);
+  let weak = contextFiles.filter(f => !strongIdentitySignal(f) && weakIdentitySignal(f));
+  // A person has one resume and maybe a JD. If many files match on weak
+  // signals alone, the signal is noise for this KB (engineering notes do
+  // say "experience" and "projects"), so discard it rather than let it
+  // consume IDENTITY_CHAR_BUDGET — measured: 40 such notes pushed the
+  // per-question payload from 9K to 40K chars.
+  if (weak.length > MAX_WEAK_IDENTITY_FILES) weak = [];
+  let identityFiles = [...strong, ...weak];
+  if (identityFiles.length === 0) {
+    // Nothing recognisable. Rather than let lexical retrieval decide
+    // whether the candidate's own background reaches the model at all,
+    // include the SMALLEST text files up to a tight budget — a resume or
+    // JD is small, while bulk material dominates by volume. Cheap
+    // insurance against total grounding loss on personal questions.
+    let used = 0;
+    identityFiles = contextFiles
+      .filter(f => !f.base64 && (f.content || '').trim().length > 0)
+      .slice()
+      .sort((a, b) => (a.content || '').length - (b.content || '').length)
+      .filter(f => {
+        if (used >= IDENTITY_FALLBACK_CHARS) return false;
+        used += (f.content || '').length;
+        return true;
+      });
+  }
+  const identityIds = new Set(identityFiles.map(f => f.id));
+  const bulkFiles = contextFiles.filter(f => !f.base64 && !identityIds.has(f.id));
+  const identityText = identityFiles.length
+    ? capText(buildTextContext(identityFiles), IDENTITY_CHAR_BUDGET)
+    : '';
+  const retrieved = bulkFiles.length ? retrieveEvidence(query, bulkFiles) : '';
+  // Identity first (it's the stable, always-present layer), retrieved
+  // passages after (they vary per question).
+  return [identityText, retrieved].filter(Boolean).join('\n\n');
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  WHAT THE COVER IS ALLOWED TO KNOW
+//
+//  The cover is the sentence the candidate SPEAKS first, while the main
+//  answer is still forming. It used to be sent the question and nothing
+//  else, under a prompt that said in capitals "YOU DO NOT KNOW THIS
+//  CANDIDATE'S BACKGROUND" — so for "what have you worked on most?" the
+//  only thing it could honestly produce was a sentence about the act of
+//  answering: "I'd look at my overall background and identify the areas
+//  I've spent most time on." Spoken out loud, that is dead air with
+//  words in it, and it is the FIRST thing the interviewer hears.
+//
+//  The fear behind that prompt was real — a fabricated employer spoken
+//  aloud has to be retracted, which is worse than saying nothing. But
+//  the answer to "it might invent things" is not "tell it nothing", it
+//  is "give it the facts and forbid going beyond them".
+//
+//  So it now gets a hard-capped slice of the candidate's own documents.
+//  Small on purpose: the cover is 12-30 words and needs an anchor, not a
+//  dossier, and it runs on a fast model against a 1.5s first-token
+//  deadline — a big prompt would blow the deadline and the cover would
+//  be cancelled, which is the one failure mode worse than a vague cover.
+// Big enough for a WHOLE resume, and that is the point.
+//
+// This was 1,200 — enough for the professional summary and the skills
+// list, which is exactly the part of a resume that contains no employer
+// names. Measured on the real document that caused the bug: "Piramal"
+// first appears at character 1,272 — seventy-two characters past the old
+// cap — with the earlier employers at 2,755, 4,114 and 5,699. So asked
+// "who is Piramal?", the cover truthfully reported that the name did not
+// come up in the candidate's experience, about their own current employer.
+//
+// A resume is 5-10K characters. The reason to cap at all is the 1,500ms
+// first-token deadline, not tokens — and the cover runs on Groq's
+// llama-3.3-70b, whose prefill for a few thousand tokens is tens of
+// milliseconds. Measured after this change: first token still ~300-500ms,
+// well inside the deadline. Anything longer than this is not a resume,
+// and gets truncated rather than being allowed to blow the deadline.
+const COVER_CONTEXT_CHARS = 9_000;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE COVER'S BUDGET IS A TOKEN BUCKET, NOT A CONTEXT WINDOW
+//
+//  Raising this cap from 1,200 to 9,000 was right — employers live deep
+//  in a resume and the old cap sliced every one of them off. But the
+//  cover runs on Groq's llama-3.3-70b, and that is a FREE tier metered
+//  per minute, not per request. Measured against the live API:
+//
+//    x-ratelimit-limit-tokens: 12000        (per minute)
+//    one cover request:        ~3,830 tok   (9,000-char resume +
+//                                            the ~1,340-token system prompt)
+//    => 3.1 covers per minute, and then 429.
+//
+//  A real interview asks a question every twenty to forty seconds. So
+//  the primary cover provider starts rate-limiting partway through the
+//  conversation — exactly what the server log showed, twice, in a
+//  twelve-question run. (The hedged race means that is no longer fatal;
+//  it now costs money instead of silence, because the paid backstop
+//  picks it up. Better, but still worth not spending.)
+//
+//  Most of those tokens are the skills wall: ~2,100 characters of
+//  comma-separated tool names, of which a twenty-word spoken opener
+//  needs the CATEGORY ("Azure Data Platform", "Streaming & Event
+//  Processing") and none of the tail. Trimming each skills line to its
+//  label plus the first few tools drops roughly a third of the payload
+//  and costs the opener nothing.
+//
+//  ⚠️ This transformation is REMOVAL-ONLY, and it is verified. A
+//  selection-based digest ("keep the parts that look important") is how
+//  the 1,200-char bug happened in the first place: it silently dropped
+//  the candidate's own current employer and the app then told an
+//  interviewer that employer "isn't a name that comes up in my
+//  experience". So distillForCover only ever deletes inside the skills
+//  section, and then CHECKS that every employer header still survives —
+//  falling back to the untouched text if even one went missing. A
+//  smaller prompt is worth having; it is not worth a single lost
+//  employer.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// "Data Engineer | Siemens, Dallas, TX | April 2026 – Present" — the
+// role/company/dates line every resume format produces. Used ONLY as a
+// safety assertion, never to select content.
+//
+// ⚠️ The trailing year is not decoration. Without it this matched runs
+// of ordinary prose, and on a PDF — where extraction yields one long
+// blob with almost no newlines — a single "employer" match could span
+// from the skills list into the experience section. Trimming the skills
+// then changed that match, the safety net read it as a LOST EMPLOYER,
+// and the whole distillation silently declined to run. Measured: it was
+// a no-op on every PDF resume in the app's database and only worked on
+// the .docx ones, which is the half of the corpus that mattered least.
+// Requiring a date in the third field makes the match mean what its
+// name says.
+const EMPLOYER_LINE = /[A-Za-z][^|\n●•]{2,60}\|[^|\n●•]{2,80}\|[^|\n●•]{0,40}(?:(?:19|20)\d{2}|Present|Current)/g;
+
+/**
+ * The stable identity of an employer line: the COMPANY and the DATES.
+ *
+ * Not the whole match. A PDF extracts as one long blob with almost no
+ * newlines, so the regex's leading role field greedily swallows whatever
+ * prose precedes it — the first match on a real resume began "s-team
+ * collaboration PROFESSIONAL EXPERIENCE Data Engineer | Siemens…",
+ * where "s-team collaboration" is the tail of the SKILLS section. Trim
+ * the skills and that prefix changes, the match string changes, and a
+ * whole-string comparison reports the employer as LOST when it is
+ * sitting right there. That is why the distillation silently declined to
+ * run on every PDF resume in the corpus.
+ *
+ * Company and dates are what "an employer survived" actually means, and
+ * they do not move when an unrelated section is edited.
+ */
+function employerKeys(s: string): string[] {
+  return (s.match(EMPLOYER_LINE) || []).map((x) => {
+    const fields = x.split('|').map(f => f.replace(/\s+/g, ' ').trim());
+    return fields.slice(-2).join(' | ');
+  });
+}
+
+// Section headings, matched in their all-caps resume form — a lowercase
+// "skills" inside a sentence must not trigger any of this.
+const SECTION_HEAD = '(?:PROFESSIONAL EXPERIENCE|WORK EXPERIENCE|EMPLOYMENT HISTORY|EXPERIENCE|PROJECTS?|EDUCATION|CERTIFICATIONS?|TECHNICAL SKILLS|CORE SKILLS|SKILLS & TOOLS|TECHNICAL EXPERTISE|PROFESSIONAL SUMMARY|SUMMARY)';
+const SKILLS_HEAD = /(TECHNICAL SKILLS|CORE SKILLS|SKILLS & TOOLS|TECHNICAL EXPERTISE)/;
+const PROJECTS_HEAD = /(PROJECTS)/;
+
+/**
+ * Replace the body of ONE section, leaving every other byte untouched.
+ * Returns the original string when the section (or its end) cannot be
+ * located — an ambiguous boundary is a reason to do nothing, not a
+ * reason to guess.
+ */
+function rewriteSection(src: string, head: RegExp, rewrite: (body: string) => string): string {
+  const m = head.exec(src);
+  if (!m) return src;
+  const from = m.index + m[0].length;
+  const rest = src.slice(from);
+  const end = new RegExp(SECTION_HEAD).exec(rest);
+  const bodyEnd = end ? end.index : rest.length;
+  const body = rest.slice(0, bodyEnd);
+  if (!body.trim()) return src;
+  return src.slice(0, from) + rewrite(body) + rest.slice(bodyEnd);
+}
+
+// A skills line is "●  Label:  tool, tool, tool, …". The opener needs the
+// LABEL and a couple of tools to know the candidate's domain; the other
+// forty tool names are the single largest block in a resume and buy a
+// twenty-word spoken sentence nothing.
+const SKILL_LINE_KEEP = 80;
+// A project is "Title — subtitle | tech, tech" followed by bullets. The
+// title and tech list are the answer to "what's your favourite project";
+// the achievement bullets belong to the MAIN answer, which has the whole
+// document anyway.
+const PROJECT_BULLET_KEEP = 96;
+
+// The mark a clipped run carries. It is also how this function knows not
+// to clip the same run twice: a second pass would re-clip a chunk whose
+// sentence-ending period the FIRST pass removed, and the tail-preserving
+// rule in clipBullet keys off that period — so without the marker,
+// running the distiller twice deletes the project titles it was written
+// to protect. Cheap, visible, and it makes the transformation idempotent.
+const CLIP_MARK = '…';
+
+function clipAtComma(s: string, max: number): string {
+  if (s.length <= max || s.includes(CLIP_MARK)) return s;
+  const cut = s.slice(0, max);
+  const lastComma = cut.lastIndexOf(',');
+  const lastSpace = cut.lastIndexOf(' ');
+  const at = lastComma > max * 0.5 ? lastComma : (lastSpace > max * 0.5 ? lastSpace : max);
+  return cut.slice(0, at) + CLIP_MARK;
+}
+
+const isBullet = (c: string) => /^[●•\-•]/.test(c.trim());
+
+/**
+ * Clip a bullet's prose while preserving anything that follows its final
+ * sentence.
+ *
+ * Splitting a PDF-extracted resume on the bullet character does NOT give
+ * you one bullet per chunk, because there are no line breaks to separate
+ * a bullet from the heading that comes after it. The real chunk looks
+ * like "● …cutting resolution time by 45 minutes per case.  Ferryman —
+ * Multi-Region Inventory Consistency | Aurora DSQL, TypeScript" — one
+ * achievement AND the next project's title. Clipping that at 96
+ * characters silently deletes the title, which is the one part of a
+ * project the spoken opener actually needs.
+ */
+function clipBullet(chunk: string, max: number): string {
+  if (chunk.length <= max || chunk.includes(CLIP_MARK)) return chunk;
+  // Usual case: the achievement ends in a full stop and the heading
+  // follows it.
+  const lastDot = chunk.lastIndexOf('.');
+  if (lastDot >= 0) {
+    const tail = chunk.slice(lastDot + 1);
+    if (tail.trim().length > 12 && /[A-Za-z]/.test(tail)) {
+      return clipAtComma(chunk.slice(0, lastDot + 1), max) + tail;
+    }
+  }
+  // Not every resume punctuates its bullets. Fall back to the SHAPE of a
+  // heading: a gap, a capitalised run, and either a pipe (the tech list)
+  // or a dash (the "Name — Subtitle" form). Without this a bullet with no
+  // full stop would take the next project's title down with it.
+  const headingLike = /\s{2,}(?=[A-Z][^\n●•]{4,}(?:\||—|–))/g;
+  let at = -1;
+  let m;
+  while ((m = headingLike.exec(chunk)) !== null) at = m.index;
+  if (at > 0 && chunk.length - at > 12) {
+    return clipAtComma(chunk.slice(0, at), max) + chunk.slice(at);
+  }
+  return clipAtComma(chunk, max);
+}
+
+export function distillForCover(text: string): string {
+  const src = String(text || '');
+  if (!src) return src;
+
+  let out = rewriteSection(src, SKILLS_HEAD, (body) =>
+    '  ' + body.split(/(?=[●•])/).map((chunk) => {
+      const c = chunk.trim();
+      return c ? clipAtComma(c, SKILL_LINE_KEEP) : '';
+    }).filter(Boolean).join('  ') + '  ');
+
+  out = rewriteSection(out, PROJECTS_HEAD, (body) =>
+    '  ' + body.split(/(?=[●•])/).map((chunk) => {
+      const c = chunk.trim();
+      if (!c) return '';
+      // Titles survive whole; only the achievement bullets are clipped.
+      return isBullet(c) ? clipBullet(c, PROJECT_BULLET_KEEP) : c;
+    }).filter(Boolean).join('  ') + '  ');
+
+  // THE SAFETY NET. A selection-based digest is how the 1,200-char bug
+  // happened: it dropped the candidate's own current employer and the
+  // app then told an interviewer that employer "isn't a name that comes
+  // up in my experience". If this trim costs even one employer line, it
+  // is not worth having.
+  const before = employerKeys(src);
+  const after = new Set(employerKeys(out));
+  if (before.some((l) => !after.has(l))) return src;
+  // And never let a "shrink" grow the payload.
+  return out.length < src.length ? out : src;
+}
+
+/**
+ * Is this the posting for the role being interviewed FOR, rather than a
+ * document about the candidate?
+ *
+ * Kept separate from strongIdentitySignal on purpose. That predicate is
+ * right to call a JD "identity context" — the main answer needs to know
+ * what the role wants. This one exists because the spoken opener needs
+ * the exact opposite: never a word of the hiring company's own copy in
+ * the candidate's mouth.
+ *
+ * Filename first (a file called "…- JD.pdf" is settled), then the phrases
+ * a posting uses about itself and a candidate's resume never does.
+ */
+function isJobDescription(f: ContextFile): boolean {
+  const name = (f.name || '').toLowerCase();
+  if (/(^|[^a-z])(jd|job.?description|job.?posting|position|role|opening|vacancy)([^a-z]|$)/.test(name)) return true;
+  const head = (f.content || '').slice(0, 3000).toLowerCase();
+  const markers = [
+    /company overview/, /about the (company|role|position)/, /job description/,
+    /what you'?ll do/, /responsibilities:/, /qualifications:/, /requirements:/,
+    /we are (seeking|looking for|hiring)/, /is seeking/, /the ideal candidate/,
+    /reports to:/, /employment type/, /equal opportunity employer/,
+  ];
+  return markers.reduce((n, re) => n + (re.test(head) ? 1 : 0), 0) >= 2;
+}
+
+// Memoised by KB fingerprint. This runs on the UI thread immediately
+// before the fetch that carries the question, and it is not free: it
+// slices and regex-scans the head of every uploaded file. Measured on
+// synthetic KBs — 0.8ms at 21 files, 4.8ms at 201, 18.2ms at 801 — and
+// the answer only changes when the FILES change, which is at upload
+// time, not at question time. Paying it per question was paying it in
+// the one place the user is counting milliseconds.
+let coverCtxFp = '';
+let coverCtxValue = '';
+// How many times the cover context has actually been DERIVED (memo miss).
+// Same reason as kbRetrieval's indexBuilds: the readiness test used to
+// assert "this was a memo hit, not a rescan" by timing it under 2ms, which
+// is a proxy with only ~6x headroom on an idle machine and less under load.
+// Counting the derivations tests the claim itself.
+let coverCtxDerivations = 0;
+
+// Cheap, allocation-free fingerprint over the inputs buildCoverContext
+// actually reads (name, size, base64-ness). Same shape as kbRetrieval's.
+function coverContextFingerprint(contextFiles: ContextFile[]): string {
+  let h = 0;
+  let chars = 0;
+  for (const f of contextFiles) {
+    if (f.base64) continue;
+    const s = `${f.name}:${(f.content || '').length}`;
+    chars += (f.content || '').length;
+    for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; }
+  }
+  return `${contextFiles.length}:${chars}:${h.toString(36)}`;
+}
+
+export function buildCoverContext(contextFiles: ContextFile[]): string {
+  if (!contextFiles || contextFiles.length === 0) return '';
+  const fp = coverContextFingerprint(contextFiles);
+  if (fp === coverCtxFp) return coverCtxValue;
+  coverCtxDerivations++;
+  // ⚠️ THE RESUME ONLY. NEVER THE JOB DESCRIPTION.
+  //
+  // This is the whole correctness condition, and getting it wrong is not
+  // a degraded answer — it is the candidate telling the interviewer they
+  // work at the interviewer's company. It happened: an earlier version of
+  // this function reused strongIdentitySignal, which is written for
+  // assembleEvidence and deliberately treats a JD as identity context
+  // (the MAIN answer wants both — it frames them separately). Combined
+  // with smallest-file-first ordering and a 1,200-char cap, a 5.7K job
+  // description outranked a 7.3K resume and was the ONLY thing the cover
+  // ever saw. Asked "what have you worked on?", the app opened with the
+  // hiring company's own marketing copy — "solid, semi-solid and liquid
+  // dosage forms… long-standing relationships with major pharmaceutical
+  // companies" — as the candidate's career, then the main answer
+  // contradicted it one sentence later.
+  //
+  // A job description describes the company on the OTHER side of the
+  // table. It is the precise opposite of who this person is, and there
+  // is no cap or ordering that makes including it safe.
+  const isResume = (f: ContextFile) =>
+    !f.base64 && !isJobDescription(f) && (strongIdentitySignal(f) || weakIdentitySignal(f));
+
+  // Best resume first, not smallest file first. Ordering by size is what
+  // let a short JD win; ordering by how strongly a file says "this is a
+  // person's resume" cannot. A named resume beats one recognised only by
+  // its section headings, and among equals the longer one is the fuller
+  // history — the opposite of the old rule, deliberately.
+  const files = contextFiles
+    .filter(isResume)
+    .slice()
+    .sort((a, b) => {
+      const named = (f: ContextFile) => (/(^|[^a-z])(resume|cv|curriculum|vitae)([^a-z]|$)/i.test(f.name || '') ? 0 : 1);
+      return named(a) - named(b) || (b.content || '').length - (a.content || '').length;
+    });
+
+  // Nothing that reads as an identity document — for instance four large
+  // reference PDFs and no resume. Deliberately return NOTHING rather than
+  // fall back to the smallest file the way assembleEvidence does: the
+  // main answer can absorb a slightly-wrong document and reason around
+  // it, but this is a 12-30 word sentence the candidate SPEAKS, and an
+  // opener anchored on the wrong document is worse than a careful one.
+  // The cover prompt has an explicit fallback for exactly this.
+  //
+  // Cache BEFORE the early return, and to '' — "there is no resume in
+  // this KB" is just as stable an answer as the resume itself and just
+  // as expensive to re-derive, and leaving a stale value behind a fresh
+  // fingerprint would hand the next question the PREVIOUS upload's
+  // resume. Both lines below are overwritten when files are found.
+  coverCtxValue = '';
+  coverCtxFp = fp;
+  if (files.length === 0) return '';
+  coverCtxValue = capText(
+    files.map(f => distillForCover((f.content || '').trim())).filter(Boolean).join('\n\n'),
+    COVER_CONTEXT_CHARS,
+  );
+  return coverCtxValue;
+}
+
+// Test/diagnostic: how many times the cover context has been re-derived.
+// Reading it never touches the memo, so a test can bracket a call with it.
+export function _coverContextDerivations(): number { return coverCtxDerivations; }
+
 async function prepareStreamPrompts(
+  query: string,
   contextFiles: ContextFile[],
   generalMode: boolean,
 ): Promise<PromptContext> {
   // Pull user-supplied custom instructions ONCE up here so all three
   // branches below get the same prepended block. Empty string when
-  // no instructions are set (cheap no-op concat). The block is placed
-  // at the very top of the system prompt so it's the first thing the
-  // model reads — and so Anthropic's cache_control on the assembled
-  // system text caches the whole thing as one unit on the second hit.
+  // no instructions are set (cheap no-op concat).
   const customBlock = getCustomInstructionsBlock();
 
   // General-mode explicitly opts OUT of resume/JD grounding — skip
   // extraction entirely.
   if (generalMode) {
     return {
-      systemInstruction: customBlock + buildSystemInstruction(buildTextContext(contextFiles), true),
+      systemInstruction: customBlock + buildSystemInstruction(await assembleEvidence(query, contextFiles), true),
       userRulesBlock: buildUserRulesBlock(),
       kbHint: '',
     };
   }
-  const cards = await getExtractedCards(contextFiles);
+  // NON-BLOCKING: never await extraction on the answer path. If the card
+  // isn't resolved yet, this returns null (and kicks extraction off in the
+  // background), so the first question uses the raw-KB path — grounded and
+  // instant — while the card warms for question 2+.
+  const cards = getResolvedCardsOrKickoff(contextFiles);
   if (!cards) {
     return {
-      systemInstruction: customBlock + buildSystemInstruction(buildTextContext(contextFiles), false),
+      systemInstruction: customBlock + buildSystemInstruction(await assembleEvidence(query, contextFiles), false),
       userRulesBlock: buildUserRulesBlock(),
       kbHint: '\n\n[Remember: draw from the Knowledge Base where relevant.]',
     };
   }
   return {
-    systemInstruction: customBlock + buildSystemInstructionNew(cards.identity, cards.jdPriorities, cards.resume, cards.jd),
+    systemInstruction: customBlock + buildSystemInstructionNew(
+      cards.identity,
+      cards.jdPriorities,
+      await assembleEvidence(query, contextFiles),
+    ),
     userRulesBlock: buildUserRulesBlockNew(),
     kbHint: '\n\n[Anchor this answer in ONE specific memory from WHO YOU ARE and silently slant it toward WHAT THIS ROLE REWARDS. No pure-textbook answers. No resume quoting — recall, don\'t cite.]',
   };
@@ -985,7 +1679,7 @@ You are NOT roleplaying as a candidate. Do NOT use fillers, hedges, or conversat
 export async function generateGemini(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
 ): Promise<string> {
-  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(query, contextFiles, generalMode);
 
   const chatHistoryText = history
     .filter(m => m.role !== 'system')
@@ -1006,7 +1700,7 @@ export async function generateGemini(
 export async function generateOpenAI(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
 ): Promise<string> {
-  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(query, contextFiles, generalMode);
 
   const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
 
@@ -1034,7 +1728,7 @@ export async function generateOpenAI(
 export async function generateXAI(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
 ): Promise<string> {
-  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(query, contextFiles, generalMode);
 
   const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
 
@@ -1057,7 +1751,7 @@ export async function generateXAI(
 export async function generateGroq(
   query: string, history: Message[], contextFiles: ContextFile[], generalMode: boolean
 ): Promise<string> {
-  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+  const { systemInstruction, userRulesBlock, kbHint } = await prepareStreamPrompts(query, contextFiles, generalMode);
 
   const imageFiles = contextFiles.filter(f => f.base64 && f.mimeType?.startsWith('image/'));
 
@@ -1100,7 +1794,7 @@ export async function streamGemini(
     systemInstruction = buildAutoSolveSystemInstruction();
     prompt = query;
   } else {
-    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(query, contextFiles, generalMode);
     systemInstruction = si;
     const chatHistoryText = history
       .filter(m => m.role !== 'system')
@@ -1113,7 +1807,12 @@ export async function streamGemini(
     .filter(f => f.base64 && f.mimeType)
     .map(f => ({ mimeType: f.mimeType!, data: f.base64! }));
 
-  const full = await proxyStream('/stream/gemini', { prompt, systemInstruction, fileParts }, onToken, signal);
+  const full = await proxyStream(
+    '/stream/gemini',
+    { prompt, systemInstruction, fileParts, coverContext: isAutoSolve ? '' : buildCoverContext(contextFiles) },
+    onToken,
+    signal,
+  );
   // Auto-solve never emits "..." — skip the listening rewrite so a short
   // code response can't be misinterpreted as a noise-gate hit.
   if (isAutoSolve) return full;
@@ -1130,7 +1829,7 @@ export async function streamOpenAI(
     systemInstruction = buildAutoSolveSystemInstruction();
     userText = query;
   } else {
-    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(query, contextFiles, generalMode);
     systemInstruction = si;
     userText = `${userRulesBlock}${query}${kbHint}\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
   }
@@ -1157,7 +1856,7 @@ export async function streamOpenAI(
   // through; server enforces tier gate via JWT.
   const full = await proxyStream(
     '/stream/openai',
-    { messages, reasoning_effort: getReasoningEffort() },
+    { messages, reasoning_effort: getReasoningEffort(), coverContext: isAutoSolve ? '' : buildCoverContext(contextFiles) },
     onToken,
     signal,
   );
@@ -1175,7 +1874,7 @@ export async function streamXAI(
     systemInstruction = buildAutoSolveSystemInstruction();
     promptText = query;
   } else {
-    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(query, contextFiles, generalMode);
     systemInstruction = si;
     promptText = `${userRulesBlock}Interviewer (Current Audio): ${query}${kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
   }
@@ -1194,7 +1893,12 @@ export async function streamXAI(
   imageFiles.forEach(f => contentParts.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } }));
   messages.push({ role: 'user', content: contentParts });
 
-  const full = await proxyStream('/stream/xai', { messages }, onToken, signal);
+  const full = await proxyStream(
+    '/stream/xai',
+    { messages, coverContext: isAutoSolve ? '' : buildCoverContext(contextFiles) },
+    onToken,
+    signal,
+  );
   if (isAutoSolve) return full;
   return (full.trim() === '...' || full.trim().toLowerCase() === 'listening...') ? 'Listening...' : full;
 }
@@ -1209,7 +1913,7 @@ export async function streamGroq(
     systemInstruction = buildAutoSolveSystemInstruction();
     promptText = query;
   } else {
-    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(contextFiles, generalMode);
+    const { systemInstruction: si, userRulesBlock, kbHint } = await prepareStreamPrompts(query, contextFiles, generalMode);
     systemInstruction = si;
     const chatHistoryText = history
       .filter(m => m.role !== 'system')
@@ -1228,12 +1932,17 @@ export async function streamGroq(
     { role: 'user', content: contentParts },
   ];
 
-  const full = await proxyStream('/stream/groq', { messages }, onToken, signal);
+  const full = await proxyStream(
+    '/stream/groq',
+    { messages, coverContext: isAutoSolve ? '' : buildCoverContext(contextFiles) },
+    onToken,
+    signal,
+  );
   if (isAutoSolve) return full;
   return full.trim() === '...' ? 'Listening...' : full;
 }
 
-// Claude (Anthropic Sonnet 4.6) lives in its own file —
+// Claude (Anthropic Sonnet 5) lives in its own file —
 // services/claudeService.ts — so the persona pipeline can layer
 // WEB SEARCH instructions on top of the shared prompt builders
 // without touching the other models, and so identity extraction
@@ -1443,6 +2152,13 @@ export async function getAutoTypePlan(args: {
 const SYNC_QUEUE_KEY = '__conv_sync_queue_v1__';
 const SYNC_QUEUE_MAX = 500;
 const SYNC_QUEUE_MAX_RETRIES = 8;
+// Gap between messages while draining a backlog. A full 500-entry queue
+// drains in ~60s at this pace, which is fine for a background catch-up and
+// leaves the user's live interview the headroom it needs.
+const DRAIN_PACE_MS = 120;
+// Same idea for the one-shot history backfill, which walks every local
+// session. Slower because each request carries a whole conversation.
+const BACKFILL_PACE_MS = 250;
 
 interface SyncQueueEntry {
   sessionId: string;
@@ -1488,10 +2204,12 @@ function enqueueSync(entry: Omit<SyncQueueEntry, 'enqueuedAt' | 'retries'> & { r
 
 // Single sync attempt. Returns:
 //   - { ok: true } on 2xx
-//   - { ok: false, retriable: true } on network error or 5xx
-//   - { ok: false, retriable: false } on 4xx (don't queue)
+//   - { ok: false, retriable: true } on network error, 5xx, 401 or 429
+//   - { ok: false, retriable: false } on other 4xx (don't queue)
+//   - rateLimited: true is reported separately from `retriable` because the
+//     drain has to treat it differently — see drainSyncQueue.
 async function attemptSync(sessionId: string, body: { name: string; messages: any[] }, token: string):
-  Promise<{ ok: boolean; retriable: boolean }> {
+  Promise<{ ok: boolean; retriable: boolean; rateLimited?: boolean }> {
   try {
     const res = await fetch(`${API_BASE}/api/v1/conversations/${encodeURIComponent(sessionId)}/sync`, {
       method: 'POST',
@@ -1502,8 +2220,28 @@ async function attemptSync(sessionId: string, body: { name: string; messages: an
       body: JSON.stringify(body),
     });
     if (res.ok) return { ok: true, retriable: false };
-    // 401 = auth — retrying with same token won't help. Drop, surface in console.
-    // 400/403/404 = bad payload or revoked access — drop.
+    // 401 = the token is expired or was revoked (a password change bumps
+    // tokens_revoked_after, which invalidates every live JWT at once —
+    // see server middleware/auth.js). Retrying with THIS token is futile,
+    // but the payload is perfectly good and the next sign-in mints a valid
+    // one. Dropping here meant every message written between revocation
+    // and the next successful sync vanished from the mirror with no queue
+    // entry and no log. Queue instead: drainSyncQueue already refuses to
+    // run without a token, so entries simply wait for the next login, and
+    // SYNC_QUEUE_MAX_RETRIES still bounds a permanently-dead token.
+    // (Hardening — no instance of this observed in the live DB, but the
+    // revocation path that triggers it is real.)
+    if (res.status === 401) return { ok: false, retriable: true };
+    // 429 = rate limited. This is the ONE 4xx that explicitly means "try
+    // again later", and dropping it was a live defect: the general limiter
+    // is 60 req/min PER IP (server index.js), every message costs one sync
+    // POST, and behind corporate NAT a whole office shares that budget. A
+    // fast exchange — or one colleague on the same egress IP — silently
+    // lost messages from the mirror with no queue entry. Found by firing
+    // the sync path concurrently against a live server: rounds 9-12 came
+    // back 429 and every one of those messages disappeared.
+    if (res.status === 429) return { ok: false, retriable: true, rateLimited: true };
+    // 400/403/404 = bad payload or revoked access — retrying cannot fix it.
     if (res.status >= 400 && res.status < 500) return { ok: false, retriable: false };
     // 5xx = server-side, retry later.
     return { ok: false, retriable: true };
@@ -1526,15 +2264,37 @@ async function drainSyncQueue(): Promise<void> {
   drainInFlight = true;
   try {
     const remaining: SyncQueueEntry[] = [];
-    for (const entry of queue) {
+    for (let i = 0; i < queue.length; i++) {
+      const entry = queue[i];
       // Bound retries so a permanently-failing payload doesn't block the
       // queue forever. After SYNC_QUEUE_MAX_RETRIES we give up and drop —
       // the local copy is still safe; only the cloud mirror is lost for
       // this one message.
       if (entry.retries >= SYNC_QUEUE_MAX_RETRIES) continue;
+
       const result = await attemptSync(entry.sessionId, entry.body, token);
-      if (result.ok) continue; // successfully drained
-      if (!result.retriable) continue; // server rejected — drop
+      if (result.ok) {
+        // Space out a long drain. Coming back from a flight with a few
+        // hundred queued messages, firing them as fast as the loop runs is
+        // exactly the burst the server's limiter exists to stop — and it
+        // would compete with the live interview the user may already be
+        // in. This is a background catch-up; it can afford to be polite.
+        if (i < queue.length - 1) await new Promise(r => setTimeout(r, DRAIN_PACE_MS));
+        continue;
+      }
+
+      if (result.rateLimited) {
+        // The server just told us to slow down. Pushing harder makes it
+        // worse, and charging this entry a retry would punish it for a
+        // condition that has nothing to do with its payload — 8 rounds of
+        // that and a perfectly good message gets dropped. Stop the pass,
+        // keep everything still pending exactly as it is, and let the next
+        // trigger (next successful sync, `online`, or app start) resume.
+        remaining.push(entry, ...queue.slice(i + 1));
+        break;
+      }
+
+      if (!result.retriable) continue; // server rejected the payload — drop
       remaining.push({ ...entry, retries: entry.retries + 1 });
     }
     writeQueue(remaining);
@@ -1644,6 +2404,7 @@ export async function backfillAllConversations(
 
   let synced = 0;
   let failed = 0;
+  let rateLimited = false;
 
   try {
     const sessions = await window.electronAPI.invoke<any[]>('db:list-sessions', userId);
@@ -1665,7 +2426,14 @@ export async function backfillAllConversations(
       });
 
       try {
-        const messagesRaw = await window.electronAPI.invoke<any[]>('db:get-messages', session.id);
+        // userId is REQUIRED — db:get-messages ownership-checks via
+        // _ownsSession, which fails closed on a null userId and returns []
+        // rather than throwing. Without it this backfill POSTed an empty
+        // messages array for every session, got a 2xx (an empty array is a
+        // legitimate rename-only sync), and counted it as `synced++` — so
+        // the repair tool reported "Synced N conversations" while doing
+        // nothing at all.
+        const messagesRaw = await window.electronAPI.invoke<any[]>('db:get-messages', session.id, userId);
         const messages = Array.isArray(messagesRaw) ? messagesRaw : [];
 
         // Normalize to server schema. Drop empty messages — server requires content.
@@ -1687,8 +2455,22 @@ export async function backfillAllConversations(
             messages: batch,
           }),
         });
+        // Rate limited. Every remaining session would get the same answer,
+        // so hammering through them just converts one stall into N failures
+        // and an alarming "failed: 140" in the UI. Stop cleanly and report
+        // how far we got — re-running picks up where this left off, since
+        // /sync is idempotent by message id.
+        if (res.status === 429) {
+          rateLimited = true;
+          break;
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         synced++;
+        // Pace the walk. This loop fires one request per local session —
+        // 171 of them on a real machine — and unpaced it trips the server's
+        // limiter within seconds, which is how a repair tool ends up
+        // needing its own repair.
+        if (i < list.length - 1) await new Promise(r => setTimeout(r, BACKFILL_PACE_MS));
       } catch (e) {
         console.warn('[backfill] session sync failed:', session.id, e);
         failed++;
@@ -1696,6 +2478,19 @@ export async function backfillAllConversations(
     }
 
     onProgress({ done: list.length, total: list.length, current: '', synced, failed });
+    // Report a rate-limit stop as its own outcome. It is neither success
+    // ("Synced 40 conversations" when 130 never went is the exact kind of
+    // false completion this tool already shipped once) nor failure —
+    // nothing broke, and clicking again resumes from where it stopped
+    // because /sync is idempotent by message id.
+    if (rateLimited) {
+      return {
+        success: false,
+        synced,
+        failed,
+        message: `Synced ${synced} of ${list.length}, then paused — the server asked us to slow down. Click again in a minute to continue where this left off.`,
+      };
+    }
     return {
       success: failed === 0,
       synced,

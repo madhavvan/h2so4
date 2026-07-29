@@ -9,6 +9,8 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const database = require('./database');
+// Decides whether a request is rate limited as a person or as an address.
+const { rateLimitIdentity, rateLimitAccountKey } = require('./middleware/rateLimitKey');
 // Alias used by the support WS persistence handlers below. The
 // WebSocket block was written against `db.` while the historical
 // import at the top of this file uses `database.` — keeping both
@@ -40,6 +42,27 @@ const PORT = process.env.PORT || 4000;
 
 // Behind Railway's reverse proxy — without this, req.protocol returns 'http'
 // and breaks the Google OAuth redirect URI match, and req.ip returns the proxy IP.
+//
+// ⚠️ DO NOT CHANGE 1 TO `true`. Every IP-keyed rate limiter depends on this
+// number, and `true` silently makes them all spoofable.
+//
+// `1` means "trust exactly one hop" — express takes the rightmost XFF entry
+// that is not a trusted proxy. Railway APPENDS the real client IP, so
+// anything a client puts in the header sits to the left of it and loses.
+// Verified against this exact config:
+//
+//   direct, client sends "9.9.9.9"            -> req.ip = 9.9.9.9        (spoofed)
+//   via proxy, "9.9.9.9, 203.0.113.50"        -> req.ip = 203.0.113.50   (real IP wins)
+//   via proxy, "9.9.9.9, 8.8.8.8, 203.0.113.50" -> req.ip = 203.0.113.50
+//
+// With `true`, express trusts every hop and takes the LEFTMOST entry — so
+// the first line above becomes the production behaviour and any caller can
+// reset their own rate-limit bucket, or attribute their traffic to someone
+// else's, by sending one header. The account-keyed limiters added in
+// middleware/rateLimiters.js survive that; the IP-keyed ones do not.
+//
+// The one real precondition is that this process is only ever reached
+// THROUGH the proxy. If it is ever exposed directly, revisit this.
 app.set('trust proxy', 1);
 
 // ── Security ──
@@ -55,6 +78,43 @@ app.use(cors({
     // Allow configured frontend URL
     const frontendUrl = process.env.FRONTEND_URL;
     if (frontendUrl && origin === frontendUrl) return callback(null, true);
+    // The phone companion is a separately-deployed origin (Vercel), so it
+    // needs naming here or its sign-in POST is blocked while the mirror
+    // socket — which CORS does not police — connects fine. That split
+    // failure reads as "login is broken" rather than as a CORS problem,
+    // which is exactly the kind of thing nobody diagnoses quickly.
+    //
+    // The known deploy is allowed BY DEFAULT rather than only via env, so
+    // shipping the phone app does not depend on remembering to set a
+    // variable on Railway first. MOBILE_APP_URLS adds to this list (a
+    // preview deploy, a native wrapper's origin); it does not replace it.
+    const mobileOrigins = [
+      'https://interview-copilot-mobile.vercel.app',
+      // ── The packaged App Store / Play builds ──
+      // A Capacitor app serves its bundle from a local origin, so every
+      // call to this API is cross-origin exactly like the Vercel one is.
+      // These two strings are Capacitor's defaults and are pinned in the
+      // companion repo's capacitor.config.ts:
+      //
+      //   capacitor://localhost   iOS
+      //   https://localhost       Android (androidScheme: 'https')
+      //
+      // Not behind an env var. The store build cannot be redeployed to
+      // fix a missing Railway variable — it is on someone's phone, and
+      // the failure it produces is the deceptive one described above:
+      // the mirror socket connects (WebSockets are not CORS-policed) and
+      // only sign-in breaks, so it presents as a broken login in a
+      // shipped app you cannot patch for a week.
+      'capacitor://localhost',
+      'https://localhost',
+      ...(process.env.MOBILE_APP_URLS || process.env.MOBILE_APP_URL || '')
+        .split(',').map(s => s.trim()).filter(Boolean),
+    ];
+    if (mobileOrigins.includes(origin)) return callback(null, true);
+    // Vercel gives every preview build its own subdomain; allowing the
+    // project's previews keeps a staged phone build testable against
+    // production without a redeploy of the API.
+    if (/^https:\/\/interview-copilot-mobile-[a-z0-9-]+\.vercel\.app$/.test(origin)) return callback(null, true);
     // Allow the API server's own origin — browsers attach Origin on the
     // same-origin POST from our server-rendered password reset form, and
     // without this the middleware rejects its own form submission.
@@ -97,53 +157,28 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 
 // ── Rate limiting ──
-const { RateLimiterMemory } = require('rate-limiter-flexible');
-
-// General rate limiter
-const generalLimiter = new RateLimiterMemory({ points: 60, duration: 60 });
-// Strict auth rate limiter (prevent brute force on login/signup)
-const authLimiter = new RateLimiterMemory({ points: 10, duration: 300 }); // 10 attempts per 5 min
-// Very strict forgot-password limiter — prevents mass email spam and
-// bill-bombing on transactional mail providers. 5 requests / 15 min / IP.
-const forgotPasswordLimiter = new RateLimiterMemory({ points: 5, duration: 900 });
-// Checkout creation limiter — every hit creates a real Stripe/Razorpay
-// session/order, so a tight window matters. 20 attempts / 5 min / IP
-// covers double-click frustration and switch-tier exploration without
-// allowing scripted abuse of the provider create-session APIs (which
-// also have account-wide rate limits we'd rather not hit).
-const checkoutLimiter = new RateLimiterMemory({ points: 20, duration: 300 });
-
-// Admin surface limiters. Two tiers:
-//   • adminLimiter — generous cap on read-heavy admin browsing (listing
-//     users, paging through audit log, pulling stats). 120/min means an
-//     admin can grind through the UI without friction.
-//   • adminDestructiveLimiter — tight cap on POST/PATCH/DELETE that mutates
-//     state. 30/5min is enough for a burst of support actions but stops
-//     a compromised token from doing thousands of refunds in a row.
-const adminLimiter = new RateLimiterMemory({ points: 120, duration: 60 });
-const adminDestructiveLimiter = new RateLimiterMemory({ points: 30, duration: 300 });
-
-// AI endpoint limiter — keyed by user (when authenticated) or IP (fallback).
-// Each AI call is real money to us (Claude w/ web_search ≈ $0.05+, GPT/Gemini
-// cheaper but still non-trivial), so a leaked token must not be able to grind
-// thousands of dollars in inference. Bumped May 2026 from 60→90/min/user
-// after users reported hitting the cap during legitimate interview use:
-// model switching, parallel chat-and-fresh-context calls, and Auto-Type
-// firing its own AI planner all share this bucket. 90/min ≈ 1.5/sec
-// sustained, still tight enough that a leaked token can't grind unbounded
-// inference, but breathing room for normal interview pace.
-const aiLimiter = new RateLimiterMemory({ points: 90, duration: 60 });
-
-// Support bot limiters — keyed by IP (endpoint is anonymous). Two tiers:
-//   • supportChatLimiter — 10 streams / minute / IP, 50 / hour / IP.
-//     A single attacker IP costs us at most ~50 × $0.005 ≈ $0.25/hour
-//     even on the most expensive question, and the hourly cap dominates.
-//   • supportHandoffLimiter — 5 handoffs / hour / IP. Each handoff fires
-//     Slack + Resend; this stops a scripted form-spam loop from filling
-//     support@minicaai.com or paging the Slack channel.
-const supportChatLimiter = new RateLimiterMemory({ points: 10, duration: 60 });
-const supportChatHourly = new RateLimiterMemory({ points: 50, duration: 3600 });
-const supportHandoffLimiter = new RateLimiterMemory({ points: 5, duration: 3600 });
+// Every bucket, the axis it counts on, and why, lives in one place —
+// middleware/rateLimiters.js. Two rules run through all of it: count abuse
+// on the thing being abused (the account, which an attacker cannot change
+// by renting another IP), and count legitimate use per person (because an
+// IP is an office, not a person).
+const {
+  generalLimiter,
+  generalUserLimiter,
+  loginAccountLimiter,
+  loginIpLimiter,
+  signupIpLimiter,
+  forgotAccountLimiter,
+  forgotIpLimiter,
+  checkoutUserLimiter,
+  checkoutIpLimiter,
+  adminLimiter,
+  adminDestructiveLimiter,
+  aiLimiter,
+  supportChatLimiter,
+  supportChatHourly,
+  supportHandoffLimiter,
+} = require('./middleware/rateLimiters');
 
 // Optional IP allowlist for admin endpoints. Comma-separated CIDR-free list
 // (single IPs and IPv4/IPv6 exact match). Empty string = no restriction
@@ -163,24 +198,82 @@ function isAdminIpAllowed(ip) {
 
 app.use(async (req, res, next) => {
   try {
-    const key = req.ip || req.connection?.remoteAddress || 'unknown';
-    await generalLimiter.consume(key);
+    // `identity.key` is the verified user when signed in, else the IP.
+    // `key` stays the raw IP on purpose — every limiter below this one
+    // exists to stop abuse from a SOURCE (login brute force, reset-mail
+    // spam, checkout scripting, anonymous support chat), and those must
+    // not become per-account or an attacker just makes another account.
+    const identity = rateLimitIdentity(req);
+    const key = identity.ip;
 
-    // Stricter limit on auth endpoints
-    if (req.path.startsWith('/api/v1/auth/login') || req.path.startsWith('/api/v1/auth/signup')) {
+    if (identity.authenticated) {
+      await generalUserLimiter.consume(identity.key);
+    } else {
+      // identity.key equals the IP here by construction; spell it out so a
+      // reader (or an audit script) can see the axis without deriving it.
+      await generalLimiter.consume(identity.ip);
+    }
+
+    // The account this request is trying to act on, for the endpoints
+    // where the caller is not signed in yet. null when there is no usable
+    // email — not a bypass, since a login without one authenticates nobody.
+    const accountKey = rateLimitAccountKey(req);
+
+    // ── Login: two axes ──
+    // The ACCOUNT bucket is the brute-force protection and is the one that
+    // did not exist before — with only an IP bucket, an attacker renting a
+    // hundred addresses got a hundred fresh budgets against one email. The
+    // IP bucket is now the anti-spraying control instead, and is loose
+    // enough that colleagues behind one office NAT can all sign in.
+    if (req.path.startsWith('/api/v1/auth/login')) {
+      if (accountKey) {
+        try {
+          await loginAccountLimiter.consume(accountKey);
+        } catch {
+          return res.status(429).json({
+            error: 'Too many sign-in attempts for this account. Please wait 15 minutes, or reset your password.',
+          });
+        }
+      }
       try {
-        await authLimiter.consume(key);
+        await loginIpLimiter.consume(key);
       } catch {
-        return res.status(429).json({ error: 'Too many login attempts. Please wait 5 minutes.' });
+        return res.status(429).json({ error: 'Too many sign-in attempts from this network. Please wait a few minutes.' });
       }
     }
 
-    // Even stricter limit on forgot-password to prevent reset-mail spam
-    if (req.path === '/api/v1/auth/forgot-password' && req.method === 'POST') {
+    // ── Signup: IP only, deliberately ──
+    // An account bucket protects nothing here: someone creating accounts in
+    // bulk uses a new email every time, so the key would never repeat.
+    // Volume from a source is the only meaningful signal.
+    if (req.path.startsWith('/api/v1/auth/signup')) {
       try {
-        await forgotPasswordLimiter.consume(key);
+        await signupIpLimiter.consume(key);
       } catch {
-        return res.status(429).json({ error: 'Too many reset requests. Please wait 15 minutes.' });
+        return res.status(429).json({ error: 'Too many sign-up attempts. Please wait 5 minutes.' });
+      }
+    }
+
+    // ── Forgot password: two axes ──
+    // Each request mails a real person, so the abuse is bombing ONE inbox —
+    // which an IP bucket never stopped, because rotating addresses reset it.
+    if (req.path === '/api/v1/auth/forgot-password' && req.method === 'POST') {
+      if (accountKey) {
+        try {
+          await forgotAccountLimiter.consume(accountKey);
+        } catch {
+          // Deliberately identical in shape to the success response the
+          // route returns, so this cannot be used to probe which addresses
+          // have accounts.
+          return res.status(429).json({
+            error: 'Too many reset requests for this address. Please wait an hour and check your inbox, including spam.',
+          });
+        }
+      }
+      try {
+        await forgotIpLimiter.consume(key);
+      } catch {
+        return res.status(429).json({ error: 'Too many reset requests from this network. Please wait 15 minutes.' });
       }
     }
 
@@ -194,10 +287,20 @@ app.use(async (req, res, next) => {
        req.path === '/api/v1/payments/create-renewal' ||
        req.path === '/api/v1/payments/upgrade-tier')
     ) {
+      // Per USER first — the caller is authenticated here, so the person is
+      // the right axis and two colleagues upgrading from one office
+      // connection no longer contend for the same 20.
       try {
-        await checkoutLimiter.consume(key);
+        await checkoutUserLimiter.consume(identity.key);
       } catch {
         return res.status(429).json({ error: 'Too many checkout attempts. Please wait a few minutes and try again.' });
+      }
+      // Loose IP backstop for the mass-account case (one machine, many
+      // accounts). Never binds on real shared-office traffic.
+      try {
+        await checkoutIpLimiter.consume(key);
+      } catch {
+        return res.status(429).json({ error: 'Too many checkout attempts from this network. Please wait a few minutes.' });
       }
     }
 
@@ -221,14 +324,17 @@ app.use(async (req, res, next) => {
         return res.status(403).json({ error: 'Admin access not allowed from this network' });
       }
       try {
-        await adminLimiter.consume(key);
+        // Per admin, not per address — two admins on the office VPN were
+        // sharing one browsing budget. ADMIN_IP_ALLOWLIST is a separate
+        // control and is unaffected by this.
+        await adminLimiter.consume(identity.key);
       } catch {
         return res.status(429).json({ error: 'Admin rate limit exceeded. Wait a minute and retry.' });
       }
       // Destructive verbs get an extra tighter bucket.
       if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
         try {
-          await adminDestructiveLimiter.consume(key);
+          await adminDestructiveLimiter.consume(identity.key);
         } catch {
           return res.status(429).json({ error: 'Too many admin mutations. Wait 5 minutes and retry.' });
         }
@@ -267,26 +373,15 @@ app.use(async (req, res, next) => {
     // header sniff: clients send Authorization: Bearer <jwt>. If parse
     // fails, fall back to IP — strictly safe since IP is always present.
     if (req.path.startsWith('/api/v1/ai/')) {
-      let aiKey = key;
+      // Was a hand-rolled base64 decode of the JWT payload with NO
+      // signature check. Survivable here (authMiddleware rejects a forged
+      // token moments later, so the attacker gains nothing but a wasted
+      // bucket entry) but it duplicated logic and was a trap waiting to be
+      // copied somewhere it would matter. rateLimitIdentity does the same
+      // job with jwt.verify, and falls back to the IP on anything it
+      // cannot vouch for.
       try {
-        const auth = req.headers.authorization;
-        if (auth && auth.startsWith('Bearer ')) {
-          // Decode payload only — signature verification happens in
-          // authMiddleware later. We just need a stable per-user bucket key.
-          const token = auth.slice(7);
-          const parts = token.split('.');
-          if (parts.length === 3) {
-            const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-            // JWT payload carries `id` (see generateToken — {id,email,tier}).
-            // The old `payload.user_id` never existed, so every authenticated
-            // AI request silently fell back to the IP bucket and corporate-NAT
-            // users 429'd each other mid-interview.
-            if (payload && payload.id) aiKey = `u:${payload.id}`;
-          }
-        }
-      } catch { /* fall back to IP */ }
-      try {
-        await aiLimiter.consume(aiKey);
+        await aiLimiter.consume(identity.key);
       } catch {
         return res.status(429).json({
           error: 'You are sending requests too fast — pause for a few seconds and try again. (App-level cap: 90/min/user.)',
@@ -551,6 +646,23 @@ process.on('SIGTERM', () => {
 const server = app.listen(PORT, () => {
   console.log(`minicaai API running on port ${PORT}`);
   console.log(`Database initialized`);
+  // Topology line. This service must run as one process — six background
+  // sweeps below, the WebSocket registries, and the in-memory rate limiters
+  // all assume it. Today Railway enforces that for us as a side effect:
+  // "Replicas cannot be used with volumes", and we have a volume. Which
+  // means the protection disappears the moment the volume does, hence the
+  // check in database.js and RUNBOOK.md § 18.
+  //
+  // RAILWAY_REPLICA_ID is logged because it is what Railway actually gives
+  // us — an opaque per-replica id, no ordinal (a replica index is still an
+  // open feature request), so it cannot be used to REFUSE to start as
+  // replica #2. What it can do is make a second instance visible: two
+  // distinct ids in the logs is the symptom.
+  const replicaId = process.env.RAILWAY_REPLICA_ID;
+  console.log(
+    `[topology] single-instance service${replicaId ? ` — replica ${replicaId}` : ''}`
+    + ` — see RUNBOOK.md §18 before scaling`,
+  );
   // Support escalation worker — scans support_escalation_queue every
   // 10s, fires staged ntfy/email/sms/fallback rungs. Started AFTER
   // listen() so route registration completes first.
@@ -608,6 +720,22 @@ setInterval(runResetTokenCleanup, RESET_TOKEN_CLEANUP_INTERVAL_MS).unref();
 const CYCLE_END_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 async function runCycleEndSweep() {
   try {
+    // Before looking for expired cancellations, make sure every canceling
+    // license actually HAS an expiry to be past. A canceled Ultra written
+    // before the resolveCancelPeriodEnd fix sits at the -1 unlimited
+    // sentinel, which this sweep's `expires_at > 0` filter skips and every
+    // access gate reads as "never expires" — canceled at the provider,
+    // unlimited here, forever. Repairing first folds those rows back into
+    // the normal lifecycle on the very next tick. Steady state is 0.
+    try {
+      const repaired = database.repairAllCancelWindows();
+      if (repaired > 0) {
+        console.warn(`[cycle-end-sweep] repaired ${repaired} canceling license(s) that had no cycle-end date`);
+      }
+    } catch (repairErr) {
+      console.warn('[cycle-end-sweep] cancel-window repair failed:', repairErr && repairErr.message);
+    }
+
     const userIds = database.getExpiredCancelingUserIds(100);
     if (!userIds || userIds.length === 0) return;
     const { sendMail, renderAccessEndedEmail } = require('./email');
@@ -750,7 +878,32 @@ const WebSocket = require('ws');
 const { verifyToken } = require('./middleware/auth');
 const SUPPORT_ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
   .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
-const wss = new WebSocket.Server({ server, path: '/ws/support' });
+// TWO WebSocket servers share this HTTP server, so BOTH must be
+// noServer and we route upgrades ourselves. Passing `server` to more
+// than one instance looks correct and silently breaks both: ws adds an
+// 'upgrade' listener per instance and each one aborts, with HTTP 400,
+// any path it does not own — so whichever registered first kills the
+// other's connections.
+const wss = new WebSocket.Server({ noServer: true });
+
+// ── Device sync: /ws/remote ──
+// The computer hosts the session; phones mirror it and can press its
+// buttons. Its own socket and path, so a support-chat fault can never
+// take the interview mirror down with it.
+const { attachRemoteChannel } = require('./services/remoteChannel');
+const remoteChannel = attachRemoteChannel(server, app);
+
+// Support owns its path the same way the remote channel owns its own:
+// path-scoped, and it does NOT abort paths it doesn't recognise. ws's
+// built-in `server` handler aborts any non-matching path with a 400,
+// which is why two `server`-attached sockets silently kill each other.
+server.on('upgrade', (req, socket, head) => {
+  let pathname = '/';
+  try { pathname = new URL(req.url, 'http://x').pathname; } catch { /* keep default */ }
+  if (pathname !== '/ws/support') return;
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+});
+console.log('[ws] /ws/support and /ws/remote each own their path');
 
 // Track connected clients: customers and agents.
 // `lastSeen` powers the idle sweeper; `pingPending` lets the heartbeat
@@ -943,10 +1096,15 @@ wss.on('connection', (ws, req) => {
             (async () => {
               try {
                 const { sendNewCustomerAlert } = require('./services/ntfy');
-                const agents = db.listOnlineSupportAgents();
+                // Notifiable, NOT online — this is the "buzz my phone the
+                // moment someone clicks Talk to a human" push, and it used
+                // the liveness query, so it only fired when the admin
+                // already had the inbox open and did not need it. See
+                // listNotifiableSupportAgents in database.js.
+                const agents = db.listNotifiableSupportAgents();
                 const targets = agents.filter(a => a.ntfy_topic && a.ntfy_topic.length > 0);
                 if (targets.length === 0) {
-                  console.log('[support/ws] instant ntfy SKIP — no online agents with topic');
+                  console.log('[support/ws] instant ntfy SKIP — no agents with a topic configured');
                   return;
                 }
                 console.log(`[support/ws] instant ntfy fanout to ${targets.length} agent(s) for thread=${thread.id}`);
@@ -1030,29 +1188,55 @@ wss.on('connection', (ws, req) => {
           //    sees the SAME agent they had before, not a generic
           //    "an agent is here".
           try {
+            // LIVENESS decides this, not assignment. The previous version
+            // announced thread.assigned_agent_email whenever it was set —
+            // but an assignment is a historical fact ("someone claimed this
+            // days ago"), not presence. A customer resuming a thread was
+            // therefore told "Priya is here" while Priya was asleep, and
+            // sat waiting on someone who would never reply.
+            //
+            // Order: the assigned agent IF they are actually connected (so a
+            // returning customer sees the same person, not a stranger), then
+            // any live agent, then a heartbeat-fresh agent mid-reconnect.
+            // If none of those hold we send nothing and the customer
+            // correctly stays in "waiting" — which is what makes the
+            // agent_left / agent_joined pair below meaningful.
             const thread = threadId ? db.getSupportThread(threadId) : null;
+            const assignedEmail = thread?.assigned_agent_email
+              ? String(thread.assigned_agent_email).toLowerCase()
+              : null;
             let agentNameForCustomer = null;
-            if (thread?.assigned_agent_email) {
-              agentNameForCustomer = thread.assigned_agent_email.split('@')[0];
-            } else {
-              // No assignment yet — any live agent will do.
-              for (const [, c] of supportClients) {
-                if (c.type === 'agent' && c.ws.readyState === WebSocket.OPEN) {
-                  agentNameForCustomer = c.name || (c.email || '').split('@')[0] || 'support';
-                  break;
-                }
+            let anyLiveAgent = null;
+            for (const [, c] of supportClients) {
+              if (c.type !== 'agent' || c.ws.readyState !== WebSocket.OPEN) continue;
+              if (assignedEmail && c.email === assignedEmail) {
+                agentNameForCustomer = c.name || assignedEmail.split('@')[0];
+                break;
               }
-              if (!agentNameForCustomer) {
-                // No live agent socket — but maybe one is just heartbeat-
-                // fresh (between WS reconnects). Check presence rows.
-                try {
-                  const online = db.listOnlineSupportAgents();
-                  if (online && online.length > 0) {
-                    agentNameForCustomer = (online[0].agent_email || '').split('@')[0] || 'support';
-                  }
-                } catch { /* non-critical */ }
-              }
+              if (!anyLiveAgent) anyLiveAgent = c;
             }
+            if (!agentNameForCustomer && anyLiveAgent) {
+              agentNameForCustomer = anyLiveAgent.name
+                || (anyLiveAgent.email || '').split('@')[0]
+                || 'support';
+            }
+            // NO heartbeat fallback here, deliberately.
+            //
+            // There used to be one: if no socket was open but a presence
+            // heartbeat was inside 90s, we announced that agent as present,
+            // reasoning they were mid-reconnect. But the heartbeat is
+            // written when an agent CONNECTS and never cleared when they
+            // leave, so for a full 90 seconds after an admin deliberately
+            // closed the inbox, arriving customers were still told an agent
+            // was with them. Caught by the end-to-end test: admin closes,
+            // customer reconnects, panel says "connected" to nobody.
+            //
+            // Presence is now exactly "an agent socket is open". A real
+            // reconnect blip resolves itself within seconds, because the
+            // agent-join handler broadcasts agent_joined to every connected
+            // customer the moment the socket is back. Briefly showing
+            // "waiting" and then correcting is honest; showing "connected"
+            // to an empty chair is not.
             if (agentNameForCustomer) {
               ws.send(JSON.stringify({ type: 'agent_joined', name: agentNameForCustomer }));
             }
@@ -1324,7 +1508,42 @@ wss.on('connection', (ws, req) => {
           }
         }
       }
+      // Delete BEFORE counting the survivors, so the socket that is closing
+      // never counts itself as still present.
       supportClients.delete(clientId);
+
+      // ── Tell waiting customers the agent is gone ──
+      // The client has always handled `agent_left` (SupportBot.tsx sets
+      // liveStatus 'closed', clears the name, posts a line) — the server
+      // simply never sent it. So the panel said "Agent connected" from the
+      // moment an admin appeared until the customer closed the app,
+      // including all night after the admin shut their laptop. A customer
+      // waited on someone who had left hours earlier.
+      //
+      // Only fire when the LAST agent socket goes. Admins routinely run
+      // Electron plus a browser tab plus a popout (cap is 4), so closing
+      // one of them must not announce a departure that did not happen.
+      if (client && client.type === 'agent') {
+        let stillHere = false;
+        for (const [, c] of supportClients) {
+          if (c.type === 'agent' && c.ws.readyState === WebSocket.OPEN) { stillHere = true; break; }
+        }
+        if (!stillHere) {
+          let told = 0;
+          for (const [, c] of supportClients) {
+            if (c.type === 'customer' && c.ws.readyState === WebSocket.OPEN) {
+              try {
+                c.ws.send(JSON.stringify({
+                  type: 'agent_left',
+                  name: client.name || (client.email || '').split('@')[0] || 'support',
+                }));
+                told++;
+              } catch { /* socket already tearing down */ }
+            }
+          }
+          if (told) console.log(`[support/ws] last agent left — notified ${told} waiting customer(s)`);
+        }
+      }
     }
   });
 });

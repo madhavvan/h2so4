@@ -4,7 +4,7 @@
 //  Why this exists: until v3.4.7 the AI proxy and auto-type endpoints
 //  trusted the renderer to enforce its own feature gates. A free user
 //  with DevTools could copy their Bearer token and POST to /chat/claude
-//  to use Sonnet 4.6 indefinitely, or to /autotype-plan to burn Haiku
+//  to use Sonnet 5 indefinitely, or to /autotype-plan to burn Haiku
 //  tokens at our cost. Client gates aren't enforcement — they're UX.
 //
 //  Reads the LICENSE row (not req.user.tier from the JWT) because:

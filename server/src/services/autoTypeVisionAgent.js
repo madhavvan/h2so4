@@ -1,5 +1,5 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  Auto-Type VISION Agent — Sonnet 4.6, vision + MULTI-OPERATION plan
+//  Auto-Type VISION Agent — Sonnet 5, vision + MULTI-OPERATION plan
 //
 //  Why multi-operation (v2):
 //    The v1 plan was SINGLE-REGION — one skip_leading, one skip_trailing,
