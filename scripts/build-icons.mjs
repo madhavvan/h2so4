@@ -22,7 +22,9 @@
  */
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import png2icons from 'png2icons';
@@ -31,6 +33,18 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SRC = path.join(root, 'build', 'icon.svg');
 const BUILD = path.join(root, 'build');
 const PUBLIC = path.join(root, 'public');
+
+// The phone companion deploys from its own repo (Vercel) and shares no
+// build with this one, so its icons cannot be an import — they are
+// generated here, from this same master, and written across. Same
+// sibling-repo convention server/test/remote-client-parity.test.js uses.
+// Skipped silently when the companion isn't checked out: a missing
+// sibling repo is not a broken icon build.
+const PHONE_CANDIDATES = [
+  path.resolve(root, '..', 'interview-copilot-mobile'),
+  path.resolve(root, '..', '..', 'interview-copilot-mobile'),
+  path.join(os.homedir(), 'interview-copilot-mobile'),
+];
 
 // Sizes we emit. 16/24/32/48/64/128/256 cover Windows ICO; 512 for Linux/PWA;
 // 1024 is the macOS Retina source. PNG copies of every size are useful for
@@ -125,7 +139,118 @@ async function main() {
   await writeFile(path.join(root, 'electron', 'tray-icon.png'), pngs[32]);
   console.log('  ✓ electron/tray-icon.png (the one the tray actually loads)');
 
+  await writePhoneIcons(svg, master, ico);
+
   console.log('\nDone.');
+}
+
+// ── The phone companion's icons ──────────────────────────────────────
+//
+// Same master, different masking rules, and the difference is the whole
+// reason this is not a copy of the block above:
+//
+//   any-purpose (192/512)  the squircle master as-is. Chrome draws these
+//                          on Android's launcher with its own shadow and
+//                          does NOT mask them, so the rounded corners we
+//                          drew are the ones that show.
+//
+//   maskable (512)         MUST be full-bleed. Android crops maskable
+//                          icons to whatever shape the launcher uses, so
+//                          transparent corners become holes. Rendered
+//                          without the squircle clip. The artwork itself
+//                          already sits inside the 80%-diameter safe
+//                          circle (furthest point ≈ 370px of the 409px
+//                          radius), so nothing needs rescaling — it only
+//                          needs its corners filled in.
+//
+//   apple-touch (180)      also full-bleed, for the same reason from the
+//                          other direction: iOS applies its OWN squircle
+//                          mask, and feeding it art that is already
+//                          rounded produces a double-rounded tile with
+//                          black corners.
+//
+// Written across into the separately-deployed companion repo, the same
+// sibling convention server/test/remote-client-parity.test.js uses. If
+// the companion isn't checked out, that is not an error here.
+async function writePhoneIcons(svg, master, ico) {
+  const phoneRoot = PHONE_CANDIDATES.find(p => existsSync(p));
+  if (!phoneRoot) {
+    console.log('• Phone companion not checked out — skipping its icons');
+    return;
+  }
+  const out = path.join(phoneRoot, 'public');
+  await mkdir(out, { recursive: true });
+  console.log('• Writing phone companion icons →', path.relative(os.homedir(), out));
+
+  const resize = (buf, n) => sharp(buf)
+    .resize(n, n, { kernel: sharp.kernel.lanczos3 })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+
+  // Any-purpose: the squircle master, straight down.
+  await writeFile(path.join(out, 'icon-192.png'), await resize(master, 192));
+  await writeFile(path.join(out, 'icon-512.png'), await resize(master, 512));
+
+  // Full-bleed master: the same drawing with the squircle clip and the
+  // rim highlight taken off. Asserted rather than assumed — if icon.svg
+  // is redrawn and these anchors move, this fails loudly instead of
+  // silently shipping a rounded icon into a maskable slot.
+  const src = svg.toString('utf8');
+  const CLIP = '<g clip-path="url(#squircle)">';
+  if (!src.includes(CLIP)) throw new Error('icon.svg: squircle clip anchor not found — phone maskable icon would be wrong');
+  let bleed = src.replace(CLIP, '<g>');
+  const rim = /\n\s*<rect id="rim"[\s\S]*?\/>/;
+  if (!rim.test(bleed)) throw new Error('icon.svg: rim anchor not found — phone maskable icon would be wrong');
+  bleed = bleed.replace(rim, '');
+
+  const bleedMaster = await sharp(Buffer.from(bleed), { density: 384 })
+    .resize(1024, 1024, { kernel: sharp.kernel.lanczos3 })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+
+  // Flattened: a maskable or apple-touch icon must have no alpha at all.
+  const opaque = (buf, n) => sharp(buf)
+    .resize(n, n, { kernel: sharp.kernel.lanczos3 })
+    .flatten({ background: '#08080a' })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+
+  await writeFile(path.join(out, 'icon-maskable-512.png'), await opaque(bleedMaster, 512));
+  await writeFile(path.join(out, 'apple-touch-icon.png'), await opaque(bleedMaster, 180));
+  await writeFile(path.join(out, 'favicon.ico'), ico);
+
+  // ── Native app assets, for @capacitor/assets to cut up ──
+  // It wants one 1024 icon and one 2732 splash, and derives every
+  // Android density and iOS slot from them.
+  const res = path.join(phoneRoot, 'resources');
+  await mkdir(res, { recursive: true });
+  await writeFile(path.join(res, 'icon.png'), await opaque(bleedMaster, 1024));
+
+  // The splash is 2732×2732 because Capacitor centre-crops it to fit
+  // every aspect ratio from a tall handset to a landscape tablet — the
+  // usable area is the middle square, so the mark goes there and the
+  // rest is flat brand background that crops away invisibly.
+  //
+  // The SQUIRCLE icon, not the full-bleed one: a full-bleed tile on a
+  // matching background would have no visible edge and read as a bug.
+  const mark = await sharp(master)
+    .resize(560, 560, { kernel: sharp.kernel.lanczos3 })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+  const splash = await sharp({
+    create: { width: 2732, height: 2732, channels: 3, background: '#08080a' },
+  })
+    .composite([{ input: mark, gravity: 'centre' }])
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+  await writeFile(path.join(res, 'splash.png'), splash);
+  // The app has one appearance — obsidian — so the dark variant is the
+  // same image rather than a second design that would have to be kept
+  // in step with it.
+  await writeFile(path.join(res, 'splash-dark.png'), splash);
+
+  console.log('  ✓ icon-192, icon-512, icon-maskable-512, apple-touch-icon, favicon.ico');
+  console.log('  ✓ resources/icon.png, splash.png, splash-dark.png (native)');
 }
 
 main().catch((err) => {

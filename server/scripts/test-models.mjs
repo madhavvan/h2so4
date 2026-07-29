@@ -214,7 +214,7 @@ const TESTS = [
 
 const MODELS = [
   { name: 'gemini',  endpoint: '/api/v1/ai/chat/gemini',  shape: 'gemini'  },
-  { name: 'openai',  endpoint: '/api/v1/ai/chat/openai',  shape: 'messages', model: 'gpt-5.5' },
+  { name: 'openai',  endpoint: '/api/v1/ai/chat/openai',  shape: 'messages', model: 'gpt-5.6' },
   { name: 'xai',     endpoint: '/api/v1/ai/chat/xai',     shape: 'messages' },
   { name: 'groq',    endpoint: '/api/v1/ai/chat/groq',    shape: 'messages' },
   { name: 'claude',  endpoint: '/api/v1/ai/chat/claude',  shape: 'claude'   },
