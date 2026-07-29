@@ -1,10 +1,10 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { Message, ContextFile } from "../types";
 
 export class GeminiService {
   private ai: GoogleGenAI | null = null;
-  // Gemini 3.5 Flash — Google's frontier Flash, fast and free on every plan.
-  private modelName = "gemini-3.5-flash";
+  // Gemini 3.6 Flash — Google's frontier Flash, fast and free on every plan.
+  private modelName = "gemini-3.6-flash";
   private currentKey: string | null = null;
 
   constructor(apiKey?: string) {
@@ -118,7 +118,11 @@ Task:
         ],
         config: {
           systemInstruction: systemInstruction,
-          temperature: 0.7, 
+          // Gemini 3.x: temperature/top_p/top_k are deprecated (ignored
+          // now, HTTP 400 later) — omit. Thinking defaults to 'medium'
+          // on 3.6-flash; pin the floor for live-answer latency, matching
+          // the server proxy route.
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
         }
       });
       

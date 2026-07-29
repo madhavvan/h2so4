@@ -1,9 +1,9 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  Auto-Type Agent — Sonnet 4.6 with tool-use
+//  Auto-Type Agent — Sonnet 5 with tool-use
 //
 //  This is the "god-level" planner that replaces the v1 Haiku one-shot.
 //  Where Haiku saw {editor, code} and produced one JSON object,
-//  Sonnet 4.6 here is given:
+//  Sonnet 5 here is given:
 //    1. A SYSTEM PROMPT that requires explicit 5-step reasoning before
 //       any output (ANALYZE → IDENTIFY → DETECT → PLAN → SUBMIT)
 //    2. A TOOL (submit_plan) that forces structured output via

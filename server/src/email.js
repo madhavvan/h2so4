@@ -525,4 +525,72 @@ function renderPassExpiryEmail({ name, tier, minutesLeft, expiresDate, signInUrl
   return { subject: `${mins} minute${mins === 1 ? '' : 's'} of interview time expires ${dateStr}`, html, text };
 }
 
-module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail, renderTierChangeEmail, renderCancellationEmail, renderAccessEndedEmail, renderGoogleLinkedEmail, renderPassExpiryEmail };
+// ── Purchase confirmation ──
+// The app emailed on failure, cancellation, tier change and pass expiry —
+// but never on a successful charge. That left Stripe's own receipt as the
+// only confirmation a buyer received, and Stripe receipts are off by
+// default in test mode and easy to leave off in live. A customer who paid
+// $159 and got nothing in their inbox has no reason to believe it worked.
+//
+// Amounts arrive in the provider's smallest unit (cents / paise), matching
+// how the payments table stores them.
+function renderPurchaseReceiptEmail({ name, tier, isTopUp, amount, currency, manageUrl }) {
+  const safeName = (name || 'there').toString().replace(/</g, '&lt;');
+  const safeTier = (tier || 'plan').toString().toUpperCase().replace(/</g, '&lt;');
+  const code = (currency || 'USD').toString().toUpperCase().replace(/</g, '&lt;');
+  const symbol = code === 'INR' ? '₹' : code === 'USD' ? '$' : '';
+  const major = Number.isFinite(amount) ? (amount / 100) : null;
+  const amountStr = major == null
+    ? ''
+    : (code === 'INR' ? `${symbol}${Math.round(major).toLocaleString('en-IN')}` : `${symbol}${major.toFixed(2)} ${code}`);
+  const url = manageUrl || 'https://minicaai.com';
+
+  const headline = isTopUp
+    ? 'Extra interview time added'
+    : `Your ${safeTier} plan is active`;
+  const bodyLine = isTopUp
+    ? 'The time is already on your clock — head back to your interview and keep going.'
+    : `Open the app and sign in with this email; ${safeTier} is ready on every device you use.`;
+
+  const text = [
+    `Hi ${safeName},`,
+    '',
+    `${headline}.`,
+    amountStr ? `Amount charged: ${amountStr}` : '',
+    '',
+    bodyLine,
+    url,
+    '',
+    'Manage your plan, see past charges, or get a refund within the policy window from Manage Subscription inside the app.',
+    '',
+    '— The minicaai team',
+  ].filter(Boolean).join('\n');
+
+  const html = `<!doctype html>
+<html><body style="margin:0;padding:0;background:#050507;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e5e7eb">
+  <div style="max-width:560px;margin:0 auto;padding:40px 24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:32px">
+      <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6)"></div>
+      <div style="font-weight:700;font-size:18px;color:#fff">minicaai</div>
+    </div>
+    <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 12px">${headline}</h1>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 16px">Hi ${safeName}, thanks — your payment went through${amountStr ? ` and <strong style="color:#e5e7eb">${amountStr}</strong> was charged` : ''}. ${bodyLine}</p>
+    <div style="margin:18px 0">
+      <a href="${url}" style="display:inline-block;padding:12px 24px;border-radius:10px;background:linear-gradient(135deg,#10b981,#3b82f6);color:#fff;font-weight:700;font-size:14px;text-decoration:none">
+        Open minicaai
+      </a>
+    </div>
+    <div style="border-top:1px solid #1f2937;padding-top:16px;font-size:12px;color:#6b7280;line-height:1.6">
+      Manage your plan, review past charges, or request a refund within the policy window from <strong style="color:#9ca3af">Manage Subscription</strong> inside the app. Your card details are held by our payment provider — we never see them.
+    </div>
+  </div>
+</body></html>`;
+
+  return {
+    subject: isTopUp ? 'Interview time added' : `Your minicaai ${safeTier} plan is active`,
+    html,
+    text,
+  };
+}
+
+module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail, renderTierChangeEmail, renderCancellationEmail, renderAccessEndedEmail, renderGoogleLinkedEmail, renderPassExpiryEmail, renderPurchaseReceiptEmail };

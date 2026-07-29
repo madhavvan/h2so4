@@ -3,8 +3,9 @@ import { Message, ContextFile } from "../types";
 
 export class XAIService {
   private openai: OpenAI | null = null;
-  // User specified model
-  private modelName = "grok-4.3";
+  // grok-4.5 — NOTE the dot: xAI's API takes 'grok-4.5'; the dash form
+  // ('grok-4-5', used in URLs/slugs) returns model-not-found.
+  private modelName = "grok-4.5";
 
   public init(apiKey: string) {
     this.openai = new OpenAI({

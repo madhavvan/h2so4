@@ -123,6 +123,34 @@
         --accent:       #c96342;  /* Anthropic terracotta */
         --accent-soft:  #f4ddd2;
 
+        /* ── Minica support chat — LIGHT (warm cream + gold) ──
+           Scoped to --mc-* on purpose. The support panel used to mix the
+           app's neutral surface tokens with hardcoded cool greys
+           (#6b7280 / #9ca3af) that never flipped with the theme, so it
+           read as a different product sitting inside a warm app. These
+           give it the same warm material as everything else WITHOUT
+           touching --cream/--ink/--accent, which the landing and the
+           auth views share globally — re-pointing those would re-skin
+           surfaces this change has no business touching. */
+        --mc-bg:          #f6f1e5;   /* panel ground */
+        --mc-raise:       #fffdf8;   /* bubbles, elevated rows */
+        --mc-input:       #fffdf8;
+        --mc-line:        #e5dcc7;
+        --mc-ink:         #141413;
+        --mc-ink-soft:    #35332c;
+        --mc-ink-muted:   #6b6a64;
+        --mc-ink-faint:   #7d7869;   /* 3.91:1 on --mc-bg (was #9b988e, 2.56:1) */
+        --mc-accent:      #8a6120;   /* gold, deepened for cream — 4.89:1 (AA) */
+        --mc-accent-soft: rgba(138, 97, 32, 0.12);
+        --mc-invert-bg:   #1a1710;   /* customer bubble: obsidian on cream */
+        --mc-invert-ink:  #f7f3e9;
+        --mc-ok:          #2a6f52;   /* agent-online — warm, 5.33:1 (AA) */
+        --mc-warn:        #b0741f;
+        --mc-danger:      #b0442f;
+        --mc-glass:       rgba(250, 247, 240, 0.92);
+        --mc-shadow:      0 18px 48px -24px rgba(20, 20, 19, 0.34),
+                          0 2px 8px -4px rgba(20, 20, 19, 0.16);
+
         /* ── Obsidian & Gold (shared with the marketing landing) ──
            The premium landing (PremiumLanding.tsx) is built on warm
            obsidian + a single precious gold accent + Newsreader serif.
@@ -209,6 +237,32 @@
         --model-menu-bg:     rgba(16, 14, 10, 0.95);
         --model-menu-border: rgba(211, 172, 99, 0.28);
         --model-menu-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 26px 64px -22px rgba(0, 0, 0, 0.88), 0 2px 10px -4px rgba(0, 0, 0, 0.5);
+
+        /* ── Minica support chat — DARK (obsidian + gold) ──
+           Same material as the model picker above and the auth views:
+           warm obsidian glass, a gold hairline instead of a grey box, and
+           a layered shadow rather than a flat drop. The customer's own
+           bubble inverts to gold — it is the one element that should read
+           as "you", and gold on obsidian is the product's signature. */
+        --mc-bg:          #100e0a;
+        --mc-raise:       #17140e;
+        --mc-input:       #14120d;
+        --mc-line:        rgba(211, 172, 99, 0.16);
+        --mc-ink:         #f2efe6;
+        --mc-ink-soft:    #d9d3c6;
+        --mc-ink-muted:   #9d968a;
+        --mc-ink-faint:   #6a6355;
+        --mc-accent:      #d3ac63;
+        --mc-accent-soft: rgba(211, 172, 99, 0.14);
+        --mc-invert-bg:   #d3ac63;   /* customer bubble: gold on obsidian */
+        --mc-invert-ink:  #14120d;
+        --mc-ok:          #6fcf9a;
+        --mc-warn:        #e0a94a;
+        --mc-danger:      #e8836b;
+        --mc-glass:       rgba(16, 14, 10, 0.94);
+        --mc-shadow:      inset 0 1px 0 rgba(255, 255, 255, 0.05),
+                          0 26px 64px -22px rgba(0, 0, 0, 0.88),
+                          0 2px 10px -4px rgba(0, 0, 0, 0.5);
       }
 
       /* ── Typography: SF-family, -webkit-font-smoothing for iOS feel ── */

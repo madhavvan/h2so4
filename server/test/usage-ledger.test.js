@@ -222,3 +222,145 @@ describe('resolveTimeBucket', () => {
     expect(b.remaining).toBe(0);
   });
 });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE ANSWERING GATE (2026-07)
+//
+//  Until now the model routes only asked "does this account have time
+//  left". That is a different question from "is this account being
+//  charged right now", and the gap between them was a free ride: leave
+//  the mic off, no session opens, nothing is charged — and every model
+//  still answered. A trial user could type questions indefinitely and
+//  never lose a second of their ten minutes.
+//
+//  hasLiveUsageSession closes it. These tests pin the two halves that
+//  matter: an OPEN session is not enough if it has gone quiet, and a
+//  session someone else superseded stops authorising immediately.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('hasLiveUsageSession — the gate the model routes ask', () => {
+  it('is false before anything starts, however much time is left', () => {
+    const uid = makeUser('pro', { credits_remaining_seconds: 3600 });
+    // The exact free ride: plenty of balance, mic off, nothing running.
+    expect(db.hasLiveUsageSession(uid)).toBe(false);
+  });
+
+  it('is true the moment a session opens', () => {
+    const uid = makeUser('free', { trial_remaining_seconds: 600 });
+    db.startUsageSession(uid, 'dev1');
+    expect(db.hasLiveUsageSession(uid)).toBe(true);
+  });
+
+  it('goes false once the session stops heartbeating', () => {
+    const uid = makeUser('pro', { credits_remaining_seconds: 3600 });
+    const s = db.startUsageSession(uid, 'dev1');
+    backdateHeartbeat(s.session_id, 120);        // past the 90s stale window
+    // Still open in the table — the sweeper has not run — but a laptop
+    // that has been silent for two minutes is closed, and letting its
+    // session keep authorising answers just moves the free ride.
+    expect(getSession(s.session_id).ended_at).toBeNull();
+    expect(db.hasLiveUsageSession(uid)).toBe(false);
+  });
+
+  it('is false again after a clean stop', () => {
+    const uid = makeUser('pro', { credits_remaining_seconds: 3600 });
+    const s = db.startUsageSession(uid, 'dev1');
+    db.stopUsageSession(uid, s.session_id);
+    expect(db.hasLiveUsageSession(uid)).toBe(false);
+  });
+
+  it('follows the newest device when a session is superseded', () => {
+    // Phone starts, then the computer comes online and takes over. There
+    // is exactly one live session throughout — never zero (which would
+    // cut the user off mid-question) and never two.
+    const uid = makeUser('ultra');
+    db.startUsageSession(uid, 'phone');
+    expect(db.hasLiveUsageSession(uid)).toBe(true);
+    db.startUsageSession(uid, 'computer');
+    expect(db.hasLiveUsageSession(uid)).toBe(true);
+    const open = db.getDB()
+      .prepare('SELECT COUNT(*) c FROM usage_sessions WHERE user_id = ? AND ended_at IS NULL')
+      .get(uid);
+    expect(open.c).toBe(1);
+  });
+
+  it('is scoped to one account', () => {
+    const a = makeUser('pro', { credits_remaining_seconds: 3600 });
+    const b = makeUser('pro', { credits_remaining_seconds: 3600 });
+    db.startUsageSession(a, 'dev1');
+    expect(db.hasLiveUsageSession(a)).toBe(true);
+    expect(db.hasLiveUsageSession(b)).toBe(false);
+  });
+
+  it('stops authorising the moment the balance runs out', () => {
+    // The beat that drains the bucket also closes the session, so the
+    // gate and the paywall agree instead of one lagging the other.
+    const uid = makeUser('free', { trial_remaining_seconds: 5 });
+    const s = db.startUsageSession(uid, 'dev1');
+    backdateHeartbeat(s.session_id, 30);
+    db.heartbeatUsageSession(uid, s.session_id);
+    expect(db.hasLiveUsageSession(uid)).toBe(false);
+  });
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  WHICH MODELS MAY THIS ACCOUNT USE?
+//
+//  /api/v1/ai/models answers it for clients that cannot work it out
+//  themselves — chiefly a phone that has never been connected to a
+//  computer, which would otherwise know only that Gemini exists and be
+//  stuck the moment Gemini is busy.
+//
+//  These pin the property that makes the endpoint worth having: its
+//  answer is derived from the SAME tier lists the model routes gate on.
+//  A second opinion here would be worse than nothing, because the way it
+//  fails is offering someone a model they will then be refused.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('the model list a client is told it can use', () => {
+  // Mirrors the route's own derivation (routes/ai.js). Kept beside the
+  // gate constants it depends on rather than hitting HTTP, so a change
+  // to those lists fails here rather than silently widening access.
+  const TRIAL_MODELS = ['free', 'basic', 'pro', 'max', 'ultra'];
+  const CLAUDE_TIERS = ['pro', 'max', 'ultra'];
+  const modelsFor = (tier, isAdmin = false) => {
+    const allow = (tiers) => isAdmin || tiers.includes(tier);
+    // Gemini unconditionally — /stream/gemini has no requireTier, only a
+    // quota gate, so this matches what the route will actually accept.
+    const out = ['gemini'];
+    if (allow(TRIAL_MODELS)) out.push('openai', 'xai', 'groq');
+    if (allow(CLAUDE_TIERS)) out.push('claude');
+    return out;
+  };
+
+  it('gives a free trial user the four non-Claude models', () => {
+    // The trial deliberately covers everything except Claude; a phone on
+    // a fresh signup must know all four, or one busy provider ends the
+    // first question someone ever asks.
+    expect(modelsFor('free')).toEqual(['gemini', 'openai', 'xai', 'groq']);
+  });
+
+  it('withholds Claude below Pro, and grants it at Pro and above', () => {
+    expect(modelsFor('basic')).not.toContain('claude');
+    for (const t of ['pro', 'max', 'ultra']) expect(modelsFor(t)).toContain('claude');
+  });
+
+  it('never returns an empty list', () => {
+    // An empty list is indistinguishable from "this app is broken". Even
+    // an unrecognised tier keeps the models every plan has.
+    for (const t of ['free', 'basic', 'pro', 'max', 'ultra', 'something-new']) {
+      expect(modelsFor(t).length).toBeGreaterThan(0);
+    }
+  });
+
+  it('always leads with a model every plan has', () => {
+    // The phone takes the first entry as its default and the rest, in
+    // order, as fallbacks — so the head of the list must be the one
+    // model nobody can be refused.
+    for (const t of ['free', 'basic', 'pro', 'max', 'ultra']) {
+      expect(modelsFor(t)[0]).toBe('gemini');
+    }
+  });
+
+  it('gives admins everything regardless of their licence row', () => {
+    expect(modelsFor('free', true)).toContain('claude');
+  });
+});

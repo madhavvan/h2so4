@@ -127,7 +127,7 @@ History lives on your machine in a local database; a mirror copy is on our serve
 
 ## 13. Reasoning-effort knob (Max & Ultra)
 
-For Max and Ultra users on the GPT-5.5 model. The reasoning slider in the chat header has three notches:
+For Max and Ultra users on the GPT-5.6 model. The reasoning slider in the chat header has three notches:
 
 - **None** — fastest, simplest answers. The default. Good for behavioural and concept questions.
 - **Low / Medium** — adds explicit step-by-step reasoning. Slower; more rigorous on math, code, and design questions.
@@ -160,7 +160,7 @@ The checkout shows the right provider for your region automatically — there's 
 |---|---|---|---|---|---|
 | Interview time | 10-min trial total | One 30-min interview | One 1-hour interview | Three 1-hour interviews | Unlimited |
 | Extend on interview day | — | +30 min / +1 h / +3 h packs | Same packs | Same packs | Not needed |
-| AI models | 4 during trial (no Claude) | Gemini, GPT-5.5, Grok, Groq | All 5 (+ Claude) | All 5 | All 5 |
+| AI models | 4 during trial (no Claude) | Gemini, GPT-5.6, Grok, Groq | All 5 (+ Claude) | All 5 | All 5 |
 | Knowledge files | 1 | Unlimited | Unlimited | Unlimited | Unlimited |
 | Pop-out window | — | ✓ | ✓ | ✓ | ✓ |
 | Auto-Solve | — | ✓ | ✓ | ✓ | ✓ |
