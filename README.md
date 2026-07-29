@@ -11,7 +11,7 @@
 When you're on a live job interview — Zoom, Google Meet, Teams, HackerRank, CoderPad, Ropes.ai — Interview Copilot:
 
 - **Captures system audio** (the interviewer's voice from your meeting app) and transcribes it word-by-word via Deepgram Nova 3.
-- **Drafts answers in your voice** using one of five LLMs (Gemini 3 Flash, Groq, GPT-5.5, Grok, or Claude Sonnet 4.6) seeded with your resume + the JD.
+- **Drafts answers in your voice** using one of five LLMs (Gemini 3.6 Flash, Groq, GPT-5.6, Grok, or Claude Sonnet 5) seeded with your resume + the JD.
 - **Stays invisible to screen-share.** Both the main window and the popout overlay are content-protected at the OS level (`setContentProtection(true)`), the icon hides from the taskbar, and the system tray gets torn down during active sessions.
 - **Types code for you** into the candidate-side editor with a human-shaped rhythm — Gaussian cadence, decision-point pauses, occasional typos with backspace correction, mouse twitches every 18–31 lines — tuned to defeat keystroke-biometric flags on proctored coding platforms.
 - **Pre-researches the role** via Claude's hosted `web_search` — every tech in your resume + the JD gets a current factsheet (latest version, recent changes, pricing, gotchas) cached for 24 hours so version/pricing/comparison questions answer in 2–3 seconds instead of 12–25.
@@ -27,7 +27,7 @@ The website at `minicaai.com` is the marketing + auth + download surface only. T
 ### For everyone
 
 - **Voice mode** — Press the mic. The renderer fetches a short-lived Deepgram key from the server, opens a WebSocket directly to Deepgram's Nova-3 endpoint, and streams 250 ms `MediaRecorder` chunks. Auto-reconnects on network blips with exponential backoff.
-- **5-model picker** — Gemini 3 Flash · Groq · GPT-5.5 · Grok · Claude Sonnet 4.6. Each is gated to a tier; locked models stay visible in the picker so users see what an upgrade unlocks.
+- **5-model picker** — Gemini 3.6 Flash · Groq · GPT-5.6 · Grok · Claude Sonnet 5. Each is gated to a tier; locked models stay visible in the picker so users see what an upgrade unlocks.
 - **Resume + JD context** — Upload PDFs, DOCX, or images. Files are extracted on-device (mammoth + pdfjs-dist + tesseract for images) and seeded into every prompt as `KNOWLEDGE BASE`.
 - **Conversation history** — Local SQLite (Electron-side, per-user-scoped), auto-titled by an LLM after the first response so "Interview <date>" placeholders become topic summaries. Synced to the cloud for cross-device + admin visibility.
 - **Stealth pop-out** — A transparent, frameless, always-on-top overlay (`alwaysOnTop('screen-saver')`, re-enforced periodically) that doesn't steal focus from your browser tab — clicks on its buttons don't fire `window.onblur` on the proctoring tab.
@@ -40,11 +40,11 @@ The website at `minicaai.com` is the marketing + auth + download surface only. T
 
 ### Max-only
 
-- **Claude Sonnet 4.6 with `web_search`** — Hosted by Anthropic; no separate Brave/SerpAPI key needed. The persona prompt includes explicit DO/DON'T trigger rules so Claude searches when it should ("what version", "currently", "right now") and answers from memory when it shouldn't (behavioral, conceptual, your own resume).
+- **Claude Sonnet 5 with `web_search`** — Hosted by Anthropic; no separate Brave/SerpAPI key needed. The persona prompt includes explicit DO/DON'T trigger rules so Claude searches when it should ("what version", "currently", "right now") and answers from memory when it shouldn't (behavioral, conceptual, your own resume).
 - **Train Model** — Pre-research every tech in your resume + JD. Two paths:
   - **Standard** — 15 keywords × batched-of-5 web searches at concurrency 2. ~$0.30/run, ~30 s wall-clock. Result cached 24 h, injected into the system prompt of *every* model (Gemini/GPT/Grok/Groq all benefit, not just Claude).
   - **Beast Mode** (admin only) — 25 keywords × individual deep research × synthesis pass. ~$3–6/run, ~3–5 min.
-- **Reasoning effort knob** — `none` / `low` / `medium` / `high` for GPT-5.5. Defaults to `none` paired with Train Model — the cached factsheets fill the depth that reasoning would otherwise compute live.
+- **Reasoning effort knob** — `none` / `low` / `medium` / `high` for GPT-5.6. Defaults to `none` paired with Train Model — the cached factsheets fill the depth that reasoning would otherwise compute live.
 - **Custom Instructions** — Free-form directives prepended to every prompt as a high-priority block (e.g. "Use STAR for behavioral", "Cite tool versions", "Keep responses under 200 words").
 
 ---
@@ -54,9 +54,9 @@ The website at `minicaai.com` is the marketing + auth + download surface only. T
 | Tier  | Price (USD)   | Price (INR)      | Models                                   | Time per session                        | Auto-Solve | Auto-Type | Train Model |
 |-------|---------------|------------------|------------------------------------------|-----------------------------------------|:----------:|:---------:|:-----------:|
 | Free  | $0            | ₹0               | All except Claude (during trial)         | One-time 10-min trial                   |     —      |     —     |      —      |
-| Basic | $25 one-time  | ₹1999 one-time   | + GPT-5.5, Grok, Groq                    | 3 credits / 14 days · renewable +1h     |     ✓      |     —     |      —      |
+| Basic | $25 one-time  | ₹1999 one-time   | + GPT-5.6, Grok, Groq                    | 3 credits / 14 days · renewable +1h     |     ✓      |     —     |      —      |
 | Pro   | $29 / month   | ₹2499 / month    | Same four (no Claude)                    | Unlimited                               |     ✓      |     —     |      —      |
-| Max   | $69 / month   | ₹5999 / month    | All four + Claude Sonnet 4.6             | Unlimited                               |     ✓      |     ✓     |      ✓      |
+| Max   | $69 / month   | ₹5999 / month    | All four + Claude Sonnet 5             | Unlimited                               |     ✓      |     ✓     |      ✓      |
 
 **Renewal** for Basic users is +1 hour for $6.99 / ₹599. The server's `grantBasicRenewal` extends `license.expires_at` by 1 h; the client detects the cross-device delta on the next `validateWithServer` call and credits the local ledger so a renewal paid on one device propagates to all devices.
 
@@ -268,7 +268,7 @@ interview-copilot-ai/
 │   │   │   ├── conversations.js    # CRUD + sync + messages
 │   │   │   └── downloads.js        # /windows · /mac{,-x64,-arm64} · /linux redirects
 │   │   ├── services/
-│   │   │   ├── autoTypeAgent.js    # Sonnet 4.6 + tool_use planner
+│   │   │   ├── autoTypeAgent.js    # Sonnet 5 + tool_use planner
 │   │   │   ├── groqAutoTypePlanner # Llama-3.3-70B fallback planner
 │   │   │   ├── freshContext.js     # Classifier → search → format injector
 │   │   │   ├── searchProvider.js   # Brave + page-content cache
@@ -336,11 +336,11 @@ The full annotated list lives in `server/.env.example`. Required in production:
 | `SERVER_URL`                                                          | Public HTTPS base URL of this server. Required so the Google OAuth callback URI is built correctly behind Railway's proxy. |
 | `ADMIN_EMAILS`                                                        | Comma-separated admin emails. These accounts get tier/region bypass and `/api/v1/admin/*` access.    |
 | `RESEND_API_KEY`, `EMAIL_FROM`                                        | Primary email transport. Cloud hosts often block outbound SMTP; Resend uses HTTPS port 443.          |
-| `ANTHROPIC_API_KEY`                                                   | Claude Sonnet 4.6 + the hosted `web_search` tool.                                                    |
-| `OPENAI_API_KEY`                                                      | GPT-5.5.                                                                                             |
+| `ANTHROPIC_API_KEY`                                                   | Claude Sonnet 5 + the hosted `web_search` tool.                                                    |
+| `OPENAI_API_KEY`                                                      | GPT-5.6.                                                                                             |
 | `XAI_API_KEY`                                                         | Grok.                                                                                                |
 | `GROQ_API_KEY`                                                        | Llama 3 / GPT-OSS-120B + Auto-Type planner fallback.                                                 |
-| `GEMINI_API_KEY`                                                      | Gemini 3 Flash (free-tier model).                                                                    |
+| `GEMINI_API_KEY`                                                      | Gemini 3.6 Flash (free-tier model).                                                                    |
 | `BRAVE_API_KEY`                                                       | Optional. Without it `freshContext.js` returns null and the chat path proceeds without retrieval.    |
 | `DATABASE_PATH`                                                       | **Required on Railway.** Must point inside an attached Volume (e.g. `/data/minicaai.db`) or every restart wipes all users. |
 
@@ -440,7 +440,7 @@ For the full release runbook (semver bumping, fallback-version sync in `server/s
 - **Storage:** `better-sqlite3` (WAL mode, daily `VACUUM INTO` snapshots × 7-day retention).
 - **Auth:** `jsonwebtoken`, `google-auth-library` (Google OAuth ID-token verification + Electron server-side OAuth callback flow).
 - **Payments:** `stripe`, `razorpay`.
-- **AI:** `@anthropic-ai/sdk` (Sonnet 4.6 + `web_search_20260209` tool), `@google/genai`, `openai`, `groq-sdk`.
+- **AI:** `@anthropic-ai/sdk` (Sonnet 5 + `web_search_20260209` tool), `@google/genai`, `openai`, `groq-sdk`.
 - **Email:** `resend` (HTTPS, primary), `nodemailer` (SMTP fallback).
 - **Live support:** `ws` (WebSocket at `/ws/support` with idle sweeper + heartbeat).
 - **Tests:** `vitest`.
@@ -521,4 +521,4 @@ PR conventions:
 
 ## License
 
-TODO — confirm. No `LICENSE` file currently in the repo; the source code header in `package.json` lists the author as Interview Copilot (`support@interviewcopilot.app`) and Azure code-signing publisherName as Venu Madhav Pentala.
+TODO — confirm. No `LICENSE` file currently in the repo; `package.json` lists the author as Interview Copilot (`support@interviewcopilot.app`). The Azure code-signing `publisherName` is set there too and must match the signing certificate's subject exactly — do not edit it to change branding.
