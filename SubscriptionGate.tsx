@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, Suspense, lazy } from 'react';
-import MinicaMark from './MinicaMark';
 import SupportBot from './SupportBot';
 import PremiumLanding from './PremiumLanding';
 // Pre-purchase refund disclosure on the mobile landing footer — same
@@ -1717,8 +1716,8 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
 
         {loading ? (
           <div className="flex items-center justify-center py-20">
-            <MinicaMark size={30} state="thinking" />
-            <span className="ml-3 text-gray-400">Loading admin data…</span>
+            <Loader2 size={24} className="text-blue-400 animate-spin" />
+            <span className="ml-3 text-gray-400">Loading admin data...</span>
           </div>
         ) : adminError ? (
           <div className="text-center py-20">
@@ -2707,7 +2706,7 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                   )}
                   {paymentsLoading && (
                     <div className="text-center py-12 text-gray-600 text-sm flex items-center justify-center gap-2">
-                      <MinicaMark size={20} state="thinking" /> Loading payments…
+                      <Loader2 size={14} className="animate-spin" /> Loading payments…
                     </div>
                   )}
                 </div>
@@ -4536,7 +4535,7 @@ const TUTORIAL_STEPS = [
   { step: '04', title: 'Start an Interview',  desc: 'Share system audio, enable auto-mode, and let minicaai listen.', duration: '2 min' },
   { step: '05', title: 'Pop-out Mode',        desc: 'Launch the invisible overlay that floats over Zoom, Meet, Teams. (Pro)', duration: '1 min' },
   { step: '06', title: 'Auto-Solve',          desc: 'Capture the editor and let AI solve coding problems on demand. (Pro)', duration: '2 min' },
-  { step: '07', title: 'Switch AI Models',    desc: 'Pick between Gemini 3.6, GPT-5.6, Claude Sonnet 5, Grok 4.5, Groq for different strengths.', duration: '1 min' },
+  { step: '07', title: 'Switch AI Models',    desc: 'Pick between Gemini 3.5, GPT-5.5, Claude Sonnet 5, Grok 4.3, Groq for different strengths.', duration: '1 min' },
   { step: '08', title: 'Manage Subscription', desc: 'Upgrade, manage billing, and view usage stats.', duration: '1 min' },
 ] as const;
 
@@ -6376,7 +6375,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
         key: 'upgrade-basic',
         Icon: Zap, iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857',
         title: 'Get Basic',
-        subtitle: 'One 30-min interview · Gemini, GPT-5.6, Grok, Groq (no Claude)',
+        subtitle: 'One 30-min interview · Gemini, GPT-5.5, Grok, Groq (no Claude)',
         price: basicPrice || undefined,
         onClick: wrapAction('upgrade-basic', () => initiateCheckout('basic')),
       });
@@ -7324,7 +7323,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         // tier without it). Pro = one full-hour interview + the complete
         // five-model lineup. Auto-Type stays Ultra-exclusive, so it's not
         // named here.
-        return 'Payment successful — Pro activated. A full hour plus every model — Claude Sonnet 5, GPT-5.6, Grok 4.5, Gemini 3.6, and Groq — now unlocked.';
+        return 'Payment successful — Pro activated. A full hour plus every model — Claude Sonnet 5, GPT-5.5, Grok 4.3, Gemini 3.5, and Groq — now unlocked.';
       case 'max':
         // Max = three full-hour interviews, same complete model lineup as
         // Pro. No Auto-Type (Ultra only) — the value is the extra hours.
@@ -7492,17 +7491,6 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       if (urlParams.get('payment') === 'success') {
         const saved = licenseService.loadAuth();
         if (saved.user) {
-          // Confirm the checkout with the server FIRST. The success_url has
-          // always carried session_id={CHECKOUT_SESSION_ID} but nothing ever
-          // consumed it — provisioning depended entirely on the webhook
-          // arriving. /verify-stripe checks the session against Stripe and
-          // grants idempotently, so the common "webhook is a few seconds
-          // behind the redirect" case resolves instantly and the rare
-          // "webhook never arrives" case stops being unrecoverable.
-          const returnSessionId = urlParams.get('session_id') || '';
-          if (returnSessionId) {
-            await licenseService.verifyStripeCheckout(returnSessionId);
-          }
           // Revalidate with server to get updated tier. The webhook may not
           // have landed yet when the user returns from Stripe — fall back to
           // the tier hint we stamped in the success_url so the banner copy
@@ -7724,7 +7712,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // a routing mismatch (rare). We surface a clear "still waiting" message
   // instead of spinning forever — relaunching the app picks up the new
   // license on the next validateWithServer tick regardless.
-  const pollForUpgrade = async (targetTier: 'basic' | 'pro' | 'max' | 'ultra', sessionId?: string): Promise<void> => {
+  const pollForUpgrade = async (targetTier: 'basic' | 'pro' | 'max' | 'ultra'): Promise<void> => {
     const POLL_INTERVAL_MS = 4000;
     const POLL_TIMEOUT_MS = 10 * 60 * 1000;
     const startedAt = Date.now();
@@ -7736,14 +7724,6 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           return;
         }
         try {
-          // Confirm the checkout with the server before falling back to
-          // "did the webhook land?". Until /verify-stripe existed, a lost
-          // or misconfigured webhook meant this poll ran its full 10
-          // minutes and then told an already-charged customer to restart
-          // the app. The call is idempotent — safe on every tick.
-          if (sessionId) {
-            await licenseService.verifyStripeCheckout(sessionId);
-          }
           const updated = await licenseService.validateWithServer();
           if (updated && updated.tier === targetTier && updated.status === 'active') {
             const baseUser = currentUser || licenseService.loadAuth().user;
@@ -7780,7 +7760,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // pollForExternalRenewal) sits safely BELOW the smallest unit (30 min —
   // the old 30-min bound was knife-edge equal to Basic's bump) and well
   // above any non-renewal noise.
-  const pollForRenewal = async (sessionId?: string): Promise<void> => {
+  const pollForRenewal = async (): Promise<void> => {
     const POLL_INTERVAL_MS = 4000;
     const POLL_TIMEOUT_MS = 10 * 60 * 1000;
     const RENEWAL_THRESHOLD_MS = 15 * 60 * 1000;
@@ -7794,10 +7774,6 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           return;
         }
         try {
-          // Same webhook-independent confirmation as pollForUpgrade.
-          if (sessionId) {
-            await licenseService.verifyStripeCheckout(sessionId);
-          }
           const updated = await licenseService.validateWithServer();
           if (updated && (updated.expires_at || 0) >= baselineExpires + RENEWAL_THRESHOLD_MS) {
             setCurrentLicense(updated);
@@ -7982,7 +7958,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             // paste manually instead of being stranded.
             setPaymentError(`Couldn't open the browser automatically. Open this URL to pay: ${data.checkout_url}`);
           }
-          await pollForUpgrade(tier, data.session_id);
+          await pollForUpgrade(tier);
         } else {
           window.location.href = data.checkout_url;
         }
@@ -8071,7 +8047,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           } else {
             setPaymentError(`Couldn't open the browser automatically. Open this URL to pay: ${data.checkout_url}`);
           }
-          await pollForRenewal(data.session_id);
+          await pollForRenewal();
         } else {
           window.location.href = data.checkout_url;
         }
@@ -8755,7 +8731,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             style={{ background: 'var(--cream, #faf8f5)', color: 'var(--ink-muted, #6b7280)' }}
           >
             <div className="flex items-center gap-2.5 text-sm">
-              <MinicaMark size={22} state="thinking" />
+              <Loader2 size={16} className="animate-spin" />
               <span>Loading documentation…</span>
             </div>
           </div>
@@ -8864,7 +8840,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   style={{ background: 'var(--cream, #faf8f5)', color: 'var(--ink-muted, #6b7280)', zIndex: 200 }}
                 >
                   <div className="flex items-center gap-2.5 text-sm">
-                    <MinicaMark size={22} state="thinking" />
+                    <Loader2 size={16} className="animate-spin" />
                     <span>Loading documentation…</span>
                   </div>
                 </div>
@@ -9024,7 +9000,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 style={{ background: 'var(--cream, #faf8f5)', color: 'var(--ink-muted, #6b7280)', zIndex: 200 }}
               >
                 <div className="flex items-center gap-2.5 text-sm">
-                  <MinicaMark size={22} state="thinking" />
+                  <Loader2 size={16} className="animate-spin" />
                   <span>Loading documentation…</span>
                 </div>
               </div>
@@ -9605,7 +9581,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               {
                 Icon: PhCpu,
                 title: 'Reasons in your voice',
-                body: 'Picks the model that fits the question — GPT-5.6, Claude Sonnet 5, Gemini 3.6, Grok 4.5, Groq — and shapes the answer to your résumé and the role.',
+                body: 'Picks the model that fits the question — GPT-5.5, Claude Sonnet 5, Gemini 3.5, Grok 4.3, Groq — and shapes the answer to your résumé and the role.',
               },
               {
                 Icon: PhShield,

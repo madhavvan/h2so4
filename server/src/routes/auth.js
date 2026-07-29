@@ -1,9 +1,6 @@
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const { generateToken, authMiddleware } = require('../middleware/auth');
-// Clears an account's failed-login counter once the password is proven
-// correct, so the brute-force limiter only ever counts failures.
-const { clearLoginAttempts } = require('../middleware/rateLimiters');
 const db = require('../database');
 
 const router = express.Router();
@@ -133,21 +130,6 @@ router.post('/login', async (req, res) => {
       }
       return res.status(401).json({ error: 'Invalid email or password' });
     }
-
-    // Credentials were correct — forget this account's failed attempts.
-    // The per-account limiter (10 / 15 min, see middleware/rateLimiters.js)
-    // is what stops a distributed brute force that IP limiting never
-    // could. Counting successes as well as failures would mean a user who
-    // legitimately signs in ten times in a quarter hour — reinstalling,
-    // moving between the main window and the popout, testing a build —
-    // locks themselves out with the RIGHT password. Clearing here keeps
-    // the bucket a record of failures only.
-    //
-    // Deliberately after verifyUserPassword and before the ban check, so a
-    // suspended user with correct credentials still gets their counter
-    // cleared: they are not the attacker this limiter exists to stop, and
-    // their 403 is not something retrying can get around anyway.
-    await clearLoginAttempts(user.email);
 
     // Check if banned
     if (user.is_banned) {
@@ -998,89 +980,6 @@ router.put('/password', authMiddleware, (req, res) => {
   } catch (err) {
     console.error('Password change error:', err);
     res.status(500).json({ error: 'Failed to change password' });
-  }
-});
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  DELETE MY ACCOUNT
-//
-//  App Store Review Guideline 5.1.1(v): an app that lets you create an
-//  account must let you delete it FROM INSIDE THE APP. "Email support"
-//  and "ask the assistant to do it" are both explicitly not enough —
-//  and until this route existed, those were the only two ways, because
-//  db.deleteUser() was reachable only from the admin surface and the
-//  support bot. Play's User Data policy asks for the same thing.
-//
-//  Password-confirmed, for the obvious reason: a JWT sitting in a
-//  browser's localStorage on an unlocked phone should not be one tap
-//  away from destroying an account and its interview history.
-//
-//  Google accounts have no password to confirm with, so they confirm by
-//  typing their own email address instead. Refusing to delete them at
-//  all would be the wrong trade — an account you cannot delete is the
-//  exact thing the guideline exists to prevent.
-//
-//  Deliberately NOT soft-delete. The point of the guideline is that the
-//  data goes, and a `deleted_at` column that keeps every transcript is
-//  the thing users are being protected from. See db.deleteUser() for
-//  what it reaches — including the device-sync log, which holds the
-//  mirrored interview transcripts and has no foreign key to hide behind.
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-router.delete('/account', authMiddleware, (req, res) => {
-  try {
-    const user = db.getUserById(req.user.id);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    const { password, confirm_email } = req.body || {};
-
-    if (user.password_hash) {
-      if (!password) {
-        return res.status(400).json({
-          error: 'password_required',
-          message: 'Enter your password to delete your account.',
-        });
-      }
-      if (!db.verifyPassword(password, user.password_hash)) {
-        return res.status(401).json({
-          error: 'wrong_password',
-          message: 'That password is not right.',
-        });
-      }
-    } else {
-      // OAuth-only account: confirm by typing the address instead.
-      const typed = String(confirm_email || '').trim().toLowerCase();
-      if (typed !== String(user.email).toLowerCase()) {
-        return res.status(400).json({
-          error: 'confirm_email_required',
-          message: 'Type your email address to confirm.',
-        });
-      }
-    }
-
-    // audit_log deliberately has no FK to users, so this row outlives the
-    // account — which is the point. Carrying the email as target_email
-    // matters for the same reason: after the delete, target_user_id
-    // points at nothing and the address is the only way to answer "did
-    // we delete this person when they asked?".
-    try {
-      db.logAdminAction('self', 'account-deleted', user.id, user.email, {
-        tier: user.tier,
-        via: 'self-service',
-      });
-    } catch { /* the deletion matters more than the note about it */ }
-
-    const gone = db.deleteUser(user.id);
-    if (!gone) return res.status(404).json({ error: 'User not found' });
-
-    // 200 with a body rather than 204: the client shows a confirmation
-    // screen, and an empty response gives it nothing to be sure about.
-    res.json({
-      success: true,
-      message: 'Your account and its data have been deleted.',
-    });
-  } catch (err) {
-    console.error('Account deletion error:', err);
-    res.status(500).json({ error: 'Failed to delete account' });
   }
 });
 

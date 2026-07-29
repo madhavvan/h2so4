@@ -43,23 +43,6 @@ function getDB() {
     );
   `);
 
-  // Sessions the user deleted here. Without this, anything imported from
-  // the account comes straight back on the next pull — you delete a
-  // conversation, it reappears, you delete it again. A tombstone is the
-  // only way a local delete can outrank a server row we do not own.
-  //
-  // Every delete is recorded, not just imported ones: "a session you
-  // deleted never comes back" is a simpler promise to keep than one with
-  // conditions, and the rows are three columns of text.
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS dismissed_sessions (
-      id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      dismissed_at INTEGER NOT NULL,
-      PRIMARY KEY (id, user_id)
-    );
-  `);
-
   // Migration: add user_id to existing sessions tables (pre-upgrade installs)
   const sessionCols = db.prepare("PRAGMA table_info(sessions)").all();
   if (!sessionCols.find(c => c.name === 'user_id')) {
@@ -195,10 +178,6 @@ function deleteSession(sessionId, userId) {
   if (!session) return { ok: false };
 
   d.prepare('DELETE FROM sessions WHERE id = ? AND user_id = ?').run(sessionId, userId);
-  // Remember the delete, so an imported session cannot walk back in on
-  // the next pull from the account.
-  d.prepare('INSERT OR REPLACE INTO dismissed_sessions (id, user_id, dismissed_at) VALUES (?, ?, ?)')
-    .run(sessionId, userId, Date.now());
 
   // If the deleted row wasn't active, nothing else to do.
   if (session.is_active !== 1) {
@@ -326,76 +305,7 @@ function closeDB() {
   }
 }
 
-// ── Conversations that were written somewhere else ──────────────────
-//
-// The phone can answer questions on its own when this machine is off.
-// Those land on the account, and this is how they arrive here.
-//
-// Idempotent from top to bottom: the session INSERT is OR IGNORE and the
-// messages are keyed by their own ids, so importing the same
-// conversation twice changes nothing. That matters because the pull runs
-// on every launch and there is no cursor to get wrong.
-//
-// Deliberately never marked active. You opened this app to interview,
-// not to be dropped into yesterday's phone notes; it appears in the
-// sidebar and waits to be clicked.
-function importRemoteSession({ id, name, createdAt, userId, messages }) {
-  if (!userId || !id) return { ok: false, reason: 'bad_args' };
-  const d = getDB();
-
-  const dismissed = d
-    .prepare('SELECT 1 FROM dismissed_sessions WHERE id = ? AND user_id = ?')
-    .get(id, userId);
-  if (dismissed) return { ok: false, reason: 'dismissed' };
-
-  const tx = d.transaction(() => {
-    d.prepare(`
-      INSERT OR IGNORE INTO sessions (id, name, created_at, is_active, user_id)
-      VALUES (?, ?, ?, 0, ?)
-    `).run(id, (name || 'From my phone').slice(0, 100), Number(createdAt) || Date.now(), userId);
-
-    // Someone else's row with the same id — refuse rather than write into
-    // it. Cannot normally happen (ids are per-account) but the check is
-    // one line and the failure it prevents is cross-account leakage.
-    const owner = d.prepare('SELECT user_id FROM sessions WHERE id = ?').get(id);
-    if (!owner || owner.user_id !== userId) return 0;
-
-    const insert = d.prepare(
-      'INSERT OR IGNORE INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)'
-    );
-    let added = 0;
-    for (const m of messages || []) {
-      if (!m?.id) continue;
-      const r = insert.run(
-        String(m.id), id,
-        m.role === 'user' || m.role === 'system' ? m.role : 'model',
-        String(m.content ?? ''), Number(m.timestamp) || Date.now()
-      );
-      added += r.changes;
-    }
-    return added;
-  });
-
-  const added = tx();
-  return { ok: true, added };
-}
-
-/** Which of these ids this machine already has, so the pull can skip
- *  fetching messages for conversations it is not going to import. */
-function knownSessionIds(ids, userId) {
-  if (!userId || !Array.isArray(ids) || !ids.length) return [];
-  const d = getDB();
-  const marks = ids.map(() => '?').join(',');
-  const have = d.prepare(`SELECT id FROM sessions WHERE user_id = ? AND id IN (${marks})`)
-    .all(userId, ...ids).map(r => r.id);
-  const gone = d.prepare(`SELECT id FROM dismissed_sessions WHERE user_id = ? AND id IN (${marks})`)
-    .all(userId, ...ids).map(r => r.id);
-  return [...new Set([...have, ...gone])];
-}
-
 module.exports = {
-  importRemoteSession,
-  knownSessionIds,
   claimOrphanSessions,
   getOrCreateActiveSession,
   startNewSession,

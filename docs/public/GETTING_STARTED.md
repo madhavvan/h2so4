@@ -51,7 +51,7 @@ The first time you open the app you'll be asked to sign in. Use email + password
 After sign-in you'll see the plan picker. Basic, Pro, and Max are **one-time interview passes** (use within 30 days); Ultra is the only monthly subscription:
 
 - **Free** — one-time 10-minute trial (every model except Claude), one context file
-- **Basic** — one 30-minute interview, four models (Gemini, GPT-5.6, Grok, Groq), unlimited context files, pop-out, screen capture, Auto-Solve — extendable on interview day (+30 min / +1 h / +3 h packs)
+- **Basic** — one 30-minute interview, four models (Gemini, GPT-5.5, Grok, Groq), unlimited context files, pop-out, screen capture, Auto-Solve — extendable on interview day (+30 min / +1 h / +3 h packs)
 - **Pro** — one 1-hour interview, all five models including Claude with web search
 - **Max** — three 1-hour interviews, all five models, plus Train Model and the reasoning-effort knob
 - **Ultra** — unlimited interviews billed monthly, everything in Max plus Auto-Type

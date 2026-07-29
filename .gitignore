@@ -109,12 +109,6 @@ Desktop.ini
 .autotype-test/
 server/scripts/.autotype-test/
 
-# Output of scripts/verify-phone-remote.mjs. Same sensitivity class as
-# the auto-type captures above: the screenshots contain whatever the live
-# session was answering, and the throwaway Chrome profile inside it holds
-# a signed JWT in localStorage.
-.phone-shots/
-
 # Local dev CDP probes + design-iteration screenshots (not for commit)
 /cdp-*.mjs
 /current-*.png

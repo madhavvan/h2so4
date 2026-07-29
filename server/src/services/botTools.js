@@ -73,9 +73,8 @@ let _stripe = null;
 let _razorpay = null;
 function getStripe() {
   if (_stripe) return _stripe;
-  // Pinned API version — see services/stripeClient.js for why an unpinned
-  // client silently returns undefined for fields this codebase reads.
-  _stripe = require('./stripeClient').createStripeClient();
+  if (!process.env.STRIPE_SECRET_KEY) return null;
+  _stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
   return _stripe;
 }
 function getRazorpay() {
@@ -934,43 +933,18 @@ const USER_SERVER_TOOLS = [
         // the same path the admin refund_payment tool uses for
         // consistency.
 
-        // Local already-refunded guard, matching the admin endpoint. The
-        // original 'completed' row survives a refund, so the "most recent
-        // paid charge" lookup above happily re-selects a payment that has
-        // already been refunded; only the provider's own rejection stopped
-        // a second attempt.
-        if (db.hasPaymentBeenRefunded(lastPaid.provider, lastPaid.provider_payment_id)) {
-          return {
-            ok: true,
-            queued: false,
-            already_refunded: true,
-            message: 'That charge has already been refunded — it can take 5–10 business days to appear on your statement.',
-          };
-        }
-
         let providerRefundId = null;
-        let subscriptionCancel = null;
         try {
           if (lastPaid.provider === 'stripe') {
             const stripe = getStripe();
             if (!stripe) return { ok: false, reason: 'Stripe is not configured on this server. Filing the request for admin review instead.' };
-            // resolveStripeRefundTarget handles the `cs_…` rows that a
-            // subscription checkout records (no PaymentIntent on the
-            // session) — without it, an in-policy Ultra refund threw here
-            // and silently fell through to "a human will review", which is
-            // the one path the published 14-day promise can't survive.
-            const { resolveStripeRefundTarget, cancelSubscriptionAfterFullRefund } = require('./stripeRefunds');
-            const refundTarget = await resolveStripeRefundTarget(stripe, lastPaid);
             const refund = await stripe.refunds.create({
-              ...refundTarget,
+              payment_intent: lastPaid.provider_payment_id?.startsWith('pi_') ? lastPaid.provider_payment_id : undefined,
+              charge: lastPaid.provider_payment_id?.startsWith('ch_') ? lastPaid.provider_payment_id : undefined,
               reason: 'requested_by_customer',
               metadata: { initiated_by: 'user-bot', user_reason: reasonText },
             });
             providerRefundId = refund.id;
-            // Full refund of a subscription charge ends the subscription —
-            // otherwise the next cycle re-charges and re-grants the tier we
-            // just refunded.
-            subscriptionCancel = await cancelSubscriptionAfterFullRefund(stripe, lastPaid, { isFullRefund: true });
           } else if (lastPaid.provider === 'razorpay') {
             const razorpay = getRazorpay();
             if (!razorpay) return { ok: false, reason: 'Razorpay is not configured on this server. Filing the request for admin review instead.' };
@@ -1014,14 +988,7 @@ const USER_SERVER_TOOLS = [
           amount_refunded: lastPaid.amount,
           currency: lastPaid.currency,
           eligibility_eligible: eligibility?.eligible,
-          // When the refunded charge was a subscription, it has also been
-          // cancelled — the user must be told, or they'll expect another
-          // month of access (or fear another charge).
-          subscription_cancelled: !!subscriptionCancel?.cancelled,
-          message: `Refund of ${lastPaid.amount} ${lastPaid.currency} processed through ${lastPaid.provider}. It usually clears within 5-10 business days.`
-            + (subscriptionCancel?.cancelled
-                ? ' Your subscription has been cancelled, so there will be no further charges.'
-                : ''),
+          message: `Refund of ${lastPaid.amount} ${lastPaid.currency} processed through ${lastPaid.provider}. It usually clears within 5-10 business days.`,
         };
       } catch (e) {
         return { ok: false, reason: `Refund processing failed: ${e.message}` };
@@ -1955,27 +1922,14 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
           return { ok: false, reason: 'Invalid refund amount.' };
         }
         let providerRefundId = null;
-        let subscriptionCancel = null;
         if (payment.provider === 'stripe') {
           const stripe = getStripe();
           if (!stripe) return { ok: false, reason: 'Stripe not configured.' };
           const validReasons = ['duplicate', 'fraudulent', 'requested_by_customer'];
           const stripeReason = validReasons.includes(args.reason) ? args.reason : 'requested_by_customer';
-          // See services/stripeRefunds.js — resolves cs_/in_/sub_ rows
-          // (every Ultra first charge) instead of handing Stripe two
-          // undefineds and 400ing.
-          const { resolveStripeRefundTarget, cancelSubscriptionAfterFullRefund } = require('./stripeRefunds');
-          let refundTarget;
-          try {
-            refundTarget = await resolveStripeRefundTarget(stripe, payment);
-          } catch (targetErr) {
-            if (targetErr.code === 'NO_REFUND_TARGET') {
-              return { ok: false, reason: targetErr.message };
-            }
-            throw targetErr;
-          }
           const refund = await stripe.refunds.create({
-            ...refundTarget,
+            payment_intent: payment.provider_payment_id.startsWith('pi_') ? payment.provider_payment_id : undefined,
+            charge: payment.provider_payment_id.startsWith('ch_') ? payment.provider_payment_id : undefined,
             amount: refundAmount,
             reason: stripeReason,
             metadata: {
@@ -1986,9 +1940,6 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
             },
           });
           providerRefundId = refund.id;
-          subscriptionCancel = await cancelSubscriptionAfterFullRefund(stripe, payment, {
-            isFullRefund: refundAmount >= payment.amount,
-          });
         } else if (payment.provider === 'razorpay') {
           const razorpay = getRazorpay();
           if (!razorpay) return { ok: false, reason: 'Razorpay not configured.' };
@@ -2016,18 +1967,13 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
           eligibility_code: eligibility.eligible ? null : eligibility.code,
           eligibility_reason: eligibility.eligible ? null : eligibility.reason,
           override_reason: !eligibility.eligible ? args.override_reason : null,
-          subscription_cancel: subscriptionCancel || null,
           via_bot: true,
         });
         return {
           ok: true,
           provider: payment.provider, provider_refund_id: providerRefundId,
           refund_row: refundRow,
-          // Tells the admin whether the recurring plan was actually stopped —
-          // a refund that leaves the subscription live re-charges next cycle.
-          subscription_cancel: subscriptionCancel || undefined,
-          message: `Refund of ${refundAmount} ${payment.currency} issued for payment #${payment.id}.`
-            + (subscriptionCancel?.cancelled ? ' Subscription cancelled.' : ''),
+          message: `Refund of ${refundAmount} ${payment.currency} issued for payment #${payment.id}.`,
         };
       } catch (e) { return { ok: false, reason: e.message }; }
     },

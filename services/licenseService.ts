@@ -12,7 +12,7 @@
 //    Claude (acts as Basic-level features for that window), time-gated by
 //    trial_remaining_seconds. Once the trial is exhausted NOTHING is free:
 //    the server 402s every model route and the client shows the paywall.
-//  - Basic ($30 one-time): ONE 30-min interview, four models (Gemini, GPT-5.6,
+//  - Basic ($30 one-time): ONE 30-min interview, four models (Gemini, GPT-5.5,
 //    Grok, Groq — NO Claude), stealth, Auto-Solve. No Auto-Type. Extend +30 min
 //    anytime. Time-gated by credits_remaining_seconds.
 //  - Pro ($50 one-time): ONE 1-hour interview, all five models incl. Claude
@@ -912,58 +912,6 @@ class LicenseService {
     this.saveAuth(data.user, data.license, data.token);
     this.startRevalidation();
     return data;
-  }
-
-  // ── Stripe checkout confirmation (webhook fallback) ──
-  // Razorpay always had a client-side confirm step; Stripe did not, so the
-  // webhook was the ONLY path from "customer paid" to "customer
-  // provisioned". A rotated webhook secret, a misconfigured endpoint, or
-  // delivery failing past Stripe's 3-day retry window meant the money was
-  // taken and the account never upgraded, recoverable only by hand — and
-  // Stripe now carries every region including India.
-  //
-  // The server verifies the session against Stripe, checks it belongs to
-  // the caller, and grants idempotently, so calling this repeatedly (as
-  // the checkout polls do) is safe: at worst it returns duplicate:true.
-  // Returns null on a network error so callers just keep polling.
-  async verifyStripeCheckout(sessionId: string): Promise<{
-    success: boolean;
-    pending?: boolean;
-    duplicate?: boolean;
-    tier?: string;
-    mode?: string;
-    license?: LicenseData | null;
-    message?: string;
-  } | null> {
-    const token = this.getToken();
-    if (!token || !sessionId) return null;
-    try {
-      const res = await fetch(`${this.API_BASE}/api/v1/payments/verify-stripe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ session_id: sessionId }),
-      });
-      // 404/403 mean this session will never resolve for this account —
-      // report it so the caller can stop asking. Any other non-OK is
-      // treated as "not yet".
-      if (!res.ok && res.status !== 202) {
-        return res.status === 403 || res.status === 404 ? { success: false } : null;
-      }
-      const data = await res.json().catch(() => null);
-      if (!data) return null;
-      // Persist immediately when the server granted — the poll's own
-      // validateWithServer would pick it up on the next tick anyway, but
-      // this makes the UI flip on the tick that actually did the work.
-      if (data.license) {
-        const saved = this.loadAuth();
-        if (saved.user) {
-          this.saveAuth({ ...saved.user, tier: data.license.tier }, { ...data.license, last_validated: Date.now() });
-        }
-      }
-      return data;
-    } catch {
-      return null; // offline / server blip — the caller keeps polling
-    }
   }
 
   async validateWithServer(): Promise<LicenseData | null> {

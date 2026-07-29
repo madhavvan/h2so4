@@ -26,23 +26,20 @@ export interface AppSettings {
   // the middle of a coding round is itself an anomaly, regardless of
   // whether the planner improves outcomes.
   localOnlyAutoType: boolean;
-  // GPT-5.x reasoning_effort knob. Manual levels are Max-tier only — the
-  // server enforces this via JWT (non-Max users get forced back to 'none'
-  // regardless of what they send). Free/Basic/Pro see the bar in the UI
-  // but only the first notch is enabled for them.
-  //   'none'   — the "Auto" notch (the stored value stays 'none' for
-  //              backward compat; the request layer sends 'auto'). The
-  //              server classifies the live question: deep analytical
-  //              shapes (coding, system design, ML, quant, cases) get
-  //              'low' — measured TTFT ≤~3.2s on gpt-5.6, inside the ≤4s
-  //              live budget — and everything else runs at 'none'
-  //              (~1-3s). Non-Max tiers always resolve to 'none'.
+  // GPT-5.x reasoning_effort knob. Max-tier only — the server enforces
+  // this via JWT (non-Max users get forced back to 'none' regardless of
+  // what they send). Free/Basic/Pro see the bar in the UI but only
+  // 'none' is enabled for them.
+  //   'none'   — skip chain-of-thought; ~1-3s answers. Best paired with
+  //              a freshly trained tech-state cache (Train Model) — the
+  //              pre-researched context fills the gap that reasoning
+  //              would otherwise compute on the fly.
   //   'low'    — light reasoning; ~3-6s answers, modest depth bump.
-  //   'medium' — balanced; ~5-10s answers. Never auto-picked (too slow
-  //              for live) — explicit choice only.
+  //   'medium' — balanced (matches OpenAI's own default); ~5-10s answers.
   //   'high'   — deep reasoning; ~10-25s answers, best for complex
   //              system-design / multi-step coding questions.
-  // Defaults to 'none'/Auto for all tiers. Max users opt up per-session.
+  // Defaults to 'none' for all tiers — fastest baseline, and non-Max are
+  // stuck there anyway. Max users opt up per-session as needed.
   reasoningEffort: 'none' | 'low' | 'medium' | 'high';
   // Free-form user-supplied directives that prepend to the system prompt
   // for every model call. Examples: "Use the STAR method on behavioral

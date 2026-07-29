@@ -2,7 +2,7 @@
 //  Groq Llama-3.3-70B Auto-Type Planner — Tier 2 fallback
 //
 //  This is the non-Anthropic backup for /autotype-agent. The primary
-//  path (Sonnet 5 in autoTypeAgent.js) is great when Anthropic is
+//  path (Sonnet 4.6 in autoTypeAgent.js) is great when Anthropic is
 //  healthy, but the existing fallback chain (Sonnet → Haiku → OCR)
 //  has all its LLM tiers on a single vendor — so an Anthropic outage
 //  takes both Tier 2 (Sonnet) and Tier 3 (Haiku) out simultaneously.

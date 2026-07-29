@@ -8,9 +8,6 @@ const db = require('../database');
 const EXTENSION_PACK_SECONDS = { m30: 1800, h1: 3600, h3: 10800 };
 function packSecondsFor(id) { return EXTENSION_PACK_SECONDS[id] || 1800; }
 const { sendMail, renderPaymentFailedEmail } = require('../email');
-// Guarantees a canceling license carries a real cycle-end date — see the
-// long note on resolveCancelPeriodEnd.
-const { resolveCancelPeriodEnd } = require('../services/subscriptionStates');
 
 const router = express.Router();
 
@@ -43,49 +40,10 @@ async function notifyPaymentFailed({ user, tier, reason }) {
   }
 }
 
-// Purchase confirmation. Until now the app emailed on FAILURE, cancel,
-// tier change and pass expiry — but never on a successful charge, leaving
-// Stripe's own receipt (which is off by default in test mode and easy to
-// forget in live) as the only confirmation a customer ever got. Fire-and-
-// forget for the same reason as notifyPaymentFailed: the money and the
-// grant are already committed, so a mail outage must not fail the webhook
-// and trigger a retry of the whole handler.
-async function notifyPurchaseReceipt({ user, tier, isTopUp, amount, currency }) {
-  try {
-    const { renderPurchaseReceiptEmail } = require('../email');
-    if (typeof renderPurchaseReceiptEmail !== 'function') return;
-    const { subject, html, text } = renderPurchaseReceiptEmail({
-      name: user.name || user.email,
-      tier,
-      isTopUp: !!isTopUp,
-      amount,
-      currency,
-      manageUrl: billingManageUrl(),
-    });
-    const result = await sendMail({ to: user.email, subject, html, text });
-    if (!result || !result.ok) {
-      console.warn('[webhook:notify] receipt mail not sent:', result && result.reason);
-    }
-  } catch (err) {
-    console.error('[webhook:notify] receipt mail threw:', err && err.message);
-  }
+let stripe = null;
+if (process.env.STRIPE_SECRET_KEY) {
+  stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 }
-
-const {
-  createStripeClient,
-  // Read both the pinned (2023-10-16) and Basil+ shapes for the four
-  // fields that moved. The webhook ENDPOINT carries its own api_version
-  // from the Dashboard — the client pin doesn't govern it — and every
-  // drift symptom is silent. See services/stripeClient.js.
-  warnOnApiVersionDrift,
-  subscriptionPeriodEnd,
-  invoicePaymentIntentId,
-  invoiceSubscriptionId,
-  latestRefundFor,
-} = require('../services/stripeClient');
-// Pinned API version — see services/stripeClient.js for why an unpinned
-// client silently returns `undefined` for the fields this file reads.
-const stripe = createStripeClient();
 
 // ── Tier helpers (mirror of payments.js — kept local to avoid a cross-file
 //    dependency; webhooks may run in a separate worker in the future). ──
@@ -189,62 +147,6 @@ function gateOutOfOrder(userId, eventCreatedSec, eventLabel) {
   return true;
 }
 
-// ─── Stripe user resolution ──────────────────────────────────────────
-// Customer-id lookup FIRST (fast, and correct for the overwhelming
-// majority), then the payments ledger as a fallback.
-//
-// Why the fallback matters: `users.stripe_customer_id` stores exactly one
-// id and it moves — the Razorpay grant paths stamp `rzp_…` over it, and
-// users who signed up before the customer-reuse fix have several `cus_`
-// ids from separate checkouts. When a refund or chargeback lands for a
-// payment made under a customer id we no longer store, the old code
-// logged "for unknown customer" and returned: money refunded, paid tier
-// retained; chargeback filed, access never revoked. The ledger row for
-// that exact payment still knows who paid, so we ask it.
-//
-// `hints` may carry any of: paymentIds[] (PaymentIntent / charge ids),
-// subscriptionId.
-function resolveStripeUser(customerId, hints = {}) {
-  const d = db.getDB();
-  if (customerId) {
-    const byCustomer = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
-    if (byCustomer) return byCustomer;
-  }
-  for (const pid of (hints.paymentIds || []).filter(Boolean)) {
-    const byPayment = db.getUserByProviderPaymentId('stripe', pid);
-    if (byPayment) {
-      console.log('[WEBHOOK] Resolved user via payments ledger (customer id moved):', byPayment.email, 'payment:', pid);
-      return byPayment;
-    }
-  }
-  if (hints.subscriptionId) {
-    const bySub = db.getUserByProviderSubscriptionId('stripe', hints.subscriptionId);
-    if (bySub) {
-      console.log('[WEBHOOK] Resolved user via subscription id (customer id moved):', bySub.email, 'sub:', hints.subscriptionId);
-      return bySub;
-    }
-  }
-  return null;
-}
-
-// ─── Did this Checkout Session actually collect the money? ────────────
-// `checkout.session.completed` fires when the SESSION completes, which is
-// NOT the same as "paid". Delayed-notification methods (SEPA Direct Debit,
-// Bacs, ACSS, boleto, OXXO, konbini, Multibanco…) complete the session
-// immediately with payment_status='unpaid' and settle days later — and
-// /create-checkout deliberately omits payment_method_types so the Stripe
-// Dashboard decides which of those are on. Granting on the unpaid session
-// hands out a full pass (or an Ultra month) before any money moves, and
-// if the payment later fails the settlement event is
-// checkout.session.async_payment_failed — which nothing handled.
-//
-// So: grant only on a paid session, and let the async_* events drive the
-// delayed case. 'no_payment_required' is a legitimately-paid state (100%
-// discount / trial with no charge).
-function sessionIsPaid(session) {
-  return session?.payment_status === 'paid' || session?.payment_status === 'no_payment_required';
-}
-
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  STRIPE WEBHOOK
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -269,11 +171,6 @@ router.post('/stripe', express.raw({ type: 'application/json' }), async (req, re
     return res.status(400).json({ error: 'Invalid signature' });
   }
 
-  // Surface a Dashboard/code version mismatch once per process. The compat
-  // accessors below keep the handlers correct either way; this just stops
-  // the drift from being invisible.
-  warnOnApiVersionDrift(event);
-
   // Idempotency: Stripe retries on any non-2xx (and occasionally on 2xx
   // if the TCP ack is lost). Record event.id before running the handler;
   // if the handler throws we clear the row so the retry can reprocess.
@@ -295,14 +192,7 @@ router.post('/stripe', express.raw({ type: 'application/json' }), async (req, re
 
 async function handleStripeEvent(event) {
   switch (event.type) {
-    // Both events mean "this Checkout Session's money is ours". The
-    // difference is timing: `completed` fires the moment the session ends
-    // (paid instantly for cards/wallets, UNPAID for delayed-notification
-    // methods), while `async_payment_succeeded` is the settlement signal
-    // for the delayed ones. The paid-check below is what keeps the two
-    // apart — see sessionIsPaid().
-    case 'checkout.session.completed':
-    case 'checkout.session.async_payment_succeeded': {
+    case 'checkout.session.completed': {
       const session = event.data.object;
       const email = session.customer_email || session.metadata?.user_email;
       // 'renewal' (legacy) and 'extension' (2026-07 one-click top-up) both
@@ -324,47 +214,11 @@ async function handleStripeEvent(event) {
         console.error('[WEBHOOK] Unknown user for checkout session:', email, session.id);
         return;
       }
-      // ── Money check BEFORE any grant ──
-      // A completed-but-unpaid session is a delayed-notification payment
-      // still in flight (SEPA/Bacs/boleto/OXXO/konbini…). Record it as
-      // pending for the audit trail and wait for
-      // checkout.session.async_payment_succeeded, which re-enters this
-      // same case with the money actually collected. Do NOT advance the
-      // out-of-order gate here — the settlement event that follows is
-      // what must be allowed to grant.
-      if (event.type === 'checkout.session.completed' && !sessionIsPaid(session)) {
-        console.log('[WEBHOOK] Session completed but payment_status=' + session.payment_status
-          + ' — deferring grant to async settlement:', session.id);
-        try {
-          db.recordPayment({
-            user_id: user.id,
-            email: user.email,
-            provider: 'stripe',
-            provider_payment_id: session.payment_intent || session.id,
-            provider_subscription_id: session.subscription || null,
-            amount: session.amount_total || 0,
-            currency: (session.currency || 'usd').toUpperCase(),
-            status: 'pending',
-            tier_granted: null,
-            metadata: {
-              checkout_session_id: session.id,
-              payment_status: session.payment_status,
-              tier: tier || null,
-              mode: isRenewal ? 'renewal' : 'tier',
-              reason: 'awaiting_async_settlement',
-            },
-          });
-        } catch (recErr) {
-          console.warn('[WEBHOOK] could not record pending session row:', recErr.message);
-        }
-        return;
-      }
-
       // Out-of-order gate — symmetric with the Razorpay payment.captured
       // handler. Without this, a stale checkout.session.completed retried
       // by Stripe after a customer.subscription.deleted would resurrect a
       // canceled customer's paid tier. (P0-S1 from the global audit.)
-      if (!gateOutOfOrder(user.id, event.created, `stripe.${event.type}`)) return;
+      if (!gateOutOfOrder(user.id, event.created, 'stripe.checkout.session.completed')) return;
 
       // Every non-renewal checkout MUST carry a valid tier in metadata.
       // If neither flag is present, this is a config bug — record it as
@@ -397,21 +251,7 @@ async function handleStripeEvent(event) {
       // matching payment row.
       const sqlite = db.getDB();
       let grantedTier;
-      let alreadyGranted = false;
-      const paymentRef = session.payment_intent || session.id;
       const apply = sqlite.transaction(() => {
-        // In-tx dedup — mirrors the Razorpay handlers. Two events can now
-        // reach this grant for one session (`completed` when it was paid
-        // instantly, `async_payment_succeeded` on the delayed path) and
-        // /verify-stripe can beat both to it from the client. Without the
-        // check the second writer trips the UNIQUE(provider,
-        // provider_payment_id) WHERE status='completed' index, the handler
-        // 500s, and Stripe retries it forever.
-        const dup = sqlite.prepare(
-          "SELECT id FROM payments WHERE provider = 'stripe' AND provider_payment_id = ? AND status = 'completed' LIMIT 1"
-        ).get(paymentRef);
-        if (dup) { alreadyGranted = true; return; }
-
         if (isRenewal) {
           const packSeconds = packSecondsFor(session.metadata?.pack);
           const updated = db.grantTimeExtension(user.id, packSeconds);
@@ -436,13 +276,14 @@ async function handleStripeEvent(event) {
         // time we see this customer if they renewed via a different
         // email / guest flow).
         if (session.customer) {
-          db.setPaymentProviderMarker(user.id, session.customer);
+          sqlite.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
+            .run(session.customer, Date.now(), user.id);
         }
         db.recordPayment({
           user_id: user.id,
           email: user.email,
           provider: 'stripe',
-          provider_payment_id: paymentRef,
+          provider_payment_id: session.payment_intent || session.id,
           provider_subscription_id: session.subscription || null,
           amount: session.amount_total || 0,
           currency: (session.currency || 'usd').toUpperCase(),
@@ -453,59 +294,11 @@ async function handleStripeEvent(event) {
             customer_id: session.customer,
             tier: grantedTier,
             mode: isRenewal ? 'renewal' : 'tier',
-            settled_via: event.type,
           },
         });
       });
       apply();
-      if (alreadyGranted) {
-        console.log('[WEBHOOK] Checkout session already granted — skipping duplicate:', paymentRef);
-        return;
-      }
       console.log('[WEBHOOK]', isRenewal ? 'Renewal applied for:' : `User upgraded to ${grantedTier.toUpperCase()}:`, email);
-      await notifyPurchaseReceipt({
-        user,
-        tier: grantedTier,
-        isTopUp: isRenewal,
-        amount: session.amount_total || 0,
-        currency: (session.currency || 'usd').toUpperCase(),
-      });
-      return;
-    }
-
-    case 'checkout.session.async_payment_failed': {
-      // The delayed-notification payment we deferred on
-      // checkout.session.completed never settled (insufficient funds,
-      // mandate revoked, voucher expired). Nothing was granted — the
-      // paid-check above saw to that — so this is bookkeeping plus telling
-      // the user, who otherwise waits for a pass that will never arrive.
-      const session = event.data.object;
-      const email = session.customer_email || session.metadata?.user_email;
-      const user = email
-        ? db.getUserByEmail(email)
-        : resolveStripeUser(session.customer, { paymentIds: [session.payment_intent, session.id] });
-      if (!user) {
-        console.log('[WEBHOOK] async_payment_failed for unknown user:', session.id);
-        return;
-      }
-      db.recordPayment({
-        user_id: user.id,
-        email: user.email,
-        provider: 'stripe',
-        provider_payment_id: session.payment_intent || session.id,
-        provider_subscription_id: session.subscription || null,
-        amount: session.amount_total || 0,
-        currency: (session.currency || 'usd').toUpperCase(),
-        status: 'failed',
-        tier_granted: null,
-        metadata: { checkout_session_id: session.id, reason: 'async_payment_failed' },
-      });
-      await notifyPaymentFailed({
-        user,
-        tier: resolveTier(session.metadata?.tier) || undefined,
-        reason: 'Your bank did not complete the payment (this can happen with bank debits and voucher payments). Nothing was charged — you can try again with a card.',
-      });
-      console.log('[WEBHOOK] Async payment failed — no grant:', user.email, session.id);
       return;
     }
 
@@ -520,13 +313,7 @@ async function handleStripeEvent(event) {
       if (invoice.billing_reason === 'subscription_create') return;
 
       const d = db.getDB();
-      // Compat reads — these two ids are what tie a RENEWAL charge back to
-      // a user. On a Basil+ endpoint the direct fields are undefined, so
-      // every recurring payment row lost both, and a later refund or
-      // chargeback on that renewal could not be resolved to an account.
-      const invPaymentIntent = invoicePaymentIntentId(invoice);
-      const invSubscription = invoiceSubscriptionId(invoice);
-      const user = resolveStripeUser(invoice.customer, { paymentIds: [invPaymentIntent], subscriptionId: invSubscription });
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(invoice.customer);
       if (!user) {
         console.log('[WEBHOOK] invoice.payment_succeeded for unknown customer:', invoice.customer);
         return;
@@ -536,8 +323,8 @@ async function handleStripeEvent(event) {
         user_id: user.id,
         email: user.email,
         provider: 'stripe',
-        provider_payment_id: invPaymentIntent,
-        provider_subscription_id: invSubscription,
+        provider_payment_id: invoice.payment_intent,
+        provider_subscription_id: invoice.subscription,
         amount: invoice.amount_paid || 0,
         currency: (invoice.currency || 'usd').toUpperCase(),
         status: 'completed',
@@ -559,7 +346,7 @@ async function handleStripeEvent(event) {
       const subTier = resolveTier(subscription.metadata?.tier);
 
       const d = db.getDB();
-      const user = resolveStripeUser(customerId, { subscriptionId: subscription.id });
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
       if (!user) return;
       // Out-of-order guard: a stale subscription.updated arriving AFTER
       // subscription.deleted (or after a more recent .updated) used to
@@ -580,12 +367,7 @@ async function handleStripeEvent(event) {
 
       const isActiveOrTrialing = ['active', 'trialing'].includes(subscription.status);
       const isCanceling = subscription.cancel_at_period_end;
-      // current_period_end moved onto subscription ITEMS in 2025-03-31.basil.
-      // Read straight off the object and a Basil+ endpoint yields 0 here on
-      // EVERY cancel — which is exactly how a canceling license ends up with
-      // no cycle-end date at all.
-      const periodEndSec = subscriptionPeriodEnd(subscription);
-      const periodEndMs = (periodEndSec || 0) * 1000;
+      const periodEndMs = (subscription.current_period_end || 0) * 1000;
 
       console.log('[WEBHOOK] Subscription updated:', customerId, 'tier:', tier, 'status:', subscription.status, 'cancel_at_period_end:', isCanceling);
 
@@ -606,15 +388,7 @@ async function handleStripeEvent(event) {
           db.updateLicenseOnPayment(user.id, {
             tier: grant.tier,
             status: 'canceling',
-            // NOT `grant.expires_at` as the fallback: for Ultra that is the
-            // -1 unlimited sentinel, and a canceling row at -1 is invisible
-            // to the cycle-end sweeper AND to /validate's auto-transition —
-            // the subscription would be canceled at Stripe and unlimited
-            // here, forever. current_period_end is precisely the field that
-            // moved off the Subscription object in 2025-03-31.basil, so an
-            // account whose webhook endpoint runs a newer version hits this
-            // on EVERY cancel, silently. See resolveCancelPeriodEnd.
-            expires_at: resolveCancelPeriodEnd(periodEndMs, grant.expires_at),
+            expires_at: periodEndMs > 0 ? periodEndMs : grant.expires_at,
             sessions_limit: grant.sessions_limit,
             ...creditsForLifecycleGrant(grant),
           });
@@ -678,49 +452,12 @@ async function handleStripeEvent(event) {
           });
         })();
       } else if (subscription.status === 'incomplete_expired') {
-        // First payment never succeeded; the subscription is dead.
-        //
-        // The old comment here asserted "never granted, no-op" — that was
-        // only true if nothing granted off the Checkout Session, which is
-        // exactly the assumption the payment_status gate now enforces. It
-        // was NOT true before that gate, and it stops being true again the
-        // moment any other path grants optimistically. So rather than
-        // trust the invariant, verify it: if a completed row exists for
-        // this subscription, we DID grant, and an expired-incomplete sub
-        // means that money never arrived — revoke.
-        const grantedRow = db.getUserByProviderSubscriptionId('stripe', subscription.id)
-          ? d.prepare(`
-              SELECT id, tier_granted FROM payments
-              WHERE provider = 'stripe' AND provider_subscription_id = ? AND status = 'completed'
-              ORDER BY created_at DESC LIMIT 1
-            `).get(subscription.id)
-          : null;
-        if (grantedRow) {
-          console.warn('[WEBHOOK] incomplete_expired but a completed grant exists for sub', subscription.id, '— revoking:', user.email);
-          sqlite.transaction(() => {
-            db.updateUserTier(user.id, 'free');
-            db.updateLicenseOnPayment(user.id, {
-              tier: 'free',
-              status: 'expired',
-              expires_at: Date.now(),
-              sessions_limit: 5,
-            });
-            db.recordPayment({
-              user_id: user.id,
-              email: user.email,
-              provider: 'stripe',
-              provider_payment_id: null,
-              provider_subscription_id: subscription.id,
-              amount: 0,
-              currency: 'USD',
-              status: 'cancelled',
-              tier_granted: 'free',
-              metadata: { reason: 'incomplete_expired_after_grant', reversed_payment_id: grantedRow.id },
-            });
-          })();
-        } else {
-          console.log('[WEBHOOK] Subscription incomplete_expired for:', user.email, '— nothing was granted, no-op');
-        }
+        // First payment never succeeded; subscription is dead. The user
+        // never received a license for this sub, so this is purely a
+        // logging hook — no DB write needed. Without this branch the
+        // event would silently fall through (which is what we want
+        // behaviourally) but we'd lose the audit trail.
+        console.log('[WEBHOOK] Subscription incomplete_expired for:', user.email, '— never granted, no-op');
       } else if (subscription.status === 'incomplete') {
         // Initial sub state, before first payment confirms. We don't grant
         // anything from this event (checkout.session.completed is the
@@ -738,7 +475,7 @@ async function handleStripeEvent(event) {
       const subscription = event.data.object;
       const tier = resolveTier(subscription.metadata?.tier);
       const d = db.getDB();
-      const user = resolveStripeUser(subscription.customer, { subscriptionId: subscription.id });
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(subscription.customer);
       if (!user) return;
       if (!gateOutOfOrder(user.id, event.created, 'customer.subscription.paused')) return;
       const license = db.getLicenseByUserId(user.id);
@@ -763,7 +500,7 @@ async function handleStripeEvent(event) {
       const subscription = event.data.object;
       const tier = resolveTier(subscription.metadata?.tier);
       const d = db.getDB();
-      const user = resolveStripeUser(subscription.customer, { subscriptionId: subscription.id });
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(subscription.customer);
       if (!user || !tier) return;
       if (!gateOutOfOrder(user.id, event.created, 'customer.subscription.resumed')) return;
       const grant = grantConfigForTier(tier);
@@ -787,10 +524,7 @@ async function handleStripeEvent(event) {
       // user immediately so they can complete the challenge in time.
       const invoice = event.data.object;
       const d = db.getDB();
-      const user = resolveStripeUser(invoice.customer, {
-        paymentIds: [invoicePaymentIntentId(invoice)],
-        subscriptionId: invoiceSubscriptionId(invoice),
-      });
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(invoice.customer);
       if (!user) return;
       const license = db.getLicenseByUserId(user.id);
       await notifyPaymentFailed({
@@ -808,7 +542,7 @@ async function handleStripeEvent(event) {
       console.log('[WEBHOOK] Subscription cancelled:', customerId);
 
       const d = db.getDB();
-      const user = resolveStripeUser(customerId, { subscriptionId: subscription.id });
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
       if (!user) return;
       if (!gateOutOfOrder(user.id, event.created, 'customer.subscription.deleted')) return;
       d.transaction(() => {
@@ -842,9 +576,7 @@ async function handleStripeEvent(event) {
       console.log('[WEBHOOK] Payment failed for:', customerId);
 
       const d = db.getDB();
-      const failedPaymentIntent = invoicePaymentIntentId(invoice);
-      const failedSubscription = invoiceSubscriptionId(invoice);
-      const user = resolveStripeUser(customerId, { paymentIds: [failedPaymentIntent], subscriptionId: failedSubscription });
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
       if (!user) return;
       // Out-of-order gate, mirrors Razorpay payment.failed (P0-S1 / P0-S2).
       if (!gateOutOfOrder(user.id, event.created, 'stripe.invoice.payment_failed')) return;
@@ -852,8 +584,8 @@ async function handleStripeEvent(event) {
         user_id: user.id,
         email: user.email,
         provider: 'stripe',
-        provider_payment_id: failedPaymentIntent,
-        provider_subscription_id: failedSubscription,
+        provider_payment_id: invoice.payment_intent,
+        provider_subscription_id: invoice.subscription,
         amount: invoice.amount_due || 0,
         currency: (invoice.currency || 'usd').toUpperCase(),
         status: 'failed',
@@ -901,20 +633,14 @@ async function handleStripeEvent(event) {
       // The provider refund id is the dedup key (see hasRefundBeenRecorded).
       // An admin-initiated refund already wrote a compensating row before
       // Stripe fired this event; without the guard we'd double-record.
-      //
-      // charge.refunds stopped being expanded by default in 2025-03-31.basil,
-      // so on a Basil+ endpoint this key is simply absent and the dedup
-      // silently degrades to "record it" — the admin row and the webhook row
-      // both book the same refund and the ledger double-counts. latestRefundFor
-      // falls back to a single refunds.list call only in that case.
-      const latestRefund = await latestRefundFor(stripe, charge);
+      const latestRefund = charge.refunds?.data?.[0] || null;
       const refundId = latestRefund?.id || null;
       const rowAmount = (typeof latestRefund?.amount === 'number') ? latestRefund.amount : refundAmount;
 
       const d = db.getDB();
-      const user = resolveStripeUser(charge.customer, { paymentIds: [charge.payment_intent, charge.id] });
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(charge.customer);
       if (!user) {
-        console.log('[WEBHOOK] charge.refunded — could not map to a user by customer OR payment ledger:', charge.customer, charge.payment_intent || charge.id);
+        console.log('[WEBHOOK] charge.refunded for unknown customer:', charge.customer);
         return;
       }
 
@@ -946,30 +672,6 @@ async function handleStripeEvent(event) {
         console.log('[WEBHOOK] charge.refunded already recorded (admin/prior) — skipping duplicate row:', refundId);
       }
 
-      // ── Is this a refund of a TIME TOP-UP rather than a plan purchase? ──
-      // "Full refund" is measured against THIS charge, so refunding a $25
-      // extension in full satisfied the condition and dropped the user to
-      // free — destroying the $89 pass the top-up was added to. The buyer
-      // loses a plan they still own because we handed back $25.
-      //
-      // The published policy says top-ups are never refundable
-      // (services/refundEligibility.js), so this only fires via a Stripe
-      // Dashboard refund or an admin override — i.e. precisely the
-      // goodwill gesture where nuking the plan is the worst outcome.
-      // Record the money, leave the plan alone.
-      //
-      // The granted minutes are deliberately NOT clawed back: the seconds
-      // may be mid-interview, and a clamped subtraction could just as
-      // easily eat time from a DIFFERENT pass bought since. An operator
-      // who wants them removed can adjust from the admin console.
-      const originalRow = db.getCompletedPaymentByProviderId('stripe', charge.payment_intent || charge.id);
-      const wasTopUp = db.isTopUpPayment(originalRow);
-
-      if (fullRefund && wasTopUp) {
-        console.log('[WEBHOOK] Full refund of a TIME TOP-UP — recording only, plan left intact for:', user.email);
-        return;
-      }
-
       if (fullRefund) {
         if (!gateOutOfOrder(user.id, event.created, 'charge.refunded.full')) return;
         d.transaction(() => {
@@ -997,12 +699,14 @@ async function handleStripeEvent(event) {
       const d = db.getDB();
       // The dispute object itself doesn't always carry customer. Resolve
       // via the charge when needed.
-      let user = resolveStripeUser(dispute.customer, { paymentIds: [dispute.charge, dispute.payment_intent] });
+      let user = dispute.customer
+        ? d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(dispute.customer)
+        : null;
       if (!user && dispute.charge && stripe) {
         try {
           const charge = await stripe.charges.retrieve(dispute.charge);
-          if (charge) {
-            user = resolveStripeUser(charge.customer, { paymentIds: [charge.payment_intent, charge.id] });
+          if (charge && charge.customer) {
+            user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(charge.customer);
           }
         } catch (err) {
           console.error('[WEBHOOK] dispute.created: could not resolve charge', dispute.charge, err.message);
@@ -1057,12 +761,14 @@ async function handleStripeEvent(event) {
         return;
       }
       const d = db.getDB();
-      let user = resolveStripeUser(dispute.customer, { paymentIds: [dispute.charge, dispute.payment_intent] });
+      let user = dispute.customer
+        ? d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(dispute.customer)
+        : null;
       if (!user && dispute.charge && stripe) {
         try {
           const charge = await stripe.charges.retrieve(dispute.charge);
-          if (charge) {
-            user = resolveStripeUser(charge.customer, { paymentIds: [charge.payment_intent, charge.id] });
+          if (charge && charge.customer) {
+            user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(charge.customer);
           }
         } catch (err) {
           console.error('[WEBHOOK] dispute.closed: could not resolve charge', dispute.charge, err.message);
@@ -1136,28 +842,17 @@ async function handleStripeEvent(event) {
         return;
       }
       const d = db.getDB();
-      const user = resolveStripeUser(customerId, { paymentIds: [obj.id, obj.payment_intent] });
+      const user = d.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').get(customerId);
       if (!user) {
         console.log('[WEBHOOK]', event.type, 'for unknown customer:', customerId);
         return;
       }
       if (!gateOutOfOrder(user.id, event.created, `stripe.${event.type}`)) return;
-      // Stripe fires BOTH payment_intent.payment_failed and charge.failed
-      // for a single declined card, and both land here — two identical
-      // "your payment failed" rows and two emails for one decline. Key
-      // both on the PaymentIntent (a charge carries its parent's id) so
-      // the second delivery is recognised as the same failure. A genuine
-      // retry creates a new PaymentIntent and still records.
-      const failureRef = (obj.object === 'charge' && obj.payment_intent) ? obj.payment_intent : obj.id;
-      if (db.hasFailedPaymentRecorded(user.id, failureRef)) {
-        console.log('[WEBHOOK]', event.type, '— failure already recorded for', failureRef, '(same decline, other event type)');
-        return;
-      }
       db.recordPayment({
         user_id: user.id,
         email: user.email,
         provider: 'stripe',
-        provider_payment_id: failureRef,
+        provider_payment_id: obj.id,
         provider_subscription_id: null,  // one-time, no sub
         amount: obj.amount || 0,
         currency: (obj.currency || 'usd').toUpperCase(),
@@ -1334,10 +1029,8 @@ async function handleRazorpayEvent(body) {
         // (still used by reads that haven't migrated to razorpay_subscription_id).
         // Prefer subscription.id (stable across renewals) over payment.id
         // (rolling per-payment) to reduce churn.
-        // setPaymentProviderMarker refuses to overwrite a live `cus_…` — see
-        // database.js for why that clobber breaks saved cards, /portal and
-        // provider detection the moment India routes back to Razorpay.
-        db.setPaymentProviderMarker(user.id, `rzp_${subscription?.id || payment?.id}`);
+        d.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
+          .run(`rzp_${subscription?.id || payment?.id}`, Date.now(), user.id);
         // New column: dedicated Razorpay subscription pointer, set once.
         if (subscription?.id) db.setRazorpaySubscriptionId(user.id, subscription.id);
         db.recordPayment({
@@ -1490,9 +1183,8 @@ async function handleRazorpayEvent(body) {
             credits_expire_at: grant.credits_expire_at,
           });
         }
-        // Never clobbers an existing Stripe `cus_…` marker — see
-        // database.js setPaymentProviderMarker.
-        db.setPaymentProviderMarker(user.id, `rzp_${payment.id}`);
+        sqlite.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
+          .run(`rzp_${payment.id}`, Date.now(), user.id);
         db.recordPayment({
           user_id: user.id,
           email: user.email,
@@ -1614,14 +1306,7 @@ async function handleRazorpayEvent(body) {
           AND status IN ('refunded', 'partially_refunded') AND amount < 0
       `).get(paymentId).s;
       const cumulativeRefunded = priorRefundedPaise + (alreadyRecorded ? 0 : refundAmount);
-      // Accounting truth — the row's metadata must still say "this payment
-      // was fully refunded" even when we choose not to touch the plan.
       const fullRefund = cumulativeRefunded >= priorPayment.amount;
-      // Same top-up carve-out as the Stripe path: refunding a ₹2,099
-      // extension in full must not revoke the ₹7,399 pass it topped up.
-      // Entitlement decision only — never the bookkeeping.
-      const wasTopUp = db.isTopUpPayment(priorPayment);
-      const revokeTier = fullRefund && !wasTopUp;
       d.transaction(() => {
         if (!alreadyRecorded) {
           db.recordPayment({
@@ -1643,7 +1328,7 @@ async function handleRazorpayEvent(body) {
             },
           });
         }
-        if (revokeTier) {
+        if (fullRefund) {
           db.updateUserTier(user.id, 'free');
           db.updateLicenseOnPayment(user.id, {
             tier: 'free',
@@ -1653,10 +1338,8 @@ async function handleRazorpayEvent(body) {
           });
         }
       })();
-      if (revokeTier) {
+      if (fullRefund) {
         console.log('[RZP WEBHOOK] Full refund — user downgraded to free:', user.email);
-      } else if (fullRefund && wasTopUp) {
-        console.log('[RZP WEBHOOK] Full refund of a TIME TOP-UP — recording only, plan left intact for:', user.email);
       } else {
         console.log('[RZP WEBHOOK] Partial refund recorded for:', user.email, 'amount:', refundAmount);
       }

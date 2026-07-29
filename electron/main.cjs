@@ -42,10 +42,6 @@ const autoTypePlanLog = require('./autoTypePlanLog.cjs');
 // P5d Part 1: target-coverage check — catches under-planned/under-typed
 // solutions that per-op verify is blind to (pure module, unit-tested).
 const { computeCoverageGaps, shouldTriggerRepair } = require('./autoTypeCoverage.cjs');
-// Indentation is the one thing the two whitespace-stripped checks above
-// cannot see, and the one that turns a correct-looking Python answer into
-// a file that will not run. See autoTypeIndent.cjs.
-const { compareIndentation, shouldReportIndent } = require('./autoTypeIndent.cjs');
 
 // ─── Crash reporter — must initialize BEFORE app emits 'ready' ───────
 // Without this, main-process crashes (V8 GC fault, native module SEGV,
@@ -2701,32 +2697,12 @@ let autoTypeAbortReason = null;
 // Populated when SID fires; renderer pulls it into the multi-line toast.
 let autoTypeAbortDiagnostic = null;
 
-// Run id of the in-flight auto-type, so the broadcast chokepoint below can
-// persist verify outcomes without every branch having to remember to.
-let autoTypeCurrentRunId = null;
-
 // Broadcast progress so the clicked CodeBlock can update its button label.
 // P8-1: tag every broadcast with the owning blockId so non-owners ignore it.
 function autoTypeBroadcast(data) {
   const tagged = (data && typeof data === 'object' && _atCurrentBlockId)
     ? { ...data, blockId: _atCurrentBlockId }
     : data;
-  // Persist the verify outcome. autoTypePlanLog documents a `verify` field
-  // but nothing wrote it, so every recorded run showed a before and an
-  // after with no verdict attached. Recording HERE rather than in each of
-  // the eight verify branches means a new branch can't silently skip it.
-  if (autoTypeCurrentRunId && data && (data.phase === 'verify-ok' || data.phase === 'verify-mismatch')) {
-    try {
-      autoTypePlanLog.record(autoTypeCurrentRunId, {
-        verify: {
-          ok: data.phase === 'verify-ok',
-          reason: data.reason || null,
-          ...(data.repairs !== undefined ? { repairs: data.repairs } : {}),
-          ...(data.missing !== undefined ? { missing: data.missing } : {}),
-        },
-      });
-    } catch (_) { /* logging must never break a run */ }
-  }
   BrowserWindow.getAllWindows().forEach(win => {
     if (!win.isDestroyed()) win.webContents.send('auto-type:status', tagged);
   });
@@ -2785,20 +2761,17 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   // "show me what the planner thought" is now a one-line tail of that file.
   const _atRunId = autoTypePlanLog.newRunId();
   autoTypePlanLog.begin(_atRunId);
-  autoTypeCurrentRunId = _atRunId;   // lets autoTypeBroadcast persist verify outcomes
   autoTypePlanLog.record(_atRunId, { language, intendedCode: code, skipLines, localOnly });
   // P8-1: pin the owning CodeBlock's ID so broadcasts can be addressed.
   const blockId = payload && typeof payload.blockId === 'string' ? payload.blockId : null;
   if (autoTypeInFlight) {
     autoTypePlanLog.record(_atRunId, { earlyBail: 'already_in_progress' });
     try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
-    autoTypeCurrentRunId = null;
     return { error: 'Auto-Type already in progress.' };
   }
   if (!code.length) {
     autoTypePlanLog.record(_atRunId, { earlyBail: 'empty_code' });
     try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
-    autoTypeCurrentRunId = null;
     return { error: 'Nothing to type.' };
   }
 
@@ -3098,7 +3071,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       // matters more here.
       autoTypeBroadcast({ phase: 'thinking', source: 'agent' });
       // GOD-LEVEL PATH: try the AI agent first. The /autotype-agent
-      // endpoint is now two-tier internally — Sonnet 5 (Anthropic)
+      // endpoint is now two-tier internally — Sonnet 4.6 (Anthropic)
       // primary with Groq Llama-3.3-70B fail-over on Anthropic outage.
       // Both planners use chain-of-thought + forced tool_choice. The
       // response includes a `planner_used` field ('sonnet' or 'groq')
@@ -3460,12 +3433,6 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         : '';
       const result = await executeMultiOpPlan(multiOpPlan, { keyboard, Key, mouse, uiaText, processName: uiaProcName });
       console.log(`[auto-type] multi-op plan complete: ${result.opCount}/${multiOpPlan.length} operation(s) executed${autoTypeAbort ? ' (aborted mid-run)' : ''}`);
-      autoTypePlanLog.record(_atRunId, {
-        executionTrace: result.executionTrace || [],
-        opsExecuted: result.opCount,
-        opsPlanned: multiOpPlan.length,
-        refused: result.refused || null,
-      });
 
       // ── Guard D: post-execution catastrophic-collapse detection ──
       // The plan-level guards can't catch an EXECUTION failure — e.g. Monaco
@@ -3556,61 +3523,21 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
                   const eg = gaps.missingLines[0] ? gaps.missingLines[0].stripped.slice(0, 50) : '';
                   console.log(`[auto-type] COVERAGE GAP: ${gaps.missingLines.length}/${gaps.meaningfulTotal} target line(s) absent despite all ops verifying (ratio=${gaps.coverageRatio.toFixed(2)}) — e.g. "${eg}". Firing completeness repair…`);
                   autoTypePlanLog.record(_atRunId, { coverageGap: { missing: gaps.missingLines.length, meaningfulTotal: gaps.meaningfulTotal, ratio: gaps.coverageRatio } });
-                  const covRepair = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText, processName: uiaProcName });
+                  const covRepair = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText });
                   console.log(`[auto-type] COVERAGE repair: ${covRepair.ok ? `${covRepair.repairs || 0} op(s)` : 'failed'} (${covRepair.reason || 'ok'})`);
                 }
               }
             } catch (covErr) {
               console.warn('[auto-type] coverage check threw (non-fatal):', covErr && covErr.message);
             }
-
-            // ── Indentation ──
-            // The two checks above both strip whitespace before comparing,
-            // so a correctly-worded but wrongly-indented answer reaches
-            // here as a clean pass. In Java that is untidy; in Python it is
-            // a file that does not run, reported as success.
-            //
-            // The repair already ran inline, per block, while that block's
-            // document lines were still known (autoTypeFixIndentation). All
-            // that is left here is telling the user about anything it could
-            // not fix or deliberately refused to touch.
-            let indentWarning = null;
-            try {
-              if (result && result.indentRepairs > 0) {
-                console.log(`[auto-type] indent: retyped ${result.indentRepairs} line(s) that landed off-shape`);
-                autoTypePlanLog.record(_atRunId, { indentRepairs: result.indentRepairs });
-              }
-              const left = (result && result.indentUnfixed) || [];
-              if (left.length) {
-                const worst = left[0];
-                indentWarning = left.some(m => m.tabMix)
-                  ? `Tabs and spaces are mixed in the typed code (e.g. "${worst.line}") — in Python that will not run. Check the indentation before you submit.`
-                  : `${left.length} line(s) landed at a different indent than intended (e.g. "${worst.line}" — expected ${worst.expected} spaces, got ${worst.actual}). Check the indentation before you submit.`;
-                console.warn(`[auto-type] INDENT: ${left.length} line(s) still off-shape after repair — ${worst.line}`);
-                autoTypePlanLog.record(_atRunId, { indentUnfixed: left.length });
-              }
-            } catch (indErr) {
-              console.warn('[auto-type] indent report threw (non-fatal):', indErr && indErr.message);
-            }
-
-            if (indentWarning) {
-              // Deliberately the SAME surface as a verify mismatch: the
-              // code is all there, but it needs your eyes before you
-              // submit — which is exactly what verify-mismatch means.
-              // `hint` at the top level — that is the field the renderer
-              // reads (App.tsx verify-mismatch handler); nesting it under a
-              // `diagnostic` object would broadcast into a void.
-              autoTypeBroadcast({ phase: 'verify-mismatch', reason: 'indent', hint: indentWarning });
-            } else {
-              autoTypeBroadcast({ phase: 'verify-ok', reason: 'multi_op_all_present' });
-            }
+            autoTypeBroadcast({ phase: 'verify-ok', reason: 'multi_op_all_present' });
           } else if (vRes.missingOps && vRes.missingOps.length > 0) {
             const summary = vRes.missingOps
               .map(m => `${m.op} L${m.start_line}: "${m.textPreview}…"`)
               .join('; ');
             console.log(`[auto-type] multi-op verify: ${vRes.missingOps.length}/${totalOps} op(s) missing after initial typing — ${summary}. Attempting REPAIR iteration…`);
 
-            const repairRes = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText, processName: uiaProcName });
+            const repairRes = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText });
 
             if (repairRes.ok && repairRes.repairs > 0) {
               console.log(`[auto-type] REPAIR applied ${repairRes.repairs}/${repairRes.totalAttempted} fix op(s); re-verifying…`);
@@ -3706,7 +3633,6 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         abortReason: autoTypeAbortReason || null,
       });
       try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
-    autoTypeCurrentRunId = null;
       autoTypeBroadcast({
         phase: 'done',
         aborted: autoTypeAbort,
@@ -3799,11 +3725,13 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         await autoTypeNavSleep(5, 14);
         await keyboard.releaseKey(Key.LeftControl);
         await autoTypeNavSleep(30, 60);
-        await autoTypeArrowRun(keyboard, Key.Down, target - 1);
-        // True column 0 before counting Rights — a single Home stops at the
-        // first non-whitespace character in Monaco, which would make every
-        // subsequent Right overshoot by the width of the indent.
-        await autoTypeGoToColumnZero(keyboard, Key);
+        for (let i = 0; i < target - 1; i++) {
+          if (autoTypeAbort) break;
+          await autoTypePressWithDwell(keyboard, Key.Down);
+          await autoTypeHumanNavSleep();
+        }
+        await autoTypePressWithDwell(keyboard, Key.Home);
+        await autoTypeNavSleep(10, 24);
         const col = Math.max(0, Math.min(400, cursorTargetColumn));
         for (let i = 0; i < col; i++) {
           if (autoTypeAbort) break;
@@ -4017,19 +3945,47 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           await autoTypeMaybeMouseTwitch(mouse);
         }
 
-        // Same line break as the multi-op path — one shared implementation
-        // so the two can't drift apart again. It replaces a predicate that
-        // GUESSED whether the editor would auto-indent (`indentEnd > 0 ||
-        // line ends with a block opener`) and only then wiped. The guess is
-        // unnecessary: selecting the indent and typing over it is correct
-        // whether or not the editor inserted one, and it never forward-
-        // deletes the following line when the guess is wrong.
+        // Whether to wipe the auto-indent the editor will insert. Most
+        // editors auto-indent the new line ONLY when:
+        //   • the just-typed line had leading whitespace (matches indent), OR
+        //   • the just-typed line ended with a block-opener (`:`, `{`, `(`, `[`),
+        //     which adds one level.
+        // For plain top-level statements (sequential imports, blank-line-
+        // separated function defs at column 0) the editor does no auto-indent
+        // and the wipe is both unnecessary AND a strong fingerprint — Home →
+        // Shift+End → Delete after every Enter is something no human does.
+        // Only run it when there's actual auto-indent to fight.
+        const editorWillAutoIndent = indentEnd > 0 || /[:{(\[]\s*$/.test(line);
+
         try {
-          await autoTypeLineBreak(keyboard, Key);
+          // P1a: every keystroke in the inter-line wipe gets real dwell.
+          await autoTypePressWithDwell(keyboard, Key.Enter);
+          await autoTypeNavSleep(38, 70);
+
+          if (editorWillAutoIndent) {
+            // Wipe the auto-inserted indent so the AI's own leading whitespace
+            // (typed on next iter) stands alone instead of compounding.
+            await autoTypePressWithDwell(keyboard, Key.Home);
+            await autoTypeNavSleep(14, 32);
+
+            // Shift+End as sequential hold (combo form trips libnut on some
+            // Windows builds). Shift held, End pressed WITH DWELL, then Shift
+            // released. The dwell-on-End is what closes the biometric signal —
+            // previously End was held for only 5-14ms (zero-ish).
+            await keyboard.pressKey(Key.LeftShift);
+            await autoTypeNavSleep(5, 14);
+            await autoTypePressWithDwell(keyboard, Key.End);
+            await autoTypeNavSleep(5, 14);
+            await keyboard.releaseKey(Key.LeftShift);
+            await autoTypeNavSleep(14, 32);
+
+            await autoTypePressWithDwell(keyboard, Key.Delete);
+            await autoTypeNavSleep(14, 32);
+          }
         } catch (kErr) {
-          // If the line break fails, continue — worst case is
+          // If the indent-reset fails, continue — worst case is
           // visible double-indent, not a broken type run.
-          console.warn('[auto-type] line-break failed:', kErr && kErr.message);
+          console.warn('[auto-type] indent-reset failed:', kErr && kErr.message);
         }
 
         // Reset prevCh at line boundaries so the first char of the new
@@ -4113,11 +4069,6 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         }
       }
     }
-
-    // If the last line typed was empty, autoTypeLineBreak left the editor's
-    // auto-indent selected. Collapse before anything else runs, so a stray
-    // keystroke (or the suffix below) doesn't silently replace it.
-    if (!autoTypeAbort) await autoTypeCollapseSelection(keyboard, Key);
 
     // ── suffix: tiny tail (usually closing brackets) typed after main content ──
     // P1a: dwell on Enter and each char.
@@ -4207,7 +4158,6 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       abortDiagnostic: autoTypeAbortDiagnostic || null,
     });
     try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
-    autoTypeCurrentRunId = null;
     // Pull abort reason + diagnostic into the 'done' broadcast so the renderer
     // never has to guess WHY a run ended. Without these fields the renderer
     // used to silently reset to idle on aborted=true, leaving the user with
@@ -4291,19 +4241,6 @@ function Read-Focused {
       }
     } catch { }
 
-    # The focused element's own NAME and control type. Cheap, and it is
-    # the only way to tell that a chord actually opened the widget we
-    # asked for — VS Code's go-to-line prompt names itself "Type a line
-    # number to go to (from 1 to N)", which is both a confirmation and a
-    # free read of the document's real length. Without this the caret
-    # jump below could type a line number into a browser's find bar.
-    $elName = ''
-    $elType = ''
-    try {
-      $elName = [string]$el.Current.Name
-      $elType = [string]$el.Current.ControlType.ProgrammaticName
-    } catch { }
-
     $tp = $null
     $hasTp = $el.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$tp)
     if ($hasTp -and $tp) {
@@ -4320,7 +4257,7 @@ function Read-Focused {
         if ($null -eq $before) { $before = '' }
         $cursorOffset = $before.Length
       }
-      $obj = [PSCustomObject]@{ ok = $true; text = $fullText; cursorOffset = $cursorOffset; source = 'text_pattern'; processId = $pid_; processName = $pname; elementName = $elName; elementType = $elType }
+      $obj = [PSCustomObject]@{ ok = $true; text = $fullText; cursorOffset = $cursorOffset; source = 'text_pattern'; processId = $pid_; processName = $pname }
       return ($obj | ConvertTo-Json -Compress -Depth 3)
     }
 
@@ -4329,14 +4266,14 @@ function Read-Focused {
     if ($hasVp -and $vp) {
       $value = $vp.Current.Value
       if ($null -eq $value) { $value = '' }
-      $obj = [PSCustomObject]@{ ok = $true; text = $value; cursorOffset = $value.Length; source = 'value_pattern'; processId = $pid_; processName = $pname; elementName = $elName; elementType = $elType }
+      $obj = [PSCustomObject]@{ ok = $true; text = $value; cursorOffset = $value.Length; source = 'value_pattern'; processId = $pid_; processName = $pname }
       return ($obj | ConvertTo-Json -Compress -Depth 3)
     }
 
     # No text/value pattern but we still know who has focus — let the Node
     # side decide whether that's our own process (abort) or an editor we
     # just can't read text from (let the user try anyway).
-    $obj = [PSCustomObject]@{ ok = $false; error = 'no_pattern'; processId = $pid_; processName = $pname; elementName = $elName; elementType = $elType }
+    $obj = [PSCustomObject]@{ ok = $false; error = 'no_pattern'; processId = $pid_; processName = $pname }
     return ($obj | ConvertTo-Json -Compress -Depth 3)
   } catch {
     $msg = $_.Exception.Message -replace '[\\r\\n]+',' '
@@ -4671,98 +4608,6 @@ async function captureScreenForVision() {
 // Humanized multi-line typer — char-by-char with the same realism layer
 // the single-region path uses. No SID here: SID is an append-model
 // integrity check; multi-op edits are discrete bounded regions.
-// ── The line break between two typed lines ──
-//
-// Shared by BOTH typing paths. They were separate copies once and the
-// multi-op copy lost a guard the legacy one still had; the divergence is
-// what produced the failures in .autotype-plans.jsonl.
-//
-// Sequence, and why each step is there:
-//   1. Shift+End  — selects whatever the editor parked AFTER the caret.
-//      When the line we just typed ends with `{`, `(` or `[`, Monaco /
-//      CodeMirror auto-closed it, so a matching closer is sitting there.
-//      If we press Enter with it in place, the editor pushes that closer
-//      onto its own line below and the code's OWN closer, typed later,
-//      becomes a duplicate — one surplus `}` per block, so nothing
-//      compiles. Selecting it here means Enter consumes it. When there is
-//      no auto-closer the selection is empty and this is a no-op.
-//   2. Enter      — deletes that selection, then splits the line.
-//   3. Home + Shift+End — selects whatever indentation the editor
-//      auto-inserted on the new line.
-//
-// The caller then types the next line; its FIRST character replaces the
-// selection, so the code's own leading whitespace stands alone instead of
-// compounding with the editor's.
-//
-// NOTHING IS EVER DELETED HERE. The old code ended step 3 with a Delete,
-// which is correct only when the editor actually auto-indented. When it
-// did not — every column-0 line, every blank line — the selection was
-// empty and Delete became a FORWARD delete that merged the next document
-// line onto this one, silently swallowing the platform's driver code
-// (`import osif __name__ == "__main__":`). Typing over the selection is
-// correct in both cases and needs no prediction about the editor.
-async function autoTypeLineBreak(keyboard, Key) {
-  const shiftEnd = async () => {
-    await keyboard.pressKey(Key.LeftShift);
-    await autoTypeNavSleep(5, 14);
-    await autoTypePressWithDwell(keyboard, Key.End);
-    await autoTypeNavSleep(5, 14);
-    await keyboard.releaseKey(Key.LeftShift);
-    await autoTypeNavSleep(14, 32);
-  };
-  await shiftEnd();                                       // 1
-  await autoTypePressWithDwell(keyboard, Key.Enter);      // 2
-  await autoTypeNavSleep(38, 70);
-  await autoTypePressWithDwell(keyboard, Key.Home);       // 3
-  await autoTypeNavSleep(14, 32);
-  await shiftEnd();
-}
-
-// Collapse a selection left live by autoTypeLineBreak. Only matters when
-// the last line typed was empty (nothing replaced the selected indent) —
-// leaving a live selection means the user's next keystroke would wipe it.
-async function autoTypeCollapseSelection(keyboard, Key) {
-  try {
-    await autoTypePressWithDwell(keyboard, Key.End);
-    await autoTypeNavSleep(10, 22);
-  } catch (_) { /* cosmetic only */ }
-}
-
-// Remove anything the editor parked after the caret at the END of a typed
-// block. autoTypeLineBreak consumes an auto-inserted closer only when
-// another line follows; when the LAST line ends with `{` / `(` / `[` — a
-// single-line op replacing a method signature, say — the closer survives.
-// Recorded run 5e0f… ended with `main(String[] args) throws Exception {}`
-// and the whole body typed after the closed brace.
-//
-// A plain Delete cannot be used: with nothing parked, Delete is a forward
-// delete that merges the following line (the defect this whole change
-// removes). Instead select to end of line and type a throwaway character —
-// that REPLACES a non-empty selection and merely inserts when the selection
-// is empty — then Backspace it away. Residue-free in one case, byte
-// identical in the other, with no prediction about the editor.
-//
-// Multi-op path only: there the executor cleared the line before typing, so
-// the only thing that can be after the caret is editor-inserted. The legacy
-// path can legitimately have the user's own text after the cursor
-// (planAutoTypeFromUIA's `cursor_mid_line`), so it just collapses instead.
-async function autoTypeConsumeTrailingResidue(keyboard, Key) {
-  try {
-    await keyboard.pressKey(Key.LeftShift);
-    await autoTypeNavSleep(5, 14);
-    await autoTypePressWithDwell(keyboard, Key.End);
-    await autoTypeNavSleep(5, 14);
-    await keyboard.releaseKey(Key.LeftShift);
-    await autoTypeNavSleep(10, 22);
-    await typeCharHumanly(keyboard, Key, ' ');
-    await autoTypeNavSleep(18, 40);
-    await autoTypePressWithDwell(keyboard, Key.Backspace);
-    await autoTypeNavSleep(10, 22);
-  } catch (e) {
-    console.warn('[auto-type] trailing-residue cleanup failed (non-fatal):', e && e.message);
-  }
-}
-
 async function typeLinesHumanized(lines, ctx) {
   const { keyboard, Key, mouse } = ctx;
   let prevCh = null;
@@ -4859,14 +4704,35 @@ async function typeLinesHumanized(lines, ctx) {
         await autoTypeSleep(Math.round(pause));
       }
 
-      // Line break: consume any auto-inserted closer, split, then leave the
-      // editor's auto-indent SELECTED so the next line types over it.
-      // See autoTypeLineBreak for the full rationale — in particular why
-      // nothing here may Delete.
+      // ── Indent reset — always wipe, then type the full indentation ──
+      // This used to be "P3c": it PREDICTED whether the editor would
+      // auto-indent after `:` / `{` and, on a predicted match, SKIPPED
+      // typing the line's leading whitespace (a stealth tweak to avoid
+      // re-typing literal space runs). That assumed code-IDE auto-indent
+      // behavior. On editors that don't auto-indent that way (plain-text,
+      // rich-text, no-gutter targets) the prediction was wrong and every
+      // line landed at column 0 → broken, non-running code. Non-running
+      // code is a far worse tell than a brief indent flicker, so we no
+      // longer predict. After every Enter we wipe whatever the editor
+      // inserted and type the next line's own indentation from a true
+      // column 0 — deterministic on every editor.
       try {
-        await autoTypeLineBreak(keyboard, Key);
+        await autoTypePressWithDwell(keyboard, Key.Enter);
+        await autoTypeNavSleep(38, 70);
+        // Select the freshly-created (possibly auto-indented) line and
+        // delete it, leaving the caret at a real column 0.
+        await autoTypePressWithDwell(keyboard, Key.Home);
+        await autoTypeNavSleep(14, 32);
+        await keyboard.pressKey(Key.LeftShift);
+        await autoTypeNavSleep(5, 14);
+        await autoTypePressWithDwell(keyboard, Key.End);
+        await autoTypeNavSleep(5, 14);
+        await keyboard.releaseKey(Key.LeftShift);
+        await autoTypeNavSleep(14, 32);
+        await autoTypePressWithDwell(keyboard, Key.Delete);
+        await autoTypeNavSleep(14, 32);
       } catch (kErr) {
-        console.warn('[auto-type] line-break failed:', kErr && kErr.message);
+        console.warn('[auto-type] indent-reset failed:', kErr && kErr.message);
       }
       // Type the next line's full indentation ourselves (no predict-skip).
       skipLeadingChars = 0;
@@ -4874,10 +4740,6 @@ async function typeLinesHumanized(lines, ctx) {
     }
     prevLineTextForBlockCheck = line;
   }
-  // Clear anything the editor parked after the caret (auto-closer from a
-  // final line ending in an opener), which also collapses the selection
-  // autoTypeLineBreak leaves live when the last line was empty.
-  if (!autoTypeAbort) await autoTypeConsumeTrailingResidue(keyboard, Key);
 }
 
 // Move the caret to the start of a 1-indexed DOCUMENT line via an
@@ -4886,344 +4748,9 @@ async function typeLinesHumanized(lines, ctx) {
 // a human navigating. Ctrl+Home briefly scrolls to the top, but it's the
 // only reliable absolute anchor across Monaco / CodeMirror / native
 // inputs, and it's a keystroke humans use constantly.
-// Land the caret at TRUE column 0 of the current line.
-//
-// Monaco / VS Code / CodeMirror implement "smart home": the FIRST Home
-// press goes to the first NON-WHITESPACE character, a second press goes to
-// column 0, and a third toggles back. Measured, not assumed — see
-// server/scripts/probe-home-key.cjs, which types a marker after each
-// variant and reads the file back.
-//
-// The navigators used a single Home, so on an indented line they stopped at
-// the indent instead of column 0. selectLineRangeContent then anchored
-// there, leaving the leading whitespace unselected and undeleted, and the
-// replacement's own indentation was typed on top of it — 16 spaces where 8
-// were intended. Visible in recorded run 5e0f… and reproduced in real
-// VS Code before this fix.
-//
-// Anchoring at End first makes the two presses deterministic: from End the
-// first press lands on smart-home and the second on column 0 — verified for
-// indented, unindented, whitespace-only and empty lines alike.
-async function autoTypeGoToColumnZero(keyboard, Key) {
-  await autoTypePressWithDwell(keyboard, Key.End);
-  await autoTypeNavSleep(8, 18);
-  await autoTypePressWithDwell(keyboard, Key.Home);
-  await autoTypeNavSleep(8, 18);
-  await autoTypePressWithDwell(keyboard, Key.Home);
-  await autoTypeNavSleep(10, 24);
-}
-
-// ── Arrow runs: tap for a hop, key-repeat for a distance ──
-//
-// Moving N lines used to be N deliberate taps: ~85ms dwell + ~130ms gap,
-// so ~215ms per line. Reaching line 30 took over six seconds of the caret
-// stepping down one row at a time, and the justification — "counted arrows
-// are indistinguishable from a human navigating" — is only true for SHORT
-// hops. Nobody presses Down twenty-nine times. They HOLD the key.
-//
-// What holding a key actually produces is a typematic delay (~250ms on
-// Windows by default) followed by a fast even repeat (~31ms). So for
-// anything past a few lines we keep the presses COUNTED — the count is
-// what makes navigation deterministic, and we are not giving that up — but
-// send them at repeat cadence instead of tap cadence. Same landing line,
-// a fraction of the time, and on screen it reads as someone holding the
-// key rather than jabbing it.
-//
-// Dwell is deliberately short in the repeat phase: an auto-repeated key
-// emits events with near-zero dwell, so that IS the faithful signature.
-async function autoTypeArrowRun(keyboard, key, count) {
-  if (!(count > 0)) return;
-  // The first press is always a real, deliberate keystroke.
-  await autoTypePressWithDwell(keyboard, key);
-  if (count === 1) return;
-
-  if (count <= 3) {
-    // A short hop — people tap these out rather than hold.
-    for (let i = 1; i < count; i++) {
-      if (autoTypeAbort) return;
-      await autoTypeHumanNavSleep();
-      await autoTypePressWithDwell(keyboard, key);
-    }
-    await autoTypeNavSleep(40, 90);
-    return;
-  }
-
-  // Longer move: typematic delay, then the repeat burst.
-  await autoTypeSleep(190 + Math.random() * 130);
-  for (let i = 1; i < count; i++) {
-    if (autoTypeAbort) return;
-    await keyboard.pressKey(key);
-    await autoTypeSleep(7 + Math.random() * 7);
-    await keyboard.releaseKey(key);
-    await autoTypeSleep(19 + Math.random() * 15);
-  }
-  // The beat after letting go, before doing anything with the caret.
-  await autoTypeSleep(130 + Math.random() * 200);
-}
-
-// Furthest we'll walk with arrow keys rather than re-anchoring. About a
-// screen and a half — the distance a person actually covers by holding an
-// arrow key. Past that they'd scroll or jump, and so do we.
-const RELATIVE_NAV_MAX_LINES = 40;
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  JUMPING, INSTEAD OF WALKING
-//
-//  Reaching line 30 used to mean Ctrl+Home followed by twenty-nine Down
-//  presses — the caret visibly crawling from the top of the file, and
-//  the cost growing with the line number (measured in real VS Code:
-//  3.2s to line 30, and it scales linearly from there).
-//
-//  Every editor worth typing into has go-to-line on Ctrl+G, and it is
-//  constant-time and exact. The reason it was not already used is the
-//  real risk: if the chord is unbound, or a browser claims it for "find
-//  again", then the digits we type next go somewhere we did not intend.
-//
-//  So we do not assume. We press the chord and ASK WHAT OPENED. The
-//  prompt names itself — VS Code's reads "Type a line number to go to
-//  (from 1 to 41)" — and only when we recognise it do we type anything.
-//  Anything else gets Escape and the old walk, unchanged.
-//
-//  Two honest limitations, both chosen deliberately:
-//   • The match is on English prompt text. A localised editor falls back
-//     to walking — slower, never wrong. Recognising the widget by shape
-//     alone cannot distinguish go-to-line from a find bar, and guessing
-//     wrong is the one outcome that must not happen.
-//   • It works in DOCUMENT line numbers, which is exactly what the
-//     absolute navigator it replaces already used. It is deliberately
-//     NOT used on the relative/UIA path, where line numbers mean
-//     something different (see navigateToUiaLine).
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-// A prompt ASKING for a line number, in the editors that ship one.
-//
-// Two things this deliberately does NOT match, both found by testing it
-// against real focused-element names rather than imagined ones:
-//   • a bare "line number" — an editor's own accessible name can say
-//     "editor, line numbers enabled"
-//   • "gotoline" run together — that is an identifier, not a sentence,
-//     and a file named goto_line.py would otherwise be read as a prompt
-// Either mistake means typing digits straight into the candidate's code,
-// so the wording has to be prompt-shaped: words, with a space.
-const GOTO_LINE_PROMPT = /(type a line number|\bgo\s?to\s+line\b)/i;
-// "(from 1 to 41)" — the document's real length, free, straight from the
-// widget. Worth having: it is the only cheap ground truth we get about a
-// document UIA will not show us.
-const GOTO_LINE_RANGE = /from\s+\d+\s+to\s+(\d+)/i;
-
-// Below this, walking from the top is quicker than opening a prompt —
-// see the note at the call site in navigateToDocLine.
-const GOTO_LINE_WORTH_IT = 13;
-
-// Editors that have already told us they do not do this. Re-probing a
-// chord that opened someone's find bar once per navigation would be a
-// small horror; one refusal is enough.
-const _gotoLineUnsupported = new Set();
-
-async function autoTypeJumpToLine(target, ctx) {
-  const { keyboard, Key, processName } = ctx;
-  const who = String(processName || 'unknown').toLowerCase();
-  if (_gotoLineUnsupported.has(who)) return false;
-
-  // What was focused BEFORE the chord. A prompt opening means focus moves
-  // to it; if focus never moved, nothing opened, whatever the name says.
-  // Locale-independent, and it costs one read on a bridge that answers in
-  // ~3ms.
-  let beforeName = null;
-  try {
-    const b = await readFocusedViaUIA(700);
-    beforeName = b ? String(b.elementName ?? '') : null;
-  } catch (_) { beforeName = null; }
-
-  await keyboard.pressKey(Key.LeftControl);
-  await autoTypeNavSleep(5, 14);
-  await autoTypePressWithDwell(keyboard, Key.G);
-  await autoTypeNavSleep(5, 14);
-  await keyboard.releaseKey(Key.LeftControl);
-  // The widget has to render before it can be read.
-  await autoTypeSleep(260 + Math.random() * 140);
-
-  // Read twice if the first look finds nothing new. A single slow frame
-  // would otherwise be read as "this editor has no go-to-line" and, worse,
-  // remembered — disabling the jump for the rest of the session over one
-  // missed render. The second look costs ~3ms on a live bridge.
-  let name = '';
-  let focusMoved = false;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let probe = null;
-    try { probe = await readFocusedViaUIA(900); } catch (_) { probe = null; }
-    name = String(probe?.elementName || '');
-    focusMoved = beforeName === null || name !== beforeName;
-    if (focusMoved && GOTO_LINE_PROMPT.test(name)) break;
-    if (attempt === 0) await autoTypeSleep(180 + Math.random() * 120);
-  }
-
-  if (!focusMoved || !GOTO_LINE_PROMPT.test(name)) {
-    // Not a line prompt. Could be a find bar, could be nothing at all.
-    // Escape restores whatever was there; the caret has not moved and the
-    // document has not been touched.
-    await autoTypePressWithDwell(keyboard, Key.Escape);
-    await autoTypeNavSleep(40, 90);
-    _gotoLineUnsupported.add(who);
-    console.log(`[auto-type] nav: "${processName}" has no go-to-line on Ctrl+G (focused element was "${name.slice(0, 60)}") — walking instead, and not asking again this session`);
-    return false;
-  }
-
-  const maxLine = Number((GOTO_LINE_RANGE.exec(name) || [])[1]) || 0;
-  if (maxLine && target > maxLine) {
-    // The plan is aiming past the end of the file. Typing it would land
-    // on the last line, silently, and the edit would go to the wrong
-    // place. Better to bail out to the walk, which at least fails the
-    // same way it always has.
-    await autoTypePressWithDwell(keyboard, Key.Escape);
-    await autoTypeNavSleep(40, 90);
-    console.warn(`[auto-type] nav: target L${target} is past the end of the document (${maxLine} lines) — declining the jump`);
-    return false;
-  }
-
-  // Typed at human speed: this is a real prompt someone is filling in.
-  for (const ch of String(target)) {
-    if (autoTypeAbort) { await autoTypePressWithDwell(keyboard, Key.Escape); return false; }
-    await typeCharHumanly(keyboard, Key, ch);
-    await autoTypeSleep(70 + Math.random() * 90);
-  }
-  await autoTypeSleep(120 + Math.random() * 160);
-  await autoTypePressWithDwell(keyboard, Key.Enter);
-  await autoTypeSleep(180 + Math.random() * 160);
-  console.log(`[auto-type] nav: jumped straight to L${target}${maxLine ? ` (document has ${maxLine} lines)` : ''}`);
-  return true;
-}
-
-// ── Why the caret's CURRENT line is not used as the anchor ──
-//
-// The obvious alternative to jumping is "read where the caret already is
-// and walk the short distance". It was written, and then removed, because
-// the two numbers are not in the same coordinate system:
-//
-//   • the planner emits DOCUMENT lines, read off the editor's gutter in
-//     the screenshot (autoTypeVisionAgent.js: "1-indexed DOCUMENT line
-//     number, read from the editor gutter")
-//   • a caret line derived from UIA text is a UIA line, and on browser
-//     editors UIA starts at the first EDITABLE line — below the locked
-//     template rows the gutter is still counting
-//
-// Subtracting one from the other yields a delta that is silently wrong by
-// however many template lines the page has, and the failure is the worst
-// kind: it navigates confidently to the wrong place and deletes correct
-// code. (That is the EvenStream/OddStream incident the orphaned
-// navigateToUiaLine below was written for — against an older planner
-// contract that did count in UIA lines. It no longer does.)
-//
-// Ctrl+G takes a DOCUMENT line, which is exactly what the planner gives
-// us, so the jump needs no translation and cannot drift.
-
-// Move to a document line the way someone already working in the file
-// would: from where the caret is.
-//
-// `fromLine` is our own accounting — exact, free, and in the same
-// DOCUMENT coordinates as the target, because both come from the plan.
-// It is known for every op after the first, and null on the first, where
-// it used to mean "reset to the top and count down": twenty-nine visible
-// Down presses to reach line 30, on every run, before a character was
-// typed. That first hop now jumps instead (navigateToDocLine).
-//
-// Short hops still walk. Below about half a screen the arrows are already
-// faster than opening a prompt, and stepping a few rows is what someone
-// working in the file actually does.
-async function autoTypeGoToLine(targetLine, fromLine, ctx) {
-  const { keyboard, Key } = ctx;
-  const target = Math.max(1, targetLine | 0);
-  if (Number.isInteger(fromLine) && fromLine >= 1) {
-    const delta = target - fromLine;
-    if (delta === 0) {
-      await autoTypeGoToColumnZero(keyboard, Key);
-      return;
-    }
-    if (Math.abs(delta) <= RELATIVE_NAV_MAX_LINES) {
-      await autoTypeArrowRun(keyboard, delta > 0 ? Key.Down : Key.Up, Math.abs(delta));
-      await autoTypeGoToColumnZero(keyboard, Key);
-      console.log(`[auto-type] nav: walked ${delta > 0 ? 'down' : 'up'} ${Math.abs(delta)} line(s) from L${fromLine} to L${target} (no viewport reset)`);
-      return;
-    }
-  }
-  await navigateToDocLine(target, ctx);
-}
-
-// The beat between arriving somewhere and starting to edit. Long enough to
-// read a few lines; log-normal so it varies the way attention does.
-async function autoTypeReadRegionPause() {
-  const d = Math.min(autoTypeLogNormal(900, 0.45), 4200);
-  await autoTypeSleep(Math.round(d));
-}
-
-// ── Review pass ──
-// An experienced engineer does not stop the instant the last character
-// lands. They go back over what they changed — especially when the fix
-// spanned separate places in the file — re-read each one, and only then
-// settle. This walks back up through the edited regions, pauses on each,
-// and returns to where the work ended.
-//
-// Navigation ONLY. It presses nothing that can modify the document, so it
-// cannot damage a run that has already succeeded. Skipped for single-region
-// edits, where there is nothing to go back and forth between.
-async function autoTypeReviewPass(regions, endLine, ctx) {
-  const { keyboard, Key } = ctx;
-  try {
-    // Earliest regions first when walking back up, and cap the tour so a
-    // 12-op plan doesn't turn into a sightseeing trip.
-    const stops = regions
-      .map(r => r.line)
-      .filter(n => Number.isInteger(n) && n >= 1)
-      .sort((a, b) => a - b)
-      .slice(0, 3);
-    if (stops.length < 2) return false;
-
-    // A pause before moving — the "am I done?" beat.
-    await autoTypeSleep(500 + Math.random() * 900);
-
-    let at = Number.isInteger(endLine) ? endLine : null;
-    for (let i = stops.length - 1; i >= 0; i--) {
-      if (autoTypeAbort) return false;
-      await autoTypeGoToLine(stops[i], at, ctx);
-      at = stops[i];
-      // Re-reading a region you just wrote is quicker than reading one you
-      // haven't seen — you're checking, not comprehending.
-      await autoTypeSleep(Math.round(Math.min(autoTypeLogNormal(650, 0.40), 2600)));
-    }
-    // Settle back where the work finished, so the caret is left somewhere
-    // the candidate would expect it.
-    if (Number.isInteger(endLine) && !autoTypeAbort) {
-      await autoTypeGoToLine(endLine, at, ctx);
-      await autoTypePressWithDwell(keyboard, Key.End);
-      await autoTypeNavSleep(10, 24);
-    }
-    console.log(`[auto-type] review pass: revisited ${stops.length} edited region(s), settled back at L${endLine}`);
-    return true;
-  } catch (e) {
-    console.warn('[auto-type] review pass failed (non-fatal):', e && e.message);
-    return false;
-  }
-}
-
 async function navigateToDocLine(lineNum, ctx) {
   const { keyboard, Key } = ctx;
   const target = Math.max(1, lineNum | 0);
-
-  // Ask for the line directly first — constant-time and exact where the
-  // editor offers it, and it declines safely where it does not.
-  //
-  // Not for shallow targets, though. The jump costs a fixed ~1.2s (chord,
-  // a beat for the widget to render, two digits typed at human speed,
-  // Enter) while walking costs about 40ms per line after a ~340ms start.
-  // Those cross near line 13, so below that the walk is genuinely quicker
-  // AND shorter to watch — a three-line hop is not the crawl anyone was
-  // complaining about. Measured in real VS Code: 3.9s to walk to L47,
-  // against ~1.2s to jump there.
-  if (target >= GOTO_LINE_WORTH_IT && await autoTypeJumpToLine(target, ctx)) {
-    await autoTypeGoToColumnZero(keyboard, Key);
-    return;
-  }
-
   // Ctrl+Home combo — hold Ctrl, press Home WITH DWELL (P1a), release Home,
   // release Ctrl. Real human key dwell of ~85ms instead of the previous
   // 5-14ms — closes the #1 keystroke-biometric fingerprint signal.
@@ -5233,10 +4760,16 @@ async function navigateToDocLine(lineNum, ctx) {
   await autoTypeNavSleep(5, 14);
   await keyboard.releaseKey(Key.LeftControl);
   await autoTypeNavSleep(30, 60);
-  // Counted Downs — deterministic landing line — but at key-repeat cadence
-  // once it's more than a hop. See autoTypeArrowRun.
-  await autoTypeArrowRun(keyboard, Key.Down, target - 1);
-  await autoTypeGoToColumnZero(keyboard, Key);
+  for (let i = 0; i < target - 1; i++) {
+    if (autoTypeAbort) break;
+    // Real dwell on each Down — previous code released the key in ~0ms
+    // which is the cleanest possible bot signature (Aalto study: human
+    // arrow-key dwell is 60-150ms, sampled log-normal).
+    await autoTypePressWithDwell(keyboard, Key.Down);
+    await autoTypeHumanNavSleep();
+  }
+  await autoTypePressWithDwell(keyboard, Key.Home);
+  await autoTypeNavSleep(10, 24);
 }
 
 // ── navigateToUiaLine — the COORDINATE-SAFE navigator ──
@@ -5316,7 +4849,8 @@ async function navigateToUiaLine(targetUiaLine, ctx) {
 
   if (delta === 0) {
     // Already on the right line — just snap to column 0.
-    await autoTypeGoToColumnZero(keyboard, Key);
+    await autoTypePressWithDwell(keyboard, Key.Home);
+    await autoTypeNavSleep(10, 24);
     return;
   }
 
@@ -5328,118 +4862,15 @@ async function navigateToUiaLine(targetUiaLine, ctx) {
     console.warn(`[auto-type] navigateToUiaLine: SUSPICIOUSLY LARGE delta=${delta} — possible planner bug or UIA cursor desync. Attempting anyway.`);
   }
 
-  await autoTypeArrowRun(keyboard, delta > 0 ? Key.Down : Key.Up, Math.abs(delta));
-  await autoTypeGoToColumnZero(keyboard, Key);
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  RE-INDENTING A LINE THAT LANDED WRONG
-//
-//  Runs immediately after a block is typed, while we still know exactly
-//  where that block is. That timing is the whole design:
-//
-//  ── HOW THE COORDINATE TRAP IS AVOIDED ──
-//  The obvious way to fix line N is to look up its line number in the
-//  editor text we just read. That number is a UIA line, and on browser
-//  editors UIA starts at the first EDITABLE line while the gutter is
-//  still counting locked template rows above it — so navigating to it
-//  goes somewhere else and retypes over correct code.
-//
-//  We never compute one. The block we just typed occupies DOCUMENT lines
-//  startLine .. startLine+n-1, straight from the plan, in the same
-//  coordinates autoTypeGoToLine already navigates in. The editor read is
-//  used ONLY to decide WHICH intended line is wrong, matched by content.
-//  Line numbers never cross the boundary between the two systems.
-//
-//  ── WHY WHOLE LINES, NOT THE WHITESPACE ──
-//  Deleting "the first 8 characters because they should be whitespace"
-//  eats code the moment the count is off by one. Selecting the line and
-//  typing the intended one is the same operation a normal replace op
-//  performs, through the same tested primitives, and the result is
-//  correct even if the selection was not what we expected.
-//
-//  ── WHAT IT REFUSES ──
-//  • a non-zero block offset — the whole block sits deeper than written
-//    (valid, the editor placed it), so retyping ONE line at the intended
-//    indent would leave that line out of step with its neighbours
-//  • more than MAX_INDENT_FIXES lines — that many is not a stray line,
-//    it is something systemic, and flailing at it makes things worse
-//  • anything it cannot re-verify afterwards
-//  Every refusal falls through to telling the user, which is what
-//  happened before this existed.
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-const MAX_INDENT_FIXES = 4;
-
-async function autoTypeFixIndentation(lines, startLine, fromLine, ctx) {
-  const { keyboard, Key } = ctx;
-  if (!Array.isArray(lines) || lines.length === 0) return { fixed: 0, caretLine: fromLine };
-
-  let snap = null;
-  try { snap = await readFocusedViaUIA(1200); } catch (_) { snap = null; }
-  if (!snap || !snap.ok || typeof snap.text !== 'string' || snap.text.indexOf('\n') === -1) {
-    return { fixed: 0, caretLine: fromLine, reason: 'no_readable_text' };
-  }
-
-  const intended = lines.join('\n');
-  const result = compareIndentation(intended, snap.text);
-  if (!shouldReportIndent(result)) return { fixed: 0, caretLine: fromLine, reason: 'nothing_to_fix' };
-
-  if (result.offset !== 0) {
-    console.warn(`[auto-type] indent: block sits ${result.offset > 0 ? '+' : ''}${result.offset} from written, and ${result.mismatches.length} line(s) break its shape — not retyping, since fixing one line to the written indent would leave it out of step with the rest.`);
-    return { fixed: 0, caretLine: fromLine, mismatches: result.mismatches, reason: 'block_offset' };
-  }
-
-  // Which of OUR lines are wrong. Matched by content, and only where that
-  // content occurs once in the block — otherwise we cannot say which
-  // occurrence the editor read was talking about.
-  const stripWs = (s) => String(s).replace(/\s+/g, '');
-  const targets = [];
-  for (const m of result.mismatches) {
-    const key = stripWs(m.line);
-    const hits = [];
-    for (let i = 0; i < lines.length; i++) if (stripWs(lines[i]) === key) hits.push(i);
-    if (hits.length === 1) targets.push({ index: hits[0], line: lines[hits[0]] });
-  }
-  if (targets.length === 0) return { fixed: 0, caretLine: fromLine, mismatches: result.mismatches, reason: 'not_locatable' };
-  if (targets.length > MAX_INDENT_FIXES) {
-    console.warn(`[auto-type] indent: ${targets.length} line(s) off-shape — too many to be a stray, not retyping.`);
-    return { fixed: 0, caretLine: fromLine, mismatches: result.mismatches, reason: 'too_many' };
-  }
-
-  targets.sort((a, b) => a.index - b.index);
-  let caret = fromLine;
-  let fixed = 0;
-  for (const t of targets) {
+  const dirKey = delta > 0 ? Key.Down : Key.Up;
+  const steps = Math.abs(delta);
+  for (let i = 0; i < steps; i++) {
     if (autoTypeAbort) break;
-    const docLine = startLine + t.index;               // plan coordinates, start to finish
-    await autoTypeGoToLine(docLine, caret, ctx);
-    // Same select-and-replace a one-line op performs.
-    await selectLineRangeContent(docLine, docLine, ctx);
-    await autoTypeSleep(120 + Math.random() * 180);
-    await autoTypePressWithDwell(keyboard, Key.Delete);
-    await autoTypeNavSleep(18, 38);
-    await typeLinesHumanized([t.line], ctx);
-    caret = docLine;
-    fixed++;
-    console.log(`[auto-type] indent: retyped L${docLine} at the written indent — "${t.line.trim().slice(0, 40)}"`);
+    await autoTypePressWithDwell(keyboard, dirKey);
+    await autoTypeHumanNavSleep();
   }
-
-  // Did it actually take? A fix reported without checking is exactly the
-  // silent-success this whole check exists to remove.
-  let after = null;
-  try { after = await readFocusedViaUIA(1200); } catch (_) { after = null; }
-  const recheck = (after && after.ok && typeof after.text === 'string')
-    ? compareIndentation(intended, after.text)
-    : null;
-  const stillWrong = recheck ? shouldReportIndent(recheck) : true;
-
-  return {
-    fixed,
-    caretLine: caret,
-    verified: !!recheck && !stillWrong,
-    mismatches: stillWrong ? (recheck ? recheck.mismatches : result.mismatches) : [],
-    reason: stillWrong ? (recheck ? 'still_wrong' : 'unverified') : 'fixed',
-  };
+  await autoTypePressWithDwell(keyboard, Key.Home);
+  await autoTypeNavSleep(10, 24);
 }
 
 // Select the CONTENT of document lines [s..e] — from (s,0) through the
@@ -5453,12 +4884,13 @@ async function selectLineRangeContent(s, e, ctx) {
   const span = Math.max(0, (e | 0) - (s | 0));
   await keyboard.pressKey(Key.LeftShift);
   await autoTypeHumanNavSleep();
-  // Shift stays held across the run — that's the natural pattern for range
-  // selection, and holding Shift+Down is exactly what a person does to grab
-  // a block. autoTypeArrowRun only touches the arrow key, so the modifier
-  // is unaffected; it just stops the selection being tapped out one
-  // deliberate row at a time on a 30-line range.
-  await autoTypeArrowRun(keyboard, Key.Down, span);
+  for (let i = 0; i < span; i++) {
+    if (autoTypeAbort) break;
+    // Real dwell per arrow (P1a). Shift stays held throughout the loop —
+    // that's the natural pattern for range selection.
+    await autoTypePressWithDwell(keyboard, Key.Down);
+    await autoTypeHumanNavSleep();
+  }
   await autoTypePressWithDwell(keyboard, Key.End);
   await autoTypeHumanNavSleep();
   await keyboard.releaseKey(Key.LeftShift);
@@ -5569,7 +5001,7 @@ async function executeMultiOpPlan(operations, ctx) {
   }
   if (validated.length === 0) {
     console.warn('[auto-type] multi-op: all ops dropped by validation — nothing to do');
-    return { typed: '', opCount: 0, executionTrace: [{ kind: 'no_ops', reason: 'all_dropped_by_overlap_validation' }] };
+    return { typed: '', opCount: 0 };
   }
   if (validated.length !== (operations || []).length) {
     console.log(`[auto-type] multi-op: ${operations.length - validated.length} op(s) dropped by validation, ${validated.length} will execute`);
@@ -5618,7 +5050,7 @@ async function executeMultiOpPlan(operations, ctx) {
   }
   if (safeOps.length === 0) {
     console.warn('[auto-type] multi-op: all ops refused by structural-line safety filter — nothing safe to do');
-    return { typed: '', opCount: 0, executionTrace: [{ kind: 'no_ops', reason: 'all_refused_by_structural_filter' }] };
+    return { typed: '', opCount: 0 };
   }
   if (safeOps.length !== ops.length) {
     console.log(`[auto-type] multi-op: structural-line filter dropped ${ops.length - safeOps.length} unsafe op(s); ${safeOps.length} will execute`);
@@ -5669,7 +5101,7 @@ async function executeMultiOpPlan(operations, ctx) {
   }
   if (finalOps.length === 0) {
     console.log('[auto-type] multi-op: all ops were no-op rewrites — editor already matches target, nothing to type');
-    return { typed: '', opCount: 0, executionTrace: [{ kind: 'no_ops', reason: 'all_no_op_rewrites' }] };
+    return { typed: '', opCount: 0 };
   }
 
   // ── Guard C: content-loss safety refusal (Stage 1) ──
@@ -5706,7 +5138,7 @@ async function executeMultiOpPlan(operations, ctx) {
       console.error(`[auto-type] multi-op: CONTENT-LOSS GUARD tripped — destructive ops would net-remove ${netRemoved}/${totalNonWs} non-whitespace chars (${Math.round(100 * netRemoved / totalNonWs)}% of the editor) without reproducing them. Refusing ${destructive.length} destructive op(s) to avoid wiping required code.`);
       const insertsOnly = finalOps.filter(o => o.op === 'insert');
       if (insertsOnly.length === 0) {
-        return { typed: '', opCount: 0, refused: 'content_loss_guard', executionTrace: [{ kind: 'refused', reason: 'content_loss_guard' }] };
+        return { typed: '', opCount: 0, refused: 'content_loss_guard' };
       }
       finalOps.length = 0;
       finalOps.push(...insertsOnly);
@@ -5715,83 +5147,10 @@ async function executeMultiOpPlan(operations, ctx) {
     console.log('[auto-type] multi-op: content-loss guard skipped — UIA not reliable for measurement (browser-hosted, flat/truncated, or partial coverage). Trusting the vision plan.');
   }
 
-  // Per-op execution trace. autoTypePlanLog documents this field in its
-  // reader contract but nothing ever wrote it, so a failed run recorded a
-  // before and an after with no record of WHICH op broke. Cheap to build,
-  // and it is the difference between diagnosing a bad run in one read and
-  // guessing at it.
-  const executionTrace = [];
-  if (validated.length !== (operations || []).length) {
-    executionTrace.push({ kind: 'dropped_overlapping', count: (operations || []).length - validated.length });
-  }
-  if (safeOps.length !== ops.length) {
-    executionTrace.push({ kind: 'dropped_structural', count: ops.length - safeOps.length });
-  }
-  if (noOpSkipped > 0) executionTrace.push({ kind: 'skipped_no_op_rewrite', count: noOpSkipped });
-
-  // ── Execution order: READING ORDER, with exact line-shift accounting ──
-  //
-  // This used to run strictly bottom-to-top. That is the easy way to keep
-  // line numbers valid — edit the lowest region first and nothing above it
-  // moves — but on a screen share it is a tell: given two broken blocks,
-  // the engine fixed the SECOND one first, and it re-anchored with
-  // Ctrl+Home before every op, snapping the viewport back to the top of
-  // the file each time.
-  //
-  // A person fixes the first problem they read, then works downward. That
-  // ordering is available as long as we account for how many lines each
-  // edit adds or removes, and shift every later anchor by the running
-  // total. The arithmetic is exact, not estimated:
-  //     replace [s..e] with T lines -> T - (e - s + 1)
-  //     delete  [s..e]              -> -(e - s + 1)
-  //     insert  after s, T lines    -> +T
-  //
-  // The plan-level checks above (structural filter, no-op detection,
-  // content-loss guard) all compare ORIGINAL line numbers against the
-  // pre-run UIA snapshot and complete before any keystroke, so they are
-  // unaffected by execution order.
-  const orderedOps = finalOps.slice().sort((a, b) => a.start_line - b.start_line);
-  let lineShift = 0;
-  // Line the caret sits on, tracked so we can walk to the next region from
-  // where we already are instead of resetting to the top of the document.
-  // null = unknown, which forces the absolute navigator.
-  let caretLine = null;
-  const editedRegions = [];
-  // Indentation repaired inline, and anything left over — reported at the
-  // end so the user hears about it once, not once per op.
-  let indentRepairs = 0;
-  const indentUnfixed = [];
-
-  // Called by EVERY path that types a block, with that block's first
-  // DOCUMENT line. Three paths type code — insert, whole-document replace,
-  // and ordinary replace — and each knows exactly where its block landed:
-  //   insert          → s + 1   (Enter created the line below s)
-  //   whole-doc Ctrl+A→ 1       (the document is the block)
-  //   replace         → s
-  // That number is the only coordinate involved, and it comes from the
-  // plan, never from reading the editor. See autoTypeFixIndentation.
-  const fixIndentation = async (lines, blockStartLine) => {
-    if (autoTypeAbort) return;
-    try {
-      const ind = await autoTypeFixIndentation(lines, blockStartLine, caretLine, ctx);
-      if (ind.fixed > 0) {
-        caretLine = ind.caretLine;
-        indentRepairs += ind.fixed;
-        executionTrace.push({ opIndex: done, kind: 'indent_fix', lines: ind.fixed, verified: !!ind.verified });
-      }
-      // Whatever is still wrong after the attempt — or was refused — is
-      // what the user gets told about at the end.
-      if (ind.mismatches && ind.mismatches.length) indentUnfixed.push(...ind.mismatches);
-    } catch (indErr) {
-      console.warn('[auto-type] indent fix threw (non-fatal):', indErr && indErr.message);
-    }
-  };
-
   let typedAll = '';
   let done = 0;
-  for (const op of orderedOps) {
+  for (const op of finalOps) {
     if (autoTypeAbort) break;
-    const opStartMs = Date.now();
 
     // ── Per-op focus re-check ──
     // A multi-op run can span many seconds. The handler's preflight ran
@@ -5810,23 +5169,18 @@ async function executeMultiOpPlan(operations, ctx) {
       break;
     }
 
-    // Anchors shift by everything already applied above this region.
-    const s = Math.max(1, (op.start_line | 0) + lineShift);
-    const e = Math.max(s, (op.end_line | 0) + lineShift);
-    const origSpan = Math.max(1, (op.end_line | 0) - (op.start_line | 0) + 1);
+    const s = Math.max(1, op.start_line | 0);
+    const e = Math.max(s, op.end_line | 0);
 
     if (op.op === 'insert') {
-      await autoTypeGoToLine(s, caretLine, ctx);
-      await autoTypeReadRegionPause();
+      await navigateToDocLine(s, ctx);
       // P1a: dwell on each key in the insert sequence.
       await autoTypePressWithDwell(keyboard, Key.End);
       await autoTypeNavSleep(10, 24);
       await autoTypePressWithDwell(keyboard, Key.Enter);
       await autoTypeNavSleep(38, 70);
-      // SELECT the auto-indent the editor inserted — the op text carries
-      // its own indentation, so the first typed character replaces this.
-      // Deleting it instead would forward-delete the following line
-      // whenever the editor did not auto-indent (see autoTypeLineBreak).
+      // Wipe any auto-indent the editor inserted — the op text carries
+      // its own indentation.
       await autoTypePressWithDwell(keyboard, Key.Home);
       await autoTypeNavSleep(10, 22);
       await keyboard.pressKey(Key.LeftShift);
@@ -5835,17 +5189,13 @@ async function executeMultiOpPlan(operations, ctx) {
       await autoTypeNavSleep(4, 10);
       await keyboard.releaseKey(Key.LeftShift);
       await autoTypeNavSleep(10, 22);
+      await autoTypePressWithDwell(keyboard, Key.Delete);
+      await autoTypeNavSleep(14, 30);
       const lines = String(op.text || '').split('\n');
       await typeLinesHumanized(lines, ctx);
       typedAll += lines.join('\n') + '\n';
       done++;
-      // Enter created line s+1; the T typed lines occupy s+1 .. s+T.
-      caretLine = s + lines.length;
-      await fixIndentation(lines, s + 1);
-      lineShift += lines.length;
-      editedRegions.push({ line: s + 1, label: `insert after L${op.start_line}` });
-      executionTrace.push({ opIndex: done, kind: 'insert', startLine: s, endLine: s, lines: lines.length, charsTyped: lines.join('\n').length, lineDelta: lines.length, durationMs: Date.now() - opStartMs });
-      console.log(`[auto-type] multi-op ${done}/${orderedOps.length}: insert after L${s} (${lines.length} line(s), shift now ${lineShift >= 0 ? '+' : ''}${lineShift}) — ${op.reason || ''}`);
+      console.log(`[auto-type] multi-op ${done}/${ops.length}: insert after L${s} (${lines.length} line(s)) — ${op.reason || ''}`);
       continue;
     }
 
@@ -5891,25 +5241,11 @@ async function executeMultiOpPlan(operations, ctx) {
       await typeLinesHumanized(lines, ctx);
       typedAll += lines.join('\n') + '\n';
       done++;
-      caretLine = lines.length;
-      // Ctrl+A wiped the document, so the block IS the document — it
-      // starts at line 1.
-      await fixIndentation(lines, 1);
-      lineShift += lines.length - origSpan;
-      editedRegions.push({ line: 1, label: 'whole-document replace' });
-      executionTrace.push({ opIndex: done, kind: 'replace_ctrl_a', startLine: 1, endLine: e, lines: lines.length, charsTyped: lines.join('\n').length, durationMs: Date.now() - opStartMs });
       continue;
     }
 
     // replace / delete — both select the content of [s..e] first.
-    // Walk from wherever the caret already is; fall back to the absolute
-    // Ctrl+Home anchor only when that distance is unknown or too far to be
-    // a plausible keyboard move.
-    await autoTypeGoToLine(s, caretLine, ctx);
-    // Arriving at a region: read it before touching it. A person looks at
-    // broken code, then edits. Selecting the instant the caret lands is the
-    // most mechanical-looking beat in a multi-block run.
-    await autoTypeReadRegionPause();
+    await navigateToDocLine(s, ctx);
     await selectLineRangeContent(s, e, ctx);
     // Glance pause — a human looks at what they've highlighted before
     // hitting Delete. Selecting then instantly deleting is a robot tell.
@@ -5925,12 +5261,7 @@ async function executeMultiOpPlan(operations, ctx) {
       await autoTypePressWithDwell(keyboard, Key.Delete);
       await autoTypeNavSleep(14, 30);
       done++;
-      // The region is gone; following content rose into line s.
-      caretLine = s;
-      lineShift -= origSpan;
-      editedRegions.push({ line: s, label: `delete L${op.start_line}-${op.end_line}` });
-      executionTrace.push({ opIndex: done, kind: 'delete', startLine: s, endLine: e, charsTyped: 0, lineDelta: -origSpan, durationMs: Date.now() - opStartMs });
-      console.log(`[auto-type] multi-op ${done}/${orderedOps.length}: delete L${s}-${e} (shift now ${lineShift >= 0 ? '+' : ''}${lineShift}) — ${op.reason || ''}`);
+      console.log(`[auto-type] multi-op ${done}/${ops.length}: delete L${s}-${e} — ${op.reason || ''}`);
     } else {
       // replace — caret at (s,0), content of s..e gone, the newline
       // before old line e+1 preserved. Type the replacement; line e+1
@@ -5939,26 +5270,10 @@ async function executeMultiOpPlan(operations, ctx) {
       await typeLinesHumanized(lines, ctx);
       typedAll += lines.join('\n') + '\n';
       done++;
-      // The T typed lines occupy s .. s+T-1.
-      caretLine = s + lines.length - 1;
-
-      // Re-indent anything that landed off-shape NOW, while this block's
-      // document lines are still exactly s..s+T-1 and no later op has
-      // shifted them.
-      await fixIndentation(lines, s);
-
-      lineShift += lines.length - origSpan;
-      editedRegions.push({ line: s, label: `replace L${op.start_line}-${op.end_line}` });
-      executionTrace.push({ opIndex: done, kind: 'replace', startLine: s, endLine: e, lines: lines.length, charsTyped: lines.join('\n').length, lineDelta: lines.length - origSpan, durationMs: Date.now() - opStartMs });
-      console.log(`[auto-type] multi-op ${done}/${orderedOps.length}: replace L${s}-${e} with ${lines.length} line(s) (shift now ${lineShift >= 0 ? '+' : ''}${lineShift}) — ${op.reason || ''}`);
+      console.log(`[auto-type] multi-op ${done}/${ops.length}: replace L${s}-${e} with ${lines.length} line(s) — ${op.reason || ''}`);
     }
   }
-  if (autoTypeAbort) executionTrace.push({ kind: 'aborted', afterOps: done, reason: autoTypeAbortReason || 'unknown' });
-  else if (editedRegions.length >= 2) {
-    await autoTypeReviewPass(editedRegions, caretLine, ctx);
-    executionTrace.push({ kind: 'review_pass', regions: editedRegions.length });
-  }
-  return { typed: typedAll, opCount: done, executionTrace, indentRepairs, indentUnfixed };
+  return { typed: typedAll, opCount: done };
 }
 
 function planAutoTypeFromUIA(params) {
@@ -6385,22 +5700,6 @@ async function autoTypeSurgicalBracketRepair(intendedCode, language, ctx) {
       return { ok: false, reason: 'uia_unavailable' };
     }
 
-    // ── Reliability gate ──
-    // Bracket balance is only meaningful over the WHOLE document. Browser-
-    // hosted Monaco / CodeMirror expose just the scrolled-visible slice via
-    // UIA, and an arbitrary slice of code virtually always looks unbalanced.
-    // Repairing against that would INSERT or DELETE braces in a file that
-    // was fine — active damage, not a fix. Same gate the coverage check
-    // uses. (A clipboard read would lift this restriction; it is the right
-    // follow-up, but it must not be guessed at from a partial read.)
-    const brProcName = String(after.processName || '');
-    if (/(^|\b)(chrome|msedge|edge|firefox|brave|opera|vivaldi|arc)(\b|$)/i.test(brProcName)) {
-      return { ok: false, reason: 'browser_hosted_uia_truncated' };
-    }
-    if (isUiaPlaceholderText(after.text)) {
-      return { ok: false, reason: 'uia_placeholder' };
-    }
-
     const intendedBal = bracketTracker.balance(intendedCode, language);
     const actualBal = bracketTracker.balance(after.text, language);
 
@@ -6654,22 +5953,6 @@ ipcMain.handle('db:get-active-session', (_event, userId) => {
 
 ipcMain.handle('db:list-sessions', (_event, userId) => {
   return database.listSessionsForUser(userId);
-});
-
-// Conversations the phone wrote while this machine was off. The renderer
-// fetches them (it holds the auth token); the main process owns the
-// database, so the write happens here.
-ipcMain.handle('db:known-session-ids', (_event, ids, userId) => {
-  return database.knownSessionIds(ids, userId);
-});
-
-ipcMain.handle('db:import-remote-session', (_event, payload) => {
-  const result = database.importRemoteSession(payload || {});
-  // Only wake the sidebar when something actually landed — this runs on
-  // a timer, and a broadcast per tick would re-render the session list
-  // forever for no reason.
-  if (result.ok && result.added > 0) broadcastToAllWindows('db:sessions-updated');
-  return result;
 });
 
 ipcMain.handle('db:new-session', (_event, name, userId) => {

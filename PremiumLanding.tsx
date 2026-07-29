@@ -1,5 +1,4 @@
 import React, { useEffect, useRef, useState } from 'react';
-import MinicaMark from './MinicaMark';
 import { pricingService, PricingTier, RegionPricing } from './services/pricingService';
 import { UltraMark } from './UltraMark';
 import { BasicMark, ProMark, MaxMark } from './TierMarks';
@@ -98,18 +97,6 @@ const CSS = `
   --line:rgba(255,255,255,.07);
   --gold-1:#f6e4b0; --gold-2:#d9b874; --gold-3:#b58f45; --gold:#d3ac63;
   --gold-line:rgba(211,172,99,.24); --gold-glow:rgba(211,172,99,.16);
-  /* ── Amethyst: the SECOND voice ──────────────────────────────────
-     The page is gold on obsidian, so a second colour has to earn its
-     place by MEANING something, or it is just a stray accent. It means
-     one thing here and never anything else:
-         gold   = the full answer — considered, arrives when it is ready
-         violet = the covering line — half a second, yours to speak NOW
-     Given the same token shape as gold (1/2/3 + line + glow) on purpose:
-     a sibling of the system reads as designed, a one-off hex reads as a
-     mistake. Blue-violet rather than magenta so it separates cleanly
-     from gold's warmth at small sizes and on a near-black ground. */
-  --pv-1:#d7c2ff; --pv-2:#a271ff; --pv-3:#6c3fd6; --pv:#b48dff;
-  --pv-line:rgba(162,113,255,.32); --pv-glow:rgba(162,113,255,.22);
   position:fixed; inset:0; overflow-y:auto; overflow-x:hidden;
   background:var(--ink); color:var(--paper);
   font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -391,41 +378,8 @@ const CSS = `
 .pl-moment{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:56px;align-items:center;padding:56px 0;}
 .pl-step-row{display:grid;grid-template-columns:auto 1fr auto;gap:clamp(20px,4vw,60px);align-items:center;padding-bottom:30px;}
 .pl-step-copy{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:20px;align-items:baseline;}
-/* ── Pricing surfaces, brought to the same material as the Answer
-   Theater and the hero card ──
-   These were the flattest cards on the page: one faint gradient and a
-   neutral hairline, sitting directly beside the most considered surfaces
-   we have. Same recipe as .pl-at — a radial light falling from above the
-   card, a 1px inner highlight along the top edge so it reads as a bevel,
-   and a deep contact shadow so the card sits ON the page instead of
-   being painted onto it. */
-.pl-price{position:relative;
-  background:
-    linear-gradient(165deg,rgba(255,255,255,.04) 0%,transparent 34%),
-    linear-gradient(180deg,#100e0a 0%,#0b0a08 55%,#080706 100%);
-  border:1px solid var(--line);border-radius:18px;
-  box-shadow:0 1px 0 rgba(246,228,176,.05) inset,0 -1px 0 rgba(0,0,0,.4) inset,
-             0 30px 60px -42px rgba(0,0,0,.9);
-  transition:border-color .35s,transform .4s cubic-bezier(.2,.9,.3,1),box-shadow .4s;}
-.pl-price::before,.pl-price-pop::before{content:'';position:absolute;inset:0;border-radius:inherit;
-  pointer-events:none;
-  background:radial-gradient(125% 78% at 50% -14%,rgba(211,172,99,.075),transparent 62%);}
-/* The featured plan is the only card that catches a moving light. Five
-   sweeping cards would be a fairground; one is a spotlight.
-   The sweep travels as a BACKGROUND POSITION on the inset:0 ::before, not
-   as a moving child — a moving child would need overflow:hidden to stay
-   inside the rounded corners, and that would clip the "Most chosen" badge,
-   which is deliberately positioned at top:-9 outside the card box. */
-.pl-price-pop{position:relative;}
-.pl-price-pop::before{
-  background:
-    linear-gradient(100deg,transparent 41%,rgba(246,228,176,.07) 50%,transparent 59%),
-    radial-gradient(125% 78% at 50% -14%,rgba(211,172,99,.075),transparent 62%);
-  background-size:300% 100%,100% 100%;
-  background-position:190% 0,0 0;
-  animation:pl-price-sheen 10s ease-in-out infinite;}
-@keyframes pl-price-sheen{0%,60%{background-position:190% 0,0 0;}100%{background-position:-90% 0,0 0;}}
-@media (prefers-reduced-motion:reduce){ .pl-price-pop::before{animation:none;background-position:190% 0,0 0;} }
+.pl-price{background:linear-gradient(180deg,rgba(255,255,255,.022),rgba(255,255,255,0));
+  border:1px solid var(--line);border-radius:18px;transition:border-color .35s,transform .4s cubic-bezier(.2,.9,.3,1),box-shadow .4s;}
 .pl-price:hover{transform:translateY(-4px);border-color:rgba(255,255,255,.14);}
 .pl-price-pop{border:1px solid var(--gold-line);
   background:linear-gradient(180deg, rgba(211,172,99,.08), rgba(211,172,99,.01));
@@ -555,585 +509,13 @@ const CSS = `
   .pl-chip-node:hover{transform:none;}
   .pl-reveal{transition-duration:.55s;}
 }
-/* ═══════════════════════════════════════════════════════════════════
-   ANSWER THEATER — the four seconds after they ask.
-   Auto-Type is the product's differentiator and it had a static three
-   line snippet. This is the same moment played out: the question
-   arriving, the depth being read, the covering line landing while you
-   are still drawing breath, the full answer continuing without a seam,
-   and — on Ultra — the code typing itself into the editor.
-   Everything here is namespaced .pl-at-* and rides CSS/timers, never
-   the React render loop; character streaming writes textContent
-   directly through refs.
-   ═══════════════════════════════════════════════════════════════════ */
-.pl-at{position:relative;border:1px solid var(--gold-line);border-radius:18px;overflow:hidden;
-  background:linear-gradient(180deg,#100e0a,#090807 62%,#070605);
-  box-shadow:0 40px 90px -50px rgba(0,0,0,.9),inset 0 1px 0 rgba(246,228,176,.05);}
-.pl-at::before{content:'';position:absolute;inset:0;pointer-events:none;z-index:4;
-  background:radial-gradient(120% 80% at 50% -10%,rgba(211,172,99,.09),transparent 62%);}
-/* travelling rim light — the stage is lit from somewhere off-frame */
-.pl-at::after{content:'';position:absolute;left:-40%;top:0;width:40%;height:100%;pointer-events:none;z-index:5;
-  background:linear-gradient(100deg,transparent,rgba(246,228,176,.045),transparent);
-  animation:pl-at-sheen 9s ease-in-out infinite;}
-@keyframes pl-at-sheen{0%,62%{left:-45%;}100%{left:115%;}}
-
-.pl-at-head{display:flex;align-items:center;justify-content:space-between;gap:12px;
-  padding:13px 16px;border-bottom:1px solid rgba(255,255,255,.05);position:relative;z-index:6;}
-.pl-at-step{display:inline-flex;align-items:center;gap:9px;font-size:10px;font-weight:700;
-  letter-spacing:.2em;text-transform:uppercase;color:var(--faint);transition:color .5s ease;
-  white-space:nowrap;}
-/* Four full labels do not fit a 354px stage — "TYPING" clipped to "TYPI".
-   Carry a short form and swap it in on narrow screens rather than let the
-   rail wrap or truncate. */
-.pl-at-sm{display:none;}
-.pl-at-step[data-on="1"]{color:var(--gold);}
-.pl-at-pip{width:5px;height:5px;border-radius:50%;background:var(--faint);transition:all .5s ease;}
-.pl-at-step[data-on="1"] .pl-at-pip{background:var(--gold);box-shadow:0 0 10px var(--gold-glow);}
-.pl-at-body{position:relative;z-index:6;padding:18px 18px 20px;min-height:318px;}
-
-/* ── the interviewer's line ── */
-.pl-at-ask{display:flex;gap:12px;align-items:flex-start;}
-.pl-at-wave{display:flex;align-items:flex-end;gap:2px;height:22px;flex-shrink:0;padding-top:2px;}
-.pl-at-wave i{width:2px;border-radius:1px;background:var(--faint);opacity:.5;height:4px;
-  transition:opacity .4s ease;}
-.pl-at[data-beat="0"] .pl-at-wave i{opacity:1;background:var(--gold);
-  animation:pl-at-bar 1s ease-in-out infinite;}
-@keyframes pl-at-bar{0%,100%{height:3px;}50%{height:18px;}}
-.pl-at-qtext{font-size:14.5px;line-height:1.55;color:var(--paper);opacity:.92;}
-
-/* ── depth read ── */
-.pl-at-depth{margin-top:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;
-  opacity:0;transform:translateY(4px);transition:opacity .5s ease,transform .5s ease;}
-.pl-at[data-beat="1"] .pl-at-depth,.pl-at[data-beat="2"] .pl-at-depth,
-.pl-at[data-beat="3"] .pl-at-depth,.pl-at[data-beat="4"] .pl-at-depth{opacity:1;transform:none;}
-.pl-at-meter{position:relative;height:3px;flex:1;min-width:120px;border-radius:2px;
-  background:rgba(255,255,255,.07);overflow:hidden;}
-.pl-at-meter b{position:absolute;inset:0 100% 0 0;border-radius:2px;
-  background:linear-gradient(90deg,var(--gold-3),var(--gold-1));
-  box-shadow:0 0 12px var(--gold-glow);transition:inset 1.1s cubic-bezier(.22,.9,.3,1);}
-.pl-at[data-beat="1"] .pl-at-meter b,.pl-at[data-beat="2"] .pl-at-meter b,
-.pl-at[data-beat="3"] .pl-at-meter b,.pl-at[data-beat="4"] .pl-at-meter b{inset:0 12% 0 0;}
-.pl-at-model{display:inline-flex;align-items:center;gap:7px;font-size:11px;color:var(--gold);
-  border:1px solid var(--gold-line);border-radius:999px;padding:4px 10px;white-space:nowrap;
-  background:rgba(211,172,99,.05);}
-
-/* ── the answer ── */
-.pl-at-answer{margin-top:16px;position:relative;border-radius:12px;padding:14px 15px;
-  background:rgba(0,0,0,.34);border:1px solid rgba(255,255,255,.05);min-height:104px;
-  font-size:14.5px;line-height:1.62;color:#e6e0d3;}
-.pl-at-cover{color:var(--paper);}
-/* the covering line gets a held gold rim the moment it lands */
-.pl-at-answer[data-cover="1"]{border-color:var(--gold-line);
-  box-shadow:0 0 0 1px rgba(211,172,99,.08),0 0 34px -8px var(--gold-glow);}
-.pl-at-rest{color:#cdc6b8;}
-.pl-at-stamp{position:absolute;top:-9px;right:12px;font-size:9px;font-weight:700;letter-spacing:.16em;
-  text-transform:uppercase;padding:3px 9px;border-radius:999px;background:#0b0a08;
-  border:1px solid var(--gold-line);color:var(--gold);opacity:0;transform:translateY(3px);
-  transition:opacity .45s ease,transform .45s ease;}
-.pl-at-answer[data-cover="1"] .pl-at-stamp{opacity:1;transform:none;}
-
-/* ── the editor (Auto-Type) ── */
-.pl-at-ed{margin-top:16px;border-radius:12px;border:1px solid rgba(255,255,255,.06);
-  background:rgba(0,0,0,.42);overflow:hidden;opacity:0;max-height:0;
-  transition:opacity .55s ease,max-height .75s cubic-bezier(.22,.9,.3,1);}
-.pl-at[data-beat="4"] .pl-at-ed{opacity:1;max-height:210px;}
-.pl-at-edhead{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;
-  border-bottom:1px solid rgba(255,255,255,.05);font-size:10px;letter-spacing:.14em;
-  text-transform:uppercase;color:var(--faint);}
-.pl-at-code{display:flex;gap:12px;padding:12px 14px 14px;
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.62;}
-.pl-at-nums{display:flex;flex-direction:column;color:var(--faint);opacity:.5;text-align:right;
-  font-variant-numeric:tabular-nums;user-select:none;}
-.pl-at-src{flex:1;white-space:pre-wrap;color:#d9d3c6;min-height:96px;}
-.pl-at-k{color:#c7a3e8;}
-.pl-at-f{color:var(--gold-1);}
-.pl-at-cur{display:inline-block;width:7px;height:15px;vertical-align:-3px;margin-left:1px;
-  background:var(--gold);box-shadow:0 0 10px var(--gold-glow);animation:pl-at-blink 1.05s steps(1) infinite;}
-@keyframes pl-at-blink{0%,49%{opacity:1;}50%,100%{opacity:0;}}
-
-/* ── caption strip under the stage ── */
-.pl-at-cap{display:flex;gap:10px;align-items:flex-start;padding:0 18px 18px;position:relative;z-index:6;
-  font-size:12.5px;line-height:1.5;color:var(--mut);min-height:38px;}
-.pl-at-cap b{color:var(--gold);font-weight:600;}
-
-/* ═══════════════════════════════════════════════════════════════════
-   THE SEAM  (.pl-seam-*)  — one sentence that changes hands
-   ───────────────────────────────────────────────────────────────────
-   Every model worth asking takes seconds to think, and in a live
-   interview that pause IS the problem. So two answers are sent: a
-   covering line in about half a second that the candidate starts
-   speaking immediately, and the full reasoning underneath, continuing
-   the exact sentence they are already in.
-
-   THE FIRST BUILD PUT THEM IN TWO PLATES WITH A DIVIDER BETWEEN, and
-   that was wrong in the only way that mattered: two boxes say "two
-   answers", and the truth is ONE answer arriving at two speeds. The
-   whole promise is that the sentence is never restarted — so the two
-   halves now live in ONE paragraph, in one container, and the seam is
-   the point inside the running text where the colour changes hands.
-   Nothing separates them, because nothing separates them.
-
-   Violet is a HINT, not a surface. It is the voice of the covering
-   line — the words, the caret, one chip — on the page's own obsidian
-   and gold material. A fully violet plate made the section look like a
-   different product.
-
-   Same discipline as .pl-at-*: CSS and timers only, character streaming
-   writes textContent through refs, so a ~1,600-char sequence costs zero
-   React renders (only the four coarse beats re-render).
-   ═══════════════════════════════════════════════════════════════════ */
-/* ── The card is GLASS, and it is borderless ──────────────────────────
-   No stroke anywhere on it. The edge is made of light: a bright specular
-   line along the top where the material catches the room, a hairline
-   ring at 5.5% white that reads as thickness rather than as a border,
-   and a deep contact shadow so the card sits ABOVE the page instead of
-   being drawn onto it.
-   The fill is a translucent veil, not a colour — everything you see
-   through it is the light field behind (.pl-seam-halo), blurred and
-   saturated. That is why the halo below is two coloured blobs rather
-   than one wash: frosted glass with nothing behind it is just grey. */
-.pl-seam{position:relative;max-width:900px;margin:0 auto;border-radius:28px;overflow:hidden;
-  border:0;
-  /* Two layers, and the ORDER is the whole trick. A specular veil of
-     white on top for the sheen; underneath it a DARK translucent base.
-     Without that base the card is a window — everything behind pours
-     through and it reads as tinted plastic. iOS dark material is mostly
-     dark; the colour behind is a hint that survives the blur, not the
-     subject. */
-  background:
-    linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.014) 52%,rgba(255,255,255,.006)),
-    linear-gradient(180deg,rgba(15,13,20,.60),rgba(9,8,11,.72));
-  -webkit-backdrop-filter:blur(36px) saturate(138%);
-  backdrop-filter:blur(36px) saturate(138%);
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,.18),
-    inset 0 0 0 1px rgba(255,255,255,.055),
-    inset 0 -1px 0 rgba(255,255,255,.035),
-    0 46px 96px -46px rgba(0,0,0,.92),
-    0 0 100px -46px var(--pv-glow);}
-/* Light falls from above in the house colour. It picks up the faintest
-   violet only while the covering line is the one speaking — the hint,
-   and the only place the container itself acknowledges the second voice. */
-.pl-seam::before{content:'';position:absolute;inset:0;pointer-events:none;z-index:4;
-  border-radius:inherit;transition:background 1.2s ease;
-  background:radial-gradient(125% 82% at 50% -12%,rgba(211,172,99,.085),transparent 62%);}
-.pl-seam[data-beat="1"]::before,.pl-seam[data-beat="2"]::before{
-  background:radial-gradient(125% 82% at 50% -12%,rgba(162,113,255,.10),transparent 60%),
-             radial-gradient(125% 82% at 50% -12%,rgba(211,172,99,.05),transparent 62%);}
-/* one slow sheen — the recipe allows exactly one per view */
-.pl-seam::after{content:'';position:absolute;left:-42%;top:0;width:42%;height:100%;
-  pointer-events:none;z-index:5;
-  background:linear-gradient(100deg,transparent,rgba(246,228,176,.045),transparent);
-  animation:pl-at-sheen 10s ease-in-out infinite;}
-
-/* A hairline of LIGHT, not a rule — on glass a dark divider reads as a
-   crack. Fades out at both ends so it never touches the card edge. */
-.pl-seam-head{display:flex;align-items:center;justify-content:space-between;gap:14px;
-  padding:14px 19px;position:relative;z-index:6;}
-.pl-seam-head::after{content:'';position:absolute;left:16px;right:16px;bottom:0;height:1px;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,.10),transparent);}
-.pl-seam-live{display:inline-flex;align-items:center;gap:8px;font-size:10px;font-weight:700;
-  letter-spacing:.2em;text-transform:uppercase;color:var(--faint);white-space:nowrap;}
-.pl-seam-live i{width:5px;height:5px;border-radius:50%;background:var(--pv-2);
-  box-shadow:0 0 10px var(--pv-glow);animation:pl-seam-pulse 2s ease-out infinite;}
-@keyframes pl-seam-pulse{0%{box-shadow:0 0 0 0 rgba(162,113,255,.5);}
-  70%{box-shadow:0 0 0 7px rgba(162,113,255,0);}100%{box-shadow:0 0 0 0 rgba(162,113,255,0);}}
-/* Which question is on stage. Pips, not numerals — the order carries no
-   meaning, so numbering it would be decoration pretending to be
-   structure. */
-.pl-seam-pips{display:inline-flex;gap:6px;}
-.pl-seam-pips b{width:14px;height:2px;border-radius:1px;background:rgba(255,255,255,.11);
-  transition:background .6s ease,box-shadow .6s ease;}
-.pl-seam-pips b[data-on="1"]{background:var(--pv-2);box-shadow:0 0 8px var(--pv-glow);}
-
-/* Fixed height, not min-height: three scenes of different lengths rotate
-   through this box, and a stage that grows and shrinks under the reader
-   is worse than a little slack at the bottom of the shortest one. */
-.pl-seam-body{position:relative;z-index:6;padding:20px 22px 18px;height:294px;}
-
-/* ── the question ── */
-.pl-seam-ask{display:flex;gap:13px;align-items:flex-start;min-height:52px;}
-.pl-seam-wave{display:flex;align-items:flex-end;gap:2px;height:22px;flex-shrink:0;padding-top:3px;}
-.pl-seam-wave i{width:2px;border-radius:1px;background:var(--faint);opacity:.45;height:4px;
-  transition:opacity .4s ease;}
-.pl-seam[data-beat="0"] .pl-seam-wave i{opacity:1;background:var(--pv-2);
-  animation:pl-at-bar 1s ease-in-out infinite;}
-.pl-seam-q{font-size:15px;line-height:1.55;color:var(--paper);opacity:.93;}
-
-/* ── ONE plate. ONE paragraph. Two voices. ────────────────────────── */
-/* Borderless too — a bordered plate inside a borderless glass card
-   fights it. This is a RECESS in the same material: darker fill, an
-   inset shadow along the top where it drops away, and a faint light
-   line along the bottom lip where it comes back up. */
-.pl-seam-say{position:relative;margin-top:16px;border-radius:19px;padding:16px 18px 17px;
-  background:linear-gradient(180deg,rgba(0,0,0,.30),rgba(0,0,0,.20));border:0;
-  box-shadow:inset 0 1px 3px rgba(0,0,0,.45),
-             inset 0 0 0 1px rgba(255,255,255,.035),
-             inset 0 -1px 0 rgba(255,255,255,.05);
-  transition:box-shadow .9s ease,background .9s ease;}
-/* While the covering line is the only thing on screen the recess is lit
-   from within by the violet — glow, not a border. */
-.pl-seam[data-beat="1"] .pl-seam-say,.pl-seam[data-beat="2"] .pl-seam-say{
-  background:linear-gradient(180deg,rgba(52,28,96,.30),rgba(0,0,0,.22));
-  box-shadow:inset 0 1px 3px rgba(0,0,0,.4),
-             inset 0 0 0 1px rgba(196,160,255,.10),
-             inset 0 -1px 0 rgba(215,194,255,.07),
-             0 0 46px -18px var(--pv-glow);}
-/* THE HANDOVER. A single light wipes the plate left to right at the
-   instant the sentence changes hands. It fires once per question and
-   nothing else on the page moves like it — this is where the section
-   spends its boldness. */
-.pl-seam-wipe{position:absolute;inset:0;border-radius:inherit;pointer-events:none;overflow:hidden;}
-.pl-seam-wipe::after{content:'';position:absolute;top:0;bottom:0;left:-38%;width:38%;opacity:0;
-  background:linear-gradient(100deg,transparent,rgba(215,194,255,.16),rgba(246,228,176,.16),transparent);}
-.pl-seam[data-beat="2"] .pl-seam-wipe::after{animation:pl-seam-wipe 1.1s cubic-bezier(.4,0,.2,1) forwards;}
-@keyframes pl-seam-wipe{0%{left:-38%;opacity:0;}10%{opacity:1;}90%{opacity:1;}100%{left:112%;opacity:0;}}
-
-/* Borderless pill, lifted off the recess by its own glass fill. */
-.pl-seam-stamp{position:absolute;top:-10px;left:17px;display:inline-flex;align-items:center;gap:7px;
-  font-size:8.5px;font-weight:700;letter-spacing:.17em;text-transform:uppercase;
-  padding:4px 11px;border-radius:999px;line-height:1.2;white-space:nowrap;border:0;
-  background:linear-gradient(180deg,rgba(133,92,214,.55),rgba(70,44,128,.5));
-  -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.2),0 4px 14px -6px rgba(0,0,0,.8);
-  color:#efe6ff;
-  opacity:0;transform:translateY(3px);transition:opacity .45s ease,transform .45s ease;}
-.pl-seam[data-beat="1"] .pl-seam-stamp,.pl-seam[data-beat="2"] .pl-seam-stamp,
-.pl-seam[data-beat="3"] .pl-seam-stamp{opacity:1;transform:none;}
-
-/* The running text. One block, two colours — the ONLY thing that marks
-   the seam is that the voice changes mid-sentence, which is exactly what
-   happens. */
-/* Holds the height of the settled answer from the first frame. Without
-   it the plate is a thin empty pill at beat 0, the box below it is a
-   void, and the caption floats a hundred pixels adrift — and this
-   section sits near the top of the page, so that frame gets seen. */
-.pl-seam-said{font-size:15px;line-height:1.68;letter-spacing:.002em;min-height:101px;}
-.pl-seam-c{color:#c9b0f6;}
-.pl-seam-f{color:#d6cfc1;}
-/* the stitch — a hairline tick sitting in the text flow at the join */
-.pl-seam-stitch{display:none;width:2px;height:1em;margin:0 7px -2px;border-radius:2px;
-  vertical-align:-2px;
-  background:linear-gradient(180deg,var(--pv-1),var(--gold-1));
-  box-shadow:0 0 12px var(--pv-glow);}
-.pl-seam[data-beat="2"] .pl-seam-stitch,.pl-seam[data-beat="3"] .pl-seam-stitch{
-  display:inline-block;animation:pl-seam-tick .5s ease-out;}
-@keyframes pl-seam-tick{0%{transform:scaleY(0);opacity:0;}60%{transform:scaleY(1.35);opacity:1;}
-  100%{transform:scaleY(1);opacity:1;}}
-/* The caret is the tension: it sits at the end of what you have said and
-   blinks while the reasoning is still coming. */
-.pl-seam-caret{display:none;width:8px;height:17px;vertical-align:-3px;margin-left:2px;
-  background:var(--pv-2);box-shadow:0 0 14px var(--pv-glow);
-  animation:pl-at-blink 1.05s steps(1) infinite;}
-.pl-seam[data-beat="1"] .pl-seam-caret,.pl-seam[data-beat="2"] .pl-seam-caret{display:inline-block;}
-
-/* ── the clock, on its own line under the plate ── */
-.pl-seam-meta{display:flex;align-items:center;gap:10px;margin-top:11px;flex-wrap:wrap;
-  font-size:10px;font-weight:700;letter-spacing:.17em;text-transform:uppercase;color:var(--faint);
-  opacity:0;transition:opacity .5s ease;}
-.pl-seam[data-beat="1"] .pl-seam-meta,.pl-seam[data-beat="2"] .pl-seam-meta,
-.pl-seam[data-beat="3"] .pl-seam-meta{opacity:1;}
-.pl-seam-clock{font-variant-numeric:tabular-nums;font-weight:700;font-size:13px;
-  letter-spacing:0;text-transform:none;color:var(--gold-1);}
-.pl-seam[data-beat="1"] .pl-seam-clock,.pl-seam[data-beat="2"] .pl-seam-clock{
-  color:var(--pv-1);text-shadow:0 0 16px var(--pv-glow);}
-.pl-seam-bar{position:relative;flex:1;min-width:90px;height:2px;border-radius:2px;
-  background:rgba(255,255,255,.06);overflow:hidden;}
-.pl-seam-bar b{position:absolute;inset:0 100% 0 0;border-radius:2px;
-  background:linear-gradient(90deg,var(--pv-3),var(--pv-1));
-  transition:inset 1.2s linear,background .8s ease;}
-.pl-seam[data-beat="1"] .pl-seam-bar b,.pl-seam[data-beat="2"] .pl-seam-bar b{inset:0 22% 0 0;}
-.pl-seam[data-beat="3"] .pl-seam-bar b{inset:0 0 0 0;
-  background:linear-gradient(90deg,var(--pv-3),var(--gold-2));}
-
-/* ── the line under the stage that says what just happened ── */
-.pl-seam-cap{display:flex;gap:10px;align-items:flex-start;padding:0 22px 18px;
-  position:relative;z-index:6;font-size:12.5px;line-height:1.5;color:var(--mut);min-height:36px;}
-.pl-seam-cap b{font-weight:600;}
-.pl-seam-cap[data-tone="pv"] b{color:var(--pv);}
-.pl-seam-cap[data-tone="gold"] b{color:var(--gold);}
-
-/* ── the legend: what the two colours ARE ─────────────────────────────
-   The stage shows the mechanism; this names it. Without it a first-time
-   visitor sees two colours of text and has to guess why. */
-.pl-seam-legend{max-width:900px;margin:18px auto 0;display:flex;gap:26px;flex-wrap:wrap;
-  align-items:flex-start;justify-content:center;padding:0 4px;}
-.pl-seam-leg{display:flex;gap:11px;align-items:flex-start;max-width:400px;text-align:left;}
-.pl-seam-swatch{flex-shrink:0;width:11px;height:11px;border-radius:3px;margin-top:4px;}
-.pl-seam-leg[data-v="pv"] .pl-seam-swatch{background:linear-gradient(140deg,var(--pv-1),var(--pv-3));
-  box-shadow:0 0 14px var(--pv-glow);}
-.pl-seam-leg[data-v="gold"] .pl-seam-swatch{background:linear-gradient(140deg,var(--gold-1),var(--gold-3));
-  box-shadow:0 0 14px var(--gold-glow);}
-.pl-seam-leg strong{display:block;font-size:11px;font-weight:700;letter-spacing:.15em;
-  text-transform:uppercase;margin-bottom:5px;}
-.pl-seam-leg[data-v="pv"] strong{color:var(--pv-1);}
-.pl-seam-leg[data-v="gold"] strong{color:var(--gold-1);}
-.pl-seam-leg span{font-size:13px;line-height:1.55;color:var(--mut);}
-
-/* ── the ambient pool the section sits in ── */
-/* ── The light field the glass refracts ──────────────────────────────
-   Frosted glass over a flat black page is just a grey rectangle. This
-   is what makes the material read: two coloured pools sitting BEHIND
-   the card — violet under the half where the covering line appears,
-   warm gold under the half where the reasoning lands — so the blur has
-   a gradient to pull through and the card picks up colour it never
-   paints itself. Wider and taller than the card on purpose, so the
-   colour runs off its edges rather than stopping at them. */
-.pl-seam-halo{position:absolute;left:50%;top:34%;transform:translateX(-50%);
-  width:min(1080px,104%);height:560px;pointer-events:none;z-index:0;
-  background:
-    radial-gradient(40% 54% at 26% 34%,rgba(162,113,255,.30),transparent 70%),
-    radial-gradient(44% 58% at 80% 68%,rgba(219,183,110,.13),transparent 72%),
-    radial-gradient(58% 62% at 50% 50%,rgba(120,80,220,.07),transparent 74%);
-  filter:blur(34px);}
-
-@media (max-width:760px){
-  /* height, not min-height — the base rule sets a fixed height, which a
-     min-height cannot override, so the old value did nothing and the
-     longest scene ran 51px past the bottom of the stage on every phone.
-     Measured with probe-seam-fit.mjs; re-run it if the copy changes. */
-  .pl-seam-body{height:422px;padding:16px 15px 16px;}
-  .pl-seam-q{font-size:13.5px;}
-  .pl-seam-said{font-size:13.8px;line-height:1.62;min-height:179px;}
-  .pl-seam-say{padding:14px 14px 15px;}
-  .pl-seam-head{padding:11px 13px;}
-  .pl-seam-live{font-size:8.5px;letter-spacing:.12em;}
-  .pl-seam-cap{font-size:12px;padding:0 15px 15px;}
-  .pl-seam-legend{gap:15px;margin-top:15px;}
-  .pl-seam-leg{max-width:none;}
-}
-
-
-/* ── Hero card, brought up to the Answer Theater's material class ──
-   The hero already had the expensive parts — rim beam, silk stream,
-   pointer-tracked sheen, corner brackets. What it lacked was the thing
-   that makes the theater card read as premium: the ANSWER given its own
-   recessed, gold-rimmed plate with a floating stamp, so the reply looks
-   like an object placed on the card rather than text sitting on it. */
-.pl-hero-answer{position:relative;margin-top:6px;border-radius:13px;padding:15px 16px 16px;
-  background:rgba(0,0,0,.30);border:1px solid var(--gold-line);
-  box-shadow:0 0 0 1px rgba(211,172,99,.06),0 0 38px -10px var(--gold-glow),
-             inset 0 1px 0 rgba(246,228,176,.05);}
-.pl-hero-answer::after{content:'';position:absolute;left:-30%;top:0;width:30%;height:100%;
-  pointer-events:none;border-radius:13px;
-  background:linear-gradient(100deg,transparent,rgba(246,228,176,.05),transparent);
-  animation:pl-at-sheen 11s ease-in-out infinite;animation-delay:-3s;}
-.pl-hero-stamp{position:absolute;top:-9px;right:13px;font-size:8.5px;font-weight:700;
-  letter-spacing:.17em;text-transform:uppercase;padding:3px 9px;border-radius:999px;
-  background:#0b0a08;border:1px solid var(--gold-line);color:var(--gold);
-  white-space:nowrap;line-height:1.2;}
-@media (max-width:760px){
-  .pl-hero-answer{padding:13px 13px 14px;}
-  .pl-hero-stamp{right:10px;font-size:8px;}
-}
-@media (prefers-reduced-motion:reduce){ .pl-hero-answer::after{display:none;} }
-
-/* The mark's own moment above the final ask. A pool of light beneath it so
-   it reads as an object resting on the page, not a sticker on top of it. */
-.pl-markbeat{position:relative;display:flex;justify-content:center;margin-bottom:30px;}
-.pl-markbeat::before{content:'';position:absolute;left:50%;top:52%;transform:translate(-50%,-50%);
-  width:230px;height:130px;pointer-events:none;
-  background:radial-gradient(closest-side,var(--gold-glow),transparent 72%);
-  opacity:.55;filter:blur(6px);}
-@media (max-width:760px){ .pl-markbeat{margin-bottom:24px;} .pl-markbeat::before{width:170px;height:100px;} }
-/* The stage is decorative (aria-hidden); this carries the same meaning
-   for screen readers and crawlers without showing twice. */
-.pl-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
-  clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0;}
-
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   WHAT WE SAY ABOUT MONEY — three beats around the price
-
-   These are the only places on the page where the product argues
-   against its own sale, so they are staged as one three-act passage
-   wrapped around the pricing table rather than collected into a wall
-   of testimonial cards:
-
-     THE VOW        before the first number   - what the money is for
-     THE ASIDE      among the numbers          - permission to leave
-     THE UNDERWRITING  after the numbers       - what happens if we fail
-
-   Each gets ONE gesture, and no two are the same KIND of gesture -
-   not merely a different duration or direction:
-     vow    light travelling through the letterforms, handed from one
-            line to the next and never returning
-     aside  optical development, triggered by STILLNESS rather than
-            by scroll or hover - the only thing here that is
-     back    displacement returning, and the only rule on the page
-            that draws right-to-left
-   All three stay inside the house metaphor (a lit thing in a dark
-   theater) and all three are transform/opacity/background-position, so
-   nothing here touches layout while it moves.
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-
-/* ⚠️ PERFORMANCE BUDGET FOR THIS WHOLE PASSAGE - it was learned the
-   expensive way. The first build of these four used will-change on a
-   blurred element, mix-blend-mode:screen, and two persistent filter:
-   blur() layers. Every one of those promotes a compositing layer that
-   the browser then maintains on EVERY frame, everywhere on the page,
-   regardless of where you have scrolled to - so a set of effects that
-   only appear near the price made the whole page feel loose under the
-   scroll wheel. Nothing here uses will-change, blend modes or filters.
-   Softness is baked into gradient STOPS, which costs nothing, and every
-   animation is transform / opacity / background-position. */
-
-/* ── 1. THE VOW - centred, and the only full-bleed line on the page ──
-   The thesis of the commercial relationship, so it gets the whole
-   width and the whole silence. A beam crosses it once, top to bottom,
-   and the two lines trade places in the light: the sentence about
-   money surrenders its brightness at the exact moment the sentence
-   about the job takes it. Lit through the GLYPHS, not behind them, so
-   it reads as light on letterpress rather than a highlighter over a
-   box. */
-.pl-vow{position:relative;overflow:hidden;}
-.pl-vow-inner{max-width:1140px;margin:0 auto;padding:0 34px;position:relative;z-index:2;}
-/* The beam. Softened by having many gradient stops rather than by a
-   blur filter - visually the same band, none of the layer cost. */
-.pl-vow-beam{position:absolute;left:50%;top:0;z-index:1;
-  width:min(940px,96%);height:42%;
-  transform:translate(-50%,-80%);opacity:0;pointer-events:none;
-  background:linear-gradient(180deg,
-    transparent 0%,rgba(246,228,176,.015) 16%,rgba(246,228,176,.05) 30%,
-    rgba(246,228,176,.10) 42%,rgba(246,228,176,.13) 50%,rgba(246,228,176,.10) 58%,
-    rgba(246,228,176,.05) 70%,rgba(246,228,176,.015) 84%,transparent 100%);}
-.pl-vow.pl-in .pl-vow-beam{animation:pl-vow-beam 2.7s cubic-bezier(.36,.08,.24,1) .16s forwards;}
-@keyframes pl-vow-beam{
-  0%{transform:translate(-50%,-80%);opacity:0;}
-  14%{opacity:1;}
-  74%{opacity:1;}
-  100%{transform:translate(-50%,190%);opacity:0;}}
-.pl-vow-line{display:block;font-weight:500;line-height:1.03;
-  letter-spacing:-0.032em;font-size:clamp(29px,5.6vw,74px);}
-/* The second line keeps the light. The first stays legible on purpose -
-   the pair is the message, and a first line dimmed to decoration would
-   throw half of it away. */
-@supports ((-webkit-background-clip:text) or (background-clip:text)){
-  .pl-vow-a,.pl-vow-b{-webkit-background-clip:text;background-clip:text;
-    -webkit-text-fill-color:transparent;color:transparent;background-repeat:no-repeat;
-    background-size:100% 360%;background-position:0% 0%;}
-  .pl-vow-a{background-image:linear-gradient(180deg,var(--paper) 0%,var(--paper) 22%,
-    var(--mut) 54%,var(--mut) 100%);}
-  .pl-vow-b{background-image:linear-gradient(180deg,#4b463d 0%,#4b463d 32%,
-    var(--gold-1) 58%,var(--gold-2) 80%,var(--gold-2) 100%);}
-  .pl-vow.pl-in .pl-vow-a{animation:pl-vow-pass 1.5s cubic-bezier(.42,0,.3,1) .30s forwards;}
-  .pl-vow.pl-in .pl-vow-b{animation:pl-vow-pass 1.5s cubic-bezier(.42,0,.3,1) .80s forwards;}
-}
-@keyframes pl-vow-pass{to{background-position:0% 100%;}}
-
-/* ── 2. THE ASIDE - LEFT, and set as a margin note ──────────────────
-   The one line that tells a reader to go somewhere cheaper. It is not
-   a headline and must not be staged as one: it is an annotation in the
-   margin of the price list, so it is small, left-aligned, hung off a
-   vertical rule, and deliberately off the centre axis everything else
-   on this page sits on.
-   Its gesture is the rule drawing DOWNWARD, like a pen stroke made
-   beside a paragraph - the only vertical draw on the page - with the
-   two lines arriving after it in sequence. */
-/* Narrow on purpose. A margin note is a narrow column of two or three
-   short lines; at 520px this ran to one long line plus the orphan "can." */
-.pl-note{position:relative;padding-left:26px;max-width:430px;}
-.pl-note-rule{position:absolute;left:0;top:2px;bottom:2px;width:2px;border-radius:2px;
-  background:linear-gradient(180deg,var(--gold-2),rgba(211,172,99,.18));
-  transform:scaleY(0);transform-origin:50% 0;
-  transition:transform 1.05s cubic-bezier(.3,.8,.25,1);}
-.pl-reveal.pl-in .pl-note-rule{transform:scaleY(1);}
-.pl-note-l{display:block;opacity:0;transform:translateY(9px);
-  transition:opacity .8s cubic-bezier(.2,.8,.2,1),transform .8s cubic-bezier(.2,.8,.2,1);}
-/* ⚠️ Sequenced with the adjacent-sibling combinator, NOT :nth-of-type.
-   nth-of-type counts by ELEMENT TYPE, and the rule above these lines is
-   also a span — so it occupies type-position 1, :nth-of-type(1) matched
-   nothing, and the SECOND line never received a reveal rule at all. It
-   sat at opacity 0 and the note silently shipped as half a sentence. */
-.pl-reveal.pl-in .pl-note-l{transition-delay:.42s;opacity:1;transform:none;}
-.pl-reveal.pl-in .pl-note-l + .pl-note-l{transition-delay:.66s;}
-
-/* ── 3. THE RECKONING - RIGHT-aligned, and it arrives from the right ─
-   What the money actually buys. Right-aligned so it mirrors the margin
-   note rather than repeating it, and its lines enter from the right
-   edge in sequence - travelling the way the eye will read them back.
-   No other block on this page is set right. */
-.pl-reck{text-align:right;margin-left:auto;max-width:760px;}
-.pl-reck-l{display:block;opacity:0;transform:translateX(38px);
-  transition:opacity .9s cubic-bezier(.2,.8,.2,1),transform 1.1s cubic-bezier(.16,.86,.26,1);}
-/* Adjacent-sibling, for the same reason as the note above. */
-.pl-reveal.pl-in .pl-reck-l{transition-delay:.10s;opacity:1;transform:none;}
-.pl-reveal.pl-in .pl-reck-l + .pl-reck-l{transition-delay:.34s;}
-.pl-reck-rule{height:1px;margin-left:auto;transform:scaleX(0);transform-origin:100% 50%;
-  background:linear-gradient(90deg,transparent,var(--gold-2));
-  transition:transform 1.2s cubic-bezier(.2,.75,.2,1) .60s;}
-.pl-reveal.pl-in .pl-reck-rule{transform:scaleX(1);}
-
-/* ── 4. THE UNDERWRITING - a SPLIT, because an agreement has two sides
-   The promise on the left at full size, the conditions on the right at
-   footnote size. Showing both halves in one composition is the honest
-   form for a guarantee, and it is the only two-column block in this
-   passage.
-   The gesture: a refund is the transaction running backwards, so the
-   final clause is displaced and absent, then travels back into its own
-   place and settles (the bezier overshoots slightly past 1 - it lands
-   rather than stops). The conditions fade in after it, because that is
-   the order you learn them in. */
-.pl-uw{display:grid;grid-template-columns:1.35fr .85fr;gap:46px;align-items:start;}
-.pl-return-back{display:inline-block;opacity:0;transform:translateX(34px);
-  transition:opacity .85s cubic-bezier(.2,.8,.25,1) .42s,
-             transform 1.3s cubic-bezier(.14,.9,.24,1.04) .42s;}
-.pl-reveal.pl-in .pl-return-back{opacity:1;transform:none;}
-.pl-uw-terms{opacity:0;transform:translateY(10px);
-  transition:opacity .9s ease 1.05s,transform .9s cubic-bezier(.2,.8,.2,1) 1.05s;}
-.pl-reveal.pl-in .pl-uw-terms{opacity:1;transform:none;}
-@media (max-width:860px){
-  .pl-uw{grid-template-columns:1fr;gap:26px;}
-}
-
-@media (max-width:760px){
-  .pl-at-body{min-height:352px;padding:15px 14px 16px;}
-  .pl-at-qtext,.pl-at-answer{font-size:13.5px;}
-  .pl-at-code{font-size:11.5px;}
-  .pl-at-head{padding:11px 12px;}
-  .pl-at-step{font-size:8.5px;letter-spacing:.11em;gap:6px;}
-  .pl-at-lg{display:none;}
-  .pl-at-sm{display:inline;}
-  /* The beam is sized to the block, so on a narrow column it becomes a
-     bar rather than light - widen it past the edges to keep it a beam. */
-  .pl-vow-beam{width:150%;height:34%;}
-  /* Displacement scaled to the measure: 34-38px of travel against a
-     320px line reads as the clause being thrown, not returned. */
-  .pl-return-back{transform:translateX(18px);}
-  .pl-reck-l{transform:translateX(22px);}
-  /* A margin note needs a margin. At 390px there is none, so it keeps
-     the rule but loses the indent it cannot afford. */
-  .pl-note{padding-left:18px;}
-}
-
 @media (prefers-reduced-motion:reduce){
   .pl-root *{animation:none !important;}
   .pl-reveal{opacity:1 !important;transform:none !important;}
-  .pl-at::after{display:none !important;}
-  /* Seam: render the finished frame and hold. Both answers present, the
-     join already made — the meaning survives without the motion. */
-  .pl-seam::after{display:none !important;}
-  .pl-seam-stamp,.pl-seam-meta{opacity:1 !important;transform:none !important;}
-  .pl-seam-stitch{display:inline-block !important;animation:none !important;}
-  .pl-seam-caret{display:none !important;}
-  .pl-seam-wipe::after{display:none !important;}
-  .pl-seam-bar b{inset:0 0 0 0 !important;transition:none !important;}
-  .pl-at-ed{opacity:1 !important;max-height:210px !important;}
-  .pl-at-depth{opacity:1 !important;transform:none !important;}
-  .pl-at-meter b{inset:0 12% 0 0 !important;transition:none !important;}
   .pl-drawline{transform:none !important;}
   .pl-foil{background-position:0 0 !important;}
   .pl-lamp,.pl-mote{display:none !important;}
   .pl-trace{stroke-dashoffset:0 !important;}
-  /* The money passage: render the settled frame of all four. The
-     meaning is in WHERE things end up, which survives without the
-     travel - first line quiet, second line gold, notes in place, rules
-     drawn, clause returned. */
-  .pl-vow-beam{display:none !important;}
-  .pl-vow-a,.pl-vow-b{background-position:0% 100% !important;}
-  .pl-note-rule{transform:scaleY(1) !important;}
-  .pl-note-l,.pl-reck-l,.pl-uw-terms{opacity:1 !important;transform:none !important;}
-  .pl-reck-rule{transform:scaleX(1) !important;}
-  .pl-return-back{opacity:1 !important;transform:none !important;}
   .pl-card-float,.pl-card-rimbeam,.pl-card-aura,.pl-card-floor::after{animation:none !important;}
   .pl-reflectwrap{opacity:1 !important;transform:none !important;filter:none !important;}
 }
@@ -2258,7 +1640,7 @@ const ShareFrame: React.FC<{ overlay?: boolean; scan?: boolean }> = ({ overlay, 
 const HERO_LINE = 'answered the moment it’s asked.';
 const ANSWER = 'I’d anchor it on an event backbone — Kafka — with stateless scoring pulling features from Redis, and the model behind a feature cache so p99 holds under 50ms.';
 
-const MODELS = ['Claude Sonnet 5', 'GPT-5.6', 'Gemini 3.6', 'Grok 4.5', 'Groq'];
+const MODELS = ['Claude Sonnet 5', 'GPT-5.5', 'Gemini 3.5', 'Grok 4.3', 'Groq'];
 const CAPS = [
   { icon: PhHeadphones, t: 'Sub-second transcription' },
   { icon: PhMonitor, t: 'Solves coding & case rounds' },
@@ -2967,440 +2349,6 @@ const SilkStreamCanvas: React.FC = () => {
   return <canvas ref={ref} className="pl-silk-canvas" aria-hidden="true" />;
 };
 
-// ── Answer Theater ────────────────────────────────────────────────
-// Plays the real shape of a live answer, once the section scrolls into
-// view: the question arrives, the depth is read, the covering line lands
-// while you're still drawing breath, the full answer continues without a
-// seam, and on Ultra the code types itself into the editor.
-//
-// No engineering internals on screen — a candidate should read this and
-// understand what they'll EXPERIENCE, not how it's built.
-//
-// Character streaming writes textContent through refs, so a 1,400-char
-// sequence costs zero React renders; only the five coarse beat changes
-// re-render. Paused entirely while off-screen, and under
-// prefers-reduced-motion it renders the finished state and never moves.
-const AT_QUESTION = 'Design a fraud-detection pipeline that scores every transaction in under 50 ms.';
-const AT_COVER = "The way I'd frame this is around a streaming backbone, with the scoring kept off the write path.";
-const AT_REST = ' Concretely — Kafka for ingest, features precomputed in Redis so a lookup is a single hop, and the model behind a feature cache. That holds p99 under 50 ms even when volume spikes.';
-const AT_CODE = 'def score(txn, feats):\n    f = feats.get(txn.card_id)\n    if f is None:\n        return FALLBACK\n    return model.predict(f, txn)';
-
-const AT_CAPTIONS: { t: string; b: string }[] = [
-  { b: 'They ask.', t: 'minicaai hears the question as it is spoken — no clicking, no pasting.' },
-  { b: 'It reads how deep the question is.', t: 'A throwaway question gets a quick answer. A hard one gets real thinking — chosen for you, every time.' },
-  { b: 'You have something to say in under a second.', t: 'An opening line lands while you are still drawing breath, so you are never the person sitting in silence.' },
-  { b: 'The full answer arrives underneath it.', t: 'It continues from where your opening left off — one thought, no seam, nothing to backtrack out of.' },
-  { b: 'On Ultra, it types the code for you.', t: 'Straight into the editor at a human pace, so what appears on the screen looks like you wrote it.' },
-];
-
-/* ═══════════════════════════════════════════════════════════════════
-   THE SEAM — three real questions, each answered twice
-   ───────────────────────────────────────────────────────────────────
-   These are not written-for-the-website examples. Every pair below is
-   the shape the product actually produces: the covering line opens with
-   what the candidate would ESTABLISH (never a guess at the mechanism,
-   because a cover that guesses gets contradicted by the reasoning
-   behind it one sentence later), and the full answer continues that
-   exact sentence rather than restarting.
-
-   `cover` / `full` are the two measured clocks — time to first word on
-   screen, and time to the full answer's first token. Real numbers from
-   the current build; if the engine is retuned, retune these with it.
-   ═══════════════════════════════════════════════════════════════════ */
-const SEAM_SCENES = [
-  {
-    q: 'Design exactly-once delivery from an event stream into a warehouse when the sink can’t deduplicate and you can’t change it.',
-    cover: 'First thing I’d establish is what that sink actually guarantees on a retry — because if it can’t dedupe and I can’t change it, true exactly-once at that hop isn’t on the table.',
-    full: 'So I’d move the guarantee upstream instead: a staging table keyed on a stable event ID, one controlled writer pushing committed batches, and a reconciliation ledger of what landed. The hop itself I’d call at-least-once and say so plainly.',
-    cover_s: 0.6,
-    full_s: 9.2,
-  },
-  {
-    q: 'A Spark job that ran in twenty minutes now takes three hours. Nothing changed in the code. What do you look at, in order?',
-    cover: 'Before I touch any tuning I’d prove what actually changed — the code didn’t, so it’s the data, the skew, or the cluster underneath it.',
-    full: 'I’d put the last green run’s stage timings next to today’s. One stage gone wide is skew, or a partition count that stopped matching the data. Every stage slower by the same factor is the cluster — spot reclaim, a smaller pool, noisy neighbours.',
-    cover_s: 0.5,
-    full_s: 4.4,
-  },
-  {
-    q: 'A stakeholder says the numbers in their dashboard are wrong. You check, and the pipeline is green. How do you handle that?',
-    cover: 'A green pipeline only tells me the job finished, not that the numbers are right — so I’d start by getting one row they believe is wrong.',
-    full: 'From that row I can walk backwards through each layer until the number changes, which turns “the dashboard is wrong” into one specific transform. Then I’d tell them what I found and when it’s fixed, rather than defending the pipeline.',
-    cover_s: 0.6,
-    full_s: 6.1,
-  },
-];
-
-const SEAM_CAPS: { b: string; t: string; tone: 'pv' | 'gold' }[] = [
-  { b: 'They stop talking.', t: 'This is the second everyone can hear you thinking.', tone: 'pv' },
-  { b: 'You’re already speaking.', t: 'Half a second, and there is something true in your mouth.', tone: 'pv' },
-  { b: 'Watch the hand-off.', t: 'Same sentence. The reasoning arrives mid-breath and takes it from here.', tone: 'pv' },
-  { b: 'No restart. No repeat. No pause.', t: 'They heard one answer. It came from two.', tone: 'gold' },
-];
-
-/* One stage, four beats, three questions on rotation. */
-const SeamStage: React.FC = () => {
-  const rootRef = React.useRef<HTMLDivElement>(null);
-  const qRef = React.useRef<HTMLSpanElement>(null);
-  const coverRef = React.useRef<HTMLSpanElement>(null);
-  const fullRef = React.useRef<HTMLSpanElement>(null);
-  const clockRef = React.useRef<HTMLSpanElement>(null);
-  const [beat, setBeat] = React.useState(0);
-  const [scene, setScene] = React.useState(0);
-
-  React.useEffect(() => {
-    const el = rootRef.current;
-    if (!el) return;
-    const S = SEAM_SCENES;
-
-    // Reduced motion: the finished frame of the first scene, held still.
-    if (prefersReduce()) {
-      if (qRef.current) qRef.current.textContent = S[0].q;
-      if (coverRef.current) coverRef.current.textContent = S[0].cover;
-      if (fullRef.current) fullRef.current.textContent = S[0].full;
-      if (clockRef.current) clockRef.current.textContent = `${S[0].full_s.toFixed(1)}s`;
-      setBeat(3);
-      return;
-    }
-
-    let alive = true;
-    let timers: number[] = [];
-    let ticker: number | null = null;
-    const wait = (ms: number) => new Promise<void>(res => { timers.push(window.setTimeout(res, ms)); });
-
-    // Words, not characters.
-    //
-    // Character-by-character is how a person TYPES, and this is not
-    // typing — it is a model emitting tokens, which arrive in clumps and
-    // fast. Streaming whole words in small bursts is both truer to what
-    // is actually happening and far more urgent to watch: the line
-    // arrives in a rush, the way it does in the product, instead of
-    // trickling out at reading speed while the viewer waits for it.
-    const stream = async (node: HTMLElement | null, text: string, perWord: number) => {
-      if (!node) return;
-      node.textContent = '';
-      const parts = text.split(/(\s+)/);
-      let buf = '';
-      for (let i = 0; i < parts.length; i++) {
-        if (!alive) return;
-        buf += parts[i];
-        if (/^\s+$/.test(parts[i])) continue;      // flush on word boundaries only
-        node.textContent = buf;
-        // A beat of hesitation after a clause, the way speech has one.
-        const tail = parts[i].slice(-1);
-        const extra = tail === ',' ? perWord * 3 : (tail === '.' || tail === '—') ? perWord * 5 : 0;
-        await wait(perWord + extra);
-      }
-      node.textContent = text;
-    };
-
-    // The clock the whole section turns on. It starts the instant the
-    // covering line appears and keeps climbing WHILE the candidate is
-    // already speaking — so the number on screen is the silence they are
-    // not having. Ramped to land exactly on the scene's real measured
-    // figure at the moment the full answer arrives.
-    const runClock = (from: number, to: number, overMs: number) => {
-      if (ticker !== null) window.clearInterval(ticker);
-      const t0 = Date.now();
-      const write = (v: number) => { if (clockRef.current) clockRef.current.textContent = `${v.toFixed(1)}s`; };
-      write(from);
-      ticker = window.setInterval(() => {
-        const p = Math.min(1, (Date.now() - t0) / overMs);
-        write(from + (to - from) * p);
-        if (p >= 1 && ticker !== null) { window.clearInterval(ticker); ticker = null; }
-      }, 60);
-    };
-
-    const cycle = async () => {
-      let i = 0;
-      while (alive) {
-        const s = S[i % S.length];
-        setScene(i % S.length);
-        setBeat(0);
-        [qRef, coverRef, fullRef].forEach(r => { if (r.current) r.current.textContent = ''; });
-        if (clockRef.current) clockRef.current.textContent = '0.0s';
-        await wait(300);
-
-        await stream(qRef.current, s.q, 62);                 // they ask
-        if (!alive) return;
-        await wait(340);
-
-        setBeat(1);                                          // the covering line
-        runClock(s.cover_s, s.full_s, 4600);
-        await stream(coverRef.current, s.cover, 58);
-        if (!alive) return;
-        // The hold is the point: the caret blinks, the clock climbs, and
-        // for these two seconds the candidate is talking and the model is
-        // still thinking. Cutting it short throws away the whole idea.
-        await wait(1500);
-
-        setBeat(2);                                          // the handover
-        await wait(1000);
-        if (!alive) return;
-
-        setBeat(3);                                          // the full answer
-        if (clockRef.current) clockRef.current.textContent = `${s.full_s.toFixed(1)}s`;
-        if (ticker !== null) { window.clearInterval(ticker); ticker = null; }
-        await stream(fullRef.current, s.full, 46);           // lands fast — it was ready
-        if (!alive) return;
-        await wait(4600);                                    // hold, then rotate
-        i++;
-      }
-    };
-
-    // Only play while the stage is on screen.
-    let running = false;
-    const io = new IntersectionObserver(([e]) => {
-      if (e.isIntersecting && !running) { running = true; alive = true; cycle(); }
-      else if (!e.isIntersecting && running) {
-        running = false; alive = false;
-        timers.forEach(clearTimeout); timers = [];
-        if (ticker !== null) { window.clearInterval(ticker); ticker = null; }
-      }
-    }, { threshold: 0.2 });
-    io.observe(el);
-
-    return () => {
-      alive = false; io.disconnect();
-      timers.forEach(clearTimeout);
-      if (ticker !== null) window.clearInterval(ticker);
-    };
-  }, []);
-
-  const cap = SEAM_CAPS[beat] || SEAM_CAPS[0];
-
-  return (
-    <div style={{ position: 'relative' }}>
-      <div className="pl-seam" ref={rootRef} data-beat={beat} aria-hidden="true">
-        <div className="pl-seam-head">
-          <span className="pl-seam-live"><i />Live interview</span>
-          <span className="pl-seam-pips">
-            {SEAM_SCENES.map((_, i) => <b key={i} data-on={i === scene ? '1' : '0'} />)}
-          </span>
-        </div>
-
-        <div className="pl-seam-body">
-          <div className="pl-seam-ask">
-            <span className="pl-seam-wave">
-              {[0, 1, 2, 3, 4].map(i => <i key={i} style={{ animationDelay: `${i * 110}ms` }} />)}
-            </span>
-            <span className="pl-seam-q">“<span ref={qRef} />”</span>
-          </div>
-
-          {/* ONE plate, ONE paragraph. The seam is the point inside the
-              running text where the colour changes hands — there is no
-              divider, because in the product there is nothing between
-              them either. */}
-          <div className="pl-seam-say">
-            <span className="pl-seam-wipe" aria-hidden />
-            <span className="pl-seam-stamp">out loud, from 0.6s</span>
-            <p className="pl-seam-said">
-              <span className="pl-seam-c" ref={coverRef} />
-              <span className="pl-seam-caret" />
-              <span className="pl-seam-stitch" />
-              <span className="pl-seam-f" ref={fullRef} />
-            </p>
-          </div>
-
-          <div className="pl-seam-meta">
-            <span>{beat >= 3 ? 'Full reasoning landed at' : 'Still reasoning'}</span>
-            <span className="pl-seam-clock" ref={clockRef}>0.0s</span>
-            <span className="pl-seam-bar"><b /></span>
-          </div>
-        </div>
-
-        <div className="pl-seam-cap" data-tone={cap.tone}>
-          <span><b>{cap.b}</b> {cap.t}</span>
-        </div>
-      </div>
-
-      {/* The legend. The stage shows the mechanism; this names it, so a
-          first-time visitor is not left guessing why the sentence is two
-          colours. */}
-      <div className="pl-seam-legend">
-        <div className="pl-seam-leg" data-v="pv">
-          <span className="pl-seam-swatch" aria-hidden />
-          <div>
-            <strong>The covering line</strong>
-            <span>Lands in about half a second, so you start talking while they’re still settling. It only ever commits to what you’d <em>establish</em> first — so there is nothing in it to walk back.</span>
-          </div>
-        </div>
-        <div className="pl-seam-leg" data-v="gold">
-          <span className="pl-seam-swatch" aria-hidden />
-          <div>
-            <strong>The real answer</strong>
-            <span>The full reasoning, seconds later. It doesn’t restart your sentence and it doesn’t repeat you — it finishes the one you’re already saying.</span>
-          </div>
-        </div>
-      </div>
-
-      {/* The stage is decorative; this is the same meaning in prose, once,
-          for assistive tech and crawlers. */}
-      <p className="pl-sr-only">
-        A hard interview question is answered twice. About half a second in, a covering line
-        arrives that you start speaking immediately — it commits only to what you would
-        establish first, so nothing in it can be contradicted. The full reasoning lands
-        seconds later and continues the same sentence rather than restarting it.
-        {SEAM_SCENES.map(sc => ` Asked: ${sc.q} You say: ${sc.cover} ${sc.full}`).join('')}
-      </p>
-    </div>
-  );
-};
-
-const AnswerTheater: React.FC = () => {
-  const rootRef = React.useRef<HTMLDivElement>(null);
-  const qRef = React.useRef<HTMLSpanElement>(null);
-  const coverRef = React.useRef<HTMLSpanElement>(null);
-  const restRef = React.useRef<HTMLSpanElement>(null);
-  const codeRef = React.useRef<HTMLSpanElement>(null);
-  const [beat, setBeat] = React.useState(0);
-  const [cover, setCover] = React.useState(0);
-  const beatRef = React.useRef(0);
-
-  React.useEffect(() => {
-    const el = rootRef.current;
-    if (!el) return;
-
-    // Reduced motion: show the finished frame, never animate.
-    if (prefersReduce()) {
-      if (qRef.current) qRef.current.textContent = AT_QUESTION;
-      if (coverRef.current) coverRef.current.textContent = AT_COVER;
-      if (restRef.current) restRef.current.textContent = AT_REST;
-      if (codeRef.current) codeRef.current.textContent = AT_CODE;
-      setBeat(4); setCover(1);
-      return;
-    }
-
-    let alive = true;
-    let timers: number[] = [];
-    const wait = (ms: number) => new Promise<void>(res => { timers.push(window.setTimeout(res, ms)); });
-    const setB = (n: number) => { beatRef.current = n; setBeat(n); };
-
-    // Stream text into a node one character at a time. Cadence varies the
-    // way real typing does — a touch slower after punctuation.
-    const stream = async (node: HTMLElement | null, text: string, per: number) => {
-      if (!node) return;
-      node.textContent = '';
-      for (let i = 0; i < text.length; i++) {
-        if (!alive) return;
-        node.textContent += text[i];
-        const ch = text[i];
-        const extra = ch === ',' ? per * 4 : (ch === '.' || ch === '—') ? per * 7 : 0;
-        await wait(per + extra + Math.random() * per * 0.7);
-      }
-    };
-
-    const clear = () => {
-      [qRef, coverRef, restRef, codeRef].forEach(r => { if (r.current) r.current.textContent = ''; });
-      setCover(0);
-    };
-
-    const cycle = async () => {
-      while (alive) {
-        clear(); setB(0);
-        await wait(700);
-        await stream(qRef.current, AT_QUESTION, 21);       // they ask
-        if (!alive) return;
-        await wait(520);
-
-        setB(1);                                            // depth read
-        await wait(1500);
-        if (!alive) return;
-
-        setB(2);                                            // the covering line
-        setCover(1);
-        await stream(coverRef.current, AT_COVER, 15);
-        if (!alive) return;
-        await wait(420);
-
-        setB(3);                                            // full answer continues
-        await stream(restRef.current, AT_REST, 12);
-        if (!alive) return;
-        await wait(900);
-
-        setB(4);                                            // Auto-Type
-        await wait(420);
-        await stream(codeRef.current, AT_CODE, 24);
-        if (!alive) return;
-        await wait(3200);                                   // hold, then loop
-      }
-    };
-
-    // Only play while the stage is actually on screen.
-    let running = false;
-    const io = new IntersectionObserver(([e]) => {
-      if (e.isIntersecting && !running) { running = true; cycle(); }
-      else if (!e.isIntersecting && running) {
-        running = false; alive = false;
-        timers.forEach(clearTimeout); timers = [];
-        alive = true;                                        // re-arm for next entry
-      }
-    }, { threshold: 0.28 });
-    io.observe(el);
-
-    return () => { alive = false; io.disconnect(); timers.forEach(clearTimeout); };
-  }, []);
-
-  const STEPS: [string, string][] = [['Listening', 'Listen'], ['Reading depth', 'Depth'], ['Answering', 'Answer'], ['Typing', 'Type']];
-  const stepOn = [beat === 0, beat === 1, beat === 2 || beat === 3, beat === 4];
-  const cap = AT_CAPTIONS[beat] || AT_CAPTIONS[0];
-
-  return (
-    <div>
-      <div className="pl-at" ref={rootRef} data-beat={beat} aria-hidden="true">
-        <div className="pl-at-head">
-          {STEPS.map(([long, short], i) => (
-            <span key={long} className="pl-at-step" data-on={stepOn[i] ? '1' : '0'}>
-              <span className="pl-at-pip" />
-              <span className="pl-at-lg">{long}</span><span className="pl-at-sm">{short}</span>
-            </span>
-          ))}
-        </div>
-
-        <div className="pl-at-body">
-          <div className="pl-at-ask">
-            <span className="pl-at-wave">{[0, 1, 2, 3, 4].map(i => (
-              <i key={i} style={{ animationDelay: `${i * 110}ms` }} />
-            ))}</span>
-            <span className="pl-at-qtext">“<span ref={qRef} />”</span>
-          </div>
-
-          <div className="pl-at-depth">
-            <span style={{ fontSize: 10, letterSpacing: '.18em', textTransform: 'uppercase', color: 'var(--faint)' }}>Depth</span>
-            <span className="pl-at-meter"><b /></span>
-            <span className="pl-at-model"><PhBolt size={12} weight="fill" /> deep question · full reasoning</span>
-          </div>
-
-          <div className="pl-at-answer" data-cover={cover ? '1' : '0'}>
-            <span className="pl-at-stamp">you start speaking · 0.4s</span>
-            <span className="pl-at-cover" ref={coverRef} />
-            <span className="pl-at-rest" ref={restRef} />
-          </div>
-
-          <div className="pl-at-ed">
-            <div className="pl-at-edhead">
-              <span>your editor</span>
-              <span style={{ color: 'var(--gold)', letterSpacing: '.16em' }}>ULTRA · AUTO-TYPE</span>
-            </div>
-            <div className="pl-at-code">
-              <span className="pl-at-nums">{[1, 2, 3, 4, 5].map(n => <span key={n}>{n}</span>)}</span>
-              <span className="pl-at-src"><span ref={codeRef} /><span className="pl-at-cur" /></span>
-            </div>
-          </div>
-        </div>
-
-        <div className="pl-at-cap"><span><b>{cap.b}</b> {cap.t}</span></div>
-      </div>
-
-      {/* The same sequence as plain prose — what assistive tech and search
-          engines read, since the stage itself is decorative. */}
-      <p className="pl-sr-only">
-        {AT_CAPTIONS.map(c => `${c.b} ${c.t}`).join(' ')}
-      </p>
-    </div>
-  );
-};
-
 const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handleTierSelect, isSubmitting, paymentError, onDismissPaymentError }) => {
   const reduce = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
   const [typed, setTyped] = useState(reduce ? HERO_LINE : '');
@@ -3968,12 +2916,9 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
                     </p>
 
                     <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', marginBottom: 8 }} className="pl-gold">You say</div>
-                    <div className="pl-hero-answer">
-                      <span className="pl-hero-stamp">yours to say · 0.8s</span>
-                      <p className="pl-serif" style={{ fontSize: 18, lineHeight: 1.55, color: 'var(--paper)', letterSpacing: '-0.01em', margin: 0 }}>
-                        {ANSWER}<span className="pl-caret" />
-                      </p>
-                    </div>
+                    <p className="pl-serif" style={{ fontSize: 18, lineHeight: 1.55, color: 'var(--paper)', letterSpacing: '-0.01em' }}>
+                      {ANSWER}<span className="pl-caret" />
+                    </p>
 
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 22 }}>
                       <span className="pl-wave">
@@ -3985,6 +2930,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--gold-line)', borderRadius: 999, padding: '4px 10px', color: 'var(--gold)', fontWeight: 600 }}>
                           <PhSparkle size={13} weight="duotone" /> Claude Sonnet 5
                         </span>
+                        <span className="pl-hide-sm">0.8s</span>
                       </span>
                     </div>
                   </div>
@@ -3995,34 +2941,6 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           </div>
         </div>
       </header>
-
-      {/* ── The seam — the two-speed answer, immediately after the hero ──
-          The first thing a visitor should understand about this product is
-          not a feature list, it is that the pause after a hard question has
-          been engineered away. That belongs here, one scroll below the
-          card, while they still care. The hero and its globe are untouched;
-          this is a separate section that begins where the header ends. */}
-      <section id="seam" className="pl-wrap pl-reveal" style={{ paddingTop: 34, paddingBottom: 46, position: 'relative', scrollMarginTop: 84 }}>
-        <div className="pl-seam-halo" aria-hidden />
-        <div style={{ position: 'relative', zIndex: 1, maxWidth: 760, margin: '0 auto 30px', textAlign: 'center' }}>
-          <p className="pl-eyebrow" style={{ marginBottom: 16 }}>The silence problem</p>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(30px,4.4vw,50px)', lineHeight: 1.09, letterSpacing: '-0.022em', marginBottom: 16 }}>
-            The question lands.
-            <br />
-            Then you’re <span className="pl-gold pl-foil">alone with it.</span>
-          </h2>
-          <p style={{ fontSize: 16, lineHeight: 1.62, color: 'var(--mut)', maxWidth: 620, margin: '0 auto' }}>
-            Any model worth asking needs seconds to think about a hard question — and in a live
-            interview, that pause is the thing that costs you the room. So we stopped making you
-            wait for it. You get <span style={{ color: 'var(--pv-1)', fontWeight: 600 }}>a line to say in half a second</span>,
-            and the full reasoning arrives underneath and picks up the exact sentence you’re already in.
-          </p>
-        </div>
-
-        <div style={{ position: 'relative', zIndex: 1 }}>
-          <SeamStage />
-        </div>
-      </section>
 
       {/* ── Trust line ──────────────────────────────────────── */}
       <section className="pl-wrap pl-reveal" style={{ paddingTop: 64, paddingBottom: 64, textAlign: 'center' }}>
@@ -4088,7 +3006,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
               The right model<br />for <span className="pl-gold pl-foil">every question.</span>
             </h2>
             <p style={{ fontSize: 16.5, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 460 }}>
-              Claude Sonnet 5 for reasoning, GPT-5.6 for range, Gemini 3.6 for speed, Grok and Groq when you need instant. Switch minds mid-interview — no one will know.
+              Claude Sonnet 5 for reasoning, GPT-5.5 for range, Gemini 3.5 for speed, Grok and Groq when you need instant. Switch minds mid-interview — no one will know.
             </p>
           </div>
         </div>
@@ -4105,12 +3023,18 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             <p style={{ fontSize: 16.5, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 460 }}>
               On Ultra, the perfect answer lands straight into the box at a human cadence — hands-free, for take-homes and live coding alike.
             </p>
-            <p style={{ fontSize: 15, lineHeight: 1.65, color: 'var(--faint)', maxWidth: 460, marginTop: 16 }}>
-              Watch the whole thing happen — the question arriving, the depth being read,
-              the first line landing before you need it, and the code writing itself.
-            </p>
           </div>
-          <AnswerTheater />
+          <div style={{ border: '1px solid var(--gold-line)', borderRadius: 16, padding: 20, background: 'linear-gradient(180deg,#100e0a,#0a0908)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 11.5, color: 'var(--gold)' }}><PhBolt size={14} weight="fill" /> Auto-Type</span>
+              <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.14em', color: 'var(--gold)', border: '1px solid var(--gold-line)', borderRadius: 999, padding: '3px 9px' }}>ULTRA</span>
+            </div>
+            <div style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 13, lineHeight: 1.6, color: '#d9d3c6', background: 'rgba(0,0,0,.35)', borderRadius: 10, padding: '14px 16px', minHeight: 92 }}>
+              def two_sum(nums, target):<br />
+              &nbsp;&nbsp;seen = {'{}'}<br />
+              &nbsp;&nbsp;for i, n in enumerate(nums):<span className="pl-caret" />
+            </div>
+          </div>
         </div>
 
         <div className="pl-goldline pl-drawline" />
@@ -4244,28 +3168,6 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           ))}
         </div>
       </div>
-
-      {/* ── The reckoning — what the money actually buys ──────
-          Placed with the PRODUCT proof, not with the price. The
-          three money statements sit around the pricing table; this
-          one is a claim about the answers themselves, so it belongs
-          where the features just finished making their case.
-          Set RIGHT — the only right-aligned block on the page — and
-          its lines enter from the right edge in sequence, travelling
-          the way the eye will read them back. */}
-      <section className="pl-wrap pl-reveal" style={{ paddingTop: 86, paddingBottom: 18 }}>
-        <div className="pl-reck">
-          <div className="pl-eyebrow" style={{ marginBottom: 22 }}>What you actually get</div>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(26px,3.5vw,44px)', fontWeight: 500, lineHeight: 1.1, letterSpacing: '-0.025em', margin: 0 }}>
-            <span className="pl-reck-l">We don&rsquo;t hand you a guess.</span>
-            <span className="pl-reck-l"><em className="pl-gold" style={{ fontStyle: 'italic' }}>Every answer carries its reasoning.</em></span>
-          </h2>
-          <div className="pl-reck-rule" style={{ maxWidth: 300, marginTop: 24 }} aria-hidden />
-          <p style={{ fontSize: 16, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 470, marginLeft: 'auto', marginTop: 22 }}>
-            Something you can defend when the follow-up question comes — not a confident sentence with nothing underneath it.
-          </p>
-        </div>
-      </section>
 
       {/* ── Capability ledger — the rest of the kit, spec-sheet style ── */}
       <section id="kit" className="pl-wrap" style={{ paddingTop: 72, paddingBottom: 24 }}>
@@ -4538,26 +3440,6 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         </p>
       </section>
 
-      {/* ── The vow — the threshold into the price ────────────
-          Deliberately the last thing read before the first number.
-          Stated after the table it would be a reassurance; stated
-          before it, it is the frame every price below is read
-          through. The shaft crosses once and the light ends on the
-          second line, which is the whole argument in one gesture. */}
-      <section className="pl-reveal pl-vow" style={{ paddingTop: 108, paddingBottom: 34, textAlign: 'center' }}>
-        <div className="pl-vow-beam" aria-hidden />
-        <div className="pl-vow-inner">
-          <div className="pl-eyebrow" style={{ marginBottom: 26 }}>What this is for</div>
-          <h2 className="pl-serif" style={{ margin: 0 }}>
-            <span className="pl-vow-line pl-vow-a">We don&rsquo;t want your money.</span>
-            <span className="pl-vow-line pl-vow-b">We want you to get the job.</span>
-          </h2>
-          <p style={{ fontSize: 16, lineHeight: 1.6, color: 'var(--mut)', maxWidth: 440, margin: '30px auto 0' }}>
-            That is the whole business. The prices below keep it running.
-          </p>
-        </div>
-      </section>
-
       {/* ── Pricing ─────────────────────────────────────────── */}
       {/* Wider than pl-wrap (1280 vs 1140): five tiers since the 2026-07
           overhaul — at 1140 the grid fits four per row and Ultra orphans. */}
@@ -4649,24 +3531,6 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             </div>
           );
         })()}
-        {/* ── The aside — a margin note, not a headline ────────
-            Sits inside the pricing block because this is where the
-            thought forms. Staged as an ANNOTATION: left-aligned,
-            hung off a vertical rule, small, off the centre axis the
-            whole page is built on — so it reads as something written
-            beside the price list rather than another statement
-            competing with it. The rule draws downward like a pen
-            stroke; the two lines follow it in sequence. */}
-        <div className="pl-reveal pl-note" style={{ margin: '54px 0 4px' }}>
-          <span className="pl-note-rule" aria-hidden />
-          <span className="pl-note-l pl-serif" style={{ fontSize: 'clamp(17px,2vw,21px)', lineHeight: 1.5, fontWeight: 500, letterSpacing: '-0.015em', color: 'var(--paper)' }}>
-            If this is more than you can spare, go find something you can.
-          </span>
-          <span className="pl-note-l" style={{ fontSize: 14.5, lineHeight: 1.6, color: 'var(--mut)', marginTop: 10 }}>
-            We would rather you walked in prepared than paid us.
-          </span>
-        </div>
-
         {/* Payment-method line must promise only what checkout can deliver
             TODAY: while the Razorpay account is pending (pricingService
             INR_CHECKOUT_ENABLED=false + server RAZORPAY_ROUTING_ENABLED
@@ -4679,42 +3543,8 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         </p>
       </section>
 
-      {/* ── The underwriting ─────────────────────────────────
-          Answers the question that follows a price — "and if it
-          doesn't work for me?" — so it sits between the number and
-          the FAQ rather than buried inside it. The clause travels
-          back into its own place and the rule draws right-to-left:
-          a refund is the transaction running backwards, and it is
-          the only motion on this page that goes that way.
-          The qualifier is stated plainly and links to the real
-          policy. A guarantee that hides its conditions is worth
-          less than one that shows them. */}
-      <section className="pl-wrap pl-reveal" style={{ paddingTop: 112, paddingBottom: 8 }}>
-        <div className="pl-uw">
-          <div>
-            <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Our side of it</div>
-            <h2 className="pl-serif" style={{ fontSize: 'clamp(26px,3.4vw,44px)', fontWeight: 500, lineHeight: 1.1, letterSpacing: '-0.025em', margin: 0 }}>
-              If our answers don&rsquo;t earn it,{' '}
-              <span className="pl-return-back"><em className="pl-gold" style={{ fontStyle: 'italic' }}>you get the money back.</em></span>
-            </h2>
-          </div>
-          {/* The conditions, at footnote scale beside the promise rather
-              than hidden below it. A guarantee that shows its terms in
-              the same breath is worth more than one that doesn't. */}
-          <div className="pl-uw-terms" style={{ paddingTop: 8 }}>
-            <div style={{ height: 1, background: 'var(--gold-line)', marginBottom: 16 }} aria-hidden />
-            <p style={{ fontSize: 14, lineHeight: 1.68, color: 'var(--mut)' }}>
-              Every refund request is read by a person, and honoured where the circumstances are right. We will tell you either way, and we will tell you why.
-            </p>
-            <button className="pl-textlink" style={{ fontSize: 14.5, marginTop: 16 }} onClick={() => setShowRefund(true)}>
-              Read the refund policy <PhArrowRight size={13} weight="bold" />
-            </button>
-          </div>
-        </div>
-      </section>
-
       {/* ── FAQ ─────────────────────────────────────────────── */}
-      <section id="faq" className="pl-wrap" style={{ paddingTop: 62, paddingBottom: 40 }}>
+      <section id="faq" className="pl-wrap" style={{ paddingTop: 80, paddingBottom: 40 }}>
         <div className="pl-reveal" style={{ textAlign: 'center', marginBottom: 40 }}>
           <div className="pl-eyebrow" style={{ marginBottom: 18 }}>Questions</div>
           <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, letterSpacing: '-0.025em' }}>
@@ -4737,14 +3567,6 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       {/* ── Closing — the final ask ── */}
       <section className="pl-wrap pl-reveal pl-closing" style={{ paddingTop: 84, paddingBottom: 100, textAlign: 'center', position: 'relative' }}>
         <div style={{ position: 'relative', zIndex: 2 }}>
-          {/* The mark, finishing itself. A question is asked; it resolves
-              into the gold drop — the line minicaai gives you; a beat; then
-              the second drop closes the quotation with the words as you
-              speak them. Placed here so the mark completes at the exact
-              moment the page makes its ask. */}
-          <div className="pl-markbeat" aria-hidden>
-            <MinicaMark size={104} state="given" />
-          </div>
           <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Calm outside · lightning within</div>
           <h2 className="pl-serif" style={{ fontSize: 'clamp(30px,4.2vw,56px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.028em', marginBottom: 26 }}>
             <span style={{ color: 'var(--paper)' }}>The offer is one</span><br />

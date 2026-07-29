@@ -48,10 +48,10 @@ const {
   getToolMeta,
 } = require('../services/botTools');
 
-// Defaults to gpt-5.6 which exposes the hosted web_search tool AND
+// Defaults to gpt-5.5 which exposes the hosted web_search tool AND
 // supports parallel function-calling on the Responses API. Older
 // minis don't.
-const MODEL = process.env.SUPPORT_MODEL || 'gpt-5.6';
+const MODEL = process.env.SUPPORT_MODEL || 'gpt-5.5';
 const MAX_HISTORY = 20;         // turns retained per request
 const MAX_MESSAGE_CHARS = 2000; // per-message char cap
 const MAX_OUTPUT_TOKENS = 1500; // per-response cap
@@ -273,7 +273,7 @@ ${toolList}
 ### Tool-use rules (admin)
 1. **Self-questions still use get_my_* tools — and "my email" counts as self.** If the admin asks about THEIR OWN subscription / license / data, call get_my_subscription / get_my_license / view_my_recent_conversations — NOT search_user. Before calling search_user with any email, ask: "is this the same email as the admin currently signed in?" If yes, that's a self-question — use the get_my_* tool instead. Calling search_user with the caller's own email always returns a redirect anyway, so save the round-trip and route correctly the first time. search_user is reserved for looking up OTHER users.
 2. **Never call any tool with empty arguments.** If args are required and the admin hasn't provided them, ASK first.
-3. **Always confirm destructive actions before passing confirmed:true.** Even for the admin. Describe what will happen ("This will refund $25 USD to user@example.com, mark payment #42 refunded, and downgrade their license to free at period end — proceed?") and wait for an explicit yes.
+3. **Always confirm destructive actions before passing confirmed:true.** Even for the admin. Describe what will happen ("This will refund $25 USD to venu@example.com, mark payment #42 refunded, and downgrade their license to free at period end — proceed?") and wait for an explicit yes.
 4. **Step-up reauth is automatic.** If a destructive tool returns needs_step_up, do NOT panic — the chat UI will prompt the admin for their password inline. After they reauth, you will be asked to retry the action. Just continue naturally.
 5. **Never expose raw errors.** If a tool fails, surface what happened in plain English with a suggested next step. Never paste a stack trace.
 6. **Batch carefully.** If asked to refund 5 payments, ask "Shall I do them one by one with confirmation each, or all at once?" and respect the answer.
@@ -353,25 +353,9 @@ function detectSession(req) {
     const email = String(decoded.email || '').toLowerCase();
     const isAdmin = email !== '' && getAdminEmails().includes(email);
 
-    // Derived from AI_CHAT_TIERS rather than a second hand-written list,
-    // because the hand-written one had already drifted: it named basic,
-    // pro and max, so an ULTRA customer matched no branch and fell through
-    // to 'anonymous'. That is not a cosmetic label — role drives three
-    // things downstream:
-    //   · the system prompt (anonymous ⇒ SYSTEM_PROMPT_PUBLIC, i.e. the
-    //     bot talks to a paying customer as though they were signed out)
-    //   · the tool catalog (anonymous ⇒ web_search ONLY, so all 17 user
-    //     tools are stripped and the bot cannot look up their own licence,
-    //     credits, payments or devices — it physically cannot answer
-    //     "why are my credits zero")
-    //   · which model loop runs
-    // Tying it to AI_CHAT_TIERS means adding a tier in one place cannot
-    // leave it half-entitled again.
-    // (AI_CHAT_TIERS is declared below; this function only runs per-request,
-    // long after module evaluation, so the reference is resolved.)
     const role = isAdmin
       ? 'admin'
-      : AI_CHAT_TIERS.has(tier)
+      : (tier === 'basic' || tier === 'pro' || tier === 'max')
         ? 'user'
         : tier === 'free' ? 'free' : 'anonymous';
 
@@ -399,18 +383,7 @@ function detectSession(req) {
   }
 }
 
-// Tiers entitled to the full AI support chat. Free gets the scripted FAQ
-// (docs/public/TIERS.md: "Full AI chat" from Basic upward), and EVERY tier
-// including Free can hand off to a human — that promise is enforced by the
-// handoff path having no tier gate at all.
-//
-// 'ultra' was missing here. It is a real, granted tier (routes/payments.js
-// returns it with sessions_limit -1) and the published table lists it under
-// "Full AI chat", so the single highest-paying customer was being dropped
-// to the Free scripted FAQ. Any new tier must be added here AND in the
-// matching set in SupportBot.tsx — the client hides the AI composer using
-// its own copy, so a tier missing from either one is silently downgraded.
-const AI_CHAT_TIERS = new Set(['basic', 'pro', 'max', 'ultra']);
+const AI_CHAT_TIERS = new Set(['basic', 'pro', 'max']);
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  POST /chat — SSE tool-loop
@@ -525,7 +498,7 @@ router.post('/chat', async (req, res) => {
     userAgent: String(req.headers['user-agent'] || '').slice(0, 200),
   };
 
-  // Hand off to Anthropic Claude (Sonnet 5 by default). The helper
+  // Hand off to Anthropic Claude (Sonnet 4.6 by default). The helper
   // owns the full tool loop, SSE event shape, step-up reauth halt,
   // and graceful error handling — same contract the inline OpenAI
   // loop used to provide. See services/anthropicSupport.js for the
@@ -1476,7 +1449,7 @@ function safeParse(s) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  AI-ASSIST FOR THE AGENT — draft + polish via GPT-5.6
+//  AI-ASSIST FOR THE AGENT — draft + polish via GPT-5.5
 //
 //  Two modes:
 //    'draft'  — read the whole thread + customer context, write a
@@ -1485,8 +1458,8 @@ function safeParse(s) {
 //               grammar/clarity without changing intent, tone, or
 //               substantive content
 //
-//  Both stream as SSE. Why GPT-5.6: the project standardized on
-//  gpt-5.6 for OpenAI calls (see services/openaiService.ts and
+//  Both stream as SSE. Why GPT-5.5: the project standardized on
+//  gpt-5.5 for OpenAI calls (see services/openaiService.ts and
 //  routes/ai.js). reasoning_effort defaults to 'low' here because
 //  this is a short-context single-turn task — bumping effort would
 //  cost more without measurable quality gain on a 4-sentence reply.
@@ -1497,10 +1470,7 @@ function safeParse(s) {
 // Claude — Sonnet's drafts read more like a human teammate than a
 // chatbot, which matters more for the FIRST-draft surface than for an
 // edit pass. Both can be overridden via env if we ever swap providers.
-// gpt-5.6 note: this call is plain chat.completions with NO tools, so
-// reasoning_effort 'low' below stays valid (5.6 only rejects the
-// tools + effort!='none' combination on /v1/chat/completions).
-const AI_ASSIST_POLISH_MODEL = process.env.SUPPORT_AI_ASSIST_POLISH_MODEL || 'gpt-5.6';
+const AI_ASSIST_POLISH_MODEL = process.env.SUPPORT_AI_ASSIST_POLISH_MODEL || 'gpt-5.5';
 const AI_ASSIST_DRAFT_MODEL = process.env.SUPPORT_AI_ASSIST_DRAFT_MODEL || 'claude-sonnet-5';
 const AI_ASSIST_MAX_TOKENS = 600;
 const AI_ASSIST_MAX_HISTORY = 25;   // recent turns sent to the model

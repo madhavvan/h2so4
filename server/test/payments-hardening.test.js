@@ -165,7 +165,7 @@ describe('credit seeding — subscription lifecycle (ultra-only rule)', () => {
     await webhooks.handleStripeEvent({
       id: `evt_ctl_${seq}`, type: 'checkout.session.completed', created: nextCreated(),
       data: { object: {
-        id: 'cs_ctl', payment_status: 'paid', customer: 'cus_CTL', customer_email: u.email, payment_intent: 'pi_ctl',
+        id: 'cs_ctl', customer: 'cus_CTL', customer_email: u.email, payment_intent: 'pi_ctl',
         amount_total: 5000, currency: 'usd', metadata: { user_email: u.email, user_id: u.id, tier: 'pro' },
       } },
     });
@@ -181,7 +181,7 @@ describe('refund / failure rows coexist with the original completed payment', ()
     await webhooks.handleStripeEvent({
       id: `evt_ref_a_${seq}`, type: 'checkout.session.completed', created: nextCreated(),
       data: { object: {
-        id: 'cs_ref', payment_status: 'paid', customer: 'cus_REF', customer_email: u.email, payment_intent: 'pi_ref',
+        id: 'cs_ref', customer: 'cus_REF', customer_email: u.email, payment_intent: 'pi_ref',
         amount_total: 5000, currency: 'usd', metadata: { user_email: u.email, user_id: u.id, tier: 'pro' },
       } },
     });
@@ -206,7 +206,7 @@ describe('refund / failure rows coexist with the original completed payment', ()
     await webhooks.handleStripeEvent({
       id: `evt_adm_${seq}`, type: 'checkout.session.completed', created: nextCreated(),
       data: { object: {
-        id: 'cs_adm', payment_status: 'paid', customer: 'cus_ADM', customer_email: u.email, payment_intent: 'pi_adm',
+        id: 'cs_adm', customer: 'cus_ADM', customer_email: u.email, payment_intent: 'pi_adm',
         amount_total: 3000, currency: 'usd', metadata: { user_email: u.email, user_id: u.id, tier: 'basic' },
       } },
     });
@@ -242,7 +242,7 @@ describe('refund / failure rows coexist with the original completed payment', ()
     await expect(webhooks.handleStripeEvent({
       id: `evt_rtr_ok_${seq}`, type: 'checkout.session.completed', created: nextCreated(),
       data: { object: {
-        id: 'cs_rtr', payment_status: 'paid', customer: 'cus_RTR', customer_email: u.email, payment_intent: 'pi_rtr',
+        id: 'cs_rtr', customer: 'cus_RTR', customer_email: u.email, payment_intent: 'pi_rtr',
         amount_total: 5000, currency: 'usd', metadata: { user_email: u.email, user_id: u.id, tier: 'pro' },
       } },
     })).resolves.toBeUndefined();
@@ -264,7 +264,7 @@ describe('refund rows dedup on the provider refund id (no double-count)', () => 
     const u = makeUser('free', { customerId: 'cus_RD1' });
     await webhooks.handleStripeEvent({
       id: `evt_rd1_buy_${seq}`, type: 'checkout.session.completed', created: nextCreated(),
-      data: { object: { id: 'cs_rd1', payment_status: 'paid', customer: 'cus_RD1', customer_email: u.email, payment_intent: 'pi_rd1', amount_total: 5000, currency: 'usd', metadata: { user_email: u.email, user_id: u.id, tier: 'pro' } } },
+      data: { object: { id: 'cs_rd1', customer: 'cus_RD1', customer_email: u.email, payment_intent: 'pi_rd1', amount_total: 5000, currency: 'usd', metadata: { user_email: u.email, user_id: u.id, tier: 'pro' } } },
     });
     // Admin console path writes the compensating row first, stamping refund_id.
     const orig = db.getPaymentsByUser(u.id).find(p => p.status === 'completed');
@@ -443,7 +443,7 @@ describe('refund accounting — partial-refund correctness', () => {
     const u = makeUser('free', { customerId: 'cus_CUM2' });
     await webhooks.handleStripeEvent({
       id: `evt_cum2_buy_${seq}`, type: 'checkout.session.completed', created: nextCreated(),
-      data: { object: { id: 'cs_cum2', payment_status: 'paid', customer: 'cus_CUM2', customer_email: u.email, payment_intent: 'pi_cum2', amount_total: 5000, currency: 'usd', metadata: { user_email: u.email, user_id: u.id, tier: 'pro' } } },
+      data: { object: { id: 'cs_cum2', customer: 'cus_CUM2', customer_email: u.email, payment_intent: 'pi_cum2', amount_total: 5000, currency: 'usd', metadata: { user_email: u.email, user_id: u.id, tier: 'pro' } } },
     });
     // Partial refund #1: $20 of $50. amount_refunded is cumulative (2000).
     await webhooks.handleStripeEvent({
@@ -508,17 +508,7 @@ describe('checkoutConflictFor — fresh checkout vs live recurring plan', () => 
 
   it('past_due Ultra is still a live sub — same guards apply during dunning', () => {
     expect(payments.checkoutConflictFor(lic('ultra', 'past_due'), true, 'basic').code).toBe('subscription_active');
-    // Still refused (a second subscription never fixes a declined card) —
-    // but past_due gets its OWN verdict. It used to fall through to
-    // 'already_subscribed', i.e. "there's nothing more to buy", told to a
-    // customer whose card had just failed and whose sub is counting down to
-    // cancellation. The refusal is right; that reason was actively harmful.
-    const pastDue = payments.checkoutConflictFor(lic('ultra', 'past_due'), true, 'ultra');
-    expect(pastDue.code).toBe('payment_method_required');
-    expect(pastDue.httpStatus).toBe(409);
-    expect(pastDue.suggested_action).toBe('update-payment-method');
-    expect(pastDue.message).toMatch(/didn't go through/);
-    expect(pastDue.message).not.toMatch(/nothing more to buy/);
+    expect(payments.checkoutConflictFor(lic('ultra', 'past_due'), true, 'ultra').code).toBe('already_subscribed');
   });
 
   it('legacy Pro SUBSCRIBER buying Ultra → upgrade_in_place (prorated swap, not a second sub)', () => {

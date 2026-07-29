@@ -74,8 +74,6 @@ const INVOKE_CHANNELS = new Set([
   'db:claim-orphan-sessions',
   'db:get-active-session',
   'db:list-sessions',
-  'db:known-session-ids',
-  'db:import-remote-session',
   'db:new-session',
   'db:switch-session',
   'db:rename-session',

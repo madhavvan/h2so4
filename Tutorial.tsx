@@ -176,7 +176,7 @@ function buildDesktopSteps(os: DesktopOS): TutorialStep[] {
             <>
                 Switch models from the dropdown in the top-right. Each model has different strengths:
                 <ul className="mt-2 text-sm space-y-1 list-disc list-inside text-gray-300">
-                    <li><span className="font-semibold text-white">Gemini, GPT-5.6, Grok, Groq</span> — on every plan (your free trial includes all four)</li>
+                    <li><span className="font-semibold text-white">Gemini, GPT-5.5, Grok, Groq</span> — on every plan (your free trial includes all four)</li>
                     <li><span className="font-semibold text-orange-400">Claude (Pro & up)</span> — smartest, web-search-aware, most human-sounding</li>
                 </ul>
             </>
@@ -345,7 +345,7 @@ function buildDesktopSteps(os: DesktopOS): TutorialStep[] {
                 <ul className="mt-3 text-sm space-y-2 text-gray-300">
                     <li className="flex gap-2"><span className="text-rose-400">→</span> <span><span className="font-semibold text-white">Running low mid-interview?</span> Top up from Settings → Manage plan — +30 min / +1 h / +3 h packs apply instantly, no restart.</span></li>
                     <li className="flex gap-2"><span className="text-rose-400">→</span> <span>Every session's transcript and answers save to your <span className="font-semibold text-white">History</span> — review or export them after the call.</span></li>
-                    <li className="flex gap-2"><span className="text-rose-400">→</span> <span>On <span className="font-semibold text-white">Max &amp; Ultra</span>, the GPT-5.6 <span className="font-semibold text-white">reasoning dial</span> trades answer speed for depth, per question.</span></li>
+                    <li className="flex gap-2"><span className="text-rose-400">→</span> <span>On <span className="font-semibold text-white">Max &amp; Ultra</span>, the GPT-5.5 <span className="font-semibold text-white">reasoning dial</span> trades answer speed for depth, per question.</span></li>
                 </ul>
             </>
         ),

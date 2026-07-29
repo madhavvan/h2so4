@@ -24,11 +24,11 @@ const db = require('../database');
 const router = express.Router();
 
 // ── Payment providers (loaded lazily for refund/cancel) ──
-const { createStripeClient } = require('../services/stripeClient');
-const { resolveStripeRefundTarget, cancelSubscriptionAfterFullRefund } = require('../services/stripeRefunds');
+let stripe = null;
 let razorpay = null;
-// Pinned API version — see services/stripeClient.js.
-const stripe = createStripeClient();
+if (process.env.STRIPE_SECRET_KEY) {
+  stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+}
 if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
   const Razorpay = require('razorpay');
   razorpay = new Razorpay({
@@ -850,31 +850,15 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
     }
 
     let providerRefundId = null;
-    let subscriptionCancel = null;
     if (payment.provider === 'stripe') {
       if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
       // Stripe reason must be one of: duplicate, fraudulent, requested_by_customer.
       // Anything else → pass as metadata.
       const validReasons = ['duplicate', 'fraudulent', 'requested_by_customer'];
       const stripeReason = validReasons.includes(reason) ? reason : 'requested_by_customer';
-      // Resolve what Stripe will actually accept. The old inline
-      // `startsWith('pi_') ? … : undefined` pair passed BOTH as undefined
-      // for any `cs_…` row — which is every Ultra first charge, because a
-      // subscription-mode Checkout Session has no PaymentIntent and the
-      // first invoice is deliberately not recorded. Result: refunding the
-      // $159 flagship's first month 500'd here, and the Stripe Dashboard
-      // was the only way to do it. See services/stripeRefunds.js.
-      let refundTarget;
-      try {
-        refundTarget = await resolveStripeRefundTarget(stripe, payment);
-      } catch (targetErr) {
-        if (targetErr.code === 'NO_REFUND_TARGET') {
-          return res.status(400).json({ error: 'refund_target_unresolved', reason: targetErr.message });
-        }
-        throw targetErr;
-      }
       const refund = await stripe.refunds.create({
-        ...refundTarget,
+        payment_intent: payment.provider_payment_id.startsWith('pi_') ? payment.provider_payment_id : undefined,
+        charge: payment.provider_payment_id.startsWith('ch_') ? payment.provider_payment_id : undefined,
         amount: refundAmount,
         reason: stripeReason,
         metadata: {
@@ -884,16 +868,6 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
         },
       });
       providerRefundId = refund.id;
-
-      // A full refund of a SUBSCRIPTION charge must end the subscription.
-      // Otherwise the money goes back, charge.refunded drops the user to
-      // free — and the next billing cycle charges them again and
-      // customer.subscription.updated re-grants the tier on an account we
-      // already refunded. Best-effort: the refund has succeeded, so a
-      // failure here is reported, never thrown.
-      subscriptionCancel = await cancelSubscriptionAfterFullRefund(stripe, payment, {
-        isFullRefund: refundAmount >= payment.amount,
-      });
     } else if (payment.provider === 'razorpay') {
       if (!razorpay) return res.status(503).json({ error: 'Razorpay not configured' });
       const refund = await razorpay.payments.refund(payment.provider_payment_id, {
@@ -933,7 +907,6 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
       eligibility_code: eligibility.eligible ? null : eligibility.code,
       eligibility_reason: eligibility.eligible ? null : eligibility.reason,
       override_reason: !eligibility.eligible ? override_reason : null,
-      subscription_cancel: subscriptionCancel || null,
     });
 
     res.json({
@@ -942,9 +915,6 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
       provider: payment.provider,
       provider_refund_id: providerRefundId,
       refund_row: refundRow,
-      // Present for Stripe subscription refunds so the operator can see
-      // whether the recurring plan was actually stopped.
-      subscription_cancel: subscriptionCancel || undefined,
     });
   } catch (err) {
     console.error('Refund error:', err);

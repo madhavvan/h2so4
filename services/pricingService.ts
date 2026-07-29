@@ -80,7 +80,7 @@ const INR_CHECKOUT_ENABLED = false;
 
 const BASE_FEATURES_FREE = [
   '10-minute free trial — all models except Claude',
-  'Gemini · GPT-5.6 · Grok · Groq during your trial',
+  'Gemini · GPT-5.5 · Grok · Groq during your trial',
   'Screen & transcript capture',
   'Community support',
 ];
@@ -92,7 +92,7 @@ const BASE_FEATURES_FREE = [
 const BASE_FEATURES_BASIC = [
   'One 30-minute interview',
   'Extend anytime (+30 min / +1 h / +3 h packs)',
-  'Four AI models (Gemini · GPT-5.6 · Grok · Groq)',
+  'Four AI models (Gemini · GPT-5.5 · Grok · Groq)',
   'Pop-out stealth mode',
   'Auto-solve with screen analysis',
   'Resume & JD context upload',

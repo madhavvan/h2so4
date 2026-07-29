@@ -134,39 +134,6 @@ function isPlanLapsed(license) {
   return false;
 }
 
-// ── The cancel window MUST be a real date ────────────────────────────
-// A 'canceling' license is the one state whose termination depends on a
-// timestamp rather than an event: the cycle-end sweeper
-// (getExpiredCancelingUserIds) and /license/validate's auto-transition
-// both find it by `expires_at`, and both filter to `expires_at > 0`
-// because a non-positive value means "never expires".
-//
-// Ultra is granted with expires_at = -1 (unlimited, provider-managed).
-// So every cancel path that wrote `periodEndMs || license.expires_at`
-// left a canceled Ultra pinned at -1 whenever the provider lookup for
-// the period end came back empty — a Stripe blip, a Razorpay 5xx, or
-// (silently, on every request) an account whose webhook endpoint runs a
-// newer API version where subscription.current_period_end no longer
-// exists. The result is a subscription that is canceled everywhere
-// except our database, invisible to BOTH fallbacks, serving unlimited
-// Ultra forever. It is the only lifecycle state with no self-healing
-// path: the one-time passes carry a real expiry and lapse on their own.
-//
-// So: never persist a canceling license without a positive window. A
-// monthly cycle end is at most ~31 days out, so that bound can never cut
-// a paying customer short — it only guarantees the state terminates.
-// Comp/lifetime grants are unaffected: they are written status='active'
-// (recordCompPayment), never 'canceling'.
-const CANCEL_FALLBACK_WINDOW_MS = 31 * 24 * 60 * 60 * 1000;
-function resolveCancelPeriodEnd(periodEndMs, currentExpiresAt, now = Date.now()) {
-  if (Number.isFinite(periodEndMs) && periodEndMs > 0) return periodEndMs;
-  // An existing positive expiry is honest — a one-time pass being
-  // canceled keeps its own window, and an already-past one just means
-  // the sweeper collects it on the next tick.
-  if (Number.isFinite(currentExpiresAt) && currentExpiresAt > 0) return currentExpiresAt;
-  return now + CANCEL_FALLBACK_WINDOW_MS;
-}
-
 // Throws when a writer would persist an unknown status. Use at the top
 // of update functions so a typo at a call site is caught at write time
 // (loud) rather than silently corrupting the row (hidden until a reader
@@ -191,6 +158,4 @@ module.exports = {
   isTerminal,
   isPlanLapsed,
   assertValidStatus,
-  resolveCancelPeriodEnd,
-  CANCEL_FALLBACK_WINDOW_MS,
 };

@@ -84,10 +84,7 @@ export interface SupportBotProps {
   onBotAction?: (action: BotAction) => void | Promise<void>;
 }
 
-// Must stay in sync with AI_CHAT_TIERS in server/src/routes/support.js.
-// 'ultra' was absent from both, so the top paid tier saw the Free scripted
-// FAQ instead of the AI chat its plan promises.
-const AI_CHAT_TIERS = new Set(['basic', 'pro', 'max', 'ultra']);
+const AI_CHAT_TIERS = new Set(['basic', 'pro', 'max']);
 
 type ScriptedTopic = { id: string; q: string; a: string };
 type ScriptedCategory = { id: string; label: string; topics: ScriptedTopic[] };
@@ -194,30 +191,19 @@ const PALETTE_LANDING: Palette = {
   font: 'var(--sans)',
 };
 
-// In-app panel. Every value is a theme-aware --mc-* token (defined in
-// index.html for both light and dark), so the panel follows the app's
-// warm cream / warm obsidian material instead of fighting it.
-//
-// What was wrong before: inkMuted and inkFaint were hardcoded COOL greys
-// (#6b7280 / #9ca3af). They never flipped with the theme, so on the warm
-// obsidian dark surface the secondary text read blue-grey against warm
-// paper, and on cream it read cold against terracotta-warm neutrals —
-// the single biggest reason the support panel looked like a different
-// product bolted into the app. invertText was flat #ffffff, brighter than
-// any real text in the product.
 const PALETTE_APP: Palette = {
-  bg: 'var(--mc-bg)',
-  bgSoft: 'var(--mc-raise)',
-  bgInput: 'var(--mc-input)',
-  border: 'var(--mc-line)',
-  ink: 'var(--mc-ink)',
-  inkSoft: 'var(--mc-ink-soft)',
-  inkMuted: 'var(--mc-ink-muted)',
-  inkFaint: 'var(--mc-ink-faint)',
-  accent: 'var(--mc-accent)',
-  accentSoft: 'var(--mc-accent-soft)',
-  invertBg: 'var(--mc-invert-bg)',
-  invertText: 'var(--mc-invert-ink)',
+  bg: 'var(--surface-color)',
+  bgSoft: 'var(--bg-color)',
+  bgInput: 'var(--surface-color)',
+  border: 'var(--border-color)',
+  ink: 'var(--text-color)',
+  inkSoft: 'var(--text-color)',
+  inkMuted: '#6b7280',
+  inkFaint: '#9ca3af',
+  accent: '#d3ac63',
+  accentSoft: 'rgba(211,172,99,0.14)',
+  invertBg: '#15130d',
+  invertText: '#ffffff',
   font: 'inherit',
 };
 
@@ -235,29 +221,10 @@ const SupportBot: React.FC<SupportBotProps> = ({
   const p = mode === 'panel' ? PALETTE_APP : PALETTE_LANDING;
 
   // ── Tier resolution ────────────────────────────────────────────
-  // The SERVER is authoritative. A `tier` prop from the parent is only an
-  // optimistic seed to avoid a spinner flash — it never replaces the probe.
-  //
-  // It used to replace it, and that was the "please sign up" bug. Both real
-  // call sites pass `tier={license?.tier ?? null}`, and `null !== undefined`,
-  // so the component took the "parent owns this" branch, evaluated
-  // `null || 'anonymous'`, and rendered "Sign up free to chat with Minica"
-  // at a signed-in customer. It then never recovered, because that branch
-  // also skipped the probe AND short-circuited the auth-change listener, so
-  // nothing re-checked once the licence finished loading. Any moment the
-  // parent's licence object was null — first paint, a slow or failed
-  // /license/validate, a token refresh — put the panel into a stuck
-  // signed-out state.
-  //
-  // Same root cause hid the admin inbox: isAdminRole is only ever set from
-  // the probe response, so whenever the parent passed a tier the probe
-  // never ran and `isAdminRole` stayed false. The in-app panel (App.tsx)
-  // always passes one — which is why the inbox appeared in the floating bot
-  // (no tier prop → probe ran) but not in the panel.
-  //
-  // Now: seed from the prop when it carries a real tier, then always probe
-  // and let the server correct it. The probe is anonymous-friendly — no
-  // token → tier='anonymous'.
+  // If parent passed a tier explicitly (App.tsx knows from userLicense,
+  // SubscriptionGate knows from currentLicense), trust it. Otherwise
+  // probe /api/v1/support/tier with whatever auth we have. The probe
+  // is anonymous-friendly — no token → tier='anonymous'.
   //
   // The bot is reactive to auth state changes:
   //   • Reads the JWT directly from localStorage at fetch time (not just
@@ -267,10 +234,8 @@ const SupportBot: React.FC<SupportBotProps> = ({
   //   • Listens for the 'minicaai-auth-changed' custom event dispatched
   //     by licenseService.saveAuth/clearAuth and re-runs the tier probe.
   //   • Also listens for cross-tab 'storage' events for parity.
-  // A falsy prop means "the parent does not know yet", NOT "anonymous".
-  // Seeding null keeps the panel in its resolving state until the server
-  // answers, instead of asserting signed-out at a signed-in user.
-  const initialResolved = tierProp || null;
+  const initialResolved =
+    tierProp === undefined ? null : (tierProp || 'anonymous');
   const [resolvedTier, setResolvedTier] = useState<string | null>(initialResolved);
   const [isAdminRole, setIsAdminRole] = useState<boolean>(false);
   const [tierProbeNonce, setTierProbeNonce] = useState(0);
@@ -292,10 +257,10 @@ const SupportBot: React.FC<SupportBotProps> = ({
   }, [authToken]);
 
   useEffect(() => {
-    // Optimistic seed only — no early return. The probe below is what
-    // decides, because it is the only thing that sees the JWT, the real
-    // licence row, and admin status.
-    if (tierProp) setResolvedTier(tierProp);
+    if (tierProp !== undefined) {
+      setResolvedTier(tierProp || 'anonymous');
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -356,10 +321,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
   // 'storage' fires for cross-tab logins. Both bump the nonce, which is
   // in the dep array of the tier-probe effect → re-runs the fetch.
   useEffect(() => {
-    // Runs regardless of the tier prop. Sign-in, sign-out and cross-tab
-    // auth changes must always re-probe — when this returned early for a
-    // parent-supplied tier, a user who signed in while the panel was open
-    // stayed stuck on whatever the prop said at mount.
+    if (tierProp !== undefined) return;  // parent owns tier; nothing to refetch
     if (typeof window === 'undefined') return;
     const refresh = () => {
       // Reset resolution to 'loading' state so UI shows spinner during refetch.
@@ -653,11 +615,16 @@ const SupportBot: React.FC<SupportBotProps> = ({
           let payload: any = null;
           try { payload = JSON.parse(dataStr); } catch { continue; }
 
-          // (Removed: a rollout-era console.log of every non-delta SSE
-          // event. It printed whole payloads, and the admin role's
-          // tool_call events carry account lookups and billing actions —
-          // not something to leave writing into anyone's DevTools once
-          // the flow was confirmed working.)
+          // TEMPORARY: log non-text events to verify SSE wiring during
+          // bot-rollout testing. Remove once the chat flow is confirmed
+          // working in both Electron and web. Text deltas would spam
+          // the console.
+          if (eventName !== 'delta') {
+            try {
+              // eslint-disable-next-line no-console
+              console.log('[support sse]', eventName, payload);
+            } catch { /* dev tools closed */ }
+          }
 
           if (eventName === 'delta' && typeof payload.text === 'string') {
             gotAny = true;
@@ -1557,7 +1524,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
     return `${day}d ago`;
   }, []);
 
-  // ── AI-assist (GPT-5.6) — draft + polish for the agent ──
+  // ── AI-assist (GPT-5.5) — draft + polish for the agent ──
   // Streams from POST /inbox/threads/:id/ai-assist. assistMode is
   // null when idle; 'draft' or 'polish' while streaming or
   // displaying a suggestion. assistText accumulates the SSE deltas.
@@ -2070,8 +2037,8 @@ const SupportBot: React.FC<SupportBotProps> = ({
   // (and OVERWRITE inboxMessages) every time another customer joined,
   // sent a message, or the 5s SLA recompute flipped a color. That
   // wiped optimistic agent appends and any live message that arrived
-  // between the WS event and the GET completing — the symptom
-  // reported as "messages not reflecting after claim".
+  // between the WS event and the GET completing — the symptom Venu
+  // hit as "messages not reflecting after claim".
   //
   // Lookup of threadId is via the ref so the effect doesn't subscribe
   // to inboxCustomers changes. The MERGE policy below preserves any
@@ -2365,17 +2332,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
       ? 'fixed inset-0 z-[100] flex items-center justify-center p-6 overflow-y-auto'
       : mode === 'floating'
       ? 'fixed bottom-6 right-6 z-[60] w-[400px] max-w-[calc(100vw-2rem)] h-[620px] max-h-[calc(100vh-3rem)]'
-      // panel: the PARENT owns the height (App.tsx pins the support modal
-      // body to min(70vh,720px)), so this must be able to shrink to it.
-      // It used to carry min-h-[500px], which on any window shorter than
-      // ~715px exceeded the height the modal was giving it — the panel
-      // refused to shrink, so the MODAL BODY scrolled instead of the chat
-      // list, and the "Talk to a human" row sat 2px past the modal edge
-      // looking chopped off. Measured on a 687px-tall window: parent gave
-      // 481px, this demanded 500px. min-h-0 lets the internal
-      // flex-1 overflow-y-auto transcript be the only thing that scrolls,
-      // which is what the modal comment upstream always intended.
-      : 'w-full h-full min-h-0';
+      : 'w-full h-full min-h-[500px]';
 
   const innerClass =
     mode === 'view'
@@ -2462,7 +2419,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                   {inboxUnreadTotal > 0 && (
                     <span
                       className="ml-0.5 inline-flex items-center justify-center text-[9px] font-bold rounded-full px-1.5 min-w-[16px] h-[16px]"
-                      style={{ background: 'var(--mc-danger)', color: '#fff' }}
+                      style={{ background: '#ef4444', color: '#fff' }}
                     >
                       {inboxUnreadTotal > 99 ? '99+' : inboxUnreadTotal}
                     </span>
@@ -2548,7 +2505,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                     className="mx-2 my-2 rounded-xl overflow-hidden"
                     style={{
                       background: p.bgSoft,
-                      border: `0.5px solid ${isVerified ? 'var(--mc-ok)' : p.border}`,
+                      border: `0.5px solid ${isVerified ? '#10b981' : p.border}`,
                       boxShadow: '0 1px 2px rgba(20,20,19,0.04)',
                     }}
                   >
@@ -2560,7 +2517,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                       title={pushCardCollapsed ? 'Expand phone push setup' : 'Collapse'}
                     >
                       {isVerified
-                        ? <CheckCircle2 size={13} strokeWidth={2} style={{ color: 'var(--mc-ok)', flexShrink: 0 }} />
+                        ? <CheckCircle2 size={13} strokeWidth={2} style={{ color: '#10b981', flexShrink: 0 }} />
                         : <Smartphone size={13} strokeWidth={1.75} style={{ color: p.accent, flexShrink: 0 }} />}
                       <span
                         className="text-[10.5px] font-semibold uppercase flex-1 truncate"
@@ -2587,7 +2544,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                       <div className="px-2.5 pb-2.5 space-y-2">
                         {isVerified ? (
                           <p className="text-[10.5px] leading-relaxed flex items-start gap-1.5" style={{ color: p.ink }}>
-                            <span style={{ color: 'var(--mc-ok)' }}>✓</span>
+                            <span style={{ color: '#10b981' }}>✓</span>
                             <span>
                               <strong>Already set up.</strong> You subscribed once; your phone will buzz every time a customer needs help — no need to re-paste anything. Last alert: <strong>{inboxPresence.ntfy_last_alert_at ? formatRelativeTime(inboxPresence.ntfy_last_alert_at) : 'never'}</strong>.
                             </span>
@@ -2622,9 +2579,9 @@ const SupportBot: React.FC<SupportBotProps> = ({
                             onClick={copyTopicUrl}
                             className="flex-1 text-[10px] font-semibold py-1 rounded transition-colors"
                             style={{
-                              background: topicCopied ? 'var(--mc-ok)' : p.bg,
+                              background: topicCopied ? '#10b981' : p.bg,
                               color: topicCopied ? '#fff' : p.ink,
-                              border: `1px solid ${topicCopied ? 'var(--mc-ok)' : p.border}`,
+                              border: `1px solid ${topicCopied ? '#10b981' : p.border}`,
                             }}
                           >
                             {topicCopied ? '✓ Copied' : 'Copy topic'}
@@ -2636,8 +2593,8 @@ const SupportBot: React.FC<SupportBotProps> = ({
                             className="flex-1 text-[10px] font-semibold py-1 rounded transition-colors disabled:opacity-60"
                             style={{
                               background:
-                                testAlertStatus === 'sent' ? 'var(--mc-ok)' :
-                                testAlertStatus === 'failed' ? 'var(--mc-danger)' :
+                                testAlertStatus === 'sent' ? '#10b981' :
+                                testAlertStatus === 'failed' ? '#ef4444' :
                                 p.accent,
                               color: '#fff',
                               border: 'none',
@@ -2699,9 +2656,9 @@ const SupportBot: React.FC<SupportBotProps> = ({
                         height: 6,
                         borderRadius: '50%',
                         background:
-                          inboxWsStatus === 'online' ? 'var(--mc-ok)'
-                          : inboxWsStatus === 'offline' ? 'var(--mc-danger)'
-                          : 'var(--mc-warn)',
+                          inboxWsStatus === 'online' ? '#10b981'
+                          : inboxWsStatus === 'offline' ? '#ef4444'
+                          : '#f59e0b',
                       }}
                       aria-label={`ws ${inboxWsStatus}`}
                     />
@@ -2733,10 +2690,10 @@ const SupportBot: React.FC<SupportBotProps> = ({
                       // and we re-tick them client-side every 5s while
                       // the inbox is open so they stay accurate.
                       const slaColor =
-                        cust.sla === 'red'    ? 'var(--mc-danger)' :   // tailwind red-500
-                        cust.sla === 'yellow' ? 'var(--mc-warn)' :   // amber-500
-                        cust.sla === 'green'  ? 'var(--mc-ok)' :   // emerald-500
-                        'var(--mc-ink-faint)';                            // gray-400
+                        cust.sla === 'red'    ? '#ef4444' :   // tailwind red-500
+                        cust.sla === 'yellow' ? '#f59e0b' :   // amber-500
+                        cust.sla === 'green'  ? '#10b981' :   // emerald-500
+                        '#9ca3af';                            // gray-400
                       const statusLabel =
                         cust.status === 'resolved' ? 'RESOLVED' :
                         cust.status === 'assigned' ? 'ASSIGNED' :
@@ -2744,9 +2701,9 @@ const SupportBot: React.FC<SupportBotProps> = ({
                         'OPEN';
                       const statusColor =
                         cust.status === 'resolved' ? p.inkFaint :
-                        cust.status === 'assigned' ? 'var(--mc-accent)' :
-                        cust.status === 'spam'     ? 'var(--mc-danger)' :
-                        'var(--mc-ok)';
+                        cust.status === 'assigned' ? '#3b82f6' :
+                        cust.status === 'spam'     ? '#ef4444' :
+                        '#10b981';
                       return (
                         <button
                           key={cust.email}
@@ -2811,7 +2768,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                           {cust.unread > 0 && (
                             <span
                               className="inline-flex items-center justify-center text-[9px] font-bold rounded-full px-1.5 min-w-[16px] h-[16px] flex-shrink-0 mt-1"
-                              style={{ background: 'var(--mc-danger)', color: '#fff' }}
+                              style={{ background: '#ef4444', color: '#fff' }}
                             >
                               {cust.unread}
                             </span>
@@ -2901,10 +2858,10 @@ const SupportBot: React.FC<SupportBotProps> = ({
                         {(() => {
                           const cust = inboxCustomers.get(inboxActiveEmail);
                           const slaColor =
-                            cust?.sla === 'red'    ? 'var(--mc-danger)' :
-                            cust?.sla === 'yellow' ? 'var(--mc-warn)' :
-                            cust?.sla === 'green'  ? 'var(--mc-ok)' :
-                            'var(--mc-ink-faint)';
+                            cust?.sla === 'red'    ? '#ef4444' :
+                            cust?.sla === 'yellow' ? '#f59e0b' :
+                            cust?.sla === 'green'  ? '#10b981' :
+                            '#9ca3af';
                           return (
                             <span
                               className={`inline-block rounded-full flex-shrink-0${cust?.sla === 'red' ? ' animate-pulse' : ''}`}
@@ -2974,13 +2931,8 @@ const SupportBot: React.FC<SupportBotProps> = ({
                                   className="text-[10px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded transition-colors"
                                   style={{
                                     background: 'transparent',
-                                    // Was hardcoded #d3ac63 — the dark-theme
-                                    // gold, which on the light cream surface
-                                    // sat at roughly 2:1 against the panel.
-                                    // p.accent resolves to the deepened gold
-                                    // in light and the bright one in dark.
-                                    color: p.accent,
-                                    border: `1px solid ${p.accent}`,
+                                    color: '#d3ac63',
+                                    border: `1px solid #d3ac63`,
                                   }}
                                   title="Mark this conversation as assigned to you"
                                 >
@@ -2992,7 +2944,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                                 onClick={() => resolveThread(inboxActiveEmail)}
                                 className="text-[10px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded transition-colors"
                                 style={{
-                                  background: 'var(--mc-ok)',
+                                  background: '#10b981',
                                   color: '#fff',
                                   border: 'none',
                                 }}
@@ -3087,7 +3039,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                               className="text-[9px] font-medium normal-case"
                               style={{ color: p.inkMuted, letterSpacing: '-0.005em' }}
                             >
-                              · {assistMode === 'polish' ? 'GPT-5.6' : 'Claude'}
+                              · {assistMode === 'polish' ? 'GPT-5.5' : 'Claude'}
                             </span>
                           </span>
                           <button
@@ -3122,7 +3074,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                           )}
                         </div>
                         {assistError && (
-                          <div className="text-[10.5px] mt-1.5" style={{ color: 'var(--mc-danger)' }}>
+                          <div className="text-[10.5px] mt-1.5" style={{ color: '#ef4444' }}>
                             {assistError}
                           </div>
                         )}
@@ -3168,8 +3120,8 @@ const SupportBot: React.FC<SupportBotProps> = ({
                           disabled={assistStreaming}
                           className="group inline-flex items-center gap-1.5 px-3 py-[7px] rounded-full transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                           style={{
-                            background: `linear-gradient(180deg, ${p.accent} 0%, color-mix(in srgb, ${p.accent} 86%, #000) 100%)`,
-                            color: p.invertText,
+                            background: `linear-gradient(180deg, ${p.accent} 0%, ${p.accent} 100%)`,
+                            color: '#ffffff',
                             border: 'none',
                             fontSize: 11,
                             fontWeight: 600,
@@ -3212,7 +3164,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                             style={{ color: p.accent, fontWeight: 500, letterSpacing: '-0.005em' }}
                           >
                             <Loader2 size={10} className="animate-spin" strokeWidth={2.25} />
-                            {assistMode === 'polish' ? 'GPT-5.6' : 'Claude'} is thinking…
+                            {assistMode === 'polish' ? 'GPT-5.5' : 'Claude'} is thinking…
                           </span>
                         )}
                       </div>
@@ -3244,8 +3196,8 @@ const SupportBot: React.FC<SupportBotProps> = ({
                           aria-label="Send reply"
                           className="w-[38px] h-[38px] rounded-full flex items-center justify-center flex-shrink-0 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
                           style={{
-                            background: `linear-gradient(180deg, ${p.accent} 0%, color-mix(in srgb, ${p.accent} 86%, #000) 100%)`,
-                            color: p.invertText,
+                            background: `linear-gradient(180deg, ${p.accent} 0%, ${p.accent} 100%)`,
+                            color: '#ffffff',
                             border: 'none',
                             boxShadow: `0 1px 0 rgba(255,255,255,0.18) inset, 0 1px 2px rgba(20,20,19,0.10), 0 4px 10px ${p.accent}33`,
                           }}
@@ -3630,7 +3582,7 @@ const SupportBot: React.FC<SupportBotProps> = ({
                               onMouseLeave={() => setCsatHoverRating(0)}
                               className="text-[22px] leading-none transition-transform hover:scale-110"
                               style={{
-                                color: active ? 'var(--mc-warn)' : p.inkFaint,
+                                color: active ? '#f59e0b' : p.inkFaint,
                                 background: 'transparent',
                                 border: 'none',
                                 padding: '2px 4px',

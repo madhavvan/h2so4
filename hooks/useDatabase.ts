@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Message, ContextFile } from '../types';
 import { syncConversationMessage, syncConversationRename } from '../services/aiProxyService';
-import { pullPhoneConversations } from '../services/phoneConversations';
 
 const isElectron = typeof window !== 'undefined'
   && !!window.electronAPI?.isElectron;
@@ -81,32 +80,6 @@ export function useDatabase(userId: string | null) {
 
     return () => { cancelled = true; };
   }, [userId]);
-
-  // ── Conversations the phone wrote while this machine was off ──────
-  // Runs after `ready` so it can never delay first paint — the sidebar
-  // is on screen with local history before this makes a single request.
-  // See services/phoneConversations.ts for why it pulls only `phone-`
-  // ids and why it polls rather than being pushed to.
-  useEffect(() => {
-    if (!ipc || !userId || !ready) return;
-    let cancelled = false;
-
-    const pull = async () => {
-      const n = await pullPhoneConversations(userId).catch(() => 0);
-      if (cancelled || !n) return;
-      // The import itself broadcasts db:sessions-updated, which the
-      // listener below turns into a list refresh — but that listener is
-      // registered once with no userId in scope, so refresh here too
-      // rather than rely on ordering.
-      ipc.invoke('db:list-sessions', userId).then((l: SessionSummary[]) => {
-        if (!cancelled) setSessions(l);
-      });
-    };
-
-    void pull();
-    const timer = setInterval(pull, 5 * 60 * 1000);
-    return () => { cancelled = true; clearInterval(timer); };
-  }, [userId, ready]);
 
   // Cross-window event listeners. Each renderer (main + popout) subscribes
   // and the main process fans out the relevant channels via broadcastToAllWindows.
@@ -207,18 +180,12 @@ export function useDatabase(userId: string | null) {
   }, []);
 
   const newSession = useCallback(async (name?: string) => {
-    // Clear the VISIBLE session FIRST, unconditionally. Previously this
-    // early-returned when ipc/userId weren't ready (browser mode, or a
-    // userId race right after sign-in) — leaving the previous session's
-    // uploaded files and messages on screen, which read as "files carried
-    // into the new chat". New chat must always look fresh, whether or not
-    // we can persist the new row.
-    setMessages([]);
-    setContextFiles([]);
     if (!ipc || !userIdRef.current) return;
     const session = await ipc.invoke('db:new-session', name, userIdRef.current);
     sessionRef.current = session;
     setSessionId(session.id);
+    setMessages([]);
+    setContextFiles([]);
   }, []);
 
   const switchSession = useCallback(async (targetId: string) => {
@@ -280,7 +247,6 @@ export function useDatabase(userId: string | null) {
     messages,
     setMessages,
     contextFiles,
-    setContextFiles,
     sessions,
     addMessage,
     addContextFile,

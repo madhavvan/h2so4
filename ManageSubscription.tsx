@@ -20,7 +20,6 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import MinicaMark from './MinicaMark';
 import {
   X, Crown, Zap, Sparkles, Check, Loader2, ExternalLink, AlertTriangle,
   Cpu, ChevronRight, Info, ShieldCheck, UploadCloud, CreditCard, Receipt,
@@ -129,18 +128,6 @@ interface SubscriptionStatus {
   // the cancel/reactivate actions — /cancel-subscription 404s for a pass
   // holder because there is no subscription to cancel; passes just expire.
   is_recurring?: boolean;
-  // Whether a top-up can be purchased RIGHT NOW. Top-ups are interview-day
-  // only (an open usage session, or session activity in the last 12 hours),
-  // and that rule is enforced on the server for both top-up routes. The
-  // Billing Hub used to render the "Add N minutes · $X" button
-  // unconditionally, so opening this dialog on any other day offered a
-  // paid action that could only 403 — the button promised something the
-  // server would refuse. Server-computed from the same predicate the gate
-  // uses, so the affordance and the rule cannot drift apart. Absent on an
-  // older server → treated as allowed (the pre-existing behavior).
-  can_extend?: boolean;
-  extend_blocked_reason?: string | null;
-  extend_blocked_message?: string | null;
 }
 
 interface ManageSubscriptionProps {
@@ -199,7 +186,7 @@ const TIER_INFO: Record<string, {
     color: 'text-emerald-400',
     gradient: 'from-emerald-600/40 to-emerald-800/40',
     icon: Zap,
-    blurb: 'One 30-min interview · Gemini, GPT-5.6, Grok, Groq (no Claude). Extendable +30 min.',
+    blurb: 'One 30-min interview · Gemini, GPT-5.5, Grok, Groq (no Claude). Extendable +30 min.',
   },
   pro: {
     label: 'Pro',
@@ -316,7 +303,7 @@ const TIER_ORDER = ['free', 'basic', 'pro', 'max', 'ultra'] as const;
 // row chrome — gold hairline for the metals, violet glow for the Ultra jewel.
 type BuyTier = 'basic' | 'pro' | 'max' | 'ultra';
 const PLAN_ROW_META: Record<BuyTier, { title: string; blurb: string; Icon: React.ComponentType<{ size?: number }>; accent: 'gold' | 'violet' }> = {
-  basic: { title: 'Get Basic', Icon: BasicMark, accent: 'gold',   blurb: 'One 30-min interview · Gemini, GPT-5.6, Grok, Groq (no Claude)' },
+  basic: { title: 'Get Basic', Icon: BasicMark, accent: 'gold',   blurb: 'One 30-min interview · Gemini, GPT-5.5, Grok, Groq (no Claude)' },
   pro:   { title: 'Get Pro',   Icon: ProMark,   accent: 'gold',   blurb: 'One 1-hour interview · all 5 models incl. Claude Sonnet 5' },
   max:   { title: 'Get Max',   Icon: MaxMark,   accent: 'gold',   blurb: 'Three 1-hour interviews · all 5 models · Train Model' },
   ultra: { title: 'Go Ultra',  Icon: UltraMark,  accent: 'violet', blurb: 'Unlimited interviews · Auto-Type · all 5 models · billed monthly' },
@@ -569,29 +556,6 @@ export function ManageSubscription({
         if (window.electronAPI?.openExternal) window.electronAPI.openExternal(data.checkout_url);
         else window.open(data.checkout_url, '_blank', 'noopener');
         setSuccess('Complete the top-up in your browser — your time lands here automatically.');
-        // ...and actually make it land. This branch (no saved card, or the
-        // bank demanded 3DS) previously promised an automatic update and
-        // then did nothing: the renderer never sees Stripe's redirect, and
-        // nothing in this modal polled. The user watched an unchanged
-        // balance until they restarted the app. /verify-stripe confirms the
-        // session server-side and grants idempotently, so a short poll
-        // turns the promise into fact — and covers a missing webhook too.
-        if (data.session_id) {
-          const started = Date.now();
-          const tick = async () => {
-            if (!mountedRef.current || Date.now() - started > 10 * 60 * 1000) return;
-            const verified = await licenseService.verifyStripeCheckout(data.session_id);
-            if (verified?.success && !verified.pending) {
-              await licenseService.validateWithServer().catch(() => {});
-              if (!mountedRef.current) return;
-              setSuccess(verified.message || 'Top-up confirmed — the extra time is on your clock.');
-              fetchSubscription();
-              return;
-            }
-            window.setTimeout(tick, 4000);
-          };
-          window.setTimeout(tick, 4000);
-        }
         return;
       }
       throw new Error(data.message || data.error || 'Top-up failed. Please try again.');
@@ -1034,27 +998,20 @@ export function ManageSubscription({
                       // +30 min · $25 unit, so picking "+3 hours" showed
                       // "$25" on the button and charged $80.
                       const sel = packs.find(p => p.id === selectedExtPack) || packs[0];
-                      // Top-ups are interview-day only, and the server owns
-                      // that rule. Undefined (older server) = allowed, which
-                      // preserves the previous behavior rather than hiding
-                      // the control behind a field that isn't there yet.
-                      const extendAllowed = sub?.can_extend !== false;
                       return (
                         <>
                           <div className="flex gap-1 mb-2">
                             {packs.map(p => (
                               <button key={p.id} onClick={() => setSelectedExtPack(p.id)}
-                                disabled={!extendAllowed}
-                                className={"px-2 py-1 rounded text-[10px] font-bold border transition-all disabled:opacity-40 disabled:cursor-not-allowed " + (selectedExtPack === p.id ? "bg-emerald-500/25 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 enabled:hover:bg-emerald-500/20")}>
+                                className={"px-2 py-1 rounded text-[10px] font-bold border transition-all " + (selectedExtPack === p.id ? "bg-emerald-500/25 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20")}>
                                 {p.label + " · " + p.currencySymbol + p.price}
                               </button>
                             ))}
                           </div>
                           <button
                             onClick={handleExtendNow}
-                            disabled={extendLoading || !extendAllowed}
-                            title={extendAllowed ? undefined : (sub?.extend_blocked_message || undefined)}
-                            className="w-full sm:w-auto px-4 py-2 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold enabled:hover:bg-emerald-500/25 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                            disabled={extendLoading}
+                            className="w-full sm:w-auto px-4 py-2 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold hover:bg-emerald-500/25 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
                           >
                             {extendLoading ? <Loader2 size={13} className="animate-spin" /> : <Zap size={13} />}
                             {`Add ${sel.minutes} minutes · ${pricingService.formatPrice(sel.price, sel.currencySymbol, sel.currency)}`}
@@ -1063,10 +1020,7 @@ export function ManageSubscription({
                       );
                     })()}
                     <p className="text-[10px] text-white/40 mt-1.5">
-                      {sub?.can_extend === false
-                        ? (sub?.extend_blocked_message
-                            || 'Top-ups are available during your interview day. Start your interview first, or buy a new interview pass.')
-                        : 'One click on your card on file. Repeat as often as you need on your interview day.'}
+                      One click on your card on file. Repeat as often as you need on your interview day.
                     </p>
                   </div>
                   )}
@@ -1090,7 +1044,7 @@ export function ManageSubscription({
         {/* Loading / error / success banners */}
         {loading && (
           <div className="flex items-center justify-center py-6 text-sm text-gray-400">
-            <MinicaMark size={22} state="thinking" className="mr-2" />
+            <Loader2 size={16} className="animate-spin mr-2" />
             Loading subscription details…
           </div>
         )}
