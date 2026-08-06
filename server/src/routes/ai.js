@@ -49,19 +49,39 @@ router.post('/context', (req, res) => {
   res.json({ ok: true, hash: result.hash, deduped: result.deduped });
 });
 
+// ── "I'm finished with those documents" ──
+//
+// The store had no way to be told this. Entries expired on a three-hour
+// TTL, so after a user deleted their files, started a new conversation or
+// signed out, their resume stayed resident on the server for the rest of
+// that window with nothing referencing it. A TTL is a backstop against
+// leaks, not a retention policy — the client knows the moment the knowledge
+// base is gone, and it should be able to say so.
+//
+// Idempotent, unauthenticated beyond the router's own auth, and scoped to
+// the caller: a user can only ever forget their own blobs.
+router.post('/context/forget', (req, res) => {
+  const dropped = contextStore.forgetUser(req.user?.id);
+  res.json({ ok: true, dropped });
+});
+
 router.use((req, res, next) => {
   try {
     const userId = req.user?.id;
     const body = req.body;
     if (!userId || !body || typeof body !== 'object') return next();
+    // ONE budget for all three fields. Per-call budgets would let a request
+    // spend the whole ceiling three times over (systemInstruction + prompt +
+    // messages), and the expansion is what we're bounding — not the field.
+    const budget = contextStore.newResolveBudget();
     if (typeof body.systemInstruction === 'string') {
-      body.systemInstruction = contextStore.resolveText(userId, body.systemInstruction);
+      body.systemInstruction = contextStore.resolveText(userId, body.systemInstruction, budget);
     }
     if (typeof body.prompt === 'string') {
-      body.prompt = contextStore.resolveText(userId, body.prompt);
+      body.prompt = contextStore.resolveText(userId, body.prompt, budget);
     }
     if (Array.isArray(body.messages)) {
-      body.messages = contextStore.resolveMessages(userId, body.messages);
+      body.messages = contextStore.resolveMessages(userId, body.messages, budget);
     }
     next();
   } catch (err) {
@@ -69,6 +89,15 @@ router.use((req, res, next) => {
       return res.status(409).json({
         error: 'context_missing',
         message: 'Uploaded context is no longer cached — resend it inline.',
+      });
+    }
+    // Answered here rather than by falling through to next(err): the global
+    // handler responds 500 unconditionally, and a 500 reads as "our fault,
+    // retry" — which for this one is the opposite of what the client should do.
+    if (err && err.code === 'CONTEXT_TOO_LARGE') {
+      return res.status(413).json({
+        error: 'context_too_large',
+        message: 'Too many context placeholders in one request.',
       });
     }
     next(err);
@@ -767,7 +796,84 @@ const { classifyQuestion } = require('../services/questionClassifier');
 //  needs to say. Returns '' whenever there is no cover — a cover failure
 //  of any kind degrades to exactly the pre-existing behavior.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE OPENER ARRIVES WITH THE REQUEST
+//
+//  The renderer composes the first sentence from its fact ledger before it
+//  sends the question — in ~35 microseconds, out of spans of the user's own
+//  documents (services/instantOpener.ts). When it does, this route has no
+//  model to wait for: it writes the sentence and issues the main call
+//  immediately.
+//
+//  That removes the whole reason the cover cost latency. `runCover` was
+//  AWAITED before the main provider call, so its chain budget was added to
+//  every answer: +1,200ms on openai and claude, +2,000ms on xai, +3,000ms
+//  on groq. A local opener costs none of it.
+//
+//  `coverPolicy: 'suppress'` is the other half, and it is the fix for the
+//  worst moment in the transcript. Asked "then why did you answer IBM?",
+//  the old chain produced "That was based on my experience with their
+//  systems at Accenture" — a second invented employer, to account for the
+//  first — because a cover model is given the question and the resume and
+//  no transcript, and is told never to deny anything. There is no opening
+//  sentence that improves being challenged about a previous answer. The
+//  client detects that shape and forbids a cover outright.
+//
+//  Length cap and control-character strip only. The text is derived from
+//  the user's own uploaded documents by the user's own client, and can only
+//  ever affect that user's answer — there is nothing here to authorise.
+const OPENER_MAX_CHARS = 400;
+
+function clientOpener(req) {
+  const raw = req.body && req.body.instantOpener;
+  if (typeof raw !== 'string') return '';
+  const clean = raw.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!clean || clean.length > OPENER_MAX_CHARS) return '';
+  return clean;
+}
+
+// The lines of the transcript the INTERVIEWER spoke, and only those.
+//
+// `recentTurns` arrives labelled from buildOpenerPayload on the client —
+// "Interviewer: …" for the human, "You already said: …" for the candidate.
+// What the interviewer said is external evidence and may widen the guard's
+// vocabulary; what the app said last turn is a claim that may itself have
+// been invented, and letting it back in is how a fabrication ends up
+// vouching for its own sequel. Anything without the interviewer's label —
+// including the head fragment a tail slice can leave behind — is not
+// trusted, because being wrong in that direction costs a dropped cover and
+// being wrong in the other costs a spoken lie.
+//
+// The mirror of interviewerLines() in services/instantOpener.ts. The two
+// have to stay identical: server/test/grounding-parity.test.js exists
+// because a client and a server that disagree about what is grounded are
+// worse than either one alone.
+function interviewerSaid(recentTurns) {
+  return String(typeof recentTurns === 'string' ? recentTurns : '')
+    .split('\n')
+    .filter((line) => /^Interviewer:/.test(line.trim()))
+    .join('\n');
+}
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 async function runCover({ sse, req, question, provider, effort = 'none', webSearch = false }) {
+  // ── 1. The client already knows what to say ──
+  const local = clientOpener(req);
+  if (local) {
+    sse.send(local);
+    sse.send(' ');
+    console.log(`[cover] ${provider} user=${req.user?.id} LOCAL shape=${req.body?.coverShape || '-'} `
+      + `words=${local.split(/\s+/).filter(Boolean).length} cost=0ms model=none`);
+    return local;
+  }
+
+  // ── 2. An opener would make this moment worse ──
+  if (req.body && req.body.coverPolicy === 'suppress') {
+    console.log(`[cover] ${provider} user=${req.user?.id} SUPPRESSED shape=${req.body?.coverShape || '-'} `
+      + `— the answer model has the transcript; an opener here can only guess`);
+    return '';
+  }
+
   if (!coverWorthy(question)) return '';
   // Measurement escape hatch. The depth model is calibrated on how long
   // the MAIN model takes, and once a cover is in front of it that number
@@ -790,23 +896,144 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
   // sentence nobody needed — the feature must only ever ADD speed.
   if (!plan) return '';
 
+  // ── HELD BACK UNTIL IT HAS BEEN CHECKED ──
+  //
+  // This used to be `onToken: (t) => sse.send(t)` — the model's words went
+  // straight to the screen, and the screen is a person's mouth a fraction
+  // of a second later. There is no way to unsay "I've spent several years
+  // at IBM" once it has been forwarded, so the tokens are collected here
+  // and released only after the whole sentence has been checked against
+  // the knowledge base's vocabulary.
+  //
+  // The cost is the cover's own generation time before the first word,
+  // which is the right trade on the only routes that still reach this
+  // code: a plan exists here because the main answer is 9-50 seconds out
+  // (grok, groq), so several hundred milliseconds buys a guarantee. The
+  // fast routes are served by the client's local opener above and never
+  // get this far.
   const t0 = Date.now();
+  let held = '';
   const cover = await streamCoverAnswer({
     question,
     category,
-    // What the candidate's own documents say. Without it the cover can
-    // only describe the act of answering — see COVER_SYSTEM.
+    // The ledger DIGEST — every role, project, skill and metric in the
+    // whole knowledge base in ~1-3KB, replacing the 9,000-char slice of a
+    // single document that used to be sent here.
     candidateContext: typeof req.body?.coverContext === 'string' ? req.body.coverContext : '',
+    // The last couple of exchanges. Without them a follow-up question is
+    // unanswerable except by invention — see the RECENT_TURNS note in
+    // coverAnswer.js.
+    recentTurns: typeof req.body?.recentTurns === 'string' ? req.body.recentTurns : '',
     plan,
     groqKey: process.env.GROQ_API_KEY,
     geminiKey: process.env.GEMINI_API_KEY,
     // Paid backstop for the day both free tiers are rate-limited.
     anthropicKey: process.env.ANTHROPIC_API_KEY,
-    onToken: (t) => sse.send(t),
+    onToken: (t) => { held += t; },
     signal: sse.signal,
   });
   if (!cover) return '';
 
+  // ── THE GUARD ──
+  // A name the knowledge base does not contain, and that the interviewer
+  // did not just say, was invented. Dropping the cover degrades to exactly
+  // the pre-existing no-cover behaviour: the answer still arrives, a
+  // little later, and nothing false was spoken.
+  const { unverifiedProperNouns, hasBannedOpener, unverifiedNumbers } = require('../services/groundingGuard');
+  const vocab = typeof req.body?.coverVocabulary === 'string' ? req.body.coverVocabulary : '';
+  // The transcript counts as allowed vocabulary too: a name the interviewer
+  // used two turns ago is theirs, not an invention. Adding it here is what
+  // lets the cover answer a follow-up at all without being rejected for
+  // echoing the thing being followed up on.
+  //
+  // ⚠️ HALF THE TRANSCRIPT, THOUGH. The candidate's own previous ANSWER is
+  // in `recentTurns` as well, labelled "You already said:", and it was going
+  // into `allowed` with everything else — so a name the model invented last
+  // turn became trusted vocabulary this turn, and the sentence that explains
+  // the invention sailed through the guard that had rejected the invention
+  // itself. That is the IBM → Accenture cascade with the guard's own help,
+  // and it bites hardest at the `vocab.trim() ? vocab : allowed` line below,
+  // where `allowed` is not merely added to the knowledge base — it IS the
+  // knowledge base. The model still SEES its previous answer: it is passed
+  // to streamCoverAnswer above, in full, as prompt context. It just no
+  // longer gets to vouch for itself.
+  const allowed = `${question}\n${interviewerSaid(req.body?.recentTurns)}`;
+
+  // ── NO KNOWLEDGE BASE IS THE STRICTEST CASE, NOT THE LOOSEST ──
+  //
+  // The guard abstains when the vocabulary is empty, and for the main answer
+  // that is right: with nothing uploaded there is nothing to contradict, and
+  // flagging every name would suppress every cover in the app's most common
+  // state. Applied to the COVER it is exactly backwards, because a
+  // no-documents session is precisely when a fast model has nothing to draw
+  // on and reaches for a name. Measured live, with no files attached:
+  //
+  //   "At my previous role at Google, we experienced a major outage…"
+  //   "I've worked at IBM and then spent several years at Accenture…"
+  //
+  // Both passed, because there was no vocabulary to fail against.
+  //
+  // So when there is no knowledge base, the QUESTION becomes the vocabulary:
+  // any name the interviewer did not just say is, by construction, invented —
+  // the candidate's background is unknown, so no name can be supported by it.
+  // A cover in that state should be a stance about approach, which needs no
+  // proper nouns at all (COVER_SYSTEM says exactly this). Losing a cover here
+  // costs a moment of silence; keeping one costs a fabricated employer spoken
+  // out loud.
+  const invented = unverifiedProperNouns(vocab.trim() ? vocab : allowed, cover, allowed);
+
+  // Style, not just facts. Measured over the last 400 answers in the user's
+  // database, 15.3% opened with a phrase COVER_SYSTEM explicitly forbids —
+  // three separate answers began with the identical words "Most of my time's
+  // been on", one of them in front of a question about concurrency. The
+  // prompt asked for variety and did not get it, so the check is here.
+  const banned = hasBannedOpener(cover);
+  if (banned) {
+    console.warn(
+      `[cover] REJECTED ${provider} user=${req.user?.id} tier=${plan.name} `
+      + `bannedOpener="${banned}" after ${Date.now() - t0}ms — a canned opening in front of `
+      + `an unrelated question is worse than no opening. text="${cover.slice(0, 100)}"`
+    );
+    return '';
+  }
+  if (invented.length) {
+    console.warn(
+      `[cover] REJECTED ${provider} user=${req.user?.id} tier=${plan.name} `
+      + `invented=[${invented.join(', ')}] after ${Date.now() - t0}ms — dropping the opener `
+      + `rather than speaking it. text="${cover.slice(0, 120)}"`
+    );
+    return '';
+  }
+
+  // ── AND THE NUMBERS ──
+  // The check above polices NAMES. It has nothing to say about a figure, and
+  // a cover that invents one is just as unspeakable: measured live against
+  // the real providers, this was FORWARDED and would have been read aloud —
+  //   "queries on our service metadata were timing out during peak traffic.
+  //    I pulled the slow logs and ran test queries against different index
+  //    sizes..."
+  // — none of it on the résumé, every proper noun in it perfectly valid. A
+  // number the candidate then has to defend is worse than one they never
+  // said, because the REAL answer is still generating and has not seen the
+  // cover's invention; the two can contradict each other out loud.
+  // `candidateContext` is the digest the model was given, so anything it
+  // quotes from there is supported by construction, and anything it did not
+  // is a figure it made up.
+  const madeUpNumbers = unverifiedNumbers(
+    typeof req.body?.coverContext === 'string' ? req.body.coverContext : '',
+    cover,
+    allowed,
+  );
+  if (madeUpNumbers.length) {
+    console.warn(
+      `[cover] REJECTED ${provider} user=${req.user?.id} tier=${plan.name} `
+      + `fabricatedNumbers=[${madeUpNumbers.join(', ')}] after ${Date.now() - t0}ms — a metric `
+      + `the background does not contain. text="${cover.slice(0, 120)}"`
+    );
+    return '';
+  }
+
+  sse.send(held);
   // A space so the main model's first token cannot fuse onto the cover's
   // last word.
   sse.send(' ');
@@ -1329,10 +1556,34 @@ function openSseStream(req, res) {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
-  // Per-request AbortController: hooked to the TCP `close` event so
-  // that a client disconnect immediately stops whatever we're reading
-  // from the upstream provider. Without this we'd keep for-await'ing
-  // tokens no one will ever see — and paying for them.
+  // ── THE DISCONNECT SIGNAL IS ON THE RESPONSE, NOT THE REQUEST ──
+  //
+  // Per-request AbortController, so a client disconnect immediately stops
+  // whatever we are reading from the upstream provider — otherwise we keep
+  // for-await'ing tokens no one will ever see, and paying for them.
+  //
+  // This was `req.on('close', onClose)`, and on Node 20 that event does not
+  // mean what it reads as. `IncomingMessage` emits 'close' when the REQUEST
+  // is complete — i.e. as soon as express.json() has consumed the body,
+  // measured at ~1ms into the handler — not when the peer goes away. Two
+  // consequences, both verified by experiment:
+  //
+  //   · In production the listener attached too LATE to hear it (the
+  //     awaiting rate limiter in index.js defers the route handler past the
+  //     tick in which 'close' fires), so the abort never ran at all. A
+  //     client that hung up after 1s still had all 20 upstream tokens
+  //     generated and billed. The protection this block describes did not
+  //     exist.
+  //   · Mount the same router with only synchronous middleware ahead of it
+  //     and the listener DOES hear it: controller.abort() fires at ~3ms,
+  //     `closed` goes true, every sse.send() becomes a no-op, the provider
+  //     call throws "Request was aborted", and sse.done() early-returns so
+  //     res.end() is never called — the response hangs until the client
+  //     times out. Streaming worked only by accident of middleware order.
+  //
+  // ServerResponse 'close' is the documented disconnect signal: it fires
+  // when the response finishes OR the connection is torn down early. On a
+  // normal finish `closed` is already true and this is a no-op.
   const controller = new AbortController();
   let closed = false;
   const onClose = () => {
@@ -1340,7 +1591,7 @@ function openSseStream(req, res) {
     closed = true;
     try { controller.abort(); } catch {}
   };
-  req.on('close', onClose);
+  res.on('close', onClose);
 
   return {
     signal: controller.signal,
@@ -1951,6 +2202,16 @@ router.post('/autotype-vision', requireTier(...ULTRA_ONLY), async (req, res) => 
   }
 });
 
+// ⚠️ LOAD-BEARING ORDER — requireTier MUST stay ahead of the body checks.
+// The desktop app uses this route as its Auto-Type entitlement probe: it
+// POSTs deliberately WITHOUT `code`, so requireTier runs, the 400 below
+// fires, and main.cjs reads "400 ⇒ this account is Ultra" without spending
+// a Haiku call. Auto-Type is otherwise gated only by localStorage, which
+// the user can edit — this probe is the real gate.
+// So: a 400 from this route is an ENTITLEMENT ASSERTION, not just input
+// validation. Inserting any body-validating middleware AHEAD of requireTier
+// would make an unentitled account 400 too, and that is a paid-feature
+// bypass, not a cosmetic bug. See electron/main.cjs autoTypeVerifyEntitlement.
 router.post('/autotype-plan', requireTier(...ULTRA_ONLY), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) {

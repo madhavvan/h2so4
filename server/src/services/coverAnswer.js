@@ -105,6 +105,34 @@ const HEDGE_STAGGER_MS = 250;
 // the run produced no cover at all.
 const HEDGE_ON_FAILURE = true;
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  A CLAIM IS NOT A COVER
+//
+//  Claiming the race on a FIRST TOKEN is what keeps the hedges — and the
+//  paid backstop — from firing on every ordinary run. But a first token
+//  is not output: the emitter withholds everything until a finished
+//  sentence clears MIN_FLUSH_WORDS, so a provider that yields one token
+//  and then wedges returns "". Measured, with a healthy alternative
+//  sitting one stagger behind it:
+//
+//    [cover] NO COVER — tier=opener 1/2 provider(s) raced in 1238ms
+//            (budget 1200ms): stallerP0: produced nothing
+//
+//  One of two. The claim was permanent, so the healthy hedge read it at
+//  its 250ms stagger, decided it was not needed and never launched —
+//  the single point of failure the hedged race exists to remove, back
+//  again through the gate that protects it.
+//
+//  So the claim now LAPSES. Tokens arrive every ~11ms at the 90 tok/s
+//  these models sustain, which makes a quarter-second of silence before
+//  the first sentence lands not slow but stopped, and the hedges are let
+//  back in. Being wrong is cheap by construction: a lapse does not abort
+//  the claimant, which keeps streaming and can still take the screen at
+//  its first flush, so a provider that merely stuttered loses nothing
+//  but the cost of one hedge that need not have run.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const CLAIM_STALL_MS = 250;
+
 // When the backstop is the ONLY remaining hope, it gets at least this
 // long for its first token even if the chain budget is nearly spent.
 //
@@ -521,7 +549,55 @@ const CATEGORY_HINTS = {
   // A behavioral question wants a specific from their life, immediately —
   // the situation, not a preamble about how they approach situations.
   behavioral: 'It is a behavioral question — open on the actual situation from the background (where, what was happening), not on how you generally handle such things.',
+  // "What certifications do you have", "what was your degree" — a lookup,
+  // not a problem. Had no hint, so it fell through to the problem-solving
+  // shape and opened with "First, I'd establish the relevance of each
+  // certification", said to someone who asked for a list.
+  clarifier: 'It is a direct factual question about them — answer it straight from the background (the list, the name, the number, the dates). Do not open by saying what you would establish, assess or rule out.',
 };
+
+// ── THE SHAPE OF A QUESTION OUTRANKS ITS TOPIC ──
+//
+// Measured on a live run against a real résumé, not imagined. "Have you
+// worked with Kafka?" classifies as `ml_data`, whose hint says "say what
+// you would verify or measure first" — a PROBLEM-SOLVING instruction
+// handed to a question about the candidate's own history. The model
+// obeyed it exactly:
+//
+//   "Before confirming my experience with Kafka, I'd want to establish
+//    the context in which it's being used…"
+//
+// Kafka is on that résumé, at 3M+ records/day. Spoken aloud in an
+// interview, that sentence sounds like someone who has never touched it —
+// on the single most common screening question there is. `other` (the
+// catch-all, which "Do you know FastAPI?" lands in) is worse still: no
+// hint at all, so it falls through to the same problem-solving shape.
+// That is the identical bug the `concept` comment above records being
+// fixed once already, still live for every category without an entry.
+//
+// A "have you / do you know / are you familiar with" question is about
+// THEM whatever its subject matter is, so the shape decides, not the
+// topic. This is checked before CATEGORY_HINTS and wins.
+const EXPERIENTIAL_Q = new RegExp([
+  '^\\s*(?:so\\s+|and\\s+|ok(?:ay)?,?\\s+|right,?\\s+|yeah,?\\s+)*',
+  '(?:(?:have|has|had)\\s+you\\s+(?:ever\\s+)?(?:worked|used|built|written|dealt|shipped|run|ran|managed|led|done|touched)',
+  '|(?:do|did)\\s+you\\s+(?:know|use|have|work)',
+  '|(?:are|were)\\s+you\\s+familiar)',
+].join(''), 'i');
+const EXPERIENTIAL_Q2 = /\bare\s+you\s+familiar\s+with\b|\bwhat(?:'s|’s| is| was)\s+your\s+experience\s+(?:with|in|of)\b|\bever\s+(?:worked|used|built)\s+with\b|\bhow\s+(?:long|many\s+years)\s+(?:have|did|were)\s+you\b/i;
+
+const EXPERIENTIAL_HINT = 'It is a question about THEIR OWN experience — answer it, do not '
+  + 'approach it. If the background supports it, say so plainly in the first few words and name '
+  + 'where: "Yeah — Kafka, at <employer>, on <the system>." If the background does NOT support '
+  + 'it, say no just as plainly and briefly name what they did work with instead. Never open by '
+  + 'saying what you would establish, confirm, clarify, consider or rule out — that is the shape '
+  + 'for a problem to solve, and this is not one.';
+
+/** True when the question asks about the candidate's own history, whatever its topic. */
+function isExperientialQuestion(question) {
+  const q = String(question || '');
+  return EXPERIENTIAL_Q.test(q) || EXPERIENTIAL_Q2.test(q);
+}
 
 // The one instruction that changes per question. It lives in the USER
 // turn, not COVER_SYSTEM, on purpose: COVER_SYSTEM stays byte-identical
@@ -554,10 +630,23 @@ function tierDirective(tier) {
 //
 // `plan` defaults to the opener tier so the three-argument form behaves
 // exactly as it did before depth-adaptivity existed.
-function userPrompt(question, category, candidateContext, plan) {
+// How much of the transcript the cover sees. The whole reason it needs any
+// is that it had none: given only the question and the resume, "then why did
+// you answer IBM?" cannot be answered without inventing the thing being
+// asked about, and the model duly invented a second employer to explain the
+// first. That precise shape is now refused before it reaches a model, but
+// every ordinary follow-up — "and the second one?", "you mentioned Kafka,
+// where?" — had the same blindness.
+const RECENT_TURNS_CHARS = 1_200;
+
+function userPrompt(question, category, candidateContext, plan, recentTurns) {
   const tier = plan || COVER_TIERS[0];
-  const hint = CATEGORY_HINTS[category] || '';
+  // Shape first, topic second — see the EXPERIENTIAL_Q note.
+  const hint = isExperientialQuestion(question)
+    ? EXPERIENTIAL_HINT
+    : (CATEGORY_HINTS[category] || '');
   const bg = String(candidateContext || '').trim();
+  const recent = String(recentTurns || '').trim().slice(-RECENT_TURNS_CHARS);
   return [
     // 9,000 matches COVER_CONTEXT_CHARS on the client, and the two must
     // agree. They did not: the client was raised to fit a whole resume
@@ -568,6 +657,14 @@ function userPrompt(question, category, candidateContext, plan) {
     // disagree; this one exists only as a backstop against a client
     // sending something absurd.
     bg ? `CANDIDATE BACKGROUND (true — use it, never go beyond it):\n${bg.slice(0, 9000)}\n` : '',
+    // Before the question, because the question is often only meaningful
+    // relative to it — and after the background, because the background is
+    // what is TRUE while this is merely what was said.
+    recent
+      ? `THE LAST FEW SECONDS OF THIS CONVERSATION (context only — a line here is\n`
+        + `not evidence about the candidate, and anything in it that the background\n`
+        + `does not support must NOT be repeated or defended):\n${recent}\n`
+      : '',
     hint ? hint + '\n' : '',
     `Interviewer asked: "${String(question).slice(0, 600)}"`,
     '',
@@ -578,13 +675,13 @@ function userPrompt(question, category, candidateContext, plan) {
 
 // ── Provider stream factories ── each returns an async iterable of
 // { text } chunks (Gemini) or is adapted to that shape (Groq).
-function geminiCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan) {
+function geminiCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan, recentTurns) {
   return async () => {
     const { GoogleGenAI } = require('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
     return ai.models.generateContentStream({
       model: 'gemini-3.6-flash',
-      contents: [{ role: 'user', parts: [{ text: userPrompt(question, category, candidateContext, plan) }] }],
+      contents: [{ role: 'user', parts: [{ text: userPrompt(question, category, candidateContext, plan, recentTurns) }] }],
       config: {
         systemInstruction: COVER_SYSTEM,
         thinkingConfig: { thinkingLevel: 'MINIMAL' },
@@ -595,7 +692,7 @@ function geminiCoverFactory(question, category, candidateContext, apiKey, abortS
   };
 }
 
-function groqCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan) {
+function groqCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan, recentTurns) {
   return async () => {
     const Groq = require('groq-sdk');
     // maxRetries: 0 — see the note on the Anthropic client below.
@@ -610,7 +707,7 @@ function groqCoverFactory(question, category, candidateContext, apiKey, abortSig
       model: 'llama-3.3-70b-versatile',
       messages: [
         { role: 'system', content: COVER_SYSTEM },
-        { role: 'user', content: userPrompt(question, category, candidateContext, plan) },
+        { role: 'user', content: userPrompt(question, category, candidateContext, plan, recentTurns) },
       ],
       max_tokens: plan.maxTokens,
       temperature: 0.7,
@@ -640,7 +737,7 @@ function groqCoverFactory(question, category, candidateContext, apiKey, abortSig
 // other two are exhausted. A cover is ~80 output tokens; the insurance
 // costs a fraction of a cent and only bills when the free tiers are
 // already down.
-function anthropicCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan) {
+function anthropicCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan, recentTurns) {
   return async () => {
     const Anthropic = require('@anthropic-ai/sdk');
     // NO SDK RETRIES, and a hard timeout.
@@ -656,7 +753,7 @@ function anthropicCoverFactory(question, category, candidateContext, apiKey, abo
       model: 'claude-haiku-4-5',
       max_tokens: plan.maxTokens,
       system: COVER_SYSTEM,
-      messages: [{ role: 'user', content: userPrompt(question, category, candidateContext, plan) }],
+      messages: [{ role: 'user', content: userPrompt(question, category, candidateContext, plan, recentTurns) }],
       stream: true,
     }, { signal: abortSignal });
     return (async function* () {
@@ -750,23 +847,59 @@ function createCoverEmitter(onToken) {
 // because at that point the words are on screen and cutting them off is
 // worse than finishing late.
 //
-// `claim()` is the race's gate. A provider calls it when it has its
-// first token; the first caller wins and every other attempt aborts
-// itself and discards what it has. Without a claim gate two providers
-// that both answer would interleave their words into one sentence.
+// `gate` is the race, and it is in TWO STAGES because a provider that
+// intends to answer and a provider that has answered are not the same
+// thing. `gate.claim()` fires on the FIRST TOKEN and only decides who
+// the hedges stand down for — it is cheap to hold and it can be handed
+// back (see CLAIM_STALL_MS). `gate.speak()` fires on the FIRST FLUSH,
+// when words actually reach the user, and THAT is the one that cannot be
+// taken back: exactly one provider is ever allowed past it, so two
+// providers that both answer can never interleave their words into one
+// sentence.
+//
+// Whichever stage is lost, the loser aborts itself quietly and reports
+// nothing — losing is not an error, somebody else simply answered.
 //
 // Returns { text, failure } — text is what actually reached the user.
-async function runOne(makeStream, onToken, outerSignal, firstTokenDeadlineMs, generationMs, claim) {
+async function runOne(makeStream, onToken, outerSignal, firstTokenDeadlineMs, generationMs, gate) {
   const controller = new AbortController();
   const onOuterAbort = () => { try { controller.abort(); } catch {} };
   if (outerSignal) {
     if (outerSignal.aborted) return { text: '', failure: 'client gone' };
     outerSignal.addEventListener('abort', onOuterAbort, { once: true });
   }
-  const emitter = createCoverEmitter(onToken);
+  // The lone injected stream (the _streamFn path) races nobody, so it
+  // owns both stages by construction.
+  const race = gate || { claim: () => true, speak: () => true, release: () => {} };
   let gotFirst = false;
   let lost = false;
   let cleanEnd = false;
+  let spoke = false;
+  let stallTimer = null;
+  // The permanent gate sits HERE, on the way to the screen, rather than
+  // on the first token — this callback runs exactly once per released
+  // sentence and its first run is the moment this cover exists. Losing
+  // here means another provider is already being read aloud: swallow the
+  // chunk and stop. (`emitted` inside the emitter is now dirty, which is
+  // why every `lost` path below returns '' rather than trusting it.)
+  const emitter = createCoverEmitter((chunk) => {
+    if (lost) return;
+    if (!spoke) {
+      if (!race.speak()) { lost = true; onOuterAbort(); return; }
+      spoke = true;
+      if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+    }
+    onToken(chunk);
+  });
+  // Re-armed on every token: holding the race while producing nothing is
+  // the one thing a claimant must not be able to do, because the hedges
+  // are standing down on the strength of it. See CLAIM_STALL_MS for why
+  // letting go here costs almost nothing when it is wrong.
+  const armStall = () => {
+    if (spoke || lost) return;
+    if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => { stallTimer = null; race.release(); }, CLAIM_STALL_MS);
+  };
   const firstTimer = setTimeout(() => { if (!gotFirst) onOuterAbort(); }, firstTokenDeadlineMs);
   // Armed only once the first token has landed — a generation deadline
   // that starts before the model has said anything is just a slower
@@ -815,14 +948,18 @@ async function runOne(makeStream, onToken, outerSignal, firstTokenDeadlineMs, ge
         if (!piece) continue;
         if (!gotFirst) {
           gotFirst = true;
-          // The race gate. Losing here is not an error — another provider
-          // simply answered first — so abort quietly and emit nothing.
-          if (claim && !claim()) { lost = true; onOuterAbort(); return; }
+          // Stage one of the race gate. Losing here is not an error —
+          // another provider simply answered first — so abort quietly and
+          // emit nothing.
+          if (!race.claim()) { lost = true; onOuterAbort(); return; }
           clearTimeout(firstTimer);
           genTimer = setTimeout(onOuterAbort, generationMs);
           armWall(generationMs);
         }
         emitter.push(piece);
+        // Stage two may have been lost inside that push.
+        if (lost) return;
+        armStall();
       }
       cleanEnd = true;
     })();
@@ -847,14 +984,28 @@ async function runOne(makeStream, onToken, outerSignal, firstTokenDeadlineMs, ge
     clearTimeout(firstTimer);
     if (genTimer) clearTimeout(genTimer);
     if (wallTimer) clearTimeout(wallTimer);
+    if (stallTimer) clearTimeout(stallTimer);
     if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
   }
   if (lost) return { text: '', failure: 'lost the race' };
   // Clean end → the held-back head is real output. Abort → it is an
   // unfinished sentence and is dropped; only what the user already saw
   // is returned.
-  const text = (cleanEnd ? emitter.finish() : emitter.abandon()).trim();
-  if (!text && !failure) failure = 'produced nothing';
+  const raw = cleanEnd ? emitter.finish() : emitter.abandon();
+  // finish() pushes that head through the SAME screen gate, so the race
+  // can still be lost on the way out — two providers whose sentences land
+  // in the same tick. Re-read `lost` for exactly that.
+  if (lost) return { text: '', failure: 'lost the race' };
+  const text = raw.trim();
+  if (!text) {
+    // Nothing ever reached the screen, so this attempt cannot be the
+    // cover. Hand the race back BEFORE returning: the hedges that stood
+    // down for this claim are waiting on precisely this signal, and a
+    // claim nobody can take back is a single point of failure wearing a
+    // gate's clothes.
+    race.release();
+    if (!failure) failure = 'produced nothing';
+  }
   return { text, failure };
 }
 
@@ -862,6 +1013,7 @@ async function streamCoverAnswer({
   question,
   category,
   candidateContext,
+  recentTurns,
   geminiKey,
   groqKey,
   anthropicKey,
@@ -937,11 +1089,11 @@ async function streamCoverAnswer({
     providers.push(..._providerFns);
     names.push(...(_names || _providerFns.map((_, i) => `p${i + 1}`)));
   }
-  if (!providers.length && groqKey) { providers.push((sig) => groqCoverFactory(question, category, candidateContext, groqKey, sig, tier)()); names.push('groq'); }
-  if (geminiKey) { providers.push((sig) => geminiCoverFactory(question, category, candidateContext, geminiKey, sig, tier)()); names.push('gemini'); }
+  if (!providers.length && groqKey) { providers.push((sig) => groqCoverFactory(question, category, candidateContext, groqKey, sig, tier, recentTurns)()); names.push('groq'); }
+  if (geminiKey) { providers.push((sig) => geminiCoverFactory(question, category, candidateContext, geminiKey, sig, tier, recentTurns)()); names.push('gemini'); }
   // Paid, and last — reached only when the free tiers are slow, exhausted
   // or down, which is exactly when it matters.
-  if (anthropicKey) { providers.push((sig) => anthropicCoverFactory(question, category, candidateContext, anthropicKey, sig, tier)()); names.push('haiku'); }
+  if (anthropicKey) { providers.push((sig) => anthropicCoverFactory(question, category, candidateContext, anthropicKey, sig, tier, recentTurns)()); names.push('haiku'); }
   if (providers.length === 0) return '';
 
   // ── THE HEDGED RACE ──
@@ -956,13 +1108,31 @@ async function streamCoverAnswer({
   // `remaining()` still gates every launch: a provider started with
   // nothing left to give it would only be delaying the answer.
   const failures = [];
+  // ── THE RACE, IN TWO STAGES ──
+  //
+  // `winner` is provisional: it is what the hedges stand down for, and it
+  // is taken on a first token because that is the earliest honest sign
+  // that a provider is alive — waiting for real words before standing the
+  // hedges down would put the PAID backstop on every ordinary run.
+  //
+  // `spoken` is the one that cannot be taken back. It flips when words
+  // reach the screen, and from that moment no other provider may write —
+  // that, not the claim, is what makes interleaved output impossible.
+  //
+  // The split is the fix for a measured silence: a claim that never turns
+  // into words is RELEASED (see CLAIM_STALL_MS and runOne) and the hedges
+  // are let back in, instead of one wedged provider taking the whole
+  // cover down while two healthy alternatives sit the run out.
   let winner = -1;
+  let spoken = false;
   let launched = 0;
-  const claim = (i) => () => {
-    if (winner !== -1) return false;
-    winner = i;
-    return true;
-  };
+  const claimWaiters = [];
+  const wakeClaimWaiters = () => { claimWaiters.splice(0).forEach((fn) => fn()); };
+  const gateFor = (i) => ({
+    claim: () => { if (winner !== -1) return false; winner = i; return true; },
+    speak: () => { if (spoken) return false; spoken = true; winner = i; wakeClaimWaiters(); return true; },
+    release: () => { if (spoken || winner !== i) return; winner = -1; wakeClaimWaiters(); },
+  });
 
   // Everyone ahead of me has given up → stop waiting, go now.
   let gaveUp = 0;
@@ -978,6 +1148,25 @@ async function streamCoverAnswer({
     check();
   });
 
+  // A hedge that arrives to find the race claimed does not give up on it,
+  // it WAITS for the claim to become words or to be handed back. Reading
+  // `winner` once and returning "not needed" is what let a provider that
+  // never spoke silence the whole chain: the claim was taken at ~0ms and
+  // both hedges bailed at their staggers, long before anyone could know
+  // the claimant would produce nothing.
+  //
+  // Bounded by what is left of the chain budget, because the main answer
+  // is queued behind this: at worst a hedge wakes with the budget gone
+  // and takes the same exit it would have taken anyway.
+  const waitClaim = () => new Promise((resolve) => {
+    if (spoken || winner === -1) { resolve(); return; }
+    let timer = null;
+    let done = false;
+    const wake = () => { if (done) return; done = true; if (timer) clearTimeout(timer); resolve(); };
+    timer = setTimeout(wake, Math.max(0, remaining()));
+    claimWaiters.push(wake);
+  });
+
   const attempt = async (i) => {
     // Hedges wait their turn, then re-check. Deciding at launch time
     // rather than up front is the whole point: if the primary already
@@ -985,7 +1174,11 @@ async function streamCoverAnswer({
     // is the difference between insurance and a standing bill.
     if (i > 0) {
       await waitTurn(i);
-      if (winner !== -1) return { i, text: '', failure: 'not needed' };
+      // Park on a live claim rather than reading it once — words on the
+      // screen mean there is nothing for me to do, a released claim means
+      // it is my turn after all. See waitClaim.
+      await waitClaim();
+      if (spoken) return { i, text: '', failure: 'not needed' };
       if (signal && signal.aborted) { noteGaveUp(); return { i, text: '', failure: 'client gone' }; }
       if (remaining() <= 200) { noteGaveUp(); return { i, text: '', failure: `chain budget ${budgetMs}ms spent` }; }
     }
@@ -1009,7 +1202,7 @@ async function streamCoverAnswer({
       firstDeadline = Math.max(firstDeadline, LAST_PROVIDER_FLOOR_MS);
     }
     try {
-      const r = await runOne(providers[i], onToken, signal, firstDeadline, genMs, claim(i));
+      const r = await runOne(providers[i], onToken, signal, firstDeadline, genMs, gateFor(i));
       if (!r.text) noteGaveUp();
       return { i, ...r };
     } catch (err) {
@@ -1074,6 +1267,7 @@ module.exports = {
   COVER_FLOOR_MS,
   SPOKEN_WORDS_PER_SEC,
   HEDGE_STAGGER_MS,
+  CLAIM_STALL_MS,
   MIN_FLUSH_WORDS,
   generationWindowMs,
   _resetObservedTtft,

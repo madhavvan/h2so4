@@ -102,16 +102,17 @@ jobs:
         run: echo "${{ secrets.APPLE_API_KEY_P8 }}" | openssl base64 -d -A > "$RUNNER_TEMP/AuthKey.p8"
         shell: bash
 
-      - name: Build Electron app (no publish — CI token can't reach the releases repo)
-        # package.json's publish is now an ARRAY (interviewcopilot-releases
-        # first, h2so4 second) so app-update.yml in every artifact points at
-        # the public releases repo. The default GITHUB_TOKEN can only write
-        # THIS repo, so `--publish always` would fail on the first (external)
-        # publisher and lose the build. Build only; the softprops step below
-        # attaches everything (including latest-*.yml) to the h2so4 release,
-        # and the releases-repo copy is synced from there. NOTE: this makes
-        # workflow_dispatch backfills upload nothing (softprops is gated to
-        # release events) — backfill by re-publishing the release instead.
+      - name: Build Electron app (no publish — assets are attached below)
+        # package.json's publish now names ONE target, madhavvan/h2so4, so
+        # app-update.yml in every artifact points at the repo that actually
+        # holds the releases. It used to list interviewcopilot-releases FIRST
+        # — a repo that was never created — which silently baked a dead update
+        # feed into every shipped build (fixed 2026-08-06; see the header of
+        # server/src/routes/downloads.js). Build only either way: the softprops
+        # step below attaches everything (including latest-*.yml) to the h2so4
+        # release. NOTE: this makes workflow_dispatch backfills upload nothing
+        # (softprops is gated to release events) — backfill by re-publishing
+        # the release instead.
         if: steps.gate.outputs.go == '1'
         run: npx electron-builder ${{ matrix.platform }} --publish never
         env:

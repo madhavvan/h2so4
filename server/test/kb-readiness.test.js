@@ -71,9 +71,25 @@ describe('the guard that made the upload prewarm dead code', () => {
 describe('the free half of readiness runs eagerly, the paid half debounced', () => {
   it('the eager effect warms retrieval and nothing that costs money', () => {
     const effect = /contextFilesRef\.current = db\.contextFiles;[\s\S]*?\}, \[db\.contextFiles\]\);/.exec(APP_SRC)[0];
-    expect(effect).toMatch(/prewarmRetrieval\(db\.contextFiles\)/);
+    // syncKnowledge is the single owner of "the knowledge base changed" —
+    // see services/knowledgeCache.ts. It replaced the bare prewarmRetrieval
+    // call so the fact ledger the spoken opener is composed from is warm
+    // before question one, and so a DELETED document's offloaded bytes are
+    // actually dropped.
+    expect(effect).toMatch(/syncKnowledge\(db\.contextFiles\)/);
     // Identity extraction is a real model call — it must not be here.
-    expect(effect).not.toMatch(/prewarmIdentity|prewarmClaudeIdentity|prewarmContext/);
+    expect(effect).not.toMatch(/prewarmIdentity|prewarmClaudeIdentity|prewarmContext|warmKnowledgeNetwork/);
+  });
+
+  it('syncKnowledge itself touches no network and no paid API', () => {
+    const KC_SRC = fs.readFileSync(
+      path.resolve(process.cwd(), '..', 'services', 'knowledgeCache.ts'), 'utf8');
+    const fn = /export function syncKnowledge[\s\S]*?\n}/.exec(KC_SRC)[0];
+    expect(fn).toMatch(/prewarmRetrieval/);
+    expect(fn).toMatch(/getLedger/);
+    // The paid half lives in warmKnowledgeNetwork, which the caller
+    // debounces. Nothing here may reach for it.
+    expect(fn).not.toMatch(/prewarmContext|prewarmIdentity|proxyRequest|fetch|offloadContext/);
   });
 
   it('identity extraction is debounced, so a five-file upload is one call', () => {
@@ -81,7 +97,12 @@ describe('the free half of readiness runs eagerly, the paid half debounced', () 
     // fresh extraction — five model calls for one upload, four of them
     // for a knowledge base that no longer existed, all contending with
     // the user's first question.
-    expect(APP_SRC).toMatch(/prewarmIdentity\(files\);\s*\n\s*prewarmClaudeIdentity\(files\);/);
+    // Both briefing-card extractions sit inside the debounced timer.
+    // warmKnowledgeNetwork is the one owner of the paid half (context-store
+    // upload + the OpenAI-side identity card); Claude's own card follows it.
+    const timer = /modelPrewarmTimerRef\.current = window\.setTimeout\([\s\S]*?\}, 900\);/.exec(APP_SRC)[0];
+    expect(timer).toMatch(/warmKnowledgeNetwork\(files\);/);
+    expect(timer).toMatch(/prewarmClaudeIdentity\(files\);/);
   });
 
   it('prewarmRetrieval touches no network and no paid API', () => {

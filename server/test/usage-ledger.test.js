@@ -106,13 +106,27 @@ describe('heartbeatUsageSession', () => {
     expect(db.getLicenseByUserId(uid).credits_remaining_seconds).toBe(1775);
   });
 
-  it('clamps a silent gap to the per-beat cap (45s) — no burst overcharge', () => {
+  it('clamps a silent gap to the stale window (90s) — no burst overcharge', () => {
     const uid = makeUser('pro', { credits_remaining_seconds: 3600, credits_expire_at: Date.now() + 86400000 });
     const { session_id } = db.startUsageSession(uid, 'dev1');
     backdateHeartbeat(session_id, 300); // 5 minutes of silence
     const r = db.heartbeatUsageSession(uid, session_id);
-    expect(r.charged).toBe(45);
-    expect(r.remaining).toBe(3600 - 45);
+    expect(r.charged).toBe(90);
+    expect(r.remaining).toBe(3600 - 90);
+  });
+
+  // The cap is the STALE WINDOW, not the beat cadence. When it was 45s a
+  // client could beat every ~85s — still inside the 90s live window, so it
+  // kept getting answers — and pay 45s for every 85s it used. The ceiling
+  // has to reach the whole window or that gap is half-price interview time.
+  it('charges the full gap for a slow-beating client just inside the live window', () => {
+    const uid = makeUser('pro', { credits_remaining_seconds: 3600, credits_expire_at: Date.now() + 86400000 });
+    const { session_id } = db.startUsageSession(uid, 'dev1');
+    backdateHeartbeat(session_id, 85); // still live (< 90s), but a slow beat
+    expect(db.hasLiveUsageSession(uid)).toBe(true);
+    const r = db.heartbeatUsageSession(uid, session_id);
+    expect(r.charged).toBe(85);          // was 45 — a 47% discount on used time
+    expect(r.remaining).toBe(3600 - 85);
   });
 
   it('drains the bucket exactly once and closes the session', () => {

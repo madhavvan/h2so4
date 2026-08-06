@@ -433,6 +433,15 @@ export function ManageSubscription({
   }> | null>(null);
   const [extendLoading, setExtendLoading] = useState(false);
   const [selectedExtPack, setSelectedExtPack] = useState('m30');
+  // ── Stable top-up attempt ids, one per pack ──
+  // The server turns attempt_id into the Stripe idempotency key
+  // (`extend_<user>_<attempt>`), so a RETRY has to send the SAME id. Minting
+  // a fresh uuid on every click defeated that: when a response was lost
+  // (dropped socket, timeout, 5xx) the retry created a SECOND PaymentIntent
+  // — a real double charge. The id now lives here until the outcome is
+  // definitively known (see handleExtendNow), keyed by pack because Stripe
+  // rejects a replayed key whose parameters changed.
+  const extendAttemptRef = useRef<Record<string, string>>({});
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -533,8 +542,13 @@ export function ManageSubscription({
     try {
       const token = licenseService.getToken();
       if (!token) throw new Error('Please sign in again to top up.');
-      const attemptId = (globalThis.crypto as any)?.randomUUID?.()
+      // Reuse the id still outstanding for this pack so a retry replays the
+      // same Stripe idempotency key and gets the ORIGINAL PaymentIntent back
+      // instead of creating a second charge.
+      const attemptId = extendAttemptRef.current[selectedExtPack]
+        || (globalThis.crypto as any)?.randomUUID?.()
         || `a_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      extendAttemptRef.current[selectedExtPack] = attemptId;
       const res = await fetch(`${API_BASE}/api/v1/payments/extend-now`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
@@ -542,6 +556,9 @@ export function ManageSubscription({
       });
       const data: any = await res.json().catch(() => ({}));
       if (res.ok && data.success && data.flow === 'off_session') {
+        // Charged and granted — this attempt is settled, so the next click
+        // is a deliberately new top-up and must mint a fresh key.
+        delete extendAttemptRef.current[selectedExtPack];
         // Server message names the tier-correct amount ("+30 minutes" /
         // "+1 hour"); the fallback stays amount-neutral so it can never
         // state the wrong figure.
@@ -552,10 +569,15 @@ export function ManageSubscription({
         return;
       }
       if (data.already_unlimited) {
+        delete extendAttemptRef.current[selectedExtPack];
         setSuccess('Your account already has unlimited time.');
         return;
       }
       if (data.provider === 'razorpay' && data.flow === 'in_app_sheet') {
+        // Razorpay never sees attempt_id (the server mints a fresh order and
+        // verifies the signature), so the off-session id is settled the
+        // moment we hand off to the sheet.
+        delete extendAttemptRef.current[selectedExtPack];
         const opened = await openRazorpayTopUpSheet(data, token, async (msg) => {
           await licenseService.validateWithServer().catch(() => {});
           if (!mountedRef.current) return;
@@ -566,6 +588,10 @@ export function ManageSubscription({
         return;
       }
       if (res.ok && data.checkout_url) {
+        // Resolved into a browser Checkout Session — no PaymentIntent was
+        // captured under this key, and that flow carries its own session-
+        // level idempotency. Settled.
+        delete extendAttemptRef.current[selectedExtPack];
         if (window.electronAPI?.openExternal) window.electronAPI.openExternal(data.checkout_url);
         else window.open(data.checkout_url, '_blank', 'noopener');
         setSuccess('Complete the top-up in your browser — your time lands here automatically.');
@@ -594,6 +620,13 @@ export function ManageSubscription({
         }
         return;
       }
+      // A 4xx is a definitive answer from our server (card declined, no pass,
+      // not an interview day, provider unconfigured) — nothing was captured,
+      // so release the id and let a corrected retry mint a fresh key. A 5xx,
+      // or a 200 we can't interpret, is AMBIGUOUS: keep the id so the retry
+      // replays the same key instead of risking a second charge. A thrown
+      // fetch (socket drop, timeout) never reaches here and keeps it too.
+      if (res.status >= 400 && res.status < 500) delete extendAttemptRef.current[selectedExtPack];
       throw new Error(data.message || data.error || 'Top-up failed. Please try again.');
     } catch (e: any) {
       if (mountedRef.current) setError(e?.message || 'Top-up failed. Please try again.');
@@ -1212,7 +1245,7 @@ export function ManageSubscription({
                 style={{ border: '1px solid rgba(211,172,99,0.38)', background: 'rgba(211,172,99,0.09)' }}
               >
                 <div className="flex items-center gap-3">
-                  <span style={{ color: '#d3ac63', display: 'inline-flex' }}><Zap size={18} /></span>
+                  <span style={{ color: 'var(--gold-ink)', display: 'inline-flex' }}><Zap size={18} /></span>
                   <div className="text-left">
                     <div className="font-semibold text-zinc-900 dark:text-white text-sm">
                       {renewPending ? 'Preparing checkout…' : `Renew · ${r.label} · ${pricingService.formatPrice(r.price, r.currencySymbol, r.currency)}`}
@@ -1220,7 +1253,7 @@ export function ManageSubscription({
                     <div className="text-xs text-zinc-600 dark:text-white/60">{`Add another ${r.minutes} minutes of interview time to your ${TIER_INFO[tier]?.label || 'current'} plan.`}</div>
                   </div>
                 </div>
-                {renewPending ? <Loader2 size={16} className="animate-spin" style={{ color: '#d3ac63' }} /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
+                {renewPending ? <Loader2 size={16} className="animate-spin" style={{ color: 'var(--gold-ink)' }} /> : <ChevronRight size={16} className="text-zinc-400 dark:text-white/40" />}
               </button>
             );
           })()}

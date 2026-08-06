@@ -187,6 +187,17 @@ function getIndex(contextFiles: ContextFile[]): KbIndex {
 // touches the cache, so a test can bracket a call with it safely.
 export function _indexBuildCount(): number { return indexBuilds; }
 
+// Drop the index. The fingerprint check above already rebuilds when the
+// FILES change, so this is not needed for correctness of retrieval — it is
+// needed because the index holds every chunk of every uploaded document in
+// memory, and "new conversation" / "sign out" has to mean the previous
+// session's documents are gone, not merely unreferenced. Called by
+// services/knowledgeCache.ts, which owns that lifecycle.
+export function resetIndex(): void {
+  cachedFp = '';
+  cachedIndex = null;
+}
+
 function idf(index: KbIndex, term: string): number {
   const nT = index.df.get(term) || 0;
   // BM25 IDF with +1 to stay non-negative for common terms.

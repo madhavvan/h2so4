@@ -11,7 +11,13 @@
 //  also add it here or it'll silently no-op.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-const { contextBridge, ipcRenderer, shell } = require('electron');
+// Note there's no `shell` here on purpose — this preload runs sandboxed
+// (neither window sets sandbox:false), and a sandboxed preload's
+// require('electron') only hands back contextBridge, crashReporter,
+// ipcRenderer, nativeImage, sharedTexture, webFrame and webUtils. Asking
+// for shell would just get you `undefined` and a TypeError at call time.
+// Anything that needs shell goes through IPC to main.
+const { contextBridge, ipcRenderer } = require('electron');
 
 // Renderer → main, fire-and-forget (ipcRenderer.send)
 const SEND_CHANNELS = new Set([
@@ -160,7 +166,18 @@ function on(channel, callback) {
 // Open external URL — only http/https/mailto. Everything else (file://,
 // javascript:, data:) is blocked because shell.openExternal will happily
 // execute file:// or weird custom protocols on Windows that can lead to
-// command execution.
+// command execution. Main re-checks the exact same allowlist before it
+// launches anything; we keep the check here as well so a bad protocol
+// never even reaches IPC — defence in depth, and the log line tells you
+// which renderer tried it.
+//
+// The actual launch is delegated to main over 'open-external-robust',
+// because this preload is sandboxed and therefore has no shell to call
+// (see the require at the top of the file). Contract note: the robust
+// helper below RESOLVES with { ok:false, ... } when a launch fails, but
+// callers of this one expect the older, simpler promise that REJECTS on
+// failure so their catch/fallback path runs — so we translate ok:false
+// into a rejection here and leave openExternalRobust's shape alone.
 const SAFE_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
 function openExternal(url) {
   try {
@@ -169,7 +186,11 @@ function openExternal(url) {
       console.warn('[preload] blocked openExternal with protocol:', u.protocol);
       return Promise.reject(new Error('Protocol not allowed'));
     }
-    return shell.openExternal(url);
+    return invoke('open-external-robust', url).then((result) => {
+      if (result && result.ok) return undefined;
+      const detail = (result && result.error) || 'unknown error';
+      throw new Error('Failed to open external URL — ' + detail);
+    });
   } catch (e) {
     return Promise.reject(e);
   }

@@ -100,6 +100,32 @@ function attachRemoteChannel(server, app, { path = REMOTE_WS_PATH } = {}) {
         try { payload = verifyToken(String(msg.token || '')); }
         catch { send(client, { kind: 'join_error', reason: 'bad_token' }); return ws.close(); }
 
+        // Force-logout check — the same one authMiddleware and detectSession
+        // (routes/support.js) run on every HTTP request. A signature that
+        // still verifies is not enough: an admin force-logout or a password
+        // reset bumps `tokens_revoked_after`, and every JWT issued before
+        // that moment is dead. Without this, a stolen token kept working on
+        // THIS socket for the rest of its multi-day life — the one
+        // authenticated surface a revocation could not reach, and the one
+        // that mirrors every answer and accepts remote commands. `iat` is in
+        // seconds, the stored timestamp is in ms. Required lazily so we
+        // don't force a circular import at module load, and a lookup that
+        // throws fails CLOSED, exactly as the HTTP surfaces do — there the
+        // db call sits inside the try that answers 401.
+        try {
+          if (payload && payload.id) {
+            const db = require('../database');
+            const revokedAfter = db.getTokensRevokedAfter(payload.id);
+            if (revokedAfter && payload.iat && payload.iat * 1000 < revokedAfter) {
+              send(client, { kind: 'join_error', reason: 'session_revoked' });
+              return ws.close();
+            }
+          }
+        } catch {
+          send(client, { kind: 'join_error', reason: 'bad_token' });
+          return ws.close();
+        }
+
         client.userId = payload.id;
         client.role = msg.role === ROLE.HOST ? ROLE.HOST : ROLE.REMOTE;
         client.sessionId = typeof msg.sessionId === 'string' ? msg.sessionId : null;

@@ -7,6 +7,8 @@ import { licenseService } from './licenseService';
 import { Message, ContextFile } from '../types';
 import { offloadContext, repairContext } from './contextStore';
 import { retrieveEvidence, kbTextLength, RETRIEVAL_MIN_CHARS, warmIndex } from './kbRetrieval';
+import { getLedgerFor, isJobDescription as isJobDescriptionFile } from './factLedger';
+import { composeOpener, ledgerDigest, ledgerVocabulary } from './instantOpener';
 
 // Prod build (`vite build` / `npm run electron:publish`): always points at
 // api.minicaai.com regardless of .env.local. Mirrors licenseService.ts:185.
@@ -175,7 +177,8 @@ export async function proxyRequest(endpoint: string, body: any): Promise<string>
   // services/contextStore.ts.
   if (response.status === 409) {
     const peek = await response.clone().json().catch(() => null);
-    if (peek?.error === 'context_missing' && await repairContext()) {
+    // Repair ONLY the blobs this body references — see repairContext.
+    if (peek?.error === 'context_missing' && await repairContext(body)) {
       response = await fire();
     }
   }
@@ -286,7 +289,7 @@ export async function proxyStream(
     if (res.status === 409) {
       const peek = await res.clone().json().catch(() => null);
       if (peek?.error === 'context_missing') {
-        await repairContext();
+        await repairContext(body);
         throw new Error('context_restored_retrying');
       }
     }
@@ -384,18 +387,85 @@ export function buildTextContext(contextFiles: ContextFile[]): string {
   return blocks.join('\n\n');
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  "IF KB IS EMPTY, FALL BACK TO GENERAL KNOWLEDGE SILENTLY"
+//
+//  That sentence used to be in this prompt, and combined with the line
+//  above it — "you are not an AI assistant, you ARE the specific person
+//  described below" — it is an instruction to invent a career and not
+//  mention that it was invented.
+//
+//  It did exactly that. Sixteen sessions in the user's own database have
+//  NO file attached, and across them the app repeatedly placed the
+//  candidate at "Meridian Health", complete with an Aurora migration it
+//  described in detail. Nobody asked it to lie; the prompt asked it to
+//  cover a gap silently, and a persona with no documents has nothing to
+//  cover the gap WITH except invention.
+//
+//  The two states are now told apart, because they need opposite
+//  instructions. With documents: anchor on them, and narrow rather than
+//  embellish where they are thin. Without documents: you are still a
+//  senior practitioner and you still answer in the first person — but you
+//  have no employer, no project and no metric to name, so you speak to how
+//  you work rather than to a history you do not have. Declining to invent
+//  is not the same as admitting to an interviewer that a tool is running,
+//  and the wording below is careful about that distinction: it never
+//  breaks character, it just stops making things up.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const NO_KB_MODE = `
+MODE — NO DOCUMENTS LOADED. You have no resume, JD or notes for this
+session. You are still a strong senior practitioner and you still answer
+in the first person — but you do not know this person's history, so you
+have nothing specific to draw on.
+
+HARD RULE: do NOT name an employer, client, product, project, team size,
+date, or metric as if it were yours. Not one. An invented employer spoken
+out loud has to be retracted the moment the interviewer follows up, and
+that is far worse than an answer with no company name in it.
+
+What to do instead — answer the QUESTION, from craft rather than
+autobiography:
+- Conceptual / technical / design / coding: answer fully and well. None of
+  these need a personal history.
+- "Tell me about a time…" / "walk me through a project": speak to how you
+  approach that class of problem, what you look for first, and the failure
+  mode you watch for. Concrete about the WORK, silent about the CV.
+- Asked directly where you worked or what you built: keep it high-level.
+  "Most of my work has been on the platform side — I'd rather walk you
+  through how I approach it than run through a list of logos" is a real
+  answer. Never produce a company name to fill the space.
+
+Never say "I don't have access to", "my knowledge base", "no documents
+were uploaded", "as an AI", or anything else that reveals a tool. Stay in
+character. Just stop short of specifics you do not have.
+
+⚠️ AND DO NOT NARRATE THIS RULE. Never use the words "invent",
+"fabricate", "make up", "overstate" or "guess" about your own answer — a
+candidate saying "I'd rather not invent a list of logos" is describing an
+instruction they were given, which is stranger than any silence. Just give
+the high-level answer and stop. (Observed live: the model lifted the word
+"invent" straight out of this prompt and said it out loud.)
+`;
+
 export function buildSystemInstruction(textContext: string, generalMode: boolean): string {
-  const modeInstruction = generalMode
-    ? `\nMODE — GENERAL KNOWLEDGE. Answer from general knowledge. If the question is about personal experience or "tell me about a time...", switch to the KNOWLEDGE BASE and speak from that lived background.\n`
-    : `\nMODE — GROUNDED IN RESUME/JD. Anchor every answer in the KNOWLEDGE BASE. Reference projects, stacks, and numbers that appear there. If KB is empty, fall back to general knowledge silently — never mention the gap.\n`;
+  const hasKb = String(textContext || '').trim().length > 0;
+  const modeInstruction = !hasKb
+    ? NO_KB_MODE
+    : generalMode
+      ? `\nMODE — GENERAL KNOWLEDGE. Answer from general knowledge. If the question is about personal experience or "tell me about a time...", switch to the KNOWLEDGE BASE and speak from that lived background.\n`
+      : `\nMODE — GROUNDED IN RESUME/JD. Anchor every answer in the KNOWLEDGE BASE. Reference projects, stacks, and numbers that appear there.
+
+KNOWLEDGE BOUNDARIES: you know ONLY what the KNOWLEDGE BASE says. Where it
+is thin on a topic, NARROW the answer instead of inventing — "used it
+mostly for X, honestly not something I've rebuilt from scratch" beats a
+confident fabrication every time, because the interviewer's next question
+is the follow-up you would have to walk back. Never name an employer,
+client, product, metric or date that does not appear above.\n`;
 
   return `
 You are the candidate in a live interview. You are not an AI assistant — you are the specific person described below, answering in real time. Your reply is either spoken out loud or typed into the interviewer's editor character-by-character.
 
-KNOWLEDGE BASE (Resume / JD / Notes):
-${textContext}
-
-Silently anchor on three things before answering: (a) seniority, (b) 2-3 strongest stack items, (c) 1-2 lived projects. Speak AS that person.
+${hasKb ? `KNOWLEDGE BASE (Resume / JD / Notes):\n${textContext}\n\nSilently anchor on three things before answering: (a) seniority, (b) 2-3 strongest stack items, (c) 1-2 lived projects. Speak AS that person.` : 'KNOWLEDGE BASE: none loaded for this session.'}
 
 ${modeInstruction}
 
@@ -1472,21 +1542,12 @@ export function distillForCover(text: string): string {
  * the exact opposite: never a word of the hiring company's own copy in
  * the candidate's mouth.
  *
- * Filename first (a file called "…- JD.pdf" is settled), then the phrases
- * a posting uses about itself and a candidate's resume never does.
+ * The implementation moved to services/factLedger.ts, which needs the same
+ * judgement for the same reason and is a leaf module everyone can import.
+ * Two copies of a predicate this load-bearing is two copies that disagree
+ * the first time either is tuned.
  */
-function isJobDescription(f: ContextFile): boolean {
-  const name = (f.name || '').toLowerCase();
-  if (/(^|[^a-z])(jd|job.?description|job.?posting|position|role|opening|vacancy)([^a-z]|$)/.test(name)) return true;
-  const head = (f.content || '').slice(0, 3000).toLowerCase();
-  const markers = [
-    /company overview/, /about the (company|role|position)/, /job description/,
-    /what you'?ll do/, /responsibilities:/, /qualifications:/, /requirements:/,
-    /we are (seeking|looking for|hiring)/, /is seeking/, /the ideal candidate/,
-    /reports to:/, /employment type/, /equal opportunity employer/,
-  ];
-  return markers.reduce((n, re) => n + (re.test(head) ? 1 : 0), 0) >= 2;
-}
+const isJobDescription = isJobDescriptionFile;
 
 // Memoised by KB fingerprint. This runs on the UI thread immediately
 // before the fetch that carries the question, and it is not free: it
@@ -1584,6 +1645,137 @@ export function buildCoverContext(contextFiles: ContextFile[]): string {
 // Test/diagnostic: how many times the cover context has been re-derived.
 // Reading it never touches the memo, so a test can bracket a call with it.
 export function _coverContextDerivations(): number { return coverCtxDerivations; }
+
+// ── Forget the previous session's knowledge ──
+//
+// Both memos below are module-level singletons holding the CONTENT of
+// uploaded documents. The fingerprint check makes them correct across a
+// file change, but correctness was never the whole requirement: "new
+// conversation" has to mean the last conversation's resume is no longer in
+// memory. Owned by services/knowledgeCache.ts so there is exactly one
+// place that knows the lifecycle.
+export function resetCoverContext(): void {
+  coverCtxFp = '';
+  coverCtxValue = '';
+}
+
+export function resetIdentityCache(): void {
+  identityCache.clear();
+  resolvedCards.clear();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  WHAT THE REQUEST CARRIES INSTEAD OF NINE THOUSAND CHARACTERS
+//
+//  Every streaming route used to send `coverContext` — up to 9,000
+//  characters of ONE document's prose, for a fast model to read under a
+//  1.5-second deadline and summarise into a spoken sentence. Measured, on
+//  a real three-resume upload, that block was 31% of the knowledge base and
+//  contained only the first file; on a 413K knowledge base, 2.2%.
+//
+//  It now sends three much smaller things, and the first of them removes
+//  the model from the critical path entirely:
+//
+//    instantOpener   the sentence to say, composed locally from verified
+//                    facts in ~35us. When present the server streams it and
+//                    issues the main model call immediately, so the cover
+//                    chain's 1,200-3,000ms block disappears.
+//    coverPolicy     'suppress' when an opener would be actively harmful —
+//                    the user is challenging a previous answer — so no
+//                    model is asked to cover it either.
+//    coverContext    the ledger DIGEST: every role, project, skill line,
+//                    degree, certification and metric in the WHOLE
+//                    knowledge base, in ~800-3,500 chars. Complete where
+//                    the prose block was partial, and smaller.
+//    coverVocabulary every proper noun the knowledge base contains, so the
+//                    server can reject a fallback model's sentence that
+//                    names something the candidate never touched.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+export interface OpenerPayload {
+  instantOpener: string;
+  coverPolicy: 'open' | 'defer' | 'suppress';
+  coverShape: string;
+  coverContext: string;
+  coverVocabulary: string;
+  /**
+   * The last couple of exchanges, for the LLM fallback only.
+   *
+   * It used to receive the question and the resume and NOTHING about the
+   * conversation, which is why "then why did you answer IBM?" produced a
+   * confident account of a job at Accenture: with no transcript, a model
+   * told to always start answering has to invent the thing it is being
+   * asked about. `suppress` now stops that exact shape from reaching a
+   * model at all — but every other follow-up ("and what about the second
+   * one?", "you mentioned Kafka — where?") has the same blindness, and on
+   * grok and groq the fallback is still what covers a 9-50 second gap.
+   */
+  recentTurns: string;
+}
+
+// How much transcript the fallback gets. Two turns is the follow-up
+// horizon; more would push the cover's prompt back toward the size that
+// made Groq's per-minute token bucket the binding constraint.
+const RECENT_TURNS_CHARS = 1_200;
+
+/**
+ * Everything the cover needs, computed locally. `history` is the recent
+ * transcript, used only to widen what counts as already-said vocabulary.
+ */
+export function buildOpenerPayload(
+  query: string,
+  contextFiles: ContextFile[],
+  history?: Message[],
+): OpenerPayload {
+  try {
+    const ledger = getLedgerFor(contextFiles || []);
+    // Labelled, because an unlabelled blob of two turns reads to a fast
+    // model as more of the question. The cover has to be able to tell what
+    // the interviewer asked from what the candidate already said.
+    //
+    // ⚠️ THE LABELS ARE LOAD-BEARING, NOT DECORATION. Both the client guard
+    // (instantOpener.interviewerLines) and the server one (interviewerSaid
+    // in routes/ai.js) read them to decide which lines may widen the trusted
+    // vocabulary: what the INTERVIEWER said is external evidence, what the
+    // app said last turn is only a claim, and admitting the second is how
+    // one fabrication authorises the next. Rename either label and both
+    // guards quietly stop trusting the interviewer too, and every cover that
+    // echoes a name from the last question starts being thrown away.
+    //
+    // The tail slice can decapitate the first line, so a line that lost its
+    // label is dropped outright rather than shipped as an unattributable
+    // fragment that the guards then have to guess about.
+    const recent = (history || [])
+      .slice(-2)
+      .map((m) => `${m.role === 'user' ? 'Interviewer' : 'You already said'}: ${String(m.content || '').replace(/\s+/g, ' ').trim()}`)
+      .join('\n')
+      .slice(-RECENT_TURNS_CHARS)
+      .replace(/^(?!Interviewer: |You already said: )[^\n]*\n?/, '');
+    const decision = composeOpener(ledger, query, recent);
+    return {
+      instantOpener: decision.kind === 'speak' ? decision.text : '',
+      coverPolicy: decision.kind === 'speak' ? 'open' : decision.kind,
+      coverShape: decision.shape,
+      coverContext: ledgerDigest(ledger),
+      coverVocabulary: ledgerVocabulary(ledger),
+      recentTurns: recent,
+    };
+  } catch {
+    // Fail open to exactly the pre-existing behaviour: no opener, a live
+    // model may cover, and the cover gets the old prose slice.
+    return {
+      instantOpener: '', coverPolicy: 'defer', coverShape: 'unknown',
+      coverContext: (() => { try { return buildCoverContext(contextFiles); } catch { return ''; } })(),
+      coverVocabulary: '', recentTurns: '',
+    };
+  }
+}
+
+// Auto-solve types code into an editor; a spoken opener would corrupt it.
+const NO_OPENER: OpenerPayload = {
+  instantOpener: '', coverPolicy: 'suppress', coverShape: 'auto-solve',
+  coverContext: '', coverVocabulary: '', recentTurns: '',
+};
 
 async function prepareStreamPrompts(
   query: string,
@@ -1809,7 +2001,7 @@ export async function streamGemini(
 
   const full = await proxyStream(
     '/stream/gemini',
-    { prompt, systemInstruction, fileParts, coverContext: isAutoSolve ? '' : buildCoverContext(contextFiles) },
+    { prompt, systemInstruction, fileParts, ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history)) },
     onToken,
     signal,
   );
@@ -1856,7 +2048,7 @@ export async function streamOpenAI(
   // through; server enforces tier gate via JWT.
   const full = await proxyStream(
     '/stream/openai',
-    { messages, reasoning_effort: getReasoningEffort(), coverContext: isAutoSolve ? '' : buildCoverContext(contextFiles) },
+    { messages, reasoning_effort: getReasoningEffort(), ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history)) },
     onToken,
     signal,
   );
@@ -1895,7 +2087,7 @@ export async function streamXAI(
 
   const full = await proxyStream(
     '/stream/xai',
-    { messages, coverContext: isAutoSolve ? '' : buildCoverContext(contextFiles) },
+    { messages, ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history)) },
     onToken,
     signal,
   );
@@ -1934,7 +2126,7 @@ export async function streamGroq(
 
   const full = await proxyStream(
     '/stream/groq',
-    { messages, coverContext: isAutoSolve ? '' : buildCoverContext(contextFiles) },
+    { messages, ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history)) },
     onToken,
     signal,
   );

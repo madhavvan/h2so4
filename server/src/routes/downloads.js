@@ -8,11 +8,22 @@
 //  Railway would add bandwidth cost on every download and slow the
 //  user's first connection.
 //
-//  The repo name lives ONLY in this file. Since 4.0.10 this points at the
-//  PUBLIC releases-only repo (binaries + update feeds); the app source
-//  lives in a separate private repo, and nothing user-facing references
-//  it. If the releases repo is ever renamed, this is the one constant to
-//  update.
+//  ── WHICH REPO SERVES THE BINARIES ──
+//  4.0.10 pointed this at `madhavvan/interviewcopilot-releases`, a public
+//  releases-only repo meant to let the source repo go private. That repo
+//  was never actually created: from 2026-07-18 until 2026-08-06 every one
+//  of these redirects 302'd into a GitHub 404 and NOBODY COULD DOWNLOAD
+//  THE APP. Pointed back at h2so4, which is public and carries the real
+//  releases (v4.0.16 has all four artifacts below).
+//
+//  This constant is NOT the only copy — `GITHUB_RELEASES_URL` in
+//  server/src/index.js reads the same repo for /license/version, and
+//  package.json → build.publish decides which repo gets baked into each
+//  build's app-update.yml. Changing the release repo means changing all
+//  THREE, and the third one only takes effect for future installs.
+//
+//  Before making h2so4 private, create the public releases repo FIRST,
+//  publish a release to it, and only then repoint these three.
 //
 //  Routes are explicit (one handler per platform) instead of /:platform
 //  with a lookup table — this keeps the router from swallowing every
@@ -22,7 +33,7 @@
 const express = require('express');
 const router = express.Router();
 
-const REPO = 'madhavvan/interviewcopilot-releases';
+const REPO = 'madhavvan/h2so4';
 
 // Artifact filenames must match the patterns in package.json's
 // build.{win,mac,linux}.artifactName — keep them in sync.

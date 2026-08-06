@@ -12,6 +12,43 @@ const router = express.Router();
 // All conversation routes require auth
 router.use(authMiddleware);
 
+// ── A client-chosen message id is not proof of ownership ──
+//
+// conversation_messages.id is a GLOBAL primary key and its value comes from
+// the CLIENT: both App.tsx and electron/database.cjs mint plain
+// `Date.now().toString()`, so ids are guessable AND can collide between two
+// users by accident. Every write below goes through INSERT OR REPLACE, so an
+// id that already exists is overwritten in place — content, role,
+// conversation_id and user_id all replaced. That means a caller who owns the
+// CONVERSATION can still destroy a message belonging to somebody else, simply
+// by naming their id. Owning the conversation says nothing about who owns the
+// id, so the id has to be resolved separately before any write.
+//
+// Returns the subset of `ids` that already name a row this caller may not
+// write: another user's message, or one of the caller's own messages sitting
+// in a different conversation (re-parenting it would make it disappear from
+// that conversation's history — the same data loss, self-inflicted). Every
+// lookup is a primary-key hit, one statement per chunk.
+const MESSAGE_ID_LOOKUP_CHUNK = 400; // SQLite's default variable cap is 999
+
+function findUnwritableMessageIds(ids, userId, conversationId) {
+  const blocked = new Set();
+  const unique = [...new Set((ids || []).map(v => String(v)))];
+  if (unique.length === 0) return blocked;
+
+  const d = db.getDB();
+  for (let i = 0; i < unique.length; i += MESSAGE_ID_LOOKUP_CHUNK) {
+    const chunk = unique.slice(i, i + MESSAGE_ID_LOOKUP_CHUNK);
+    const rows = d.prepare(
+      `SELECT id FROM conversation_messages
+        WHERE id IN (${chunk.map(() => '?').join(',')})
+          AND NOT (user_id = ? AND conversation_id = ?)`,
+    ).all(...chunk, userId, conversationId);
+    for (const row of rows) blocked.add(String(row.id));
+  }
+  return blocked;
+}
+
 // ── List all conversations for current user ──
 router.get('/', (req, res) => {
   try {
@@ -108,6 +145,14 @@ router.post('/:id/messages', (req, res) => {
       return res.status(400).json({ error: 'Message id, role, and content are required' });
     }
 
+    // The insert below is INSERT OR REPLACE on a client-chosen global id —
+    // see findUnwritableMessageIds. Refuse rather than clobber a row that
+    // isn't ours. 409, not 403: the request is well formed and the caller
+    // does own the conversation; it is the id that is already taken.
+    if (findUnwritableMessageIds([id], req.user.id, req.params.id).size > 0) {
+      return res.status(409).json({ error: 'Message id already in use' });
+    }
+
     db.addConversationMessage({
       id,
       conversation_id: req.params.id,
@@ -150,16 +195,38 @@ router.post('/:id/sync', (req, res) => {
       return res.status(400).json({ error: 'Messages array required' });
     }
 
-    const formattedMessages = messages.map(m => ({
-      id: m.id,
-      conversation_id: req.params.id,
-      user_id: req.user.id,
-      role: m.role,
-      content: m.content,
-      timestamp: m.timestamp || Date.now(),
-    }));
+    // Same client-chosen-id hazard as POST /:id/messages, except a batch can
+    // carry a whole conversation (the one-shot history backfill posts every
+    // message of a session at once). Rejecting the request would lose the
+    // ENTIRE batch — attemptSync in services/aiProxyService.ts treats any
+    // non-429 4xx as permanent and drops the payload — so drop only the ids
+    // we are not allowed to write and store everything else.
+    const unwritable = findUnwritableMessageIds(
+      messages.filter(m => m && m.id != null).map(m => m.id),
+      req.user.id,
+      req.params.id,
+    );
+
+    const formattedMessages = messages
+      .filter(m => !(m && m.id != null && unwritable.has(String(m.id))))
+      .map(m => ({
+        id: m.id,
+        conversation_id: req.params.id,
+        user_id: req.user.id,
+        role: m.role,
+        content: m.content,
+        timestamp: m.timestamp || Date.now(),
+      }));
 
     db.addConversationMessages(formattedMessages);
+
+    const dropped = messages.length - formattedMessages.length;
+    if (dropped > 0) {
+      console.warn(
+        `Sync dropped ${dropped} message(s) whose id belongs elsewhere ` +
+        `(user ${req.user.id}, conversation ${req.params.id})`,
+      );
+    }
 
     res.json({ success: true, synced: formattedMessages.length });
   } catch (err) {

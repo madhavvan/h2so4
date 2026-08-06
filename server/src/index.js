@@ -198,6 +198,15 @@ function isAdminIpAllowed(ip) {
 
 app.use(async (req, res, next) => {
   try {
+    // Express routes case-insensitively and non-strictly, so `/API/V1/Admin/x`,
+    // `/api/v1/auth/Login` and `/api/v1/payments/create-checkout/` all reach the
+    // same handlers. Every guard below therefore compares against ONE canonical
+    // form of the path — lowercased, trailing slashes stripped — or an attacker
+    // steps around the whole block with a capital letter or a trailing slash.
+    // `req.path` carries no query string, and Express matches routes on the
+    // still-encoded pathname, so case + trailing slash are the only skews.
+    const p = (req.path || '').toLowerCase().replace(/\/+$/, '') || '/';
+
     // `identity.key` is the verified user when signed in, else the IP.
     // `key` stays the raw IP on purpose — every limiter below this one
     // exists to stop abuse from a SOURCE (login brute force, reset-mail
@@ -225,7 +234,7 @@ app.use(async (req, res, next) => {
     // hundred addresses got a hundred fresh budgets against one email. The
     // IP bucket is now the anti-spraying control instead, and is loose
     // enough that colleagues behind one office NAT can all sign in.
-    if (req.path.startsWith('/api/v1/auth/login')) {
+    if (p.startsWith('/api/v1/auth/login')) {
       if (accountKey) {
         try {
           await loginAccountLimiter.consume(accountKey);
@@ -246,7 +255,7 @@ app.use(async (req, res, next) => {
     // An account bucket protects nothing here: someone creating accounts in
     // bulk uses a new email every time, so the key would never repeat.
     // Volume from a source is the only meaningful signal.
-    if (req.path.startsWith('/api/v1/auth/signup')) {
+    if (p.startsWith('/api/v1/auth/signup')) {
       try {
         await signupIpLimiter.consume(key);
       } catch {
@@ -257,7 +266,7 @@ app.use(async (req, res, next) => {
     // ── Forgot password: two axes ──
     // Each request mails a real person, so the abuse is bombing ONE inbox —
     // which an IP bucket never stopped, because rotating addresses reset it.
-    if (req.path === '/api/v1/auth/forgot-password' && req.method === 'POST') {
+    if (p === '/api/v1/auth/forgot-password' && req.method === 'POST') {
       if (accountKey) {
         try {
           await forgotAccountLimiter.consume(accountKey);
@@ -283,9 +292,9 @@ app.use(async (req, res, next) => {
     // provider's own account-wide rate ceilings.
     if (
       req.method === 'POST' &&
-      (req.path === '/api/v1/payments/create-checkout' ||
-       req.path === '/api/v1/payments/create-renewal' ||
-       req.path === '/api/v1/payments/upgrade-tier')
+      (p === '/api/v1/payments/create-checkout' ||
+       p === '/api/v1/payments/create-renewal' ||
+       p === '/api/v1/payments/upgrade-tier')
     ) {
       // Per USER first — the caller is authenticated here, so the person is
       // the right axis and two colleagues upgrading from one office
@@ -307,7 +316,7 @@ app.use(async (req, res, next) => {
     // Admin surface. Enforce IP allowlist first (if configured), then
     // apply read/write rate limits. Only active for /api/v1/admin/**; all
     // other traffic is unaffected.
-    if (req.path.startsWith('/api/v1/admin/')) {
+    if (p === '/api/v1/admin' || p.startsWith('/api/v1/admin/')) {
       if (!isAdminIpAllowed(key)) {
         // Audit the attempt before we drop the connection. We don't yet
         // know WHICH admin — no JWT is checked at this layer — but we do
@@ -345,7 +354,7 @@ app.use(async (req, res, next) => {
     // burst cap (10/min) plus a slower drip cap (50/hour) so an attacker
     // can't both spike *and* sustain. Hits BEFORE the route to keep us
     // from spending OpenAI tokens on the abuse traffic.
-    if (req.path.startsWith('/api/v1/support/chat')) {
+    if (p.startsWith('/api/v1/support/chat')) {
       try {
         await supportChatLimiter.consume(key);
         await supportChatHourly.consume(key);
@@ -355,7 +364,7 @@ app.use(async (req, res, next) => {
         });
       }
     }
-    if (req.path.startsWith('/api/v1/support/handoff')) {
+    if (p.startsWith('/api/v1/support/handoff')) {
       try {
         await supportHandoffLimiter.consume(key);
       } catch {
@@ -372,7 +381,7 @@ app.use(async (req, res, next) => {
     // resolve user_id here without parsing JWT, so we attempt a cheap
     // header sniff: clients send Authorization: Bearer <jwt>. If parse
     // fails, fall back to IP — strictly safe since IP is always present.
-    if (req.path.startsWith('/api/v1/ai/')) {
+    if (p === '/api/v1/ai' || p.startsWith('/api/v1/ai/')) {
       // Was a hand-rolled base64 decode of the JWT payload with NO
       // signature check. Survivable here (authMiddleware rejects a forged
       // token moments later, so the attacker gains nothing but a wasted
@@ -520,7 +529,11 @@ app.get('/stealth-test', (req, res) => {
 //
 // Download filenames MUST match electron-builder's artifactName entries
 // in package.json → build → {win,mac,linux}.
-const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/interviewcopilot-releases/releases/latest';
+// Must name the SAME repo as REPO in routes/downloads.js. It pointed at
+// `interviewcopilot-releases` from 2026-07-18 to 2026-08-06 — a repo that
+// was never created — so this fetch 404'd on every refresh and the endpoint
+// silently served FALLBACK_VERSION to every client for three weeks.
+const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/h2so4/releases/latest';
 const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 // Offline fallback ONLY — the GitHub Releases fetch above is the live
@@ -532,9 +545,14 @@ const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 // downgrade prompt. Whatever value is used MUST point at a version that
 // actually has a GitHub release.
 const FALLBACK_VERSION = {
-  version: process.env.LATEST_APP_VERSION || '4.0.8',
+  // Bumped 4.0.8 → 4.0.16 on 2026-08-06. While GITHUB_RELEASES_URL pointed
+  // at a repo that did not exist, the fetch failed on every refresh and this
+  // fallback WAS the live answer — so production told every client the
+  // latest version was 4.0.8 while 4.0.16 was the shipped build. v4.0.16 is
+  // the newest non-draft release on madhavvan/h2so4.
+  version: process.env.LATEST_APP_VERSION || '4.0.16',
   minVersion: '2.0.0',
-  releaseDate: '2026-05-26',
+  releaseDate: '2026-07-18',
   releaseNotes: 'Latest stable release.',
   downloadUrl: {
     // Routed through get.minicaai.com → 302 → GitHub release CDN. Keeps the
@@ -903,6 +921,29 @@ server.on('upgrade', (req, socket, head) => {
   if (pathname !== '/ws/support') return;
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
+
+// -- Reap upgrades that nobody owns --
+// Node closes an upgrade socket by itself ONLY while the server has no
+// 'upgrade' listener at all. From the moment one is registered the socket
+// is ours, and both path-scoped handlers above deliberately `return` on a
+// path they do not own (that `return` is precisely what stops them from
+// killing each other's connections). So `GET /anything` carrying an
+// `Upgrade: websocket` header left a live, unauthenticated TCP socket
+// with no owner, no timeout and no close path: anyone could open them in
+// a loop until the process ran out of file descriptors, taking the whole
+// HTTP API down with it, from a request that never touched auth.
+//
+// Registered LAST so the real owners always get first refusal - this
+// listener only ever sees a socket both of them passed on, and destroying
+// it is the whole job: a WebSocket client reads the reset as a failed
+// handshake, which is what an unroutable path should look like.
+const OWNED_WS_PATHS = new Set(['/ws/support', remoteChannel?.wss?.remotePath || '/ws/remote']);
+server.on('upgrade', (req, socket) => {
+  let pathname = '/';
+  try { pathname = new URL(req.url, 'http://x').pathname; } catch { /* keep default */ }
+  if (OWNED_WS_PATHS.has(pathname)) return;
+  try { socket.destroy(); } catch { /* already gone */ }
+});
 console.log('[ws] /ws/support and /ws/remote each own their path');
 
 // Track connected clients: customers and agents.
@@ -931,6 +972,66 @@ const SUPPORT_IDLE_MS = 30 * 60 * 1000;
 const SUPPORT_PING_INTERVAL_MS = 60 * 1000;
 const SUPPORT_MAX_PER_USER = { customer: 1, agent: 4 };
 
+// -- New-chat flood control --
+// Creating a support thread is the expensive, side-effecting half of a
+// join: it writes a row, enqueues the whole escalation ladder (ntfy, then
+// email, then SMS) and fans an instant push out to every notifiable
+// agent. None of that requires an account, because role 'customer' with
+// no token is a supported anonymous flow - so an unauthenticated
+// connect/join/disconnect loop minted unbounded threads, paged every
+// admin's phone and mail-bombed the support inbox, for free.
+//
+// The per-role connection cap above does NOT bound this: an anonymous
+// socket is handed a fresh anon_<timestamp> identity on every join, so
+// each connection counts as its own logical user and never contends with
+// the one before it.
+//
+// Counted on NEW THREADS rather than on connections or messages -
+// reconnecting to an existing thread is harmless, and thread creation is
+// the only path here that spends money. Signed-in customers are counted
+// on their verified user id, so an anonymous flood can exhaust the
+// anonymous budget without ever locking a paying customer out of
+// support. The env overrides exist mainly so the probe scripts in
+// server/scripts (each run starts a fresh anonymous chat) can be raised
+// during a debugging session.
+function supportEnvLimit(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+const SUPPORT_NEW_THREAD_WINDOW_MS = 10 * 60 * 1000;
+const SUPPORT_NEW_THREADS_PER_ANON_IP = supportEnvLimit('SUPPORT_NEW_THREADS_PER_IP', 8);
+const SUPPORT_NEW_THREADS_PER_USER = supportEnvLimit('SUPPORT_NEW_THREADS_PER_USER', 20);
+const SUPPORT_NEW_THREADS_ANON_GLOBAL = supportEnvLimit('SUPPORT_NEW_THREADS_ANON_GLOBAL', 30);
+const supportThreadBuckets = new Map();   // key -> { count, resetAt }
+
+// Fixed-window counter. Synchronous and in-process on purpose: the join
+// handler is synchronous, and every limiter in this service is in-memory
+// for the single-instance reason documented in middleware/rateLimiters.js.
+// Returns true when the caller may create a thread, and charges it.
+function takeSupportThreadSlot(key, limit, now) {
+  if (supportThreadBuckets.size > 5000) {
+    // Keys are attacker-chosen (one per source address), so the map has
+    // to be swept or this fix leaks the memory it exists to protect.
+    for (const [k, v] of supportThreadBuckets) if (now >= v.resetAt) supportThreadBuckets.delete(k);
+  }
+  const bucket = supportThreadBuckets.get(key);
+  if (!bucket || now >= bucket.resetAt) {
+    supportThreadBuckets.set(key, { count: 1, resetAt: now + SUPPORT_NEW_THREAD_WINDOW_MS });
+    return true;
+  }
+  if (bucket.count >= limit) return false;
+  bucket.count += 1;
+  return true;
+}
+
+// How long a socket may stay connected without joining. Every real client
+// (the customer panel, App.tsx's root admin socket, the probe scripts)
+// sends join from its own onopen, and a socket that never joins is never
+// registered in supportClients - so the sweeper at the bottom of this
+// file, which walks that map, can neither see nor close it. Without a
+// deadline those sockets are held until the process exits.
+const SUPPORT_JOIN_DEADLINE_MS = 90 * 1000;
+
 // Helper: list connections for the same logical user (same role +
 // email). When count >= cap we evict the OLDEST so the newest tab
 // always wins and an in-flight reconnect doesn't get itself kicked.
@@ -953,6 +1054,30 @@ wss.on('connection', (ws, req) => {
   const remoteIp = req?.headers?.['x-forwarded-for']?.split(',')[0]?.trim()
     || req?.socket?.remoteAddress || '';
   const remoteUa = String(req?.headers?.['user-agent'] || '').slice(0, 200);
+
+  // Rate-limit key. Deliberately NOT remoteIp: that takes the LEFTMOST
+  // X-Forwarded-For entry, which is whatever the client typed. Fine as
+  // best-effort provenance, useless as a limiter key - an attacker sets a
+  // new value on every connection and gets a fresh bucket each time.
+  // Railway APPENDS the real client address, so with trust proxy = 1 (see
+  // the top of this file) the RIGHTMOST entry is the one the proxy
+  // vouches for. Falls back to the socket address with no proxy in front.
+  const forwardedChain = String(req?.headers?.['x-forwarded-for'] || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const rateLimitIp = (forwardedChain.length ? forwardedChain[forwardedChain.length - 1] : '')
+    || req?.socket?.remoteAddress || 'unknown';
+
+  // A socket that connects and never joins is not in supportClients, and
+  // the sweeper at the bottom of this file only walks supportClients - so
+  // nothing pings it, times it out or closes it, and an anonymous client
+  // could hold file descriptors open for the life of the process just by
+  // opening sockets and staying silent. Cleared the moment a join is
+  // accepted below, after which the sweeper owns this socket.
+  let joinDeadline = setTimeout(() => {
+    joinDeadline = null;
+    if (!clientId) { try { ws.close(4408, 'join timeout'); } catch { /* already gone */ } }
+  }, SUPPORT_JOIN_DEADLINE_MS);
+  joinDeadline.unref?.();
 
   ws.on('message', (raw) => {
     try {
@@ -1066,6 +1191,34 @@ wss.on('connection', (ws, req) => {
           // would resurface someone else's conversation.
           let thread = isAuthedCustomer ? db.findResumableSupportThread(email) : null;
           if (!thread) {
+            // -- Flood control, BEFORE the row + the ladder + the fanout --
+            // An anonymous join is charged to its source address first, so
+            // one abuser burns only its own budget, and only then to a
+            // global anonymous ceiling that a flood rotating addresses
+            // still has to fit inside. A verified customer is charged to
+            // their user id instead and is never locked out by anonymous
+            // traffic. Refusing here is what bounds the escalation ladder
+            // and the ntfy/email fanout below, not just the row count.
+            const nowMs = Date.now();
+            const mayCreate = isAuthedCustomer
+              ? takeSupportThreadSlot(`u:${boundUserId}`, SUPPORT_NEW_THREADS_PER_USER, nowMs)
+              : (takeSupportThreadSlot(`ip:${rateLimitIp}`, SUPPORT_NEW_THREADS_PER_ANON_IP, nowMs)
+                && takeSupportThreadSlot('anon:global', SUPPORT_NEW_THREADS_ANON_GLOBAL, nowMs));
+            if (!mayCreate) {
+              console.warn(`[support/ws] new-chat rate limit - refused thread for ${isAuthedCustomer ? email : `anon ip=${rateLimitIp}`}`);
+              try {
+                ws.send(JSON.stringify({
+                  type: 'rate_limited',
+                  scope: 'new_chat',
+                  message: 'Too many new chats have been started from here. Please try again in a few minutes, or email support@minicaai.com.',
+                }));
+              } catch { /* socket already closing */ }
+              // Closed rather than left registered without a thread: a
+              // thread-less socket would accept messages the customer
+              // believes are being delivered and silently drop every one.
+              try { ws.close(4429, 'new chat rate limit'); } catch { /* already closed */ }
+              return;
+            }
             thread = db.createSupportThread({
               customer_email: email,
               customer_name: data.name || null,
@@ -1139,6 +1292,9 @@ wss.on('connection', (ws, req) => {
         if (typeof global.__supportConnSeq === 'undefined') global.__supportConnSeq = 0;
         global.__supportConnSeq += 1;
         clientId = `${role}_${email}_${global.__supportConnSeq}`;
+        // Registered: the idle/heartbeat sweeper owns this socket from
+        // here, so the unauthenticated join deadline is no longer needed.
+        if (joinDeadline) { clearTimeout(joinDeadline); joinDeadline = null; }
         supportClients.set(clientId, {
           ws,
           type: role,
@@ -1496,6 +1652,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    if (joinDeadline) { clearTimeout(joinDeadline); joinDeadline = null; }
     if (clientId) {
       const client = supportClients.get(clientId);
       if (client) {

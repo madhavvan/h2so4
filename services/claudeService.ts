@@ -32,10 +32,12 @@ import {
   buildAutoSolveSystemInstruction,
   assembleEvidence,
   buildCoverContext,
+  buildOpenerPayload,
   SUBSTANCE_PREPEND,
   type ExtractedCards,
   type OnToken,
 } from './aiProxyService';
+import { registerForgetHook } from './knowledgeCache';
 import {
   readTechStateCache,
   writeTechStateCache,
@@ -530,6 +532,24 @@ export async function trainClaudeModelBeast(
 
   await Promise.all(Array.from({ length: Math.min(3, keywords.length) }, worker));
 
+  // Same "never cache a run that learned nothing" rule as standard mode, and
+  // for the same reason — researchOneTechBeast returns null on every failure
+  // branch, so a fan-out that gets rate-limited across the board leaves results
+  // empty and the card would be nothing but a header claiming authority over
+  // the model's training data. The floor is zero-only here on purpose: beast
+  // research is per-tech rather than batched, so a partial yield is genuinely
+  // partial — eight real deep factsheets, not one batch that happened to
+  // survive — and it cost $3-6 to buy. Discarding that would hurt more than
+  // keeping it, and beast is admin-only where the 24h lockout doesn't bite
+  // because the re-train confirm is always offered. We bail here rather than
+  // after Stage 3 so a dead run doesn't pay for one more Claude call to
+  // synthesize an empty factsheet list.
+  if (results.length === 0) {
+    const failMsg = 'Research failed — nothing was learned. Try again in a few minutes.';
+    onProgress({ stage: 'error', done: 0, total: keywords.length, pct: 0, message: failMsg });
+    return { success: false, techCount: 0, cardLength: 0, cached: false, message: failMsg };
+  }
+
   // Stage 3: synthesis pass
   onProgress({
     stage: 'finalizing',
@@ -614,6 +634,28 @@ export async function trainClaudeModel(
       message: `${done}/${total} — ${current}`,
     });
   });
+
+  // A run that learned nothing must never be cached. researchBatch returns {}
+  // on every failure branch — no JSON in the reply, a parse throw, or the call
+  // itself throwing, each after exactly one 2.5s retry — and batchResearch only
+  // pushes the techs it actually got back, so when Anthropic's web_search rate
+  // limiter takes out every batch (the very fan-out failure the 15-keyword cap
+  // above exists to soften) this comes back []. Persisting that wrote a
+  // header-only card which still told the model "these CURRENT facts override
+  // your training data" while carrying zero facts, flipped hasTechStateCache
+  // true for the full 24h TTL, and — since the Train button is hidden while a
+  // cache is fresh — locked a Max-tier feature for a day on the strength of a
+  // run that produced nothing. Below the floor we write nothing, so the next
+  // click is a real retry. Floor is 3 factsheets but never more than we asked
+  // for: a thin resume that only yields two keywords must still be trainable.
+  const minCards = Math.min(3, keywords.length);
+  if (cards.length < minCards) {
+    const failMsg = cards.length === 0
+      ? 'Research failed — nothing was learned. Try again in a few minutes.'
+      : `Research mostly failed — only ${cards.length}/${keywords.length} came back. Try again in a few minutes.`;
+    onProgress({ stage: 'error', done: cards.length, total: keywords.length, pct: 0, message: failMsg });
+    return { success: false, techCount: cards.length, cardLength: 0, cached: false, message: failMsg };
+  }
 
   onProgress({
     stage: 'finalizing',
@@ -978,7 +1020,10 @@ export async function streamClaude(
 
   const full = await proxyStream(
     '/stream/claude',
-    { messages, systemInstruction, enableWebSearch, coverContext: isAutoSolve ? '' : buildCoverContext(contextFiles) },
+    { messages, systemInstruction, enableWebSearch,
+      ...(isAutoSolve
+        ? { instantOpener: '', coverPolicy: 'suppress', coverShape: 'auto-solve', coverContext: '', coverVocabulary: '', recentTurns: '' }
+        : buildOpenerPayload(query, contextFiles, history)) },
     onToken,
     signal,
   );
@@ -993,6 +1038,18 @@ export async function streamClaude(
 // ~2-5s preflight cost. Fire-and-forget; safe to call repeatedly
 // (hits the cache after the first run). Noop when there's nothing
 // useful to extract.
+// Claude's briefing-card caches are the fourth and fifth copies of the
+// uploaded knowledge base in memory. knowledgeCache owns when they are
+// emptied, but it cannot import this file — claudeService imports
+// aiProxyService, which knowledgeCache also imports, so a direct import
+// would close a cycle. Registering the reset inverts the dependency: this
+// module knows about knowledgeCache, and knowledgeCache knows only that
+// something asked to be told.
+registerForgetHook(() => {
+  claudeIdentityCache.clear();
+  claudeResolvedCards.clear();
+});
+
 export function prewarmClaudeIdentity(contextFiles: ContextFile[]): void {
   if (!contextFiles || contextFiles.length === 0) return;
   const { resume, jd } = splitResumeAndJd(contextFiles);

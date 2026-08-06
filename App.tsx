@@ -15,7 +15,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT, prewarmIdentity, prewarmContext, prewarmRetrieval, generateConversationTitle } from './services/aiProxyService';
+import { streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT, generateConversationTitle } from './services/aiProxyService';
+import { syncKnowledge, warmKnowledgeNetwork, forgetKnowledge } from './services/knowledgeCache';
 import { RemoteHost, remoteWsUrl } from './services/remoteHost';
 import { remoteHostRef, publishRemote, registerAutoTypeBlock, extractCodeBlocks, runAutoTypeForCode } from './services/remoteBridge';
 import { streamClaude, prewarmClaudeIdentity, trainClaudeModel, trainClaudeModelBeast, hasCachedTechState, type TrainingProgress } from './services/claudeService';
@@ -912,7 +913,13 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true, hid
     <div
       className="fixed inset-0 flex items-center justify-center p-4"
       style={{
-        background: inPopout ? 'rgba(11,10,8,0.82)' : (inElectron ? 'rgba(0,0,0,0.92)' : 'rgba(0,0,0,0.5)'),
+        // 0.92 black is right on obsidian — the app behind simply recedes.
+        // On cream it drops a near-black sheet behind a cream modal, so the
+        // product looks like it changed theme when a dialog opens. Themed via
+        // --modal-scrim (index.html): dark keeps 0.92 exactly, light uses a
+        // warm 38% that dims without extinguishing. An inline style cannot be
+        // reached by a stylesheet, which is why this is a token and not a rule.
+        background: inPopout ? 'rgba(11,10,8,0.82)' : (inElectron ? 'var(--modal-scrim)' : 'rgba(0,0,0,0.5)'),
         borderRadius: inPopout ? '18px' : undefined,
         zIndex: 99999,
         WebkitAppRegion: 'no-drag',
@@ -1391,7 +1398,7 @@ const ChatInterface = ({
                             >
                                 {!inElectron
                                   ? <>Share the meeting tab's audio, or try a sample below</>
-                                  : <>Turn on the mic and set <span style={{ color: '#d3ac63' }}>Manual → Auto</span> for the best experience</>
+                                  : <>Turn on the mic and set <span style={{ color: 'var(--gold-ink)' }}>Manual → Auto</span> for the best experience</>
                                 }
                             </p>
                             {!inElectron && handlePlaySampleQuestion && (
@@ -1771,7 +1778,7 @@ const ChatInterface = ({
                             <p className="text-center text-lg md:text-xl px-8 leading-relaxed select-none pointer-events-none" style={{ fontFamily: 'var(--serif)', letterSpacing: '0.01em', color: 'var(--text-color)', opacity: 0.22 }}>
                                 {!isElectron
                                   ? <>Share the meeting tab's audio, or play a sample question below</>
-                                  : <>Turn on the mic and set <span style={{ color: '#d3ac63' }}>Manual → Auto</span> for the best experience</>
+                                  : <>Turn on the mic and set <span style={{ color: 'var(--gold-ink)' }}>Manual → Auto</span> for the best experience</>
                                 }
                             </p>
                             {!isElectron && handlePlaySampleQuestion && (
@@ -3291,6 +3298,37 @@ const PlanExpiryNotice = ({ message, cta, onCta, onDismiss }: {
   </div>
 );
 
+// ── Unreadable-upload notice ─────────────────────────────────────────
+//
+// An extraction failure used to be swallowed entirely, and for a defensible
+// reason: a native alert() showing the filename is not covered by
+// setContentProtection, so it would leak a resume filename to anyone on a
+// screen-share. The conclusion drawn from that was silence, and silence is
+// what let a password-protected PDF look attached while contributing nothing
+// — the app then answered from a persona with no history and never said why.
+//
+// This is the same information delivered inside the protected window, and
+// deliberately WITHOUT the filename: the count is what the user needs, and
+// the name is the part that must not appear. Nothing here traps focus.
+const UnreadableFilesNotice = ({ count, onDismiss }: { count: number; onDismiss: () => void }) => (
+  <div
+    role="status"
+    className="fixed top-20 right-6 z-[94] max-w-xs px-4 py-3 rounded-xl bg-rose-500/[0.12] border border-rose-500/40 text-rose-200 text-sm font-medium shadow-xl backdrop-blur-sm"
+  >
+    <div className="flex items-start gap-3">
+      <AlertTriangle size={16} className="shrink-0 mt-0.5 text-rose-300" />
+      <span className="leading-snug">
+        {count === 1 ? "Couldn't read that file" : `Couldn't read ${count} of those files`} — no
+        selectable text. If it's a scan or password-protected, export a text-based copy or paste
+        the text in instead. {count === 1 ? 'It was' : 'They were'} not attached.
+      </span>
+      <button onClick={onDismiss} className="text-rose-400 hover:text-rose-200 ml-auto shrink-0" aria-label="Dismiss">
+        <X size={14} />
+      </button>
+    </div>
+  </div>
+);
+
 // ── Exhausted modal — blocking; offers the PLAN-SPECIFIC extension for
 // Basic/Pro/Max (Basic +30 min · $25, Pro/Max +1 hour · $45 — see
 // pricingService.getRenewalPrice), plan picker for everyone (2026-07
@@ -4344,6 +4382,17 @@ const PopoutResizeHandles: React.FC = () => {
   );
 };
 
+// Auto-Solve's whole premise is that the model can SEE the screen. captureScreenshot
+// returns null on four perfectly ordinary paths — the feature gate, an empty
+// desktop-source list, a dead/absent video track, and any throw (a revoked macOS
+// screen-recording permission lands there). Sending AUTO_SOLVE_PROMPT anyway asks the
+// model to solve a problem that isn't attached, so it invents one — and because the
+// auto-solve system instruction forces a single fenced code block, that invention
+// renders as an ordinary code block that Auto-Type will type into the candidate's live
+// editor. Every auto-solve path therefore bails on a null capture and says so out loud.
+// One shared string so the call sites can't drift apart.
+const SCREEN_CAPTURE_FAILED_MESSAGE = 'Could not capture the screen — check screen-recording permission for this app, then try Auto-Solve again.';
+
 function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLicense }: { userProfile: UserProfile | null; userLicense: LicenseData | null; onLogout: () => void; setUserProfile: (u: UserProfile | null) => void; setUserLicense: (l: LicenseData | null) => void }) {
   // --- Feature Gates ---
   const gate = useFeatureGate(userLicense);
@@ -4541,9 +4590,16 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   // debounced in the prewarmContext effect below; the two were merged
   // here before, which meant the free work inherited the paid work's
   // debounce and the paid work inherited the free work's eagerness.
+  // syncKnowledge replaces the bare prewarmRetrieval call and is the single
+  // place that means "the knowledge base changed": it rebuilds the fact
+  // ledger (2-5ms for a resume) so the very first question can compose its
+  // spoken opener locally instead of waiting on a model, warms the BM25
+  // index and the cover slice, and — the part that was missing entirely —
+  // drops the offloaded bytes of any document that is no longer attached.
+  // See services/knowledgeCache.ts for why one owner rather than six.
   useEffect(() => {
       contextFilesRef.current = db.contextFiles;
-      prewarmRetrieval(db.contextFiles);
+      syncKnowledge(db.contextFiles);
   }, [db.contextFiles]);
 
   // --- "Train Model" pipeline state (Max-tier only) ---
@@ -4673,6 +4729,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     expiresAt: number;
   };
   const [checkoutToast, setCheckoutToast] = useState<CheckoutToast | null>(null);
+  // How many files in the last upload could not be read. See
+  // UnreadableFilesNotice for why the count and not the filename.
+  const [unreadableCount, setUnreadableCount] = useState(0);
   const [checkoutUrlCopied, setCheckoutUrlCopied] = useState(false);
   useEffect(() => {
     const handler = (e: Event) => {
@@ -5031,7 +5090,14 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const cancelActiveStream = useCallback(() => {
     const ctrl = streamAbortRef.current;
     if (ctrl) {
-      streamAbortRef.current = null;
+      // Do NOT null the ref here. Every stream owner (executeSend,
+      // handleRegenerate) resets isProcessing in a `finally` guarded by
+      // `streamAbortRef.current === abort`. Clearing the ref BEFORE the
+      // abort lands makes that guard fail, so the aborted run never flips
+      // isProcessing back off and the app wedges on "thinking" after New
+      // Chat / conversation switch / phone Stop mid-answer. The owning run
+      // nulls the ref itself in its finally; callers that immediately start
+      // a replacement stream overwrite it on the very next line.
       try { ctrl.abort(); } catch {}
     }
   }, []);
@@ -5448,14 +5514,13 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     if (modelPrewarmTimerRef.current !== null) window.clearTimeout(modelPrewarmTimerRef.current);
     modelPrewarmTimerRef.current = window.setTimeout(() => {
       modelPrewarmKeyRef.current = key;
-      prewarmContext(files);
+      warmKnowledgeNetwork(files);
       // Identity extraction for BOTH prompt pipelines. These used to run
       // undebounced on every contextFiles change, which meant a five-file
       // upload fired five extractions — five different KB hashes, five
       // model calls, four of them for a knowledge base that no longer
       // existed by the time they returned, all contending with the user's
       // first question. Debounced with the rest of the paid work.
-      prewarmIdentity(files);
       prewarmClaudeIdentity(files);
     }, 900);
     return () => {
@@ -5920,6 +5985,28 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const executeSend = useCallback(async (textToSend: string, imageBase64?: string, isAutoSolve?: boolean, _fallbackAttempt?: number) => {
       if (!textToSend.trim()) return;
 
+      // ── Auto-Solve consistency assert ──
+      // isAutoSolve swaps in a system instruction whose entire job is "solve
+      // the coding problem visible in the attached screenshot", forced to a
+      // single fenced code block — the exact shape Auto-Type types into the
+      // candidate's editor. With no image the model has nothing to read and
+      // fabricates a problem, so this pairing is never a request worth
+      // sending. Both current call sites already bail on a null capture; this
+      // is the belt-and-braces stop that makes a call site added later safe
+      // too. Sits ahead of the plan preflight because a refused send should
+      // burn nothing.
+      if (isAutoSolve && !imageBase64) {
+        console.error('[auto-solve] refused — screen capture returned nothing, not sending a screenshot-less solve');
+        const captureFailMsg: Message = {
+          id: Date.now().toString(),
+          role: 'system',
+          content: SCREEN_CAPTURE_FAILED_MESSAGE,
+          timestamp: Date.now()
+        };
+        if (db.isElectron) { db.addMessage(captureFailMsg); } else { setMessages(prev => [...prev, captureFailMsg]); }
+        return;
+      }
+
       // ── Live-time preflight (2026-07 plan-handling fix) ──
       // Tier FEATURES persist at a 0 balance (a time-exhausted Pro is
       // still Pro: models selectable, Pop-out open) — only live USE is
@@ -5954,7 +6041,15 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
 
       // ── Feature Gate: Block disallowed models ──
       const currentModel = settingsRef.current.selectedModel;
-      if (!gate.canUseModel(currentModel)) {
+      // Read the LIVE gate, not the render-time closure. executeSend is
+      // memoised on [cancelActiveStream], so the `gate` captured here is
+      // whatever the FIRST render computed — a user who upgrades or renews
+      // mid-session would otherwise keep being refused off a stale
+      // allowedModels: []. gateRef mirrors `gate` on every render (see its
+      // declaration + syncing effect below), so it is always the current
+      // plan; the closure is only a fail-soft fallback.
+      const liveGate = gateRef.current || gate;
+      if (!liveGate.canUseModel(currentModel)) {
         // Post-trial free users have NO usable models —
         // FEATURE_GATES.free.models is empty under the 2026-07 policy and
         // the server 402s every model route. (Time-exhausted paid users
@@ -5963,19 +6058,19 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         // the belt-and-braces fallback for auth-state races.) Show the
         // paywall message instead of "switching" to a model that's just
         // as locked (and would error server-side mid-interview).
-        if (gate.allowedModels.length === 0) {
+        if (liveGate.allowedModels.length === 0) {
           const wallMsg: Message = {
             id: Date.now().toString(),
             role: 'model',
-            content: gate.actualTier === 'free'
+            content: liveGate.actualTier === 'free'
               ? 'Your **10-minute free trial** is used up — pick a plan to keep going. [See plans](upgrade)'
-              : `Your **${gate.actualTier.charAt(0).toUpperCase() + gate.actualTier.slice(1)} plan** has ended. [Renew your plan](upgrade) to continue.`,
+              : `Your **${liveGate.actualTier.charAt(0).toUpperCase() + liveGate.actualTier.slice(1)} plan** has ended. [Renew your plan](upgrade) to continue.`,
             timestamp: Date.now()
           };
           if (db.isElectron) { db.addMessage(wallMsg); } else { setMessages(prev => [...prev, wallMsg]); }
           return;
         }
-        const fallback = gate.getDefaultModel();
+        const fallback = liveGate.getDefaultModel();
         setSettings(prev => ({ ...prev, selectedModel: fallback as any }));
         localStorage.setItem("SELECTED_MODEL", fallback);
         // Notify user — tier-aware so we don't promise the wrong upgrade.
@@ -6247,7 +6342,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         // _fallbackAttempt) so we never loop across a full provider outage.
         const failedModel = settingsRef.current.selectedModel;
         if (!_fallbackAttempt && looksLikeProviderOutage(actualError)) {
-          const next = pickFallbackModel(failedModel, gate.allowedModels);
+          const next = pickFallbackModel(failedModel, liveGate.allowedModels);
           if (next) {
             const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
             const failedLabel = MODEL_REGISTRY[failedModel as ModelKey]?.short ?? cap(failedModel);
@@ -6688,6 +6783,23 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       getSessionId: () => db.sessionId || 'live',
       isBusy: () => isProcessingRef.current,
       getSnapshot: () => remoteSnapshotFnRef.current(),
+      // A refused join is terminal: an expired token, an admin force-logout,
+      // or a rotated signing secret will be refused again a second later,
+      // and forever. The host used to ignore the refusal and reconnect ~1x/s
+      // for the life of the process. It now stops — but stopping quietly
+      // only moves the failure, because the phone just goes dead with no
+      // reason given. Say it once, in the transcript they're already reading.
+      onFatal: (reason) => {
+        const syncDead: Message = {
+          id: Date.now().toString(),
+          role: 'system',
+          content: reason === 'revoked'
+            ? 'Phone sync stopped — this device was signed out remotely. Sign in again to reconnect it.'
+            : 'Phone sync stopped — the sign-in on this device is no longer valid. Sign in again to reconnect it.',
+          timestamp: Date.now(),
+        };
+        if (db.isElectron) { db.addMessage(syncDead); } else { setMessages(prev => [...prev, syncDead]); }
+      },
     });
 
     // Every button the phone can press maps to the SAME function the
@@ -7294,10 +7406,30 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           break;
         case 'cmd-auto-solve':
           captureScreenshot().then(screenshot => {
+            if (!screenshot) {
+              // Capture happens HERE, on main, even though the button was
+              // pressed in the popout — so the failure has to be reported
+              // from here too. There is no "show a message" relay type (the
+              // popout's from-main handler only knows state-sync/credit-sync/
+              // stream-*): committed turns reach the popout over the
+              // db:messages-updated IPC, which is exactly what db.addMessage
+              // fires. So the popout renders this system bubble in the same
+              // transcript it renders every other message in, and the phone
+              // gets it too via the message publisher. Sending anyway would
+              // hand Auto-Type an invented solution.
+              const captureFailMsg: Message = {
+                id: Date.now().toString(),
+                role: 'system',
+                content: SCREEN_CAPTURE_FAILED_MESSAGE,
+                timestamp: Date.now()
+              };
+              if (db.isElectron) { db.addMessage(captureFailMsg); } else { setMessages(prev => [...prev, captureFailMsg]); }
+              return;
+            }
             // isAutoSolve=true swaps the system prompt to code-only output
             // and skips the candidate-persona voice rules, so CodeBlock's
             // auto-type receives pure code instead of prose-as-comments.
-            executeSend(AUTO_SOLVE_PROMPT, screenshot || undefined, true);
+            executeSend(AUTO_SOLVE_PROMPT, screenshot, true);
           });
           break;
         case 'cmd-clear':
@@ -7404,7 +7536,22 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     // skips the candidate-persona voice rules, so CodeBlock's auto-type
     // receives pure code instead of prose-as-comments.
     const screenshot = await captureScreenshot();
-    executeSend(AUTO_SOLVE_PROMPT, screenshot || undefined, true);
+    if (!screenshot) {
+      // No image, no send — see SCREEN_CAPTURE_FAILED_MESSAGE. Nothing in the
+      // UI used to say the capture had failed, so a revoked screen-recording
+      // permission read to the candidate as a normal answer that happened to
+      // solve a different problem. Say it plainly instead, in the transcript
+      // they're already watching.
+      const captureFailMsg: Message = {
+        id: Date.now().toString(),
+        role: 'system',
+        content: SCREEN_CAPTURE_FAILED_MESSAGE,
+        timestamp: Date.now()
+      };
+      if (db.isElectron) { db.addMessage(captureFailMsg); } else { setMessages(prev => [...prev, captureFailMsg]); }
+      return;
+    }
+    executeSend(AUTO_SOLVE_PROMPT, screenshot, true);
   };
 
   const handleClear = () => {
@@ -7537,6 +7684,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       return;
     }
 
+    // Reset the per-batch failure count: the notice describes THIS upload.
+    setUnreadableCount(0);
+    let unreadable = 0;
+
     // Process each file
     const processFile = async (file: File, index: number) => {
       const isText = file.type.startsWith('text/') ||
@@ -7566,10 +7717,11 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             base64: undefined
           });
         } catch (err) {
-          // Silent skip on extraction failure — a native alert() showing
-          // the filename would leak a resume/JD filename to screen-share.
-          // The file simply is not attached; user sees it is absent from
-          // the Attached Files list.
+          // Not attached — and now COUNTED. A native alert() showing the
+          // filename would leak it to a screen-share, which is why this was
+          // silent; the notice reports the count inside the protected
+          // window instead, so an unreadable file is no longer invisible.
+          unreadable++;
           console.error('[context] PDF extract failed:', err);
         } finally {
           setIsProcessing(false);
@@ -7587,6 +7739,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             base64: undefined
           });
         } catch (err) {
+          unreadable++;
           console.error('[context] DOCX extract failed:', err);
         } finally {
           setIsProcessing(false);
@@ -7643,6 +7796,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       await processFile(fileArray[i], i);
       filesProcessed++;
     }
+    if (unreadable > 0) setUnreadableCount(unreadable);
   };
   
   const handleAddPasteText = () => {
@@ -8604,6 +8758,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           browser registration corrupted, AV blocking, OS shell process
           busy). The user can copy the URL into the browser of their
           choice instead of being stranded. */}
+      {unreadableCount > 0 && (
+        <UnreadableFilesNotice count={unreadableCount} onDismiss={() => setUnreadableCount(0)} />
+      )}
+
       {checkoutToast && (
         <div
           className="fixed left-1/2 top-4 -translate-x-1/2 z-[100000] max-w-lg w-[92vw] sm:w-auto pointer-events-none"
@@ -9490,6 +9648,13 @@ export default function App() {
   }, [authenticated]);
 
   const handleLogout = () => {
+    // The knowledge caches are module-level singletons, so they outlive
+    // this component. New-chat and last-file-deleted already reach
+    // forgetKnowledge through the syncKnowledge effect (an empty file list
+    // means there is no knowledge base); signing out does not change the
+    // file list, so it has to say so itself. Otherwise the next account on
+    // this machine starts with the previous one's resume still resident.
+    forgetKnowledge();
     licenseService.logout();
     setAuthenticated(false);
     setUser(null);

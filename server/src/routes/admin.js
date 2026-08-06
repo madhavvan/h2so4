@@ -369,6 +369,16 @@ function handleChangeTier(req, res) {
     const previousTier = user.tier;
     const defaults = TIER_LICENSE_DEFAULTS[tier];
 
+    // Materialize a license row first. updateLicenseOnPayment is a bare
+    // UPDATE, so on a user without one it affected zero rows while this route
+    // still answered { success: true, tier } — the operator got a green toast
+    // and an ULTRA badge for a customer who had no license and was still
+    // gated out. Existing licenses are returned untouched.
+    const licenseRow = db.ensureLicenseForUser(user.id);
+    if (!licenseRow) {
+      return res.status(500).json({ error: 'Could not create a license for this user' });
+    }
+
     db.updateUserTier(user.id, tier);
     // Admin grant of a paid tier = unlimited-until-revoked: seed the -1 credit
     // sentinel so the client's interview-time gate treats it as unlimited
@@ -477,7 +487,18 @@ router.post('/users/:id/grant-comp', authMiddleware, adminOnly, stepUpOnly, (req
       return res.status(400).json({ error: 'Use change-tier to move a user to free; comp is for paid tiers' });
     }
 
+    // Same reason as change-tier: recordCompPayment's license UPDATE is a
+    // no-op without a row, and it then returns null — which this route's
+    // audit write used to dereference into a 500, AFTER the comp payment row
+    // had already been inserted and users.tier already changed.
+    if (!db.ensureLicenseForUser(user.id)) {
+      return res.status(500).json({ error: 'Could not create a license for this user' });
+    }
+
     const result = db.recordCompPayment(user.id, targetTier, note || null);
+    if (!result) {
+      return res.status(500).json({ error: 'Comp grant failed — license not updated' });
+    }
 
     writeAudit(req, 'grant-comp', user, {
       tier: targetTier,
@@ -788,6 +809,51 @@ router.post('/users/:id/cancel-subscription', authMiddleware, adminOnly, stepUpO
 // without waiting for a webhook round-trip. The webhook is idempotent (uses
 // event_id in webhook_events), so it won't double-record.
 router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async (req, res) => {
+  // ── The double-refund window, and the claim that closes it ────────
+  // hasPaymentBeenRefunded() below is a plain READ, and every provider
+  // call after it is awaited. Two admins — or one double-click, or a
+  // client retry — landing inside that await window BOTH passed the
+  // read and BOTH issued a real refund at Stripe/Razorpay: the money
+  // left twice and only one refund was ever booked locally. A read can
+  // serialize nothing; the guard has to be a WRITE exactly one caller
+  // can win.
+  //
+  // claimRefundOnce() is a single INSERT OR IGNORE against the
+  // webhook_events PRIMARY KEY (db.recordWebhookEventOnce) under a
+  // namespaced key no provider event id can collide with. One statement
+  // is atomic in SQLite, so of N racing requests exactly one sees
+  // changes>0 and the losers are rejected BEFORE reaching the provider
+  // — and it holds across processes, not just this event loop.
+  //
+  // Granularity is (provider, provider_payment_id) — the same key the
+  // existing hasPaymentBeenRefunded() dedup uses — so a refund of a
+  // DIFFERENT payment is never blocked and nothing that used to succeed
+  // now fails. The claim is taken immediately before the provider call
+  // and released only when no money moved: releaseRefundClaim() is a
+  // no-op once refundIssued flips, so a failure AFTER the refund keeps
+  // the payment claimed.
+  let refundClaimKey = null;
+  let refundIssued = false;
+  let providerRefundId = null;
+  const claimRefundOnce = (provider, providerPaymentId) => {
+    const key = `admin-refund:${provider}:${providerPaymentId}`;
+    if (!db.recordWebhookEventOnce(key, provider, 'admin.refund.claim')) return false;
+    refundClaimKey = key;
+    return true;
+  };
+  const releaseRefundClaim = () => {
+    if (!refundClaimKey || refundIssued) return;
+    const key = refundClaimKey;
+    refundClaimKey = null;
+    try {
+      db.clearWebhookEvent(key);
+    } catch (releaseErr) {
+      // Fail closed. A claim we could not release blocks further refunds
+      // of THIS payment only, and is clearable by hand — cheaper than
+      // ever refunding the same charge twice.
+      console.error('Failed to release refund claim', key, releaseErr && releaseErr.message);
+    }
+  };
   try {
     const payment = db.getPaymentById(parseInt(req.params.id, 10));
     if (!payment) return res.status(404).json({ error: 'Payment not found' });
@@ -849,7 +915,8 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
       return res.status(400).json({ error: 'Invalid refund amount' });
     }
 
-    let providerRefundId = null;
+    // providerRefundId is declared at the top of the handler so the catch
+    // block can tell "never reached the provider" from "money moved".
     let subscriptionCancel = null;
     if (payment.provider === 'stripe') {
       if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
@@ -873,6 +940,20 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
         }
         throw targetErr;
       }
+      // Claim before a cent moves. A request that loses the claim has
+      // refunded nothing, so rejecting it here is the whole outcome.
+      if (!claimRefundOnce(payment.provider, payment.provider_payment_id)) {
+        return res.status(409).json({
+          error: 'A refund for this payment is already in progress or was just completed',
+          code: 'refund_already_claimed',
+        });
+      }
+      // Belt to the claim's braces at Stripe itself: if this call times
+      // out we release the claim and an admin may retry, and the
+      // idempotency key makes Stripe replay the SAME refund instead of
+      // creating a second one. The amount is part of the key so a
+      // corrected retry after a clean rejection is still a fresh call.
+      const refundIdempotencyKey = `admin-refund:${payment.provider_payment_id}:${refundAmount}`;
       const refund = await stripe.refunds.create({
         ...refundTarget,
         amount: refundAmount,
@@ -882,7 +963,9 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
           admin_email: req.user.email,
           admin_reason: reason || '',
         },
-      });
+      }, { idempotencyKey: refundIdempotencyKey });
+      // The money has moved — from here the claim is permanent.
+      refundIssued = true;
       providerRefundId = refund.id;
 
       // A full refund of a SUBSCRIPTION charge must end the subscription.
@@ -896,6 +979,13 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
       });
     } else if (payment.provider === 'razorpay') {
       if (!razorpay) return res.status(503).json({ error: 'Razorpay not configured' });
+      // Same claim-before-money rule as the Stripe branch above.
+      if (!claimRefundOnce(payment.provider, payment.provider_payment_id)) {
+        return res.status(409).json({
+          error: 'A refund for this payment is already in progress or was just completed',
+          code: 'refund_already_claimed',
+        });
+      }
       const refund = await razorpay.payments.refund(payment.provider_payment_id, {
         amount: refundAmount,
         notes: {
@@ -904,6 +994,8 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
           admin_reason: reason || '',
         },
       });
+      // The money has moved — from here the claim is permanent.
+      refundIssued = true;
       providerRefundId = refund.id;
     } else {
       return res.status(400).json({ error: `Cannot refund payments from provider=${payment.provider}` });
@@ -948,6 +1040,10 @@ router.post('/payments/:id/refund', authMiddleware, adminOnly, stepUpOnly, async
     });
   } catch (err) {
     console.error('Refund error:', err);
+    // No-op once the provider actually issued the refund: a failure in the
+    // bookkeeping AFTER the money moved must leave the payment claimed so
+    // a retry cannot refund it a second time.
+    releaseRefundClaim();
     res.status(500).json({ error: err.message || 'Failed to refund payment' });
   }
 });

@@ -100,6 +100,33 @@
         --border-color: #e8e2d1;        /* --cream-line — warm border */
         --text-color: #141413;          /* --ink — warm near-black */
 
+        /* ── GOLD, WHEN IT IS TEXT ───────────────────────────────────
+           The brand gold is a LIGHT colour. As a background with dark
+           type on it (#241b08) it is correct in either theme, and it is
+           left alone everywhere it is used that way. As TEXT or as an
+           icon it only works on obsidian — measured on the cream page:
+
+             #d3ac63  1.98:1      #cba966  2.07:1
+             #f0d78a  1.32:1      #e6d29c  1.38:1
+
+           which is the "bright and barely visible yellow" in light mode.
+
+           So gold-as-ink is its own token. Same hue, blended toward black
+           until it clears 5:1 on cream, which keeps it recognisably gold
+           rather than turning it into another black. Dark mode keeps the
+           original exactly.
+
+           It is a VARIABLE and not just a CSS override because several of
+           these are written as inline styles (style={{ color: '#d3ac63' }}),
+           and no stylesheet rule can beat an inline style without
+           !important. Those sites now reference this token instead. */
+        --gold-ink: #7e673b;            /* 5.0:1 on cream */
+        /* Dialog backdrop. 92% black is correct on obsidian; on cream it
+           blacks out the app behind a cream modal. 38% warm dims without
+           extinguishing. */
+        --modal-scrim: rgba(20, 20, 19, 0.38);
+        --gold-ink-strong: #6b562f;     /* 6.6:1 — small/bold gold text */
+
         /* Theme-aware popover surfaces (model picker, dropdowns, tooltips).
            Default = light cream translucent. .dark overrides below set
            the dark navy used by the original popout-design popover. */
@@ -230,6 +257,12 @@
         --surface-color: #15130d; /* warm elevated surface (was zinc-900) */
         --border-color: #221f17;  /* faint warm hairline — softer, less "boxed" */
         --text-color: #ece7dc;    /* warm paper text (was zinc-200) */
+
+        /* Gold-as-ink: on obsidian the brand gold IS the right colour, so
+           dark mode keeps it unchanged. See the note in :root above. */
+        --gold-ink: #d3ac63;
+        --modal-scrim: rgba(0, 0, 0, 0.92);   /* unchanged */
+        --gold-ink-strong: #f0d78a;
 
         /* Dark-mode popover surfaces — warm obsidian glass with a gold
            hairline (was deep navy + white border), so the model picker /

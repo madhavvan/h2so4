@@ -123,13 +123,25 @@ describe('question one is grounded, without waiting for extraction', () => {
   it('is sent on every streaming route that fires a cover', () => {
     const claude = fs.readFileSync(path.resolve(process.cwd(), '..', 'services', 'claudeService.ts'), 'utf8');
     // Four stream* functions live in aiProxyService (openai, gemini, xai,
-    // groq) and one in claudeService. Every one of them now fires a cover,
-    // so every one of them has to carry the background — a route that
-    // fires a cover without it produces the content-free opener this
-    // whole file exists to prevent.
-    const sent = (PROXY_SRC.match(/coverContext: isAutoSolve \? '' : buildCoverContext\(contextFiles\)/g) || []).length;
+    // groq) and one in claudeService. Every one of them fires a cover, so
+    // every one has to carry the background — a route that fires a cover
+    // without it produces the content-free opener this file exists to
+    // prevent.
+    //
+    // The payload is now built by ONE function, buildOpenerPayload, and it
+    // carries strictly more than the old prose block did: the locally
+    // composed opener, the cover policy, the ledger DIGEST (every role,
+    // project, skill line and metric in the WHOLE knowledge base, where the
+    // old coverContext was a 9,000-char slice of a single file) and the
+    // vocabulary the server needs to police a fallback model.
+    const sent = (PROXY_SRC.match(/buildOpenerPayload\(query, contextFiles, history\)/g) || []).length;
     expect(sent).toBe(4);
-    expect(claude).toMatch(/coverContext: isAutoSolve \? '' : buildCoverContext\(contextFiles\)/);
+    expect(claude).toMatch(/buildOpenerPayload\(query, contextFiles, history\)/);
+    // And the payload really does carry the background.
+    const fn = /export function buildOpenerPayload[\s\S]*?\n}/.exec(PROXY_SRC)[0];
+    expect(fn).toMatch(/ledgerDigest\(ledger\)/);
+    expect(fn).toMatch(/ledgerVocabulary\(ledger\)/);
+    expect(fn).toMatch(/composeOpener\(ledger, query, recent\)/);
     // Auto-Solve output is code typed into an editor — no spoken opener,
     // so no background needs to travel with it.
   });

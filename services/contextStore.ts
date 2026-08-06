@@ -96,14 +96,46 @@ export async function offloadContext(text: string): Promise<string> {
   return makePlaceholder(hash);
 }
 
-// Re-upload every blob we've offloaded. Called by the transport when the
-// server reports `context_missing`, so the very same request body can be
-// retried with its placeholders intact. Returns true if anything was
+// Which blobs does THIS request actually reference? Pulled out of the body
+// that just failed, so a repair re-uploads what is needed and nothing else.
+const PLACEHOLDER_RE = /⟪CTX:([a-f0-9]{64})⟫/g;
+
+export function referencedHashes(body: unknown): string[] {
+  let s: string;
+  try {
+    s = typeof body === 'string' ? body : JSON.stringify(body ?? '');
+  } catch {
+    return [];
+  }
+  const out = new Set<string>();
+  PLACEHOLDER_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PLACEHOLDER_RE.exec(s)) !== null) out.add(m[1]);
+  return Array.from(out);
+}
+
+// Restore the offloaded blobs THIS request needs, so the very same body can
+// be retried with its placeholders intact. Returns true if anything was
 // successfully restored.
-export async function repairContext(): Promise<boolean> {
+//
+// ⚠️ `only` is not an optimisation, it is the correctness condition.
+// Without it this re-uploaded EVERY blob the renderer had ever offloaded —
+// including documents the user had since DELETED, and including other
+// conversations' resumes. One eviction on the server therefore pushed the
+// user's whole document history back up, which is both a privacy problem
+// and, at scale, a stampede: the server's store is bounded, so the
+// re-upload of N blobs evicts other users' entries and causes their next
+// request to 409 as well. Callers pass the request body; only the hashes it
+// actually mentions are sent.
+export async function repairContext(only?: string[] | unknown): Promise<boolean> {
   if (hashToText.size === 0) return false;
+  const wanted = Array.isArray(only)
+    ? only
+    : (only === undefined ? Array.from(hashToText.keys()) : referencedHashes(only));
   let restored = false;
-  for (const [hash, text] of Array.from(hashToText.entries())) {
+  for (const hash of wanted) {
+    const text = hashToText.get(hash);
+    if (!text) continue;
     const got = await upload(text);
     if (got === hash) restored = true;
     else if (got) {
@@ -114,6 +146,51 @@ export async function repairContext(): Promise<boolean> {
     }
   }
   return restored;
+}
+
+// ── Forgetting ──
+//
+// `hashToText` holds the FULL TEXT of every document ever offloaded, and
+// before this there was no way to empty it: no clear, no reset, no
+// eviction. Delete a file and its text stayed; start a new conversation and
+// the last one's resume stayed; sign out and it was still there. Called by
+// services/knowledgeCache.ts on delete / new conversation / sign-out.
+export function forgetAll(): void {
+  uploaded.clear();
+  hashToText.clear();
+  // …and tell the server, which otherwise keeps the bytes for the rest of
+  // its three-hour TTL after the user has deleted the files, opened a new
+  // conversation or signed out. Fire-and-forget: the TTL is still the
+  // backstop, so a failed request costs nothing but a later cleanup.
+  void tellServerToForget();
+}
+
+async function tellServerToForget(): Promise<void> {
+  try {
+    const token = licenseService.getToken();
+    if (!token) return;
+    await fetch(`${API_BASE}/api/v1/ai/context/forget`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: '{}',
+      keepalive: true,   // survives the renderer navigating away on sign-out
+    });
+  } catch {
+    // Silent. Forgetting is hygiene, not correctness — never surface it.
+  }
+}
+
+/** Keep only the blobs for `texts`; drop every other document's bytes. */
+export function forgetExcept(texts: string[]): void {
+  const keepKeys = new Set(texts.map(localKey));
+  const keepHashes = new Set<string>();
+  for (const [key, hash] of Array.from(uploaded.entries())) {
+    if (keepKeys.has(key)) keepHashes.add(hash);
+    else uploaded.delete(key);
+  }
+  for (const hash of Array.from(hashToText.keys())) {
+    if (!keepHashes.has(hash)) hashToText.delete(hash);
+  }
 }
 
 // Test/diagnostic surface.

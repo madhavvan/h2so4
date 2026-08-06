@@ -48,7 +48,18 @@ interface HostOptions {
    * decided together instead of drifting.
    */
   getSnapshot?: () => Record<string, any>;
-  onStatus?: (s: { connected: boolean; remotes: number }) => void;
+  /** `error` is set only when hosting stopped for a reason a reconnect
+   *  cannot fix, so a status view can say "device sync is off because your
+   *  session expired" instead of "reconnecting…" forever. */
+  onStatus?: (s: { connected: boolean; remotes: number; error?: string }) => void;
+  /**
+   * Hosting is over and retrying is pointless — the token is expired,
+   * revoked, or signed with a rotated secret. Separate from onStatus
+   * because a status is a level and this is an edge: it fires once, and
+   * the close that follows cannot overwrite it. Mirrors RemoteClient's
+   * onFatal so both ends of device sync report a refused join the same way.
+   */
+  onFatal?: (reason: string) => void;
 }
 
 // Auto-Solve captures the screen and costs money. If the socket blips
@@ -66,12 +77,15 @@ export class RemoteHost {
   private retry = 0;
   private closedByUs = false;
   private connected = false;
+  // Sticky so the close that follows a refused join can still name the
+  // reason — the frame arrives first, the close a moment later.
+  private fatalReason: string | null = null;
 
   constructor(opts: HostOptions) { this.opts = opts; }
 
   on(type: RemoteCommandType, fn: CommandHandler) { this.handlers.set(type, fn); return this; }
 
-  start() { this.closedByUs = false; this.connect(); }
+  start() { this.closedByUs = false; this.fatalReason = null; this.connect(); }
 
   stop() {
     this.closedByUs = true;
@@ -164,7 +178,6 @@ export class RemoteHost {
     catch { return this.scheduleReconnect(); }
 
     this.ws.onopen = () => {
-      this.retry = 0;
       this.sendRaw({
         kind: 'join',
         token: this.opts.token,
@@ -178,8 +191,31 @@ export class RemoteHost {
       let msg: any;
       try { msg = JSON.parse(String(ev.data)); } catch { return; }
 
+      // The socket opened but the server refused the join: an expired JWT,
+      // a rotated signing secret, or an admin force-logout. It closes
+      // immediately behind this frame, so with no branch here onclose just
+      // reconnects — handshake, refusal, close, repeat, about once a
+      // second for as long as the app is open, and across restarts, since
+      // the dead token is still in localStorage. A bad token does not fix
+      // itself by being retried. Stop, and say why; signing in again
+      // re-creates the host with a live token.
+      if (msg.kind === 'join_error') {
+        const reason = String(msg.reason || 'join_error');
+        this.fatalReason = reason;
+        this.connected = false;
+        this.opts.onStatus?.({ connected: false, remotes: 0, error: reason });
+        this.opts.onFatal?.(reason);
+        this.stop();
+        return;
+      }
+
       if (msg.kind === 'joined') {
         this.connected = true;
+        // The backoff resets HERE and not in onopen — a refused join opens
+        // a perfectly good socket every time, so resetting on the handshake
+        // pins the wait at the 1s floor no matter how long the failure
+        // lasts. Only a join the server accepted counts as working.
+        this.retry = 0;
         this.opts.onStatus?.({ connected: true, remotes: 0 });
         this.startHeartbeat();
         // Announce current state immediately so a phone that joined
@@ -203,7 +239,12 @@ export class RemoteHost {
     this.ws.onclose = () => {
       this.connected = false;
       if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = null; }
-      this.opts.onStatus?.({ connected: false, remotes: 0 });
+      // Repeats the fatal reason when there is one. This close lands after
+      // the join_error frame, so a UI holding the last status would
+      // otherwise have "session expired" overwritten by an ordinary
+      // disconnect and sit on "reconnecting…" for a reconnect that is
+      // never coming — scheduleReconnect below is already a no-op by then.
+      this.opts.onStatus?.({ connected: false, remotes: 0, error: this.fatalReason ?? undefined });
       this.scheduleReconnect();
     };
     this.ws.onerror = () => { try { this.ws?.close(); } catch { /* onclose handles it */ } };

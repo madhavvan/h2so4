@@ -662,21 +662,125 @@ html.electron-transparent:not(.dark) .msg.user .bubble {
   background: linear-gradient(180deg, rgba(211, 172, 99, 0.34) 0%, rgba(181, 143, 69, 0.26) 100%) !important;
   color: #2a1f08 !important;
 }
+/* ── The composer slab, matched to the main app's light .composer-shell ──
+   That shell is iOS-folder glass in the app's own warmth: a warm taupe panel
+   that composites to rgb(215,210,200) — about twelve L* below the page — with
+   a white rim all round and warm brown shadows.
+
+   Light here was cream at 0.78 plus a hard border-top: the same camouflage the
+   main app had before it was fixed, and structurally unlike the DARK popout,
+   which already builds a proper slab. This brings light into line with both.
+
+   Two things differ from the main app by necessity, not by choice:
+
+   1. No blur. backdrop-filter crashes a transparent window (see the global
+      kill above), so the frost cannot be simulated — only the value, hue and
+      edge can. The panel therefore carries its colour at high opacity rather
+      than earning it from a blurred backdrop.
+
+   2. Nothing is behind it but the desktop. In the app the veil composites
+      over a known cream page; here it composites over whatever the user has
+      on screen. At 0.78 the panel's colour would swing with the wallpaper —
+      taupe over grey, washed over white, muddy over black. Opacity goes to
+      0.93 so the taupe reads true against any background. That is the same
+      trade the "Latest" pill already makes at 0.92 (App.tsx) and for the same
+      reason: no blur means opacity is the only way to hold a colour. It costs
+      some see-through on one small band; the messages area, which is most of
+      the window, stays as transparent as it was. */
 html.electron-transparent:not(.dark) .input-area {
-  background: rgba(250, 247, 240, 0.78) !important;
-  border-top: 1px solid rgba(20, 20, 19, 0.14) !important;
+  background: linear-gradient(180deg,
+    rgba(203, 187, 167, 0.96) 0%,
+    rgba(198, 181, 160, 0.965) 45%,
+    rgba(193, 175, 153, 0.97) 100%) !important;
+  border-top: none !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.62),          /* bright glint, 1px */
+    inset 0 0 0 1px rgba(255, 255, 255, 0.14),        /* rim, quiet */
+    inset 0 -22px 32px -26px rgba(74, 58, 38, 0.24),  /* inner floor */
+    0 1px 2px rgba(74, 58, 38, 0.08),                 /* contact */
+    0 4px 10px -4px rgba(74, 58, 38, 0.14),           /* tight key */
+    0 18px 44px -24px rgba(74, 58, 38, 0.34);         /* ambient float */
 }
+/* The rim — brightest top-left, second dimmer catch at the bottom-right.
+   The dark rule paints this white-on-dark, which is invisible on taupe. */
+html.electron-transparent:not(.dark) .input-area::after {
+  background: linear-gradient(135deg,
+    rgba(255, 255, 255, 0.80) 0%,
+    rgba(255, 255, 255, 0.22) 20%,
+    rgba(255, 255, 255, 0.06) 55%,
+    rgba(255, 255, 255, 0.16) 100%);
+}
+html.electron-transparent:not(.dark) .input-area:focus-within {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.68),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.18),
+    inset 0 0 40px -12px rgba(126, 103, 59, 0.18),    /* gold warmth */
+    0 1px 2px rgba(74, 58, 38, 0.08),
+    0 4px 10px -4px rgba(74, 58, 38, 0.14),
+    0 20px 48px -24px rgba(74, 58, 38, 0.38),
+    0 0 26px -13px rgba(126, 103, 59, 0.30);          /* outer gold whisper */
+}
+html.electron-transparent:not(.dark) .input-area:focus-within::after {
+  background: linear-gradient(135deg,
+    rgba(255, 255, 255, 0.86) 0%,
+    rgba(244, 224, 163, 0.40) 22%,
+    rgba(211, 172, 99, 0.16) 58%,
+    rgba(244, 224, 163, 0.24) 100%);
+}
+/* Textarea bare inside the slab — the shell carries the glass, as it does in
+   the dark popout and in the main app. The white text-halo goes with it: it
+   existed to lift ink off an arbitrary wallpaper, and the slab now does that
+   job. Keeping it would only soften the type against a surface it no longer
+   needs rescuing from. Placeholder matches the main app's, same ratio. */
 html.electron-transparent:not(.dark) .pip-textarea {
-  background: rgba(20, 20, 19, 0.04) !important;
+  background: transparent !important;
   color: #141413 !important;
-  text-shadow: 0 1px 4px rgba(255, 255, 255, 0.5) !important;
+  text-shadow: none !important;
 }
-html.electron-transparent:not(.dark) .send-btn {
-  background: rgba(20, 20, 19, 0.06) !important;
+html.electron-transparent:not(.dark) .pip-textarea::placeholder {
+  color: rgb(76, 66, 52) !important;
 }
-html.electron-transparent:not(.dark) .send-btn svg {
-  color: #141413 !important;
-  filter: drop-shadow(0 1px 3px rgba(255, 255, 255, 0.5)) !important;
+/* Send = gold, as it is in the main app and in the dark popout. Light had it
+   as a faint ink disc at 6% — the primary action reading as disabled. The
+   Auto-Solve sibling (.ml-2) stays the quieter gold glass so there is one
+   clear "go", which is the distinction the dark rules already draw. */
+html.electron-transparent:not(.dark) .send-btn:not(.ml-2) {
+  background: linear-gradient(145deg, #ecd69c 0%, #d4b16d 55%, #ac8640 100%) !important;
+  box-shadow:
+    0 6px 16px -6px rgba(126, 103, 59, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.28) !important;
+}
+html.electron-transparent:not(.dark) .send-btn:not(.ml-2) svg {
+  color: #231c0c !important;
+  filter: none !important;
+}
+html.electron-transparent:not(.dark) .send-btn.ml-2 {
+  background: rgba(126, 103, 59, 0.12) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26) !important;
+}
+html.electron-transparent:not(.dark) .send-btn.ml-2 svg {
+  color: rgb(76, 66, 52) !important;
+  filter: none !important;
+}
+/* AUTO/MANUAL and MIC chips. Resting they take --text-muted, which is
+   rgba(20,20,19,0.55) — fine over a cream band, but against the taupe slab it
+   composites to 3.59:1 and fails AA at 10px. Same value the main app's MANUAL
+   and OFF chips use, and the same ratio.
+
+   The active states were built for a dark surface and invert badly on a light
+   one: gold #d3ac63 on a 20% gold wash, and #34d399 on a 20% green wash, are
+   both light-on-light. Each drops to an ink-weight version of its own hue so
+   the state still reads as gold or green without going invisible. */
+html.electron-transparent:not(.dark) .pip-toggle {
+  color: rgb(74, 64, 50) !important;                  /* clears AA on every backdrop */
+}
+html.electron-transparent:not(.dark) .pip-toggle.active-gold {
+  background: rgba(211, 172, 99, 0.26) !important;
+  color: rgb(102, 82, 44) !important;                 /* 4.6:1 on its own wash */
+}
+html.electron-transparent:not(.dark) .pip-toggle.active-green {
+  background: rgba(16, 185, 129, 0.22) !important;
+  color: rgb(17, 84, 61) !important;                  /* 5.2:1 on its own wash */
 }
 html.electron-transparent:not(.dark) .header-info h4,
 html.electron-transparent:not(.dark) .header-info span,

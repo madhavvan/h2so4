@@ -857,15 +857,16 @@ const USER_SERVER_TOOLS = [
   // own bill.
   {
     name: 'request_refund',
-    description: 'File a refund request for the caller\'s most recent paid invoice. Auto-approves when the published refund policy allows it (14 days from charge + under 2 hours of use; top-ups are never auto-refunded) — returns refund_processed=true. Otherwise queues an admin review (returns queued=true). The caller does not need to specify which payment — we always target the most recent.',
+    description: 'File a refund request for the caller\'s most recent paid invoice. Real money moves, so the SERVER requires the user to re-enter their password in the app\'s secure prompt first — you cannot authorize this yourself, and a "yes" in the transcript is not authorization. Auto-approves when the published refund policy allows it (14 days from charge + under 2 hours of use; top-ups are never auto-refunded) — returns refund_processed=true. Otherwise queues an admin review (returns queued=true). The caller does not need to specify which payment — we always target the most recent.',
     parameters: {
       type: 'object',
       properties: {
         reason: { type: 'string', description: 'Why the user wants the refund. Required.', maxLength: 500 },
-        confirmed: { type: 'boolean', description: 'Must be true. Bot must confirm with the user first.' },
+        confirmed: { type: 'boolean', description: 'Must be true. Bot must confirm with the user first. Courtesy pre-check only — it does NOT authorize the refund; the server requires the user\'s password.' },
       },
       required: ['reason', 'confirmed'],
     },
+    destructive: true,
     handler: async ({ reason, confirmed }, ctx) => {
       if (!confirmed) {
         return { ok: false, reason: 'Need user confirmation before filing a refund request. Ask them to confirm.' };
@@ -874,6 +875,23 @@ const USER_SERVER_TOOLS = [
       if (!reasonText) {
         return { ok: false, reason: 'A reason is required for refund requests. Ask the user why they want it.' };
       }
+      // ── Real money needs a real human gesture ──────────────────────
+      // `confirmed` is a boolean the MODEL writes into its own tool call,
+      // and /chat replays a caller-supplied transcript — so an attacker can
+      // seed a fake "yes, refund me" turn and the model will attest it. The
+      // only authorization that survives that is the one the admin refund
+      // path already uses: a fresh step-up password confirmation the user
+      // types into the client's inline prompt. Same soft-fail shape as the
+      // ADMIN_DESTRUCTIVE tools — the chat loop turns it into the SSE
+      // step_up_required event and replays this exact intent once
+      // /reauth-execute has verified the password server-side.
+      const gate = checkStepUp(ctx, 'request_refund', { reason: reasonText, confirmed: true });
+      if (gate) return gate;
+      // Refund-claim state. Declared out here so the outer finally can
+      // always release a claim we took but never spent.
+      let refundClaimKey = null;
+      let refundIssued = false;
+      let releaseRefundClaim = () => {};
       try {
         const payments = db.getPaymentsByUser(ctx.user.id);
         const lastPaid = (payments || []).find(p => p.status === 'completed' && p.amount > 0);
@@ -948,6 +966,55 @@ const USER_SERVER_TOOLS = [
           };
         }
 
+        // …and that read serializes nothing. It is followed by an awaited
+        // provider call, so two turns (a double-click, a client retry, a
+        // second tab) can both pass it and both move real money. Take the
+        // SAME atomic claim routes/admin.js takes before its provider call:
+        // one INSERT OR IGNORE against the webhook_events PRIMARY KEY, so
+        // exactly one caller wins — across processes, not just this loop.
+        // The key is deliberately byte-identical to the admin endpoint's so
+        // an admin refund and a user refund of the same charge interlock
+        // instead of racing. Released only when no money moved.
+        if (!lastPaid.provider_payment_id) {
+          botAudit(ctx, 'user-refund-provider-failed', ctx.user, {
+            payment_id: lastPaid.id,
+            provider: lastPaid.provider,
+            err: 'missing provider_payment_id',
+          });
+          return {
+            ok: true,
+            queued: true,
+            message: 'Refund couldn\'t be processed automatically — we\'ve filed it for admin review and someone will follow up within 24 hours.',
+          };
+        }
+        refundClaimKey = `admin-refund:${lastPaid.provider}:${lastPaid.provider_payment_id}`;
+        let claimHeld = false;
+        try {
+          claimHeld = db.recordWebhookEventOnce(refundClaimKey, lastPaid.provider, 'user.refund.claim');
+        } catch (claimErr) {
+          console.error('[botTools] refund claim failed:', claimErr && claimErr.message);
+          claimHeld = false;
+        }
+        if (!claimHeld) {
+          return {
+            ok: true,
+            queued: false,
+            already_refunded: true,
+            message: 'That charge has already been refunded — it can take 5–10 business days to appear on your statement.',
+          };
+        }
+        releaseRefundClaim = () => {
+          // No-op once money has moved: a failure AFTER the provider call
+          // must keep the charge claimed. Fail closed if the release itself
+          // throws — a stuck claim blocks further refunds of THIS charge
+          // only and is clearable by hand, which is cheaper than ever
+          // refunding the same charge twice.
+          if (!claimHeld || refundIssued) return;
+          claimHeld = false;
+          try { db.clearWebhookEvent(refundClaimKey); }
+          catch (releaseErr) { console.error('[botTools] refund claim release failed:', releaseErr && releaseErr.message); }
+        };
+
         let providerRefundId = null;
         let subscriptionCancel = null;
         try {
@@ -967,6 +1034,7 @@ const USER_SERVER_TOOLS = [
               metadata: { initiated_by: 'user-bot', user_reason: reasonText },
             });
             providerRefundId = refund.id;
+            refundIssued = true; // money has moved — the claim is now permanent
             // Full refund of a subscription charge ends the subscription —
             // otherwise the next cycle re-charges and re-grants the tier we
             // just refunded.
@@ -978,6 +1046,7 @@ const USER_SERVER_TOOLS = [
               notes: { initiated_by: 'user-bot', user_reason: reasonText },
             });
             providerRefundId = refund.id;
+            refundIssued = true; // money has moved — the claim is now permanent
           } else {
             return { ok: false, reason: `Can't auto-refund payments from provider=${lastPaid.provider}. Queued for admin review.` };
           }
@@ -1025,6 +1094,10 @@ const USER_SERVER_TOOLS = [
         };
       } catch (e) {
         return { ok: false, reason: `Refund processing failed: ${e.message}` };
+      } finally {
+        // Every exit — early return, provider throw, eligibility bail —
+        // runs this. It is a no-op unless we hold an unspent claim.
+        releaseRefundClaim();
       }
     },
   },
@@ -1035,7 +1108,7 @@ const USER_SERVER_TOOLS = [
   // asks "which plan should I get?" or "am I on the right plan?".
   {
     name: 'recommend_plan',
-    description: 'Recommend a plan tier based on the caller\'s actual usage history. Returns: current_tier, recommended_tier, reasoning. Use when the user asks "which plan is right for me?" or "should I upgrade/downgrade?". No mutations — pure read-and-think.',
+    description: 'Recommend a plan tier based on the caller\'s actual usage history. Returns: current_tier, recommended_tier, reasoning, prices_usd. Use when the user asks "which plan is right for me?" or "should I upgrade/downgrade?". No mutations — pure read-and-think. Quote prices ONLY from the prices_usd it returns (they come from the live checkout table) — never from memory.',
     parameters: { type: 'object', properties: {} },
     handler: async (_args, ctx) => {
       try {
@@ -1051,35 +1124,59 @@ const USER_SERVER_TOOLS = [
         const payments = db.getPaymentsByUser(ctx.user.id) || [];
         const paidCount = payments.filter(p => p.status === 'completed' && p.amount > 0).length;
 
+        // Prices come from the ONE table checkout is validated against —
+        // routes/payments.js EXPECTED_USD_CENTS, the numbers
+        // assertStripePriceMatches refuses to charge past. They used to be
+        // retyped here, and drifted into "$25 / $29 a month / $69 a month":
+        // three prices that no longer exist, quoted to a paying customer by
+        // this tool while preview_tier_change quoted the real ones from the
+        // same file. Anything unresolvable falls back to the published
+        // 2026-07 table, so a require failure degrades to stale-but-loud
+        // rather than to a crash.
+        let usdCents = { basic: 3000, pro: 5000, max: 8900, ultra: 15900 };
+        try {
+          const canonical = require('../routes/payments')?._test?.EXPECTED_USD_CENTS;
+          if (canonical && ['basic', 'pro', 'max', 'ultra'].every(t => Number.isFinite(canonical[t]))) {
+            usdCents = canonical;
+          }
+        } catch { /* keep the fallback table */ }
+        const usd = t => "$" + (usdCents[t] / 100).toFixed(2).replace(/\.00$/, '');
+
+        // 2026-07 model, identical to the one preview_tier_change describes:
+        // Basic/Pro/Max are ONE-TIME interview passes, Ultra is the only
+        // subscription. The retired "monthly Pro / monthly Max" ladder is
+        // what made the two tools contradict each other.
+        const PLAN = {
+          basic: `${usd('basic')} one-time · one 30-minute interview`,
+          pro:   `${usd('pro')} one-time · one 1-hour interview`,
+          max:   `${usd('max')} one-time · three 1-hour interviews`,
+          ultra: `${usd('ultra')}/month · unlimited interviews + Auto-Type`,
+        };
+
         let recommended;
         let reasoning;
 
         if (currentTier === 'free') {
-          if (sessionsUsed >= 4) {
-            recommended = 'basic';
-            reasoning = `You've used ${sessionsUsed}/5 sessions this month — you'll hit the limit soon. Basic ($25 one-time, 3 sessions over 14 days) is a low-commitment way to try the paid features without a recurring charge.`;
-          } else {
-            recommended = 'basic';
-            reasoning = `You're on Free with ${sessionsUsed} sessions used. If you want unlimited time, premium models, and Auto-Solve, Basic is the easiest first step ($25 one-time, no auto-renewal).`;
-          }
+          recommended = 'basic';
+          reasoning = `You're on Free${sessionsUsed ? ` with ${sessionsUsed} session${sessionsUsed === 1 ? '' : 's'} used` : ''}, which is the one-time 10-minute trial — there's no ongoing free time. Basic (${PLAN.basic}) is the cheapest way in and doesn't auto-renew. If the interview you're preparing for runs a full hour, Pro (${PLAN.pro}) covers it in one purchase.`;
         } else if (currentTier === 'basic') {
-          if (sessionsUsed >= 3) {
-            recommended = 'pro';
-            reasoning = `You've used all 3 Basic sessions. If you have more interviews coming up, Pro ($29/mo) unlocks unlimited sessions + all premium models except Claude.`;
-          } else {
-            recommended = 'basic';
-            reasoning = `You still have ${sessionsLimit - sessionsUsed} Basic sessions left. Stay on Basic unless you know you'll need more sessions or Auto-Type.`;
-          }
+          recommended = paidCount >= 2 ? 'pro' : 'basic';
+          reasoning = paidCount >= 2
+            ? `You've bought ${paidCount} passes already. Pro (${PLAN.pro}) covers a full hour in one purchase and Max (${PLAN.max}) covers three — both cheaper per interview than repeat Basic passes.`
+            : `Basic (${PLAN.basic}) is what you have. If your next interview runs longer than 30 minutes, Pro (${PLAN.pro}) is the one-step move; if you only need a few more minutes on the pass you already own, the +30 min / +1 h / +3 h top-ups are the cheaper fix.`;
         } else if (currentTier === 'pro') {
-          // Pro user → recommend Max only if they would benefit from Claude or Auto-Type.
-          // We can't read their actual interview behavior so we play conservative.
           recommended = paidCount >= 3 ? 'max' : 'pro';
           reasoning = paidCount >= 3
-            ? `You\'ve been on Pro for ${paidCount} cycles. If your interviews are coding-heavy or you want Claude (more thoughtful on system design) + Auto-Type, Max is worth the bump to $69/mo.`
-            : `Pro covers most interview use cases well. Stay here unless you specifically want Claude (system design / hard problems) or Auto-Type (Max-only).`;
+            ? `You've paid ${paidCount} times. If your interviews come in clusters, Max (${PLAN.max}) is three 1-hour interviews for less than three Pro passes, and it adds Train Model plus reasoning-effort control.`
+            : `Pro (${PLAN.pro}) covers a full-hour interview and every model including Claude. Move up only if you have several interviews lined up (Max — ${PLAN.max}) or you want Auto-Type and unlimited time (Ultra — ${PLAN.ultra}).`;
+        } else if (currentTier === 'max') {
+          recommended = paidCount >= 4 ? 'ultra' : 'max';
+          reasoning = paidCount >= 4
+            ? `You've bought ${paidCount} passes. At that rate Ultra (${PLAN.ultra}) costs less than buying Max passes back to back, and it's the only plan with Auto-Type.`
+            : `Max (${PLAN.max}) already covers three 1-hour interviews with every model, Train Model and reasoning control. The only step up is Ultra (${PLAN.ultra}), which is worth it if you want Auto-Type or you're interviewing every week.`;
         } else {
-          recommended = 'max';
-          reasoning = `You're already on Max — the top tier. Stay here as long as you're actively interviewing.`;
+          recommended = 'ultra';
+          reasoning = `You're on Ultra (${PLAN.ultra}) — unlimited interviews, every model, Auto-Type. There's nothing above it. If you stop interviewing for a while, cancel and come back on a one-time pass (Basic ${usd('basic')} / Pro ${usd('pro')} / Max ${usd('max')}) instead of paying monthly.`;
         }
 
         return {
@@ -1091,6 +1188,9 @@ const USER_SERVER_TOOLS = [
           paid_history_count: paidCount,
           reasoning,
           no_change_needed: currentTier === recommended,
+          // Returned explicitly so the model quotes the live checkout
+          // numbers instead of whatever it remembers.
+          prices_usd: { basic: PLAN.basic, pro: PLAN.pro, max: PLAN.max, ultra: PLAN.ultra },
         };
       } catch (e) {
         return { ok: false, reason: `Recommendation failed: ${e.message}` };
@@ -1169,24 +1269,41 @@ const USER_SERVER_TOOLS = [
   // confirmation because deletion is irreversible.
   {
     name: 'delete_my_account',
-    description: 'PERMANENTLY delete the caller\'s account, license, devices, and conversation history (payment records are retained for financial-compliance bookkeeping, as the privacy policy states). Required by privacy law (GDPR Article 17 / CCPA right to delete) — every user must be able to self-serve this. Irreversible. Requires explicit user confirmation with the literal string "I understand this is permanent" passed as confirmation_phrase.',
+    description: 'PERMANENTLY delete the caller\'s account, license, devices, and conversation history (payment records are retained for financial-compliance bookkeeping, as the privacy policy states). Required by privacy law (GDPR Article 17 / CCPA right to delete) — every user must be able to self-serve this. Irreversible. The SERVER makes the user re-enter their password in the app\'s secure prompt before anything is deleted: you cannot confirm on their behalf, there is no phrase or argument that skips it, and you must never ask for or repeat a password in chat. Call it with confirmed:true once the user has clearly asked for deletion and you have told them it is permanent.',
     parameters: {
       type: 'object',
       properties: {
-        confirmation_phrase: { type: 'string', description: 'Must be the literal string "I understand this is permanent". Anything else rejects.' },
+        confirmed: { type: 'boolean', description: 'Must be true. Set it only after the user has explicitly asked to delete their account and you have explained that it is permanent. This is a courtesy pre-check — it does NOT authorize the deletion.' },
       },
-      required: ['confirmation_phrase'],
+      required: ['confirmed'],
     },
     destructive: true,
-    handler: async ({ confirmation_phrase }, ctx) => {
-      const PHRASE = 'I understand this is permanent';
-      if (String(confirmation_phrase || '').trim() !== PHRASE) {
+    handler: async ({ confirmed }, ctx) => {
+      if (confirmed !== true) {
         return {
           ok: false,
-          reason: `Account deletion requires the user to type exactly: "${PHRASE}". They typed something else.`,
-          required_phrase: PHRASE,
+          reason: 'Account deletion needs an explicit request from the user. Once they have asked for it and understand it is permanent, call delete_my_account again with confirmed:true — the server will then ask them for their password.',
         };
       }
+      // DELETE /api/v1/auth/account — the real self-service delete — verifies
+      // the caller's PASSWORD (or, for OAuth-only accounts, their typed email)
+      // before touching anything, "for the obvious reason: a JWT sitting in a
+      // browser's localStorage on an unlocked phone should not be one tap away
+      // from destroying an account". This tool reaches the identical
+      // db.deleteUser(), so it needs identical proof.
+      //
+      // The old gate was a literal phrase — and this tool PUBLISHED that
+      // phrase in its own description and parameter schema, so the model
+      // could type it itself; /chat also replays a caller-supplied
+      // transcript, so an attacker could seed a turn in which the "user"
+      // already said it. A secret the verifier hands to the prover is not a
+      // gate. Password step-up is the same proof every destructive admin
+      // tool takes: the chat loop converts this soft-fail into the SSE
+      // step_up_required event and replays the intent only after
+      // /reauth-execute has verified the password server-side. Nothing
+      // model-visible names a bypass string any more.
+      const gate = checkStepUp(ctx, 'delete_my_account', { confirmed: true });
+      if (gate) return gate;
       try {
         const user = db.getUserById(ctx.user.id);
         if (!user) return { ok: false, reason: 'User not found.' };
@@ -1922,6 +2039,11 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
       if (!args.confirmed) return { ok: false, reason: 'Confirm refund first.' };
       const gate = checkStepUp(ctx, 'refund_payment', args);
       if (gate) return gate;
+      // Refund-claim state — see the claim block below. Declared out here so
+      // the outer finally can always release a claim we took but never spent.
+      let refundClaimKey = null;
+      let refundIssued = false;
+      let releaseRefundClaim = () => {};
       try {
         const payment = db.getPaymentById(args.payment_id|0);
         if (!payment) return { ok: false, reason: 'Payment not found.' };
@@ -1954,6 +2076,31 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
         if (!Number.isFinite(refundAmount) || refundAmount <= 0 || refundAmount > payment.amount) {
           return { ok: false, reason: 'Invalid refund amount.' };
         }
+        // The same atomic claim POST /admin/payments/:id/refund takes, for
+        // the same reason: hasPaymentBeenRefunded() above is a READ followed
+        // by an awaited provider call, so two admins — or one double-click —
+        // can both pass it and both move money. One INSERT OR IGNORE on the
+        // webhook_events PRIMARY KEY under the identical key the HTTP
+        // endpoint uses, so the two paths interlock instead of racing.
+        refundClaimKey = `admin-refund:${payment.provider}:${payment.provider_payment_id}`;
+        let claimHeld = false;
+        try {
+          claimHeld = db.recordWebhookEventOnce(refundClaimKey, payment.provider, 'admin.refund.claim');
+        } catch (claimErr) {
+          console.error('[botTools] refund claim failed:', claimErr && claimErr.message);
+          claimHeld = false;
+        }
+        if (!claimHeld) {
+          return { ok: false, reason: 'A refund for this payment is already recorded or in flight.' };
+        }
+        releaseRefundClaim = () => {
+          // No-op once money has moved — a failure AFTER the provider call
+          // must keep the payment claimed.
+          if (!claimHeld || refundIssued) return;
+          claimHeld = false;
+          try { db.clearWebhookEvent(refundClaimKey); }
+          catch (releaseErr) { console.error('[botTools] refund claim release failed:', releaseErr && releaseErr.message); }
+        };
         let providerRefundId = null;
         let subscriptionCancel = null;
         if (payment.provider === 'stripe') {
@@ -1986,6 +2133,7 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
             },
           });
           providerRefundId = refund.id;
+          refundIssued = true; // money has moved — the claim is now permanent
           subscriptionCancel = await cancelSubscriptionAfterFullRefund(stripe, payment, {
             isFullRefund: refundAmount >= payment.amount,
           });
@@ -2000,6 +2148,7 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
             },
           });
           providerRefundId = refund.id;
+          refundIssued = true; // money has moved — the claim is now permanent
         } else {
           return { ok: false, reason: `Cannot refund payments from provider=${payment.provider}.` };
         }
@@ -2029,7 +2178,12 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
           message: `Refund of ${refundAmount} ${payment.currency} issued for payment #${payment.id}.`
             + (subscriptionCancel?.cancelled ? ' Subscription cancelled.' : ''),
         };
-      } catch (e) { return { ok: false, reason: e.message }; }
+      } catch (e) {
+        return { ok: false, reason: e.message };
+      } finally {
+        // Runs on every exit. No-op unless we hold an unspent claim.
+        releaseRefundClaim();
+      }
     },
   },
 

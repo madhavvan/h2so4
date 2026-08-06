@@ -687,21 +687,30 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
   if (!stripe) {
     return res.status(503).json({ error: 'Stripe is not configured. Contact support.' });
   }
-  // Resolve the new line item — env-driven Price ID (validated) if set,
-  // else inline price_data with the hardcoded amount. Same helper as
-  // createStripeCheckout so the two flows can never disagree on what
-  // ${targetTier} costs.
+  // Resolve the new line item. An in-place swap rewires a SUBSCRIPTION ITEM,
+  // and Stripe only lets a subscription item reference a real Price — the
+  // inline `price_data.product_data` shape resolveStripeLineItem returns for
+  // Checkout is rejected outright there, which is why every in-place Ultra
+  // upgrade used to 500 on the update call below.
+  //
+  // When no usable Price is configured we neither guess an id nor error: we
+  // degrade to a fresh Checkout Session (which DOES accept price_data), so
+  // the user always has a path to Ultra. The client already handles a
+  // checkout_url response from this route — it is the same fall-through the
+  // no-provider-on-file case uses.
   let newLineItem;
   try {
-    newLineItem = await resolveStripeLineItem(stripe, targetTier);
+    newLineItem = await resolveStripeSubscriptionPrice(stripe, targetTier);
   } catch (err) {
-    if (err.code === 'NO_PRICE_DATA') {
-      return res.status(400).json({ error: `Unknown tier: ${targetTier}` });
-    }
-    console.error(`[upgrade-tier] resolveStripeLineItem failed for tier=${targetTier}:`, err.message || err);
+    console.error(`[upgrade-tier] price lookup failed for tier=${targetTier}:`, err.message || err);
     return res.status(503).json({
       error: 'Pricing service is temporarily unavailable. Please try again in a moment.',
     });
+  }
+  if (!newLineItem) {
+    const priceEnvName = STRIPE_PRICE_ENV[targetTier] || 'the tier Price env var';
+    console.warn(`[upgrade-tier] no usable Price for an in-place ${targetTier} swap (${priceEnvName}) — sending ${user.email} to a fresh checkout instead. Set ${priceEnvName} to a real recurring Price to restore the prorated upgrade.`);
+    return await createStripeCheckout(req, res, targetTier);
   }
 
   // Stripe customers can in theory have multiple active subscriptions.
@@ -728,9 +737,10 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
   // fall through to the existing license tier (no change), and the upgrade
   // would silently revert on the next webhook tick.
   await stripe.subscriptions.update(subscription.id, {
-    // newLineItem is { price: 'price_xxx' } when an env var is set, or
-    // { price_data: {...} } when we're using the inline default. Stripe
-    // accepts either shape on subscription updates.
+    // newLineItem is ALWAYS { price: 'price_xxx' } — a subscription item can
+    // only reference a real Price. (The inline { price_data: { product_data } }
+    // shape Checkout accepts is INVALID here; resolveStripeSubscriptionPrice
+    // returns null in that case and we degraded to Checkout above.)
     items: [{ id: itemId, ...newLineItem }],
     proration_behavior: 'create_prorations',
     // If the subscription was scheduled to cancel at period end (status
@@ -973,6 +983,34 @@ function interviewDayDenial(userId) {
   };
 }
 
+// ── Off-session top-up dedup window ───────────────────────────────────
+// A completed `mode: 'extension'` payment row for the SAME pack inside this
+// window means the user's last click already charged the card AND already
+// granted the time. A second click inside it is a double-click, an app
+// retry, or a response the client never saw — never a genuine second
+// purchase (nobody burns a 30-minute pack in two minutes). Scoping it to the
+// same pack keeps the product rule intact: a deliberate different-size
+// top-up seconds later still goes through.
+//
+// Metadata is parsed in JS rather than with SQL json_extract so a legacy or
+// malformed metadata blob can only be skipped, never throw inside the money
+// path. The time bound keeps the scanned set to a handful of rows.
+const EXTEND_DEDUP_WINDOW_MS = 2 * 60 * 1000;
+function recentOffSessionExtension(userId, packId, windowMs = EXTEND_DEDUP_WINDOW_MS) {
+  const rows = db.getDB().prepare(`
+    SELECT id, provider_payment_id, created_at, metadata FROM payments
+    WHERE user_id = ? AND provider = 'stripe' AND status = 'completed'
+      AND created_at > ?
+    ORDER BY created_at DESC, rowid DESC LIMIT 20
+  `).all(userId, Date.now() - windowMs);
+  for (const row of rows) {
+    let meta;
+    try { meta = JSON.parse(row.metadata || '{}'); } catch { continue; }
+    if (meta && meta.mode === 'extension' && (!packId || meta.pack === packId)) return row;
+  }
+  return null;
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  CREATE RENEWAL — +30 min top-up (browser-checkout fallback)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1053,9 +1091,13 @@ router.post('/create-renewal', authMiddleware, async (req, res) => {
 // Grant safety: the direct grant here races only with itself (no webhook
 // grants bare PaymentIntents — checkout.session.completed never fires for
 // them), and the UNIQUE(provider, provider_payment_id) index plus the
-// in-tx dedup make client retries idempotent. The Stripe idempotencyKey
-// (from the client's attempt_id) makes double-clicks safe at the charge
-// layer too — same key returns the same PaymentIntent, not a second charge.
+// in-tx dedup make client retries idempotent. The Stripe idempotencyKey is
+// derived from SERVER-side, STABLE inputs (user + pack + tier + a coarse
+// time bucket) — NOT from the client's attempt_id, which is a fresh UUID on
+// every click and so produced a second key, a second PaymentIntent and a
+// second REAL charge for one double-click. A repeat inside the window now
+// collapses onto the same PaymentIntent, and recentOffSessionExtension
+// refuses a second off-session charge before we ever call Stripe.
 // (Eligibility windowing now lives in interviewDayDenial above, shared with
 // /create-renewal so the rule can't hold on one route and not the other.)
 
@@ -1137,6 +1179,33 @@ router.post('/extend-now', authMiddleware, async (req, res) => {
     }
     if (!paymentMethodId) return await createStripeRenewal(req, res);
 
+    // ── Second-click guard: never charge the same top-up twice ──
+    // The idempotency key below collapses repeats that land in the same time
+    // bucket; this closes the two cases it cannot — two clicks straddling a
+    // bucket boundary, and a first attempt whose response never reached the
+    // client. That first charge already put the time on the clock, so we
+    // answer with the SAME success shape (duplicate: true, nothing charged)
+    // rather than billing the card a second time.
+    const priorExtension = recentOffSessionExtension(req.user.id, extPack.id);
+    if (priorExtension) {
+      console.warn(`[extend-now] duplicate top-up suppressed for ${req.user.email} (pack=${extPack.id}, prior_payment=${priorExtension.provider_payment_id || 'n/a'})`);
+      const priorLicense = db.getLicenseByUserId(req.user.id);
+      const priorBucket = db.resolveTimeBucket(priorLicense);
+      return res.json({
+        success: true,
+        provider: 'stripe',
+        flow: 'off_session',
+        duplicate: true,
+        charged_cents: 0,
+        pack: extPack.id,
+        granted_seconds: 0,
+        remaining: priorBucket.remaining,
+        source: priorBucket.source,
+        license: priorLicense ? { ...priorLicense, last_validated: Date.now() } : null,
+        message: `${extPack.label} is already on your clock — you weren't charged again.`,
+      });
+    }
+
     let intent;
     try {
       intent = await stripe.paymentIntents.create({
@@ -1154,7 +1223,19 @@ router.post('/extend-now', authMiddleware, async (req, res) => {
           tier: license.tier,
           pack: extPack.id,
         },
-      }, attemptId ? { idempotencyKey: `extend_${req.user.id}_${attemptId}` } : undefined);
+      },
+      // Idempotency key from SERVER-side, STABLE inputs ONLY. It used to be
+      // `extend_<user>_<attemptId>`, where attempt_id is a fresh client
+      // crypto.randomUUID() per click — two clicks meant two keys, two
+      // PaymentIntents and two real charges (the in-tx dedup below keys on
+      // intent.id, which also differed, so the second charge granted a second
+      // pack as well). pack + tier ride in the key because Stripe rejects a
+      // reused key carrying different params. attempt_id is still recorded on
+      // the payment row for support forensics — it just no longer decides
+      // billing. Window-aligned with recentOffSessionExtension so any repeat
+      // that guard lets through is guaranteed a distinct bucket (a genuine
+      // second purchase still charges).
+      { idempotencyKey: `extend_${req.user.id}_${extPack.id}_${license.tier}_${Math.floor(Date.now() / EXTEND_DEDUP_WINDOW_MS)}` });
     } catch (chargeErr) {
       const code = chargeErr?.code || chargeErr?.raw?.code;
       if (code === 'authentication_required') {
@@ -1240,6 +1321,14 @@ const STRIPE_PRICE_ENV = {
   basic: 'STRIPE_PRICE_BASIC_USD',
   pro:   'STRIPE_PRICE_PRO_USD',
   max:   'STRIPE_PRICE_MAX_USD',
+  // Ultra is the only RECURRING plan, and the only tier whose Price ID is
+  // load-bearing beyond Checkout: an in-place subscription swap can ONLY
+  // point a subscription item at a real Price — Stripe rejects the inline
+  // price_data/product_data shape there. Leaving it unset is safe (Checkout
+  // keeps using the inline default); it costs only the prorated in-place
+  // Ultra upgrade, which then degrades to a fresh Checkout Session. See
+  // resolveStripeSubscriptionPrice.
+  ultra: 'STRIPE_PRICE_ULTRA_USD',
 };
 
 // Inline-Price defaults — used when the per-tier STRIPE_PRICE_*_USD env
@@ -1343,6 +1432,34 @@ async function resolveStripeLineItem(stripe, tier) {
     throw err;
   }
   return { price_data: priceData };
+}
+
+// ── Subscription-ITEM price resolution (in-place plan swaps) ──────────
+// Checkout accepts inline `price_data.product_data` — it creates the Product
+// for you. A SUBSCRIPTION ITEM does not: there `price_data` requires an
+// existing `product` id, so posting the Checkout shape at
+// subscriptions.update fails ('Received unknown parameter:
+// items[0][price_data][product_data]') and every in-place Ultra upgrade 500'd
+// after the user clicked Go Ultra.
+//
+// So an in-place swap is only possible against a REAL Price ID. Returns
+// { price: 'price_…' } when one is configured AND validates against the
+// published in-app amount, or null when there is nothing safe to swap to —
+// the caller then degrades to a fresh Checkout Session instead of erroring,
+// so the user always has a way to buy. We never fabricate a Price id here:
+// create a real recurring $159/mo Ultra Price in Stripe and set
+// STRIPE_PRICE_ULTRA_USD to restore the prorated in-place path.
+async function resolveStripeSubscriptionPrice(stripeClient, tier) {
+  const envVar = STRIPE_PRICE_ENV[tier];
+  const priceId = envVar ? process.env[envVar] : null;
+  if (!priceId) return null;
+  try {
+    await assertStripePriceMatches(stripeClient, priceId, tier);
+    return { price: priceId };
+  } catch (err) {
+    console.warn(`[upgrade-tier] ${envVar} is unusable for an in-place ${tier} swap (${err.message}) — degrading to a fresh Checkout Session.`);
+    return null;
+  }
 }
 
 async function createStripeCheckout(req, res, tier) {
@@ -2894,6 +3011,11 @@ module.exports._test = {
   // Interview-day eligibility, shared by /extend-now and /create-renewal
   interviewDayDenial,
   EXTENSION_ELIGIBLE_WINDOW_MS,
+  // Off-session top-up duplicate-charge guard (/extend-now)
+  recentOffSessionExtension,
+  EXTEND_DEDUP_WINDOW_MS,
+  // Subscription-item price resolution for in-place plan swaps
+  resolveStripeSubscriptionPrice,
   // Provider ownership for existing subscriptions (cancel/reactivate/swap)
   resolveUserProvider,
 };

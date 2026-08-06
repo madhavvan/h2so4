@@ -85,6 +85,75 @@ function getAdminEmails() {
     .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 }
 
+// ─── Admin network gate (mirrors index.js) ─────────────────────────
+// index.js applies ADMIN_IP_ALLOWLIST to /api/v1/admin/** only. This
+// router is deliberately mounted OUTSIDE that gate — /chat, /handoff
+// and /scripted-topics have to serve anonymous callers — which means
+// every admin-privileged surface in THIS file (the admin tool dispatch
+// inside /chat, the password oracle in /reauth-execute) was reachable
+// from any address on earth with nothing but a leaked JWT. Read live
+// from env, same as getAdminEmails(), so a change takes effect on the
+// next request without a restart.
+function isAdminIpAllowed(ip) {
+  const list = (process.env.ADMIN_IP_ALLOWLIST || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  if (list.length === 0) return true;            // disabled → allow all
+  if (!ip) return false;
+  // Normalize IPv6-mapped IPv4 (::ffff:1.2.3.4 → 1.2.3.4), same as index.js.
+  const raw = String(ip);
+  const normalized = raw.startsWith('::ffff:') ? raw.slice(7) : raw;
+  return list.includes(raw) || list.includes(normalized);
+}
+
+// ─── Server-side confirmation ledger for destructive tools ─────────
+// The chat history posted to /chat is CLIENT-SUPPLIED. Every "always
+// confirm before a destructive action" rule in the system prompts is
+// therefore only as trustworthy as the caller: a crafted request can
+// invent the prior assistant turns ("Are you sure?" / "Yes, go ahead")
+// that the model reads as an existing confirmation, and an injected
+// instruction inside a single message can do the same without the user
+// ever seeing it. A confirmation the client can author is not a
+// confirmation.
+//
+// So the gate no longer reads the transcript at all. A destructive tool
+// runs only when the SERVER has already refused that exact (user, tool,
+// arguments) once, in an EARLIER HTTP request. The model cannot
+// manufacture a second request — only a real client round-trip, i.e.
+// the user actually answering the question, produces one. Entries are
+// short-lived and single-use.
+const PENDING_CONFIRM_TTL_MS = 10 * 60 * 1000;
+const PENDING_CONFIRM_MAX = 500;
+const pendingConfirms = new Map();   // key → { at, requestId }
+
+function confirmKey(userId, tool, args) {
+  const a = (args && typeof args === 'object' && !Array.isArray(args)) ? args : {};
+  // The confirmation flags are exactly what the model flips between
+  // attempts, so they must not change the identity of the action —
+  // otherwise "confirmed:false" and "confirmed:true" are two different
+  // pending entries and the gate never closes.
+  const material = {};
+  for (const k of Object.keys(a).sort()) {
+    if (k === 'confirmed' || k === 'confirm' || k === 'confirmation_phrase') continue;
+    material[k] = a[k];
+  }
+  let json;
+  try { json = JSON.stringify(material); } catch { json = '[unserializable]'; }
+  return `${userId || 'anon'}\x00${tool}\x00${json}`;
+}
+
+function prunePendingConfirms(now) {
+  for (const [k, v] of pendingConfirms) {
+    if (now - v.at > PENDING_CONFIRM_TTL_MS) pendingConfirms.delete(k);
+  }
+  // Hard ceiling so a hostile caller can't grow this map without bound.
+  // Map preserves insertion order, so the first key is the oldest.
+  while (pendingConfirms.size > PENDING_CONFIRM_MAX) {
+    const oldest = pendingConfirms.keys().next();
+    if (oldest.done) break;
+    pendingConfirms.delete(oldest.value);
+  }
+}
+
 let knowledgeBase = '';
 let SYSTEM_PROMPT_PUBLIC = '';
 let SYSTEM_PROMPT_USER = '';
@@ -504,7 +573,20 @@ router.post('/chat', async (req, res) => {
 
   let aborted = false;
   const abortController = new AbortController();
-  req.on('close', () => {
+  // ── THE DISCONNECT SIGNAL IS ON THE RESPONSE, NOT THE REQUEST ──
+  // This was `req.on('close', ...)`. On Node 20 IncomingMessage emits
+  // 'close' when the REQUEST is complete — i.e. as soon as
+  // express.json() has drained the body, ~1ms into the handler — not
+  // when the peer goes away. And the awaiting rate limiter in index.js
+  // defers this handler past the tick in which that fires, so the
+  // listener attached too late to hear even the wrong event: the abort
+  // was dead code both ways. A client that hung up one second in still
+  // had the entire Claude turn generated and billed, with every SSE
+  // write going to a closed socket. ServerResponse 'close' is the
+  // documented disconnect signal — it fires on early teardown AND on
+  // normal finish, where aborting an already-settled controller is a
+  // harmless no-op. Same bug, same fix, as routes/ai.js openSseStream().
+  res.on('close', () => {
     aborted = true;
     try { abortController.abort(); } catch { /* idempotent */ }
   });
@@ -523,6 +605,98 @@ router.post('/chat', async (req, res) => {
     user, tier, role,
     ip: req.ip || null,
     userAgent: String(req.headers['user-agent'] || '').slice(0, 200),
+  };
+
+  // ── Per-dispatch authorization + confirmation gate ───────────────
+  // Which tools the MODEL was shown is a suggestion, not a control. The
+  // loop dispatches whatever tool NAME comes back, and a tool name can
+  // come back from a fabricated history, an instruction injected into
+  // the caller's own message, or plain hallucination. That put the whole
+  // admin tool surface — refund, ban, delete-user, impersonate,
+  // config-write — one model turn away on a route that has no
+  // authMiddleware, no adminOnly, no admin IP allowlist and none of the
+  // admin rate buckets, because the only gate was which LIST we handed
+  // the model.
+  //
+  // botTools.executeTool does check ctx.role, but that is one string in
+  // an object we build here; this re-derives admin status from the
+  // SIGNED JWT's email against ADMIN_EMAILS on every single call — the
+  // exact check middleware/admin.js adminOnly() applies — and then
+  // applies the network + rate controls /api/v1/admin/** gets. Refusals
+  // are soft-fails so the bot re-phrases them (the never-show-errors
+  // rule) instead of leaking a 403 into the chat.
+  const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const callerEmail = String((user && user.email) || '').toLowerCase();
+  const limiterKey = session.userId ? `u:${session.userId}` : (req.ip || 'unknown');
+
+  const guardedExecuteTool = async (name, args, callCtx) => {
+    const meta = getToolMeta(name);
+    const isAdminTool = !!meta && typeof meta.category === 'string' && meta.category.startsWith('ADMIN');
+
+    if (isAdminTool) {
+      const verifiedAdmin = !!callerEmail && getAdminEmails().includes(callerEmail);
+      if (!verifiedAdmin || role !== 'admin') {
+        console.warn(`[support/chat] BLOCKED admin tool ${name} — caller=${callerEmail || 'anonymous'} role=${role} ip=${req.ip || 'unknown'}`);
+        try {
+          require('../database').logAdminAction(
+            callerEmail || 'unknown',
+            'unauthorized-admin-attempt',
+            session.userId || null,
+            callerEmail || null,
+            { path: '/api/v1/support/chat', method: 'POST', tool: name, ip: req.ip },
+          );
+        } catch { /* best-effort */ }
+        return { ok: false, reason: `${name} is an operator-only action and is not available on this account.` };
+      }
+      if (!isAdminIpAllowed(req.ip)) {
+        console.warn(`[support/chat] BLOCKED admin tool ${name} — ip ${req.ip} not in ADMIN_IP_ALLOWLIST`);
+        try {
+          require('../database').logAdminAction(
+            callerEmail, 'admin-ip-blocked', session.userId || null, callerEmail,
+            { path: '/api/v1/support/chat', method: 'POST', tool: name, ip: req.ip },
+          );
+        } catch { /* best-effort */ }
+        return { ok: false, reason: 'That action can only be run from an approved network.' };
+      }
+      // Same buckets, same per-admin key, as the REST admin surface, so
+      // the bot cannot be used as an unmetered side channel around them.
+      try {
+        const { adminLimiter, adminDestructiveLimiter } = require('../middleware/rateLimiters');
+        await adminLimiter.consume(limiterKey);
+        if (meta.destructive) await adminDestructiveLimiter.consume(limiterKey);
+      } catch {
+        return { ok: false, reason: 'That is a lot of admin actions in a short window — give it a few minutes and ask me again.' };
+      }
+    }
+
+    // Confirmation gate — see the pendingConfirms notes near the top of
+    // this file. Applies to EVERY destructive tool, admin and user:
+    // step-up covers the admin ones only for the 15 minutes after a
+    // password prompt, and the user-tier destructive set
+    // (cancel_subscription, delete_my_account) has no step-up at all.
+    if (meta && meta.destructive) {
+      const now = Date.now();
+      prunePendingConfirms(now);
+      const key = confirmKey(session.userId, name, args);
+      const pending = pendingConfirms.get(key);
+      // A pending entry from THIS request proves nothing — the model
+      // asked and answered itself inside one turn. Only an entry armed
+      // by an earlier request means a human came back and replied.
+      if (!pending || pending.requestId === requestId) {
+        pendingConfirms.set(key, {
+          at: pending ? pending.at : now,
+          requestId: pending ? pending.requestId : requestId,
+        });
+        return {
+          ok: false,
+          code: 'needs_confirmation',
+          reason: `${name} has not been confirmed by the user yet. Describe exactly what it will do and what it cannot undo, then ask for an explicit yes. When they answer, call ${name} again with the same arguments and it will run.`,
+        };
+      }
+      pendingConfirms.delete(key);   // single use
+    }
+
+    return executeTool(name, args, callCtx);
   };
 
   // Hand off to Anthropic Claude (Sonnet 5 by default). The helper
@@ -548,7 +722,7 @@ router.post('/chat', async (req, res) => {
       toolCatalog: tools,
       callerMessages: messages,
       ctx: toolCtx,
-      executeTool,
+      executeTool: guardedExecuteTool,
       getToolMeta,
       sse,
       emitToolCallToClient,
@@ -593,11 +767,17 @@ router.post('/chat', async (req, res) => {
 //    { password, intent: { tool, args } }
 //
 //  Flow:
-//    1. authMiddleware checks the caller's existing JWT.
-//    2. adminOnly checks they're in ADMIN_EMAILS.
+//    1. detectSession() checks the caller's existing JWT.
+//    2. The intent's tool CATEGORY picks the gate. An ADMIN_* tool (or
+//       any name we cannot positively identify) still requires
+//       ADMIN_EMAILS + the admin IP allowlist. A USER_CLIENT/USER_SERVER
+//       tool requires only a signed-in caller, because delete_my_account
+//       and request_refund now take this same password step-up and they
+//       belong to ordinary customers, not operators.
 //    3. We verify the password against db.verifyUserPassword.
 //    4. We mint a new stepUp=true JWT (15-min TTL).
-//    5. We re-execute the captured intent under that new JWT.
+//    5. We re-execute the captured intent under that new JWT, in a tool
+//       context carrying the CALLER'S OWN role.
 //    6. Return { token, result, message } so the client can swap the
 //       JWT in localStorage + render the assistant follow-up.
 //
@@ -606,11 +786,77 @@ router.post('/chat', async (req, res) => {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 router.post('/reauth-execute', async (req, res) => {
   const session = detectSession(req);
-  if (!session.user || !session.isAdmin) {
-    return res.status(session.user ? 403 : 401).json({
-      error: session.user ? 'Admin only' : 'Authentication required',
-      code: session.user ? 'not_admin' : 'no_auth',
+  if (!session.user) {
+    return res.status(401).json({
+      error: 'Authentication required',
+      code: 'no_auth',
     });
+  }
+
+  // ── Which privilege boundary is this step-up standing on? ─────────
+  // A flat admin-only gate here was right while step-up existed only for
+  // ADMIN_DESTRUCTIVE tools. botTools now takes the same password proof
+  // for two USER_SERVER tools — delete_my_account and request_refund — so
+  // a Basic customer asking Minica to close their account got
+  // step_up_required from /chat and then a hard 403 from the only
+  // endpoint that can clear it. The step-up was unclosable and both tools
+  // failed forever for exactly the people they exist for. A right the
+  // user holds by law (GDPR Art. 17) cannot depend on being an operator.
+  //
+  // So the gate is per-INTENT, not per-caller. The category is read from
+  // the SERVER's own catalog keyed by the requested name — the body
+  // supplies a NAME, never a privilege — and anything we cannot
+  // positively identify as user-tier (unknown name, absent intent,
+  // non-string category) falls through to the admin branch and keeps the
+  // full pre-existing admin + network gate. Fail closed, never open.
+  //
+  // Picking the gate is not the authorization. executeTool() re-checks
+  // the tool's category against ctx.role below, and ctx.role is now the
+  // caller's REAL role, so a non-admin naming an admin tool is refused
+  // twice by two independent checks.
+  const intentTool = String(req.body?.intent?.tool || '');
+  const intentMeta = intentTool ? getToolMeta(intentTool) : null;
+  const isAdminIntent =
+    !intentMeta
+    || typeof intentMeta.category !== 'string'
+    || intentMeta.category.startsWith('ADMIN');
+
+  if (isAdminIntent && !session.isAdmin) {
+    console.warn(`[support/reauth-execute] BLOCKED admin step-up ${intentTool || '(no tool)'} — caller=${session.email || 'anonymous'} role=${session.role} ip=${req.ip || 'unknown'}`);
+    try {
+      require('../database').logAdminAction(
+        session.email || 'unknown', 'unauthorized-admin-attempt',
+        session.userId || null, session.email || null,
+        { path: '/api/v1/support/reauth-execute', method: 'POST', tool: intentTool || null, ip: req.ip },
+      );
+    } catch { /* best-effort */ }
+    return res.status(403).json({ error: 'Admin only', code: 'not_admin' });
+  }
+  // This endpoint takes a password and tells the caller whether it was
+  // right — a password oracle for the most valuable account in the
+  // system. It lives under /api/v1/support/, so NONE of the controls
+  // index.js puts on /api/v1/admin/** reached it: no IP allowlist, no
+  // admin buckets, and the only limiter on this router covers
+  // /support/chat. Unthrottled, anyone holding a stolen admin JWT (or an
+  // admin session left open on a shared machine) could grind the
+  // password at network speed with no lockout and no ceiling. Apply the
+  // same network gate the admin surface gets…
+  // …but ONLY for admin-category step-ups. ADMIN_IP_ALLOWLIST is the
+  // office/VPN perimeter for the OPERATOR surface. Applying it to a
+  // customer deleting their own account would lock every user outside
+  // that network out of a right they are guaranteed — and the account
+  // being attacked in the oracle scenario above is the admin's, not
+  // theirs. isAdminIntent is true for everything we could not identify as
+  // user-tier, so the operator surface keeps this gate exactly as it was.
+  if (isAdminIntent && !isAdminIpAllowed(req.ip)) {
+    try {
+      require('../database').logAdminAction(
+        session.email || 'unknown', 'admin-ip-blocked',
+        session.userId || null, session.email || null,
+        { path: '/api/v1/support/reauth-execute', method: 'POST', ip: req.ip },
+      );
+    } catch { /* best-effort */ }
+    return res.status(403).json({ error: 'Admin access not allowed from this network' });
   }
   const { password, intent } = req.body || {};
   if (!password || typeof password !== 'string') {
@@ -620,7 +866,33 @@ router.post('/reauth-execute', async (req, res) => {
     return res.status(400).json({ error: 'Intent is required and must include a tool name' });
   }
 
+  // …and the same brute-force buckets /api/v1/auth/login uses, on the
+  // SAME keys, so a guess here and a guess there spend one shared
+  // budget: 10 per 15 min against the ACCOUNT (the thing being attacked,
+  // which an attacker cannot change by renting another address) plus a
+  // loose per-source cap for the spray case. Consumed before the compare
+  // so parallel guesses can't race past it, and cleared on success below
+  // exactly as login does, so a legitimate admin never accumulates.
+  const {
+    loginAccountLimiter, loginIpLimiter, clearLoginAttempts,
+  } = require('../middleware/rateLimiters');
+  const acctKey = `a:${String(session.user.email || '').trim().toLowerCase()}`;
+  try {
+    await loginAccountLimiter.consume(acctKey);
+    await loginIpLimiter.consume(req.ip || 'unknown');
+  } catch {
+    return res.status(429).json({
+      error: 'Too many password attempts. Wait 15 minutes and try again.',
+      code: 'reauth_rate_limited',
+    });
+  }
+
   const db = require('../database');
+  // Constant-time by construction, verified: db.verifyUserPassword →
+  // verifyPassword() re-derives PBKDF2-SHA512 over the stored salt and
+  // compares with crypto.timingSafeEqual behind a length check, so there
+  // is no early-exit byte comparison to time here. Do not "simplify"
+  // that to ===.
   const verified = db.verifyUserPassword(session.user.email, password);
   if (!verified) {
     // Audit failed reauth — same as /admin/reauth does.
@@ -630,6 +902,12 @@ router.post('/reauth-execute', async (req, res) => {
     } catch { /* best-effort */ }
     return res.status(401).json({ error: 'Invalid password' });
   }
+
+  // Correct password — forget this account's failed attempts, the same
+  // way routes/auth.js does on a successful sign-in, so the bucket stays
+  // a record of FAILURES only and an admin who reauths legitimately a
+  // few times an hour never locks themselves out.
+  await clearLoginAttempts(session.user.email);
 
   const { generateToken } = require('../middleware/auth');
   const now = Date.now();
@@ -651,7 +929,15 @@ router.post('/reauth-execute', async (req, res) => {
       stepUpAt: now,
     },
     tier: session.tier,
-    role: 'admin',
+    // The caller's ACTUAL role — never a hardcoded 'admin'. This object is
+    // the ONLY thing executeTool() consults to authorize the replayed tool
+    // (botTools.js: role 'admin' → every category, 'user' → USER_CLIENT +
+    // USER_SERVER only, anything else → nothing). Stamping 'admin' here
+    // meant that the instant a non-admin was allowed to finish a step-up,
+    // their replay would run with operator authority. It is read straight
+    // off detectSession(), which derives it from the SIGNED JWT's email
+    // against ADMIN_EMAILS, so no part of the request can set it.
+    role: session.role,
     ip: req.ip || null,
     userAgent: String(req.headers['user-agent'] || '').slice(0, 200),
   };
@@ -1682,8 +1968,14 @@ router.post('/inbox/threads/:id/ai-assist', async (req, res) => {
   };
 
   // Abort the upstream stream if the client disconnects mid-flight.
+  // Must be the RESPONSE's 'close': IncomingMessage emits 'close' when
+  // the request body has been consumed, not when the peer goes away, and
+  // the async limiter in index.js defers this handler past that tick
+  // anyway — so this listener never fired and an abandoned draft kept
+  // generating, and billing, into a dead socket. Same defect and same
+  // fix as the /chat loop above and routes/ai.js openSseStream().
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  res.on('close', () => controller.abort());
 
   try {
     if (useAnthropic) {

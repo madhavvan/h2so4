@@ -119,3 +119,6 @@ server/scripts/.autotype-test/
 /cdp-*.mjs
 /current-*.png
 /globe-*.png
+
+# Cross-session coordination scratch file (two Claude Code tabs). Never commit.
+.claude-session-coordination.md

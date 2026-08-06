@@ -35,12 +35,6 @@
       {
         "provider": "github",
         "owner": "madhavvan",
-        "repo": "interviewcopilot-releases",
-        "releaseType": "draft"
-      },
-      {
-        "provider": "github",
-        "owner": "madhavvan",
         "repo": "h2so4",
         "releaseType": "release"
       }
@@ -83,7 +77,7 @@
       "target": "nsis",
       "icon": "build/icon.ico",
       "artifactName": "InterviewCopilot-Setup.${ext}",
-      "verifyUpdateCodeSignature": false,
+      "verifyUpdateCodeSignature": true,
       "azureSignOptions": {
         "endpoint": "https://eus.codesigning.azure.net/",
         "codeSigningAccountName": "minica-signing-4729",
