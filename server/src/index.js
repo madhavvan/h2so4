@@ -425,7 +425,11 @@ app.get('/stealth-test', (req, res) => {
 //
 // Download filenames MUST match electron-builder's artifactName entries
 // in package.json → build → {win,mac,linux}.
-const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/interviewcopilot-releases/releases/latest';
+// Must name the SAME repo as REPO in routes/downloads.js. It pointed at
+// `interviewcopilot-releases` from 2026-07-18 to 2026-08-06 — a repo that
+// was never created — so this fetch 404'd on every refresh and the endpoint
+// silently served FALLBACK_VERSION to every client for three weeks.
+const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/h2so4/releases/latest';
 const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 // Offline fallback ONLY — the GitHub Releases fetch above is the live
@@ -437,9 +441,14 @@ const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 // downgrade prompt. Whatever value is used MUST point at a version that
 // actually has a GitHub release.
 const FALLBACK_VERSION = {
-  version: process.env.LATEST_APP_VERSION || '4.0.8',
+  // Bumped 4.0.8 → 4.0.16 on 2026-08-06. While GITHUB_RELEASES_URL pointed
+  // at a repo that did not exist, the fetch failed on every refresh and this
+  // fallback WAS the live answer — so production told every client the
+  // latest version was 4.0.8 while 4.0.16 was the shipped build. v4.0.16 is
+  // the newest non-draft release on madhavvan/h2so4.
+  version: process.env.LATEST_APP_VERSION || '4.0.16',
   minVersion: '2.0.0',
-  releaseDate: '2026-05-26',
+  releaseDate: '2026-07-18',
   releaseNotes: 'Latest stable release.',
   downloadUrl: {
     // Routed through get.minicaai.com → 302 → GitHub release CDN. Keeps the

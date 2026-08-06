@@ -35,12 +35,6 @@
       {
         "provider": "github",
         "owner": "madhavvan",
-        "repo": "interviewcopilot-releases",
-        "releaseType": "draft"
-      },
-      {
-        "provider": "github",
-        "owner": "madhavvan",
         "repo": "h2so4",
         "releaseType": "release"
       }
