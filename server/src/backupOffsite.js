@@ -20,7 +20,9 @@
 //       counts) before relying on this — the SigV4 signing here has NOT been
 //       exercised against a live bucket in-repo.
 //  For continuous (not just daily) replication, Litestream is the more
-//  robust option — see BACKUP-OFFSITE.md.
+//  robust option — see docs/private/BACKUP-OFFSITE.md. (Moved there from
+//  server/ on 2026-08-07: it describes the backup topology and recovery
+//  path of a live system, which does not belong in a public repo.)
 //
 //  Env:
 //    BACKUP_S3_BUCKET             (required) bucket name
