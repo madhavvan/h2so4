@@ -444,11 +444,18 @@ const FALLBACK_VERSION = {
   // Bumped 4.0.8 → 4.0.16 on 2026-08-06. While GITHUB_RELEASES_URL pointed
   // at a repo that did not exist, the fetch failed on every refresh and this
   // fallback WAS the live answer — so production told every client the
-  // latest version was 4.0.8 while 4.0.16 was the shipped build. v4.0.16 is
-  // the newest non-draft release on madhavvan/h2so4.
-  version: process.env.LATEST_APP_VERSION || '4.0.16',
+  // latest version was 4.0.8 while 4.0.16 was the shipped build.
+  //
+  // Bumped 4.0.16 → 4.0.17 on 2026-08-07 with that release. This value is
+  // what every client is told when GitHub is unreachable AND the in-memory
+  // cache is cold, so leaving it behind the shipped build means a restarted
+  // server quietly tells the fleet it is up to date when it is not — and
+  // this endpoint is the ONLY update channel that still reaches the
+  // v4.0.11-v4.0.16 installs whose baked update feed 404s. Bump it in the
+  // same commit as every version bump.
+  version: process.env.LATEST_APP_VERSION || '4.0.17',
   minVersion: '2.0.0',
-  releaseDate: '2026-07-18',
+  releaseDate: '2026-08-07',
   releaseNotes: 'Latest stable release.',
   downloadUrl: {
     // Routed through get.minicaai.com → 302 → GitHub release CDN. Keeps the
