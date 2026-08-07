@@ -55,9 +55,119 @@ const FILES = {
   'linux':      'InterviewCopilot-Linux.AppImage',
 };
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE BROWSER MUST NEVER REACH github.com.
+//
+//  This used to 302 straight to
+//  `github.com/<owner>/<repo>/releases/latest/download/<file>` and let the
+//  browser follow GitHub's own redirects. Two problems, and the second is
+//  the one that actually bit:
+//
+//   1. The hop is VISIBLE. `github.com/<owner>/<repo>` sits in the address
+//      bar on the way past, so the download quietly tells every user which
+//      host and which repository the product is built out of.
+//   2. WHEN IT BREAKS, GITHUB RENDERS THE ERROR. From 2026-07-18 the feed
+//      pointed at a repo that did not exist, so every download landed on
+//      GitHub's 404 — GitHub's branding, GitHub's chrome, and the missing
+//      repo path printed on it. The outage leaked the thing the redirect
+//      was already leaking, only louder and to everyone who clicked.
+//
+//  So the hops are followed HERE instead. GitHub's last redirect points at
+//  release-assets.githubusercontent.com with a signed, opaque asset id —
+//  no owner, no repo name anywhere in it — and that is what the browser is
+//  sent to. If any of it fails, the user gets OUR page (see
+//  unavailablePage) and never GitHub's.
+//
+//  This is still a REDIRECT, not a proxy: the 150-195MB never crosses this
+//  server, so the original bandwidth rationale holds. The only cost is one
+//  small HEAD-ish request per click, cached below.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Signed asset URLs last about an hour; five minutes is well inside that
+// and keeps a burst of downloads from re-resolving on every click.
+const ASSET_TTL_MS = 5 * 60 * 1000;
+const assetCache = new Map();   // file -> { url, at }
+
+/**
+ * Follow GitHub's redirect chain until it leaves github.com, and return the
+ * signed CDN URL. Returns '' when the asset cannot be resolved for any
+ * reason — a missing release, a renamed file, GitHub being down, a network
+ * timeout. Never throws: the caller's job is to show a human a page, not to
+ * handle an exception on a download click.
+ */
+async function resolveAssetUrl(file) {
+  const cached = assetCache.get(file);
+  if (cached && Date.now() - cached.at < ASSET_TTL_MS) return cached.url;
+
+  let url = `https://github.com/${REPO}/releases/latest/download/${file}`;
+  try {
+    // Four hops is generous — GitHub uses two — and bounds a redirect loop.
+    for (let hop = 0; hop < 4; hop++) {
+      const res = await fetch(url, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: { 'User-Agent': 'minicaai-downloads', Range: 'bytes=0-0' },
+        signal: AbortSignal.timeout(6000),
+      });
+      // Left github.com, or arrived at the bytes: this is the URL to hand out.
+      if (res.status === 200 || res.status === 206) {
+        assetCache.set(file, { url, at: Date.now() });
+        return url;
+      }
+      if (res.status < 300 || res.status >= 400) return '';   // 404 and friends
+      const next = res.headers.get('location');
+      if (!next) return '';
+      url = new URL(next, url).toString();
+      // The moment the host is no longer GitHub's own site, we have the
+      // signed asset URL — hand it over without spending another request.
+      if (!/(^|\.)github\.com$/i.test(new URL(url).hostname)) {
+        assetCache.set(file, { url, at: Date.now() });
+        return url;
+      }
+    }
+  } catch { /* timeout, DNS, TLS — all mean "show our page" */ }
+  return '';
+}
+
+/** Our own "not right now" page. Names no host, no repository, no vendor. */
+function unavailablePage(platform) {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Download — Interview Copilot</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#0a0a0d;color:#fff;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+  .card{max-width:460px;width:100%;text-align:center}
+  h1{font-size:21px;margin:0 0 10px;font-weight:700}
+  p{color:#9d968a;font-size:14px;line-height:1.6;margin:0 0 22px}
+  a.btn{display:inline-block;padding:13px 22px;border-radius:12px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;text-decoration:none;font-weight:600;font-size:14px}
+  .sub{margin-top:20px;font-size:12px;color:#6a6355}
+  .sub a{color:#d3ac63;text-decoration:none}
+</style></head><body><div class="card">
+  <h1>That download isn't ready right now</h1>
+  <p>The ${platform} build is briefly unavailable. This is on us, not on you — it usually clears within a few minutes.</p>
+  <a class="btn" href="/">Try another platform</a>
+  <p class="sub">Still stuck? <a href="mailto:support@minicaai.com">support@minicaai.com</a> — tell us which platform and we'll send you a link.</p>
+</div></body></html>`;
+}
+
+const PLATFORM_LABEL = {
+  'InterviewCopilot-Setup.exe': 'Windows',
+  'InterviewCopilot-Mac-x64.dmg': 'Intel Mac',
+  'InterviewCopilot-Mac-arm64.dmg': 'Apple Silicon',
+  'InterviewCopilot-Linux.AppImage': 'Linux',
+};
+
 function redirectTo(file) {
-  return (_req, res) => {
-    const url = `https://github.com/${REPO}/releases/latest/download/${file}`;
+  return async (_req, res) => {
+    const url = await resolveAssetUrl(file);
+    if (!url) {
+      // 503, not 404: the app exists, this copy of it is momentarily out of
+      // reach. And it is OUR page — a user must never be handed someone
+      // else's error screen from a button on our site.
+      console.warn(`[downloads] could not resolve ${file} — served the unavailable page instead`);
+      return res.status(503).set('Content-Type', 'text/html; charset=utf-8')
+        .send(unavailablePage(PLATFORM_LABEL[file] || 'requested'));
+    }
     res.redirect(302, url);
   };
 }
