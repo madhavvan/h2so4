@@ -265,7 +265,9 @@
 :root:not(.dark) .text-amber-200\/70 { color: #b4540b; }   /* was 1.11:1 -> 4.60:1 */
 :root:not(.dark) .text-amber-200\/80 { color: #b4540b; }   /* was 1.13:1 -> 4.60:1 */
 :root:not(.dark) .text-amber-200\/90 { color: #b4540b; }   /* was 1.13:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-300\/60 { color: #b4540b; }   /* was 1.18:1 -> 4.60:1 */
 :root:not(.dark) .text-amber-300\/90 { color: #b4540b; }   /* was 1.30:1 -> 4.60:1 */
+:root:not(.dark) .hover\:text-amber-100:hover { color: #b4540b; }   /* was 1.02:1 -> 4.60:1 */
 :root:not(.dark) .text-amber-400 { color: #b4540b; }   /* was 1.55:1 -> 4.60:1 */
 :root:not(.dark) .text-amber-400\/60 { color: #b4540b; }   /* was 1.31:1 -> 4.60:1 */
 :root:not(.dark) .text-amber-400\/70 { color: #b4540b; }   /* was 1.37:1 -> 4.60:1 */

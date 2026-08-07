@@ -5243,6 +5243,53 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     downloadUrl?: { windows: string; mac: string; linux: string };
   } | null>(null);
 
+  // ── Which update offer the user has already waved off ──
+  //
+  // The auto-updater can be broken in ways this app cannot repair from here.
+  // v4.0.11-v4.0.16 each shipped with an app-update.yml naming a repo that
+  // was never created, so `checkForUpdates` 404s on its first request on
+  // every launch and those installs can NEVER pull an update themselves —
+  // the feed URL lives in their installed resources, not on any server we
+  // control. This server-driven check is the only channel that still reaches
+  // them, and its result used to render *solely* inside the Settings modal
+  // under "App Updates", a section a user has no reason to ever open. So the
+  // one working signal was shown where nobody looks, and the fleet sat
+  // stranded for three weeks without a word.
+  //
+  // Dismissal is deliberately keyed to the version being OFFERED, not a
+  // boolean: waving this away silences that one release, and the next one
+  // asks again. A sticky "don't show me updates" would recreate exactly the
+  // silent stranding this banner exists to end.
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string>(() => {
+    try { return localStorage.getItem('dismissed_update_version') || ''; } catch { return ''; }
+  });
+  const dismissUpdateBanner = useCallback((version: string) => {
+    setDismissedUpdateVersion(version);
+    try { localStorage.setItem('dismissed_update_version', version); } catch {}
+  }, []);
+
+  // The auto-updater is going to deliver it — say nothing and let it work.
+  // Only 'error' / 'idle' / 'up-to-date' mean nothing is inbound. ('idle'
+  // covers the window before the first check resolves AND the state the
+  // 'ready' banner's own dismiss button resets to.)
+  const updaterIsHandlingIt =
+    updateStatus.status === 'checking' ||
+    updateStatus.status === 'available' ||
+    updateStatus.status === 'downloading' ||
+    updateStatus.status === 'ready';
+
+  // Pick the one link that matches this machine rather than offering three.
+  const platformDownloadUrl = useMemo(() => {
+    const urls = serverVersionInfo?.downloadUrl;
+    if (!urls) return null;
+    switch (licenseService.getPlatform()) {
+      case 'macOS': return urls.mac;
+      case 'Linux': return urls.linux;
+      case 'Windows': return urls.windows;
+      default: return urls.windows;
+    }
+  }, [serverVersionInfo]);
+
   // Injected by Vite from package.json (see vite.config.ts). Single source
   // of truth — no more version drift between manifest and the server check.
   const APP_VERSION = __APP_VERSION__;
@@ -8218,6 +8265,50 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
               <button
                 onClick={() => setUpdateStatus({ status: 'idle' })}
                 className="text-blue-300/60 hover:text-blue-100 text-lg leading-none ml-1"
+                aria-label="Dismiss"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ── Manual-update banner: the updater is NOT going to deliver this ──
+            Shown when the server knows about a newer version and nothing is
+            inbound from the auto-updater. That combination means this install
+            cannot heal itself — either the update check is erroring, or it is
+            cheerfully reporting "up to date" against a feed that no longer
+            carries releases. Both were true of the entire v4.0.11-v4.0.16
+            fleet, and neither produced a single word of UI outside a Settings
+            panel nobody opens.
+
+            Amber, not blue: the blue banner above is "we did the work, press
+            the button"; this one is "you have to go get it". Different ask,
+            different colour. */}
+        {!isPopoutElectron && isElectron && serverVersionInfo?.isOutdated
+          && !updaterIsHandlingIt
+          && dismissedUpdateVersion !== serverVersionInfo.latest && (
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[9999] animate-in fade-in slide-in-from-top-2">
+            <div className="flex items-center gap-3 bg-amber-500/10 border border-amber-500/30 backdrop-blur-sm rounded-lg px-4 py-2.5 shadow-lg">
+              <Download size={14} className="text-amber-400 shrink-0" />
+              <span className="text-sm text-amber-200">
+                v{serverVersionInfo.latest} is available
+                <span className="text-amber-300/60"> — this copy can’t install it automatically</span>
+              </span>
+              {platformDownloadUrl && (
+                <a
+                  href={platformDownloadUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => dismissUpdateBanner(serverVersionInfo.latest)}
+                  className="px-3 py-1 rounded-md text-xs font-bold bg-amber-500 text-white hover:bg-amber-600 transition-colors flex items-center gap-1.5"
+                >
+                  Download <ExternalLink size={11} />
+                </a>
+              )}
+              <button
+                onClick={() => dismissUpdateBanner(serverVersionInfo.latest)}
+                className="text-amber-300/60 hover:text-amber-100 text-lg leading-none ml-1"
                 aria-label="Dismiss"
               >
                 ×
