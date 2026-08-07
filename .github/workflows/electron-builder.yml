@@ -49,6 +49,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # Job-level so the mirror step's `if:` can test it. A step's own `env:`
+    # block is not reliably in scope for that step's own conditional, and a
+    # secret cannot be referenced from an `if:` directly.
+    env:
+      FEED_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+
     steps:
       - name: Decide if this matrix entry should build
         id: gate
@@ -103,16 +109,29 @@ jobs:
         shell: bash
 
       - name: Build Electron app (no publish — assets are attached below)
-        # package.json's publish now names ONE target, madhavvan/h2so4, so
-        # app-update.yml in every artifact points at the repo that actually
-        # holds the releases. It used to list interviewcopilot-releases FIRST
-        # — a repo that was never created — which silently baked a dead update
-        # feed into every shipped build (fixed 2026-08-06; see the header of
-        # server/src/routes/downloads.js). Build only either way: the softprops
-        # step below attaches everything (including latest-*.yml) to the h2so4
-        # release. NOTE: this makes workflow_dispatch backfills upload nothing
-        # (softprops is gated to release events) — backfill by re-publishing
-        # the release instead.
+        # package.json's publish names TWO targets, in this order:
+        #   1. madhavvan/interviewcopilot-releases  ← baked into app-update.yml
+        #   2. madhavvan/h2so4                      ← legacy feed for <=v4.0.9
+        # Entry #1 is the one electron-builder writes into every artifact's
+        # app-update.yml, so it is the feed the shipped fleet will phone home
+        # to. That is why BOTH upload steps below must run: an artifact whose
+        # channel file lands only on h2so4 is invisible to every client built
+        # from this config.
+        #
+        # History worth keeping: v4.0.11-v4.0.16 listed interviewcopilot-
+        # releases first while that repo did not exist AND with releaseType
+        # `draft`, so every one of those builds shipped with a feed that 404s
+        # on its first request — the entire fleet has been unable to auto-
+        # update since 2026-07-18. Two rules fall out of that:
+        #   - the #1 target must be a repo that EXISTS and is PUBLIC, and
+        #   - releaseType must be `release`; drafts appear in neither
+        #     releases.atom nor /releases/latest, so a draft feed is a dead
+        #     feed even when the repo is real.
+        # `npm run release:verify` asserts both against the live feed.
+        #
+        # NOTE: --publish never means workflow_dispatch backfills upload
+        # nothing (both upload steps are gated to release events) — backfill
+        # by re-publishing the release instead.
         if: steps.gate.outputs.go == '1'
         run: npx electron-builder ${{ matrix.platform }} --publish never
         env:
@@ -136,8 +155,9 @@ jobs:
       # Belt-and-suspenders: electron-builder's publish should already have
       # attached every relevant file (binary + blockmap + latest-*.yml) to
       # the release. softprops re-uploads anything missed without overwriting
-      # successful uploads.
-      - name: Upload any additional files to release
+      # successful uploads. This one targets the repo that fired the event
+      # (h2so4) — it is the LEGACY feed, still read by <=v4.0.9 installs.
+      - name: Upload additional files to the source-repo release (legacy feed)
         uses: softprops/action-gh-release@v2
         if: steps.gate.outputs.go == '1' && github.event_name == 'release'
         with:
@@ -151,3 +171,34 @@ jobs:
             dist-electron/*.blockmap
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # THE ONE THAT REACHES USERS. secrets.GITHUB_TOKEN is scoped to this
+      # repo only, so the step above physically cannot write to the update-
+      # feed repo — without this step, CI-built macOS and Linux artifacts
+      # (and, critically, latest-mac.yml / latest-linux.yml) never reach the
+      # feed that every shipped app-update.yml points at, and Mac/Linux users
+      # stay stranded even though Windows works. Requires a PAT with
+      # `contents: write` on madhavvan/interviewcopilot-releases, stored as
+      # the RELEASES_REPO_TOKEN secret on THIS repo.
+      #
+      # Gated on the secret being present so a fork or a fresh clone without
+      # the secret still completes the legacy upload instead of failing red.
+      # If it is skipped, `npm run release:mirror -- <tag>` does the same job
+      # from a workstation. Either way, `npm run release:verify` is what
+      # proves the feed is actually serving before you call a release done.
+      - name: Mirror artifacts to the update-feed repo (what users update from)
+        uses: softprops/action-gh-release@v2
+        if: steps.gate.outputs.go == '1' && github.event_name == 'release' && env.FEED_TOKEN != ''
+        with:
+          repository: madhavvan/interviewcopilot-releases
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
+          tag_name: ${{ github.event.release.tag_name }}
+          fail_on_unmatched_files: false
+          files: |
+            dist-electron/*.yml
+            dist-electron/*.exe
+            dist-electron/*.dmg
+            dist-electron/*.zip
+            dist-electron/*.AppImage
+            dist-electron/*.deb
+            dist-electron/*.blockmap
