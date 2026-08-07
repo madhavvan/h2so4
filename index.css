@@ -707,35 +707,52 @@
 
    The greys inside the panel move too — they were tuned cool to sit on a cool
    surface and would import a blue cast back into a warm one. */
+/* ── THE FILL IS A WASH NOW, NOT A PANEL ──
+   This was an all-but-opaque taupe — rgba(196,178,159,0.74) down to
+   rgba(186,167,146,0.79) — so the composer read as a brown slab sitting on
+   a cream page rather than as part of it. The popout, on the same light
+   theme, does the opposite: its surfaces are transparent with a 4-6% warm
+   ink tint (see --bubble-user / --bubble-ai in pip-styles.css), which is
+   why that window looks white and this one looked muddy.
+
+   Same idea here, and deliberately the SAME HUE — rgba(74,58,38) is the
+   warm brown these shadows are already built from, so the composer keeps
+   its warmth and its family resemblance to the rest of the theme. What
+   changes is the alpha: ~0.76 of an opaque taupe becomes a ~5% wash, so
+   the cream page shows through and the box reads white-with-warmth
+   instead of brown. The blur stays — it is what makes it a surface.
+
+   Dark theme is untouched: every rule here is :root:not(.dark), and the
+   popout has its own stylesheet. */
 :root:not(.dark) .composer-shell {
   background: linear-gradient(180deg,
-    rgba(196, 178, 159, 0.74) 0%,
-    rgba(191, 173, 152, 0.76) 45%,
-    rgba(186, 167, 146, 0.79) 100%);
+    rgba(74, 58, 38, 0.055) 0%,
+    rgba(74, 58, 38, 0.035) 45%,
+    rgba(74, 58, 38, 0.022) 100%);
   -webkit-backdrop-filter: blur(40px) saturate(1.5);
   backdrop-filter: blur(40px) saturate(1.5);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.62),          /* bright glint, 1px */
-    inset 0 0 0 1px rgba(255, 255, 255, 0.14),        /* rim, quiet */
-    inset 0 -24px 36px -28px rgba(74, 58, 38, 0.24),  /* inner floor */
-    0 1px 2px rgba(74, 58, 38, 0.08),                 /* contact */
-    0 5px 12px -5px rgba(74, 58, 38, 0.14),           /* tight key */
-    0 28px 62px -28px rgba(74, 58, 38, 0.36);         /* ambient float */
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),          /* bright glint, 1px */
+    inset 0 0 0 1px rgba(74, 58, 38, 0.07),           /* rim — warm hairline */
+    inset 0 -24px 36px -30px rgba(74, 58, 38, 0.14),  /* inner floor, lighter */
+    0 1px 2px rgba(74, 58, 38, 0.05),                 /* contact */
+    0 5px 12px -5px rgba(74, 58, 38, 0.09),           /* tight key */
+    0 28px 62px -30px rgba(74, 58, 38, 0.22);         /* ambient float */
 }
 :root:not(.dark) .composer-shell:focus-within {
   background: linear-gradient(180deg,
-    rgba(201, 184, 165, 0.75) 0%,
-    rgba(196, 178, 158, 0.77) 45%,
-    rgba(191, 172, 151, 0.80) 100%);
+    rgba(74, 58, 38, 0.070) 0%,
+    rgba(74, 58, 38, 0.046) 45%,
+    rgba(74, 58, 38, 0.030) 100%);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.68),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.18),
-    inset 0 0 56px -16px rgba(126, 103, 59, 0.18),    /* gold warmth, now native */
-    inset 0 -24px 36px -28px rgba(74, 58, 38, 0.22),
-    0 1px 2px rgba(74, 58, 38, 0.08),
-    0 5px 12px -5px rgba(74, 58, 38, 0.14),
-    0 28px 62px -28px rgba(74, 58, 38, 0.38),
-    0 0 26px -13px rgba(126, 103, 59, 0.30);          /* outer gold whisper */
+    inset 0 1px 0 rgba(255, 255, 255, 0.78),
+    inset 0 0 0 1px rgba(126, 103, 59, 0.16),         /* rim warms on focus */
+    inset 0 0 56px -16px rgba(126, 103, 59, 0.13),    /* gold warmth, now native */
+    inset 0 -24px 36px -30px rgba(74, 58, 38, 0.13),
+    0 1px 2px rgba(74, 58, 38, 0.05),
+    0 5px 12px -5px rgba(74, 58, 38, 0.09),
+    0 28px 62px -30px rgba(74, 58, 38, 0.24),
+    0 0 26px -13px rgba(126, 103, 59, 0.22);          /* outer gold whisper */
 }
 
 /* The rim: brightest top-left, returning a second dimmer catch at the

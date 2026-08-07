@@ -286,13 +286,21 @@ describe('the prediction learns from what actually happened', () => {
   const ARGS = { provider: 'openai', deep: false, effort: 'none' };
 
   it('a slow answer lengthens the NEXT cover on that route', () => {
-    // The real event: predicted 1,400ms, actual 25,000ms, opener tier —
-    // roughly 13 seconds of speech against 25 seconds of silence.
-    expect(planCover(predictMainTtftMs(ARGS)).name).toBe('opener');
+    // The real event: predicted 1,400ms, actual 25,000ms — roughly 13
+    // seconds of speech against 25 seconds of silence.
+    //
+    // Since COVER_FLOOR_MS rose to 2,500 the calibrated 1,400ms baseline
+    // earns NO cover at all, which is the correct answer for a route that
+    // normally speaks in 1.4s. That makes this a sharper demonstration of
+    // the learning than it was before: observation has to turn "say
+    // nothing" into "say something real", not merely lengthen an opener.
+    expect(planCover(predictMainTtftMs(ARGS))).toBeNull();
     recordMainTtftMs(ARGS, 25_000);
     const after = predictMainTtftMs(ARGS);
     expect(after).toBeGreaterThan(staticTtftMs(ARGS));
-    expect(planCover(after).name).not.toBe('opener');
+    const plan = planCover(after);
+    expect(plan, 'a 25s answer must earn a cover').not.toBeNull();
+    expect(plan.name).not.toBe('opener');
   });
 
   it('one bad minute cannot pin the cover to it forever', () => {

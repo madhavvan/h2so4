@@ -316,6 +316,40 @@ describe('client and server guards agree exactly', () => {
     }
   });
 
+  // ── MEASURED IN THE RUNNING APP, 2026-08-07 ──
+  // The interviewer asked "…but every DAG is green", and the cover answered
+  //   "Success signals don't necessarily mean correctness, so the DAGs
+  //    being green doesn't confirm the dashboard's accuracy."
+  // which is precisely the judgement this engine was rebuilt to produce.
+  // The guard threw it away over `Success` and `DAGs`, and the candidate
+  // got 2.4 extra seconds of silence while the main model caught up.
+  //   - `DAGs`    : the question said DAG. A plural is the same name.
+  //   - `Success` : an abstract noun opening a sentence. Morphology cannot
+  //                 reach it — there is no suffix to read.
+  it('does not reject a judgement over a plural or an abstract noun', () => {
+    const q = 'Finance says the dashboard is wrong, but every DAG is green. How do you play that?';
+    const cover = "Success signals don't necessarily mean correctness, so the DAGs being green doesn't confirm the dashboard's accuracy.";
+    expect(guard.unverifiedProperNouns('siemens apollo kafka airflow', cover, q)).toEqual([]);
+  });
+
+  it('matches a name the interviewer used, in either number', () => {
+    // Acronyms get pluralised in speech constantly: DAG/DAGs, API/APIs,
+    // SLA/SLAs, KPI/KPIs. The allowed set holds whichever the interviewer
+    // happened to say, and the candidate says the other one.
+    expect(guard.unverifiedProperNouns('kafka', 'The DAGs are green.', 'every DAG is green')).toEqual([]);
+    expect(guard.unverifiedProperNouns('kafka', 'The API is the boundary.', 'which APIs did you expose?')).toEqual([]);
+    expect(guard.unverifiedProperNouns('kafka', 'That breaks the SLA.', 'without degrading SLAs')).toEqual([]);
+  });
+
+  it('…and a plural does NOT smuggle an invented employer past it', () => {
+    // The relaxation is about NUMBER, not about identity. "Accentures" is
+    // still Accenture and still absent from the knowledge base.
+    expect(guard.unverifiedProperNouns('kafka', 'I worked at Accentures.', 'tell me about your background'))
+      .not.toEqual([]);
+    expect(guard.unverifiedProperNouns('kafka', 'Googles infrastructure ran it.', 'tell me about your background'))
+      .not.toEqual([]);
+  });
+
   it('lets a real opening through', () => {
     const GOOD = [
       'At Apollo Hospitals I owned the Kafka and Python path for around 3M records a day.',

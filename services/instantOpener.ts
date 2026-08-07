@@ -155,7 +155,11 @@ const WHERE_WORKED_FORMS = [
 // shape in a technical screen after the background question.
 const EXPERIENCE_WITH = [
   /\b(?:do|did) you have (?:any )?(?:experience|exposure|familiarity) (?:with|in|on)\s+(.{2,40})/i,
-  /\bhave you (?:used|worked with|worked on|touched|built with)\s+(.{2,40})/i,
+  // "did you use X" / "do you use X" were missing, and they are among the
+  // most common ways an interviewer asks this — measured deferring on
+  // "Did you use Tableau?" while "have you used Tableau?" answered fine.
+  // The auxiliary carries no meaning here; only the verb does.
+  /\b(?:have|has|had|did|do|does)\s+you\s+(?:ever\s+)?(?:use|used|work(?:ed)?\s+(?:with|on)|touch(?:ed)?|built\s+with|build\s+with)\s+(.{2,40})/i,
   /\b(?:what|how much)(?:'s| is| was)? your experience (?:with|in|on)\s+(.{2,40})/i,
   /\bare you (?:familiar|comfortable|experienced) (?:with|in)\s+(.{2,40})/i,
   /\bhow (?:strong|good) are you (?:with|in|at)\s+(.{2,40})/i,
@@ -243,6 +247,9 @@ function anyMatch(res: RegExp[], s: string): boolean {
  */
 let toolFp = '';
 let toolSet: Set<string> = new Set();
+// Solo tools share toolSet's fingerprint cache — they are built in the
+// same pass, so they can never be stale relative to it.
+let soloSet: Set<string> = new Set();
 function toolVocabulary(ledger: Ledger): Set<string> {
   if (ledger.fingerprint === toolFp) return toolSet;
   const out = new Set<string>();
@@ -271,6 +278,69 @@ function toolVocabulary(ledger: Ledger): Set<string> {
     for (const item of String(s || '').split(/[,;|/]+/)) admitItem(item);
   };
 
+  // ── A TOKEN THAT ONLY EVER APPEARS INSIDE A LONGER NAME IS NOT A TOOL ──
+  //
+  // `admitItem` splits every list entry into tokens, so a two-word product
+  // contributes both of its halves. That is right for "Apache Kafka" (kafka
+  // is a tool) and catastrophic for "Google Cloud", "Snowflake schema
+  // modeling" and "Data Engineering Tools", which contributed `cloud`,
+  // `schema` and `data`. Measured on the real question corpus, spoken:
+  //
+  //   "how do you handle schema evolution"  -> "schema, at Indiana
+  //                                             University mostly."
+  //   "Are you using tablet cloud or tablet server?"
+  //                                         -> "cloud — yeah, that was the
+  //                                             G Technologies work."
+  //
+  // TOPIC_STOP exists to catch these and, as its own comment predicted, a
+  // denylist never finishes: it had `data` and not `cloud` or `schema`.
+  //
+  // The structural signal is that a real product name STANDS ALONE
+  // somewhere in the lists — "Kafka" and "Kubernetes" are their own comma
+  // item; `cloud` and `schema` never are, they only ever appear welded to
+  // something else. So the topic shape, which SPEAKS the token, is
+  // restricted to solo items. The looser set stays for everything that
+  // merely reads the vocabulary.
+  // A section HEADING names a category; its words are the ones that are
+  // never products. "Cloud Platforms" is why `cloud` must not be sayable,
+  // "Databases" is why `databases` must not — while `kafka`, which appears
+  // in no heading, is exactly the kind of word this shape exists to say.
+  const headingWords = new Set<string>();
+  for (const s of ledger.skills) {
+    for (const w of String(s.subject || '').toLowerCase().split(/[^a-z0-9+#.]+/)) {
+      if (w.length >= 2) headingWords.add(w);
+    }
+  }
+  const solo = new Set<string>();
+  const admitSolo = (s: string): void => {
+    for (const item of String(s || '').split(/[,;|/]+/)) {
+      const clean = item.replace(/[()]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!clean) continue;
+      const words = clean.split(' ');
+      // A single-word item is the product outright. For a short compound,
+      // the LAST word is the product and the first is a vendor — "Apache
+      // Kafka" is Kafka, "AWS Glue" is Glue. Rejecting compounds outright
+      // was too strict and cost a real answer to "tell me about your Kafka
+      // work", which opener-safety pins.
+      if (words.length > 3) continue;
+      const tok = words[words.length - 1].replace(/[^A-Za-z0-9+#.]/g, '').replace(/^\.+|\.+$/g, '');
+      if (!/^[A-Z0-9]/.test(tok)) continue;
+      const w = tok.toLowerCase();
+      if (w.length < 2 || w.length > 30) continue;
+      // …unless that last word is a category word, in which case the item
+      // is a KIND of thing, not a thing. "Google Cloud" ends in a heading
+      // word; "Apache Kafka" does not.
+      if (words.length > 1 && (headingWords.has(w) || TOPIC_STOP.has(w))) continue;
+      solo.add(w);
+    }
+  };
+  for (const s of ledger.skills) admitSolo(s.detail);
+  for (const p of ledger.projects) {
+    const d0 = String(p.detail || '');
+    const dash0 = d0.indexOf(' — ');
+    admitSolo(dash0 === -1 ? d0 : d0.slice(dash0 + 3));
+  }
+
   for (const s of ledger.skills) admitList(s.detail);
   for (const p of ledger.projects) {
     admitItem(p.subject);
@@ -282,7 +352,152 @@ function toolVocabulary(ledger: Ledger): Set<string> {
   }
   toolFp = ledger.fingerprint;
   toolSet = out;
+  soloSet = solo;
   return out;
+}
+
+/** Tools that appear as a STANDALONE list item — the ones safe to SPEAK. */
+function soloToolVocabulary(ledger: Ledger): Set<string> {
+  toolVocabulary(ledger);          // populates soloSet under the same fingerprint
+  return soloSet;
+}
+
+/** Words that name a CATEGORY on this résumé, taken from its own headings. */
+function categoryWords(ledger: Ledger): Set<string> {
+  const out = new Set<string>();
+  for (const s of ledger.skills) {
+    for (const w of String(s.subject || '').toLowerCase().split(/[^a-z0-9+#.]+/)) {
+      if (w.length >= 2) out.add(w);
+    }
+  }
+  return out;
+}
+
+/**
+ * Is this word a technology this candidate can be said to have used?
+ *
+ * The skills and project lists are the best evidence, but they are not the
+ * only evidence: plenty of résumés name a tool ONLY in an experience
+ * bullet — "Owned Apache Kafka and Python pipelines" with no Streaming
+ * line to back it up. Requiring the skills list rejected "have you used
+ * Kafka?" on exactly those résumés, which is a worse failure than the one
+ * it was guarding against.
+ *
+ * So the knowledge base's whole vocabulary is admitted, minus the two
+ * things that are demonstrably NOT products: the résumé's own section
+ * headings (`cloud`, `databases`, `data`) and TOPIC_STOP's ordinary verbs
+ * and nouns. That is what keeps "what is your experience in data
+ * engineering?" from answering "data was a big part of the Apollo work".
+ */
+function isSpeakableTech(ledger: Ledger, word: string): boolean {
+  const w = String(word || '').toLowerCase();
+  // Three characters, because the two-letter words that reached this point
+  // were prepositions: "what databases have you used IN production?"
+  // captured `in` and the app said "I have, yeah — in is in there."
+  if (!w || w.length < 3) return false;
+  if (TOPIC_STOP.has(w)) return false;
+  if (categoryWords(ledger).has(w)) return false;
+  // ⚠️ THE SKILLS AND PROJECT LISTS ONLY — never the whole vocabulary.
+  //
+  // `ledger.vocabulary` is every proper noun in the knowledge base, which
+  // is a far weaker claim than "this is a technology". Admitting it (to
+  // rescue a tool named only in an experience bullet) immediately put
+  // these back into the candidate's mouth, measured on the real corpus:
+  //
+  //   "Which AWS services have you used for data pipelines?"
+  //        -> "That's the Apollo Hospitals side of things — pipelines."
+  //   "Your experience with the risk management?"
+  //        -> "risk, at Philips mostly."
+  //   "…not to talk about the role or really anything…"
+  //        -> "That's the MSN Pharmaceuticals side of things — Role."
+  //
+  // The bullet-only case that motivated the widening turned out to be an
+  // artefact of a synthetic test résumé: every real résumé in the app's
+  // database that mentions Kafka also lists it under skills. A narrow list
+  // that occasionally stays quiet beats a broad one that says "pipelines"
+  // out loud.
+  return toolVocabulary(ledger).has(w);
+}
+
+// ── A PROCESS QUESTION IS NOT ANSWERED BY NAMING A TOOL ──
+//
+// The topic shape says, in effect, "yes, and here is where I used it".
+// That is a real answer to "did you use Tableau prep?" and a non-answer to
+// "how have you managed Kubernetes clusters, and what strategies did you
+// use for scaling?" — where naming Kubernetes and an employer engages with
+// nothing that was asked. Graded on the real corpus, this single
+// distinction accounts for most of the shape's bad output:
+//
+//   "How did you productionize the LLM calls (latency, cost, retries)?"
+//        -> "That's the Apollo Hospitals side of things — Azure."
+//   "How does the team balance experimentation with reliability?"
+//        -> "Azure — yeah, that was the Apollo Hospitals work."
+//   "Walk me through a complex PySpark pipeline you built."
+//        -> "That's the G Technologies side of things — PySpark."
+//
+// None of these are WRONG, which is what makes them dangerous: they are
+// confident, fluent and empty, and they are the first thing the
+// interviewer hears. There is no fact in a résumé that opens a "how"
+// question, so the honest move is to defer and let the model that can
+// actually reason answer it.
+const PROCESS_Q = new RegExp([
+  '\\bhow\\s+(?:do|did|does|would|have|has|are|is|can|could|should|you)\\b',
+  '|\\bwhat\\s+(?:strategies|approach|steps|process|techniques|optimi[sz]ations|trade-?offs)\\b',
+  '|\\b(?:walk|take)\\s+me\\s+through\\b',
+  '|\\b(?:explain|describe|elaborate)\\b',
+  '|\\btell\\s+me\\s+about\\s+(?:a|an|the)\\b',
+  '|\\bwhy\\s+(?:do|did|would|is|are|was)\\b',
+  '|\\bwhat\\s+would\\s+you\\s+do\\b',
+].join(''), 'i');
+
+/** True when the question asks HOW something is done, not WHETHER it was. */
+function isProcessQuestion(q: string): boolean {
+  return PROCESS_Q.test(String(q || ''));
+}
+
+// ── MENTIONING A TOOL IS NOT ASKING ABOUT THEIR EXPERIENCE OF IT ──
+//
+// The lexical topic branch fires when the question and an employer's
+// bullet share a technology word. That is a very low bar: an interview is
+// FULL of sentences that name a tool without asking whether the candidate
+// used it. Graded on the real corpus, everything below was spoken, and
+// every one of them deflects a real question into a CV placement:
+//
+//   "hey, what is the latest glue version?"
+//        -> "Glue, at KIMS Hospitals mostly."          (they asked a fact)
+//   "what tabs do you see in the AWS Glue dashboard?"
+//        -> "Glue — yeah, that was the G Technologies work."
+//   "My application in the Kubernetes platform is not responding."
+//        -> "That's the G Technologies side of things — Kubernetes."
+//   "I need you optimize the Spark job? That is running too slow"
+//        -> "Spark — yeah, that was the Nizam's Institute work."
+//
+// This is exactly the "trivial resume recall" the product owner called
+// out: anyone can name where they used a tool, and doing it in front of a
+// question that asked something else is worse than saying nothing. So the
+// branch now requires the question to actually ASK about their experience.
+// `EXPERIENCE_WITH` above handles the cases whose phrasing it can capture;
+// this is the same intent expressed as a gate for the ones it cannot.
+const EXPERIENCE_FRAMING = new RegExp([
+  '\\b(?:have|has|had|did)\\s+you\\s+(?:ever\\s+)?',
+  '(?:use|used|work|worked|build|built|run|ran|manage|managed|touch|touched|ship|shipped|write|written)\\b',
+  '|\\bdo\\s+you\\s+have\\s+(?:any\\s+)?experience\\b',
+  '|\\bare\\s+you\\s+familiar\\s+with\\b',
+  '|\\byour\\s+experience\\s+(?:with|in|of)\\b',
+  '|\\bever\\s+(?:used|worked|built)\\b',
+  '|\\bhow\\s+(?:long|many\\s+years)\\s+have\\s+you\\b',
+  // Possessive framing is asking about them just as plainly as "have you
+  // used" is. An earlier, tighter version of this list deferred on "tell
+  // me about your Kafka work" — a question that is entirely about their
+  // experience — which the opener-safety suite caught. Same failure shape
+  // as the BACKGROUND_Q narrowing: too strict costs a real answer.
+  '|\\btell\\s+me\\s+about\\s+your\\b',
+  '|\\byour\\s+(?:experience|work|background|projects?|role)\\b',
+].join(''), 'i');
+
+/** True when the question asks about the candidate's own use of something. */
+function asksAboutTheirExperience(q: string): boolean {
+  return EXPERIENCE_FRAMING.test(String(q || ''));
 }
 
 /** Stable, order-independent hash — picks a phrasing without randomness. */
@@ -790,10 +1005,37 @@ export function composeOpener(
     // platforms shape below, which exists precisely to name the tools off a
     // skills line, was never reached.
     if (!known) break;
+    // ⚠️ THE CAPTURED TERM HAS TO BE A TECHNOLOGY, AND THIS BRANCH USED TO
+    // ACCEPT ANY VOCABULARY WORD. `ledger.vocabulary` is every proper noun
+    // in the knowledge base, so "what is your experience in data
+    // engineering?" captured "data engineering", matched on the head
+    // `data`, and the app said out loud:
+    //     "Yeah — data was a big part of the Apollo Hospitals work."
+    // TOPIC_STOP was never consulted here — it guards the lexical branch
+    // further down — so the same denylist that already contained `data`
+    // did nothing. Both branches now answer to the same test.
+    const askedLower = asked.toLowerCase();
+    const isTech = isSpeakableTech(ledger, askedLower)
+      || asked.split(/\s+/).some((p) => isSpeakableTech(ledger, p));
+    if (!isTech) break;
+    // A "how" question is not answered by naming where a tool was used.
+    if (isProcessQuestion(q)) break;
     // Name where it happened when the ledger can place it, because "yes"
     // alone invites the follow-up this opener exists to get ahead of.
     const placed = selectFacts(ledger, asked, 3).find((f) => f.kind === 'employer');
-    const label = ledger.vocabulary.has(asked.toLowerCase()) ? asked : asked.split(/\s+/)[0];
+    // ⚠️ THE PRODUCT, NOT THE VENDOR. When the captured phrase is not in
+    // the vocabulary as a whole, this used to speak its FIRST word — so
+    // "Have you used Apache Airflow in production?" was answered
+    // "Yeah — Apache was a big part of the Apollo Hospitals work."
+    // Nobody calls Airflow "Apache". Prefer the token the knowledge base
+    // itself treats as a product, scanning from the END, because English
+    // puts the vendor first and the thing second.
+    const solo = soloToolVocabulary(ledger);
+    const parts = asked.split(/\s+/);
+    const product = [...parts].reverse().find((p) => solo.has(p.toLowerCase().replace(/[^a-z0-9+#.]/gi, '')));
+    const label = ledger.vocabulary.has(asked.toLowerCase())
+      ? asked
+      : (product || parts[0]);
     return placed
       ? emit(pick(HAVE_USED_FORMS, seed)(label, placed.subject), 'topic')
       : emit(pick(HAVE_USED_NO_ORG_FORMS, seed)(label), 'topic');
@@ -838,15 +1080,102 @@ export function composeOpener(
     const qTerms = new Set(
       q.toLowerCase().split(/[^a-z0-9+#.]+/).filter((t) => t.length > 3).map(stem),
     );
-    const labelHit = ledger.skills.find((s) => {
-      const label = s.subject.toLowerCase();
-      for (const t of qTerms) if (label.includes(t)) return true;
-      return false;
-    });
-    const ranked = selectFacts(ledger, q, 3, ['skill']);
-    const skill = labelHit || ranked[0] || ledger.skills[0];
+    // ── MATCH THE ITEMS, NOT JUST THE HEADING, AND NEVER GUESS ──
+    //
+    // This used to score sections by HEADING alone and then fall back to
+    // `ledger.skills[0]` — an arbitrary section — and speak its FIRST three
+    // items. Graded on the real question corpus, that produced, aloud:
+    //
+    //   "What vector databases have you used (OpenSearch, Neptune,
+    //    Pinecone)?"   -> "Databases — PostgreSQL, MySQL, MongoDB."
+    //        …while the résumé's own Databases line lists Pinecone,
+    //          Weaviate, Milvus and Chroma. It had the answer and read
+    //          past it.
+    //   "What are the Tableau tools did you use?"
+    //                  -> "Data Engineering Tools — Airflow, Prefect, Spark."
+    //   "what's g technology is based on?"
+    //                  -> "Programming Languages — Java, Spring Boot, Python."
+    //
+    // So: score a section by how many of ITS ITEMS the question names, with
+    // the heading worth less than an item; surface the items that MATCHED
+    // rather than the first three; and when nothing matches, say nothing.
+    // An arbitrary section spoken with confidence is the "trivial résumé
+    // recall" this engine is supposed to be better than.
+    // ⚠️ WHOLE TOKENS, WEIGHTED BY HOW DISTINCTIVE THEY ARE.
+    //
+    // A substring test lets the most generic word in the question decide
+    // the answer. "What is your experience with the ETL tools, work
+    // orchestration, airflow…" scored `data` against "Data Quality" and
+    // answered "SRE & Governance — Data Quality, Data Observability" — a
+    // section the question never mentioned — while the Data Engineering
+    // Tools line, which literally lists Airflow, sat unread. Matching whole
+    // tokens and weighting by term length makes `airflow` (7) outrank
+    // `data` (4), which is the whole difference.
+    //
+    // Items are cleaned first: firstTools splits "Elasticsearch (or
+    // OpenSearch)" into a fragment beginning with a conjunction, and
+    // "or OpenSearch" spoken aloud is an obvious parse artifact.
+    const cleanItem = (t: string) => t.replace(/^(?:or|and|e\.g\.?|etc\.?)\s+/i, '').trim();
+    const scoreOf = (s: Fact): { score: number; hits: string[] } => {
+      const items = firstTools(s, 40).map(cleanItem).filter(Boolean);
+      const scored: Array<{ item: string; w: number }> = [];
+      for (const it of items) {
+        const toks = new Set(it.toLowerCase().split(/[^a-z0-9+#.]+/).filter(Boolean).map(stem));
+        let w = 0;
+        for (const t of qTerms) if (toks.has(t)) w = Math.max(w, t.length);
+        if (w) scored.push({ item: it, w });
+      }
+      // Most distinctive match first, so "Pinecone" is spoken before the
+      // category word "Vector Databases" that happens to sit beside it.
+      scored.sort((a, b) => b.w - a.w);
+      const label = s.subject.toLowerCase().split(/[^a-z0-9+#.]+/).filter(Boolean).map(stem);
+      let headScore = 0;
+      for (const t of qTerms) if (label.includes(t)) headScore = Math.max(headScore, t.length);
+      // ⚠️ THE BEST MATCH DECIDES, NOT THE MOST MATCHES.
+      // Summing let a section win on volume: "…ETL tools, work
+      // orchestration, airflow…" matched the generic `data` against three
+      // items of "SRE & Governance — Data Quality, Data Observability,
+      // Data Contracts" (3 x 4) and beat the single `airflow` (1 x 7) in
+      // the section that literally lists Airflow. One distinctive hit is
+      // worth more than three vague ones, so the max leads and the count
+      // only breaks ties.
+      const maxW = scored.length ? scored[0].w : 0;
+      const score = maxW * 10 + Math.min(scored.length, 3) + headScore;
+      // A hit that merely repeats the heading ("Vector Databases" under
+      // "Databases") is a sub-category label, not a product. Keep it, but
+      // behind anything concrete — nobody answers "which databases?" with
+      // the word "databases".
+      const isCategoryish = (it: string) => {
+        const toks = it.toLowerCase().split(/[^a-z0-9+#.]+/).filter(Boolean).map(stem);
+        return toks.length > 1 && toks.some((t) => label.includes(t));
+      };
+      const concrete = scored.filter((x) => !isCategoryish(x.item));
+      const rest = scored.filter((x) => isCategoryish(x.item));
+      return { score, hits: [...concrete, ...rest].map((x) => x.item) };
+    };
+    let best: Fact | null = null;
+    let bestHits: string[] = [];
+    let bestScore = 0;
+    for (const s of ledger.skills) {
+      const { score, hits } = scoreOf(s);
+      if (score > bestScore) { bestScore = score; best = s; bestHits = hits; }
+    }
+    // No fallback to an arbitrary section, and never in front of a "how"
+    // or "describe" question — a skills list does not answer either.
+    const skill = bestScore > 0 && !isProcessQuestion(q) ? best : null;
     if (skill) {
-      const tools = firstTools(skill, 3).join(', ');
+      // The matched items first; top up from the section when the match was
+      // on the heading alone, or when everything that matched was the
+      // category word itself — "which databases?" answered with the word
+      // "Databases" is not an answer, so name actual products beside it.
+      const picked = bestHits.slice(0, 3);
+      if (picked.length < 3) {
+        for (const t of firstTools(skill, 8)) {
+          if (picked.length >= 3) break;
+          if (!picked.some((p) => p.toLowerCase() === t.toLowerCase())) picked.push(t);
+        }
+      }
+      const tools = picked.slice(0, 3).join(', ');
       // A skills section written as a bare list has no heading to speak, so
       // the label is the reserved placeholder rather than the candidate's
       // own words. Saying it out loud would be inventing a category.
@@ -909,16 +1238,35 @@ export function composeOpener(
     // are the ones in the skills lines and the projects' tech lists. A word
     // that is not one of those is not a tool, however capitalised a bullet
     // left it.
-    const tools = toolVocabulary(ledger);
+    // SOLO tools only here, because this branch SPEAKS the token. See
+    // soloToolVocabulary: a word that only ever appears welded into a
+    // longer name ("Google Cloud", "Snowflake schema modeling") is not a
+    // product, and saying it aloud produced "cloud — yeah, that was the
+    // G Technologies work."
+    // LONGEST match, not first. "Have you used Apache Airflow?" shares both
+    // `apache` and `airflow` with the bullet, and taking the first produced
+    // "Yeah — Apache was a big part of the Apollo Hospitals work." The
+    // vendor prefix is never the answer; the product is.
+    //
+    // isSpeakableTech rather than the solo list: a tool named only in an
+    // experience bullet ("Owned Apache Kafka and Python pipelines", no
+    // Streaming skills line) is still a tool, and requiring the skills list
+    // deferred "tell me about your Kafka work" on exactly those résumés.
+    // Category words are still excluded, and the two gates below — the
+    // question must ASK about their experience and must not be a "how" —
+    // are what make the looser word list safe here.
     const tool = String(emp.detail || '')
       .split(/[\s,;()]+/)
       .map((t) => t.replace(/[^A-Za-z0-9+#.]/g, ''))
-      .find((t) => {
-        const lower = t.toLowerCase();
-        return t.length > 2 && qTokens.has(lower)
-          && tools.has(lower) && !TOPIC_STOP.has(lower);
-      });
-    if (tool) return emit(pick(TOPIC_FORMS, seed)(tool, emp.subject), 'topic');
+      .filter((t) => t.length > 2 && qTokens.has(t.toLowerCase())
+        && isSpeakableTech(ledger, t.toLowerCase()))
+      .sort((a, b) => b.length - a.length)[0];
+    // Speak only when the question actually asked about their experience,
+    // and never in front of a "how" question — naming a tool begins to
+    // answer neither.
+    if (tool && asksAboutTheirExperience(q) && !isProcessQuestion(q)) {
+      return emit(pick(TOPIC_FORMS, seed)(tool, emp.subject), 'topic');
+    }
   }
 
   // Nothing certain to say. A live model may still fill the gap on the

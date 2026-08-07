@@ -29,9 +29,91 @@ describe('the prompt the cover model actually receives', () => {
     expect(p).toContain('Fidelity');
   });
 
+  // The question here must be one ABOUT THEM. Since 2026-08-06 the résumé
+  // is only sent when it is, because a fast model handed a résumé and a
+  // hard technical question answers from the résumé — measured live,
+  // "I'd verify the current data processing workflows at Indiana
+  // University and Apollo Hospitals" in front of a question about the
+  // INTERVIEWER's Airflow instance.
   it('says the background is true and bounds it', () => {
-    const p = userPrompt('q?', 'other', RESUME);
+    const p = userPrompt('have you worked with Kafka?', 'other', RESUME);
     expect(p).toMatch(/true — use it, never go beyond it/);
+  });
+
+  it('does NOT send the résumé for a problem to solve', () => {
+    // A problem question is answered from the QUESTION. Sending the
+    // résumé is what produced résumé recitation in front of every
+    // technical question in the 2026-08-06 run.
+    const p = userPrompt(
+      'How would you design exactly-once delivery into a non-idempotent sink?',
+      'system_design',
+      RESUME,
+    );
+    expect(p).not.toContain('CANDIDATE BACKGROUND');
+    expect(p).not.toContain('Apollo');
+  });
+
+  // ── THE ASYMMETRY THAT DECIDES THIS PREDICATE ──
+  // Graded over the real question corpus on 2026-08-06. A narrower version
+  // of BACKGROUND_Q withheld the résumé from three genuinely
+  // candidate-focused questions, and none of them degraded gracefully:
+  //   "explain about your peojects"  -> "I need the CANDIDATE BACKGROUND
+  //                                      section to answer this"
+  //   "largest data volume you have" -> "around two terabytes" (invented;
+  //                                      the truth is 3M records/day)
+  //   "which Azure services have you used" -> "I haven't worked with Azure"
+  // Withholding it produces invention or denial, SPOKEN. Sending it to a
+  // problem question only produces recitation, which the prompt forbids
+  // anyway. So the predicate is deliberately generous, and these are the
+  // cases that pin both edges of it.
+  it('is generous about what counts as a question about them', () => {
+    for (const q of [
+      'can you explain about your peojects?',
+      'What is the largest data volume you have personally been responsible for?',
+      'Which Azure services have you used for LLM workloads?',
+      'Have you ever worked at IBM?',
+      'Do you know FastAPI?',
+      'Are you familiar with Databricks?',
+      'Tell me about a time you disagreed with your team lead.',
+      'What is a technical decision you made that turned out to be wrong?',
+      'where have your worked before?',
+    ]) {
+      expect(userPrompt(q, 'ml_data', RESUME), q).toContain('CANDIDATE BACKGROUND');
+    }
+  });
+
+  it('but hypothetical framing is not a question about them', () => {
+    // "you" in a hypothetical is not the same pronoun. An earlier version
+    // matched a bare "do you" and handed the résumé to a Snowflake cost
+    // question, which is how résumé recitation reached a problem answer.
+    for (const q of [
+      'How would you design exactly-once delivery into a non-idempotent sink?',
+      'Cut our Snowflake bill by 40 percent without degrading SLA. Where do you start?',
+      'How would you approach a 400-DAG Airflow instance with a 30% failure rate?',
+      'A dashboard shows wrong numbers but every pipeline is green.',
+      'What is the difference between a data lake and a lakehouse?',
+      'How does Kafka guarantee ordering?',
+    ]) {
+      expect(userPrompt(q, 'ml_data', RESUME), q).not.toContain('CANDIDATE BACKGROUND');
+    }
+  });
+
+  it('still sends it for the questions that are about them', () => {
+    // "tell me about yourself" does not match the have-you/do-you shape,
+    // so it needs its own predicate — and it reaches the live cover
+    // whenever the résumé failed to parse, which is when it matters most.
+    for (const q of [
+      'tell me about yourself',
+      'walk me through your background',
+      'where have you worked before?',
+      'what have you worked on?',
+    ]) {
+      expect(userPrompt(q, 'other', RESUME), q).toContain('CANDIDATE BACKGROUND');
+    }
+    // …and for the two categories that are lookups about their own life.
+    expect(userPrompt('what was your degree?', 'clarifier', RESUME)).toContain('CANDIDATE BACKGROUND');
+    expect(userPrompt('tell me about a time you shipped something hard', 'behavioral', RESUME))
+      .toContain('CANDIDATE BACKGROUND');
   });
 
   it('omits the section entirely when there is no background', () => {
@@ -46,10 +128,11 @@ describe('the prompt the cover model actually receives', () => {
     // before its first employer. Measured after raising it: first token
     // still 500-740ms on Groq llama-3.3-70b. So: generous enough for any
     // resume, hard enough that a 50K document cannot blow the deadline.
-    const huge = userPrompt('q?', 'other', 'x'.repeat(50_000));
+    const ABOUT_THEM = 'have you worked with Kafka?';
+    const huge = userPrompt(ABOUT_THEM, 'other', 'x'.repeat(50_000));
     expect(huge.length).toBeLessThan(10_000);
-    const realistic = userPrompt('q?', 'other', 'x'.repeat(7_300));   // a real resume
-    expect(realistic).toContain('x'.repeat(7_300));                   // uncut
+    const realistic = userPrompt(ABOUT_THEM, 'other', 'x'.repeat(7_300));  // a real resume
+    expect(realistic).toContain('x'.repeat(7_300));                        // uncut
   });
 });
 
@@ -183,15 +266,60 @@ describe('question one is grounded, without waiting for extraction', () => {
 //  be contradicted. After: 0 of 7 contradicted, 0 of 7 reciting the
 //  resume (was 4 and 3).
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-describe('problems open with what you would establish, not the fix', () => {
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  A PROBLEM QUESTION GETS A JUDGEMENT, NOT A PROCESS
+//
+//  History, because this rule has now been wrong in BOTH directions and
+//  the tests below exist to stop it swinging a third time.
+//
+//  v1 said "name the technique/pattern you would reach for" — so the
+//  cover guessed a mechanism the reasoning model then contradicted one
+//  sentence later, out loud, mid-answer.
+//  v2 over-corrected to "open with WHAT YOU WOULD ESTABLISH FIRST" —
+//  safe, uncontradictable, and completely empty. Measured live in the
+//  running app on 2026-08-06: "I'd want to confirm the current ETL
+//  pipeline's performance metrics" in front of a question about
+//  exactly-once delivery, while the main model's own first sentence was
+//  "true exactly-once delivery is impossible if the sink supports
+//  neither deduplication nor transactional writes." The cover was
+//  DISPLACING a better opening with filler.
+//
+//  v3 (current) names the third option the first two missed: state what
+//  is ALREADY TRUE about the problem as stated — the constraint, the
+//  distinction, or the reframe. Substantive, and still uncontradictable,
+//  because it is a claim about the QUESTION rather than about a system
+//  nobody has looked at yet.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('problems open with a judgement, not a process', () => {
   it('separates questions about them from problems to solve', () => {
     expect(COVER_SYSTEM).toMatch(/THREE KINDS OF QUESTION, THREE KINDS OF OPENING/);
-    expect(COVER_SYSTEM).toMatch(/WHAT YOU WOULD ESTABLISH FIRST, never with the\s*\n?solution/);
+    expect(COVER_SYSTEM).toMatch(/THE ONE THING THAT IS ALREADY TRUE ABOUT THIS PROBLEM/);
   });
 
-  it('says why, so nobody softens it back into guessing', () => {
-    expect(COVER_SYSTEM).toMatch(/a named cause or mechanism is a GUESS/);
-    expect(COVER_SYSTEM).toMatch(/walk it back\s*\n?\s*mid-sentence/);
+  it('names the three substantive shapes it can take', () => {
+    expect(COVER_SYSTEM).toMatch(/THE CONSTRAINT that decides the whole answer/);
+    expect(COVER_SYSTEM).toMatch(/THE DISTINCTION the question turns on/);
+    expect(COVER_SYSTEM).toMatch(/THE REFRAME/);
+  });
+
+  it('still forbids guessing the cause — the v1 failure', () => {
+    expect(COVER_SYSTEM).toMatch(/THIS IS NOT A GUESS AT THE CAUSE/);
+    expect(COVER_SYSTEM).toMatch(/Never name the culprit, the\s*\n?\s*mechanism, or the fix/);
+    // …and still says WHY, so nobody softens it back into guessing.
+    expect(COVER_SYSTEM).toMatch(/contradict them one sentence\s*\n?\s*later/);
+  });
+
+  it('and now forbids narrating the process — the v2 failure', () => {
+    expect(COVER_SYSTEM).toMatch(/IT IS NOT A DESCRIPTION OF YOUR PROCESS/);
+    // The exact sentences measured in the app, quoted in the prompt so a
+    // future editor sees what this is guarding against.
+    expect(COVER_SYSTEM).toMatch(/I'd verify the\s*\n?\s*current metrics/);
+    // The test a writer can apply to their own sentence.
+    expect(COVER_SYSTEM).toMatch(/still make sense pasted under a\s*\n?\s*completely different question/);
+  });
+
+  it('keeps the employment history out of a problem answer', () => {
+    expect(COVER_SYSTEM).toMatch(/never open a problem\s*\n?\s*question with their employment history/);
   });
 
   it('forbids importing a technology the question never mentioned', () => {
@@ -200,18 +328,24 @@ describe('problems open with what you would establish, not the fix', () => {
     expect(COVER_SYSTEM).toMatch(/Never assume their stack/);
   });
 
-  it('the category hints no longer ask for a technique up front', () => {
-    const { CATEGORY_HINTS } = (() => {
+  it('the category hints ask for a judgement, not a technique and not a process', () => {
+    const CATEGORY_HINTS = (() => {
       const src = fs.readFileSync(
         path.resolve(process.cwd(), 'src', 'services', 'coverAnswer.js'), 'utf8');
-      const m = /const CATEGORY_HINTS = \{[\s\S]*?\n\};/.exec(src)[0];
-      return { CATEGORY_HINTS: m };
+      return /const CATEGORY_HINTS = \{[\s\S]*?\n\};/.exec(src)[0];
     })();
-    // These two lines were the direct cause of the guessed mechanisms.
+    // v1's mistake — guessing a mechanism.
     expect(CATEGORY_HINTS).not.toMatch(/name the technique\/pattern you would reach for/);
     expect(CATEGORY_HINTS).not.toMatch(/name the overall shape you would start from/);
-    expect(CATEGORY_HINTS).toMatch(/what you would clarify or check about the input first/);
-    expect(CATEGORY_HINTS).toMatch(/which constraint or requirement you would pin down first/);
+    // v2's mistake — narrating the process. Every one of these shipped.
+    expect(CATEGORY_HINTS).not.toMatch(/what you would clarify or check about the input first/);
+    expect(CATEGORY_HINTS).not.toMatch(/which constraint or requirement you would pin down first/);
+    expect(CATEGORY_HINTS).not.toMatch(/say what you would verify or measure first/);
+    expect(CATEGORY_HINTS).not.toMatch(/say how you would break the problem down first/);
+    // v3 — what they must ask for instead.
+    expect(CATEGORY_HINTS).toMatch(/the invariant that decides the approach/);
+    expect(CATEGORY_HINTS).toMatch(/the constraint the whole design turns on/);
+    expect(CATEGORY_HINTS).toMatch(/what is or is not achievable given what they described/);
   });
 });
 

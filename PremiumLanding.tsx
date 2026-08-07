@@ -4656,11 +4656,19 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             whole page is built on — so it reads as something written
             beside the price list rather than another statement
             competing with it. The rule draws downward like a pen
-            stroke; the two lines follow it in sequence. */}
+            stroke; the two lines follow it in sequence.
+
+            ⚠️ TONE: this asks, it does not dismiss. The first line read
+            "If this is more than you can spare, go find something you
+            can." — which sends a candidate who cannot afford it away, in
+            the same breath as the price. The second line was always the
+            warm one; the first now opens the door instead of closing it,
+            so the pair reads as an invitation to talk rather than a
+            verdict on whether they belong here. Keep it that way. */}
         <div className="pl-reveal pl-note" style={{ margin: '54px 0 4px' }}>
           <span className="pl-note-rule" aria-hidden />
           <span className="pl-note-l pl-serif" style={{ fontSize: 'clamp(17px,2vw,21px)', lineHeight: 1.5, fontWeight: 500, letterSpacing: '-0.015em', color: 'var(--paper)' }}>
-            If this is more than you can spare, go find something you can.
+            If this is more than you can spare right now, please tell us.
           </span>
           <span className="pl-note-l" style={{ fontSize: 14.5, lineHeight: 1.6, color: 'var(--mut)', marginTop: 10 }}>
             We would rather you walked in prepared than paid us.

@@ -236,6 +236,28 @@ const SENTENCE_OPENERS = new Set([
   'lately', 'occasionally', 'frequently', 'rarely', 'possibly',
   'apparently', 'seemingly', 'presumably', 'hopefully', 'thankfully',
   'unfortunately', 'interestingly', 'surprisingly',
+  // Plain adjectives, quantifiers and engineering adjectives that a real
+  // JUDGEMENT starts with. Added 2026-08-06 when the cover prompt stopped
+  // asking for a description of process and started asking for the thing
+  // that is already true — at which point the openings it produced began
+  // with words like these, and every one was rejected as an invented
+  // company. Same failure the 'additionally' note above records; the
+  // isInflectedEnglish() rule below now covers the -ing/-ly/-tion shapes
+  // generically, and these are the ones morphology cannot reach.
+  // Abstract nouns a judgement opens on. "Success signals don't
+  // necessarily mean correctness…" was rejected as an invented company
+  // over the word `Success` — morphology cannot reach these (no suffix to
+  // read) and they are the vocabulary of exactly the sentences this engine
+  // was rebuilt to produce.
+  'success', 'failure', 'correctness', 'completion', 'accuracy',
+  'throughput', 'ordering', 'reliability', 'availability', 'durability',
+  'quality', 'safety', 'speed', 'scale', 'volume', 'freshness', 'staleness',
+  'strict', 'strictly', 'daily', 'hourly', 'weekly', 'monthly',
+  'green', 'both', 'most', 'many', 'much', 'any', 'all', 'each',
+  'real', 'simple', 'hard', 'easy', 'wrong', 'right', 'full',
+  'complete', 'partial', 'fast', 'slow', 'cheap', 'accurate',
+  'atomic', 'idempotent', 'transactional', 'eventual', 'immediate',
+  'duplicate', 'duplicates', 'sequential', 'parallel', 'linear',
 ]);
 
 function tokenize(s: string): string[] {
@@ -618,7 +640,14 @@ const NAME_JOINERS = new Set(['of', 'the', 'and', 'for', '&']);
 function collectVocabulary(text: string, into: Set<string>): void {
   for (const run of text.match(PROPER_RUN) || []) {
     for (const tok of run.split(/[\s&]+/)) {
-      const w = tok.replace(/[^A-Za-z0-9+#.'’-]/g, '').toLowerCase();
+      // ⚠️ THE KEEP-SET HERE MUST MATCH THE ONE IN unverifiedProperNouns.
+      // It used to keep '.', which the matcher strips — so a name ENDING A
+      // SENTENCE was stored as "sla." while the matcher looked for "sla",
+      // and the two never met. Measured live 2026-08-06: the interviewer
+      // asked to "cut the bill without degrading SLA." and the cover
+      // answering it was thrown away for inventing SLA — a word the
+      // question had just used. Mirrors groundingGuard.js.
+      const w = tok.replace(/[^A-Za-z0-9+#'’-]/g, '').toLowerCase();
       if (w.length >= 2 && !NAME_JOINERS.has(w)) into.add(w);
     }
   }
@@ -1124,6 +1153,64 @@ export function _ledgerBuilds(): number { return memoBuilds; }
 // insufficient for entity questions — a sentence CLAIMING Goldman also
 // echoes it — which is exactly why those questions are answered from the
 // ledger instead of by a model. See services/instantOpener.ts.
+
+// ── A SENTENCE-INITIAL WORD THAT IS ENGLISH MORPHOLOGY, NOT A NAME ──
+// Kept byte-identical to isInflectedEnglish / ENGLISH_SUFFIX in
+// server/src/services/groundingGuard.js. The parity test fails if they
+// drift.
+//
+// SENTENCE_OPENERS is a fixed list, so the waiver it grants is only ever
+// as complete as the list. Measured 2026-08-06, after the cover prompt was
+// changed to ask for a real judgement instead of a description of process,
+// its openings were rejected one after another — "Strict exactly-once is
+// impossible…", "Treating green as completion…", "Achieving that at the
+// sink…" — all ordinary English, all reported as invented companies, so
+// the cover was dropped and the candidate got silence instead.
+//
+// Morphology is the discriminator a list cannot be: these suffixes are
+// English derivation and inflection, and company names essentially never
+// take them. Acronyms are excluded before this is consulted, so "IBM"
+// opening a sentence is still IBM, and a bare capitalised noun (Google,
+// Accenture, Optum) carries no suffix and is still caught.
+// ⚠️ `-ity` IS DELIBERATELY ABSENT. It reads as pure morphology
+// (quality, integrity, availability) right up until you remember that
+// Fidelity is an employer — and "recently at Fidelity Investments" is a
+// fabrication this codebase has already caught in the field, pinned in
+// grounding-parity.test.js. `-ency`/`-ancy` are kept because no employer
+// in reach takes them, and they buy back the words a judgement about
+// distributed systems genuinely opens with: Consistency, Latency,
+// Redundancy, Frequency.
+const ENGLISH_SUFFIX = /(?:ing|edly|ed|ly|est|tion|sion|ness|ment|ance|ence|ency|ancy|able|ible|ive|ous|ful|less|ised|ized)$/i;
+
+// Closed list, on purpose — see the hyphen note in unverifiedProperNouns.
+// These are English prefixes that attach to an ordinary word; a company
+// name essentially never begins with one, and keeping the list closed is
+// what stops "Google-scale" being cleared by its own second half.
+// Kept byte-identical to HYPHEN_PREFIX in
+// server/src/services/groundingGuard.js.
+const HYPHEN_PREFIX = new Set([
+  'non', 'pre', 'post', 'anti', 'multi', 'sub', 'semi', 're', 'un',
+  'inter', 'intra', 'over', 'under', 'cross', 'self', 'near', 'quasi',
+  'pseudo', 'co', 'bi', 'tri', 'ex', 'mid', 'off', 'out', 'up', 'de',
+  'micro', 'macro', 'mini', 'auto', 'meta', 'ultra', 'super', 'hyper',
+]);
+
+function isInflectedEnglish(word: string): boolean {
+  const w = String(word || '');
+  // ⚠️ NEVER a hyphenated compound. "Accenture-led" and "IBM-hosted" both
+  // end in -ed, and waiving them here let a fabricated employer through in
+  // testing — the suffix belongs to the SECOND half while the name sits in
+  // the first. Compounds are decided by the hyphen rules in
+  // unverifiedProperNouns, which look at the head, and only there.
+  if (w.includes('-')) return false;
+  if (w.length < 6) return false;
+  const m = ENGLISH_SUFFIX.exec(w);
+  if (!m) return false;
+  // The part before the suffix has to look like a stem, not a stub:
+  // "Boeing" is bo+ing and fails this; "Treating" is treat+ing and passes.
+  return (w.length - m[0].length) >= 4;
+}
+
 export function unverifiedProperNouns(
   ledger: Ledger,
   text: string,
@@ -1202,7 +1289,19 @@ export function unverifiedProperNouns(
     // "Nizam's" match a vocabulary entry of "nizam" while a genuine
     // possessive brand ("McDonald's") still matches its own full form.
     const base = w.replace(/['’](?:s|d|ve|ll|re|m|t)$/, '');
-    const known = (set: Set<string>) => set.has(w) || (!!base && set.has(base));
+    // ⚠️ A PLURAL IS THE SAME NAME. The interviewer asked "…every DAG is
+    // green", the cover said "…the DAGs being green", and the guard called
+    // DAGs invented because the allowed set held `dag` — throwing away a
+    // correct sentence. Acronyms get pluralised in speech constantly:
+    // DAGs/DAG, APIs/API, SLAs/SLA, KPIs/KPI. Mirrors groundingGuard.js.
+    const forms = new Set([w, base].filter(Boolean));
+    for (const f of [w, base]) {
+      if (!f) continue;
+      if (f.endsWith('es') && f.length > 4) forms.add(f.slice(0, -2));
+      if (f.endsWith('s') && f.length > 3) forms.add(f.slice(0, -1));
+      else forms.add(`${f}s`);
+    }
+    const known = (set: Set<string>) => { for (const f of forms) if (set.has(f)) return true; return false; };
     // THE EARNED WAIVER. A sentence-initial word skips the check only when
     // something says it is an ordinary word: one of the two common-word
     // lists, or its own lowercase twin elsewhere in this text. Anything else
@@ -1212,7 +1311,8 @@ export function unverifiedProperNouns(
     // DISCOURSE is consulted here as well as below on purpose, so the waiver
     // stays correct if the checks under it are ever reordered.
     if (initials.has(m.index) && !isAcronym
-      && (known(DISCOURSE) || known(SENTENCE_OPENERS) || known(lowered))) continue;
+      && (known(DISCOURSE) || known(SENTENCE_OPENERS) || known(lowered)
+        || isInflectedEnglish(base))) continue;
     if (known(DISCOURSE)) continue;
     if (known(ledger.vocabulary)) continue;
     if (known(extra)) continue;
@@ -1223,8 +1323,27 @@ export function unverifiedProperNouns(
     // Only the LEADING segment is consulted, so "Google-scale" is still
     // Google and still caught. Mirrors groundingGuard.js — parity test.
     const stem = base.split('-')[0];
+    // SENTENCE_OPENERS is consulted here too: "Exactly-once" is `exactly`
+    // plus English, and `exactly` is an ordinary word this file already
+    // knows — it was only ever missing from THIS check, so the single most
+    // likely opening word of an answer about delivery semantics was
+    // reported as an invented company.
     if (stem !== base && stem.length >= 2
-      && (DISCOURSE.has(stem) || ledger.vocabulary.has(stem) || extra.has(stem))) continue;
+      && (DISCOURSE.has(stem) || SENTENCE_OPENERS.has(stem)
+        || ledger.vocabulary.has(stem) || extra.has(stem))) continue;
+    // A LEADING ENGLISH PREFIX IS MORPHOLOGY, NOT A NAME. "Non-idempotent"
+    // is `non` + `idempotent`, and the leading-segment rule above can never
+    // clear it, because "non" appears in no vocabulary anywhere. Measured
+    // 2026-08-06: a correct claude cover was dropped over
+    // invented=[Non-idempotent]. When the head is a prefix, the word the
+    // compound is actually ABOUT is what follows it.
+    // Deliberately NOT "clear it if any segment is known": "Google-scale"
+    // would then be cleared by `scale`. Mirrors groundingGuard.js.
+    if (stem !== base && HYPHEN_PREFIX.has(stem)) {
+      const tail = base.slice(stem.length + 1);
+      if (tail && (DISCOURSE.has(tail) || SENTENCE_OPENERS.has(tail)
+        || ledger.vocabulary.has(tail) || extra.has(tail) || isInflectedEnglish(tail))) continue;
+    }
     // Last resort: a plain substring check against the whole knowledge
     // base, so a name the proper-noun scanner tokenised differently still
     // passes. Cheap, and it only runs for words already suspected.

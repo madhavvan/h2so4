@@ -64,10 +64,13 @@ describe('the predicted gap matches what was measured', () => {
   it('counts web search against Claude, which is where its silence comes from', () => {
     const bare = predictMainTtftMs({ provider: 'claude', webSearch: false });
     const searching = predictMainTtftMs({ provider: 'claude', webSearch: true });
-    // Bare Sonnet 5 is the fastest main model in the fleet — 1.6s shallow
-    // / 2.1s deep as PAINTED first character — so it gets the shortest
-    // cover there is, but it does get one.
-    expect(planCover(bare).name).toBe('opener');
+    // Bare Sonnet 5 is the fastest main model in the fleet, and since
+    // 2026-08-06 that means it gets NO cover at all. Measured A/B on the
+    // running route: first word at 1,664ms WITH a cover against 1,151ms
+    // WITHOUT one — the cover arrived after the answer would have, so it
+    // cost half a second AND displaced the main model's own opening
+    // sentence. Its predicted gap sits under COVER_FLOOR_MS by design.
+    expect(planCover(bare)).toBeNull();
     // A live search is a different animal entirely: the first token waits
     // on a round-trip to the web. This is the ONE figure in the table
     // that is estimated rather than measured — triggering a real
@@ -184,8 +187,12 @@ describe('the tiers are ordered and the budgets stay proportionate', () => {
     // The main call is issued only after the cover returns, so the chain
     // budget IS added latency on the deep answer. It has to stay small
     // relative to the wait it is covering.
-    for (const [gap, expected] of [[2000, 'opener'], [6000, 'bridge'], [20000, 'holding']]) {
+    // 3000 rather than 2000 for the opener case: COVER_FLOOR_MS is 2,500
+    // since the cover's own measured first token (median ~750ms, tail past
+    // 1.5s) made a 1,200ms floor fire covers into gaps they could not beat.
+    for (const [gap, expected] of [[3000, 'opener'], [6000, 'bridge'], [20000, 'holding']]) {
       const plan = planCover(gap);
+      expect(plan, `${gap}ms should still earn a cover`).not.toBeNull();
       expect(plan.name).toBe(expected);
       expect(plan.chainBudgetMs, `${expected} may delay a ${gap}ms answer too far`)
         .toBeLessThan(gap * 0.65);

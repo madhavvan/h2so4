@@ -361,13 +361,33 @@ const COVER_TIERS = [
   { name: 'holding', minWords: 60, maxWords: 110, maxTokens: 420, chainBudgetMs: 3000, totalDeadlineMs: 4500 },
 ];
 
-// Below this predicted gap, DO NOT fire a cover at all. Gemini at
-// thinkingLevel MINIMAL reaches its first token in 0.7-0.8s (bench AND
-// in-app agree); the cover's own fastest provider needs 0.22-0.28s and
-// then has to generate. Racing a model that fast wins nothing and costs
-// the main answer real milliseconds — the feature must only ever ADD
-// perceived speed.
-const COVER_FLOOR_MS = 1200;
+// Below this predicted gap, DO NOT fire a cover at all — racing a model
+// that is already fast wins nothing and costs the main answer real
+// milliseconds. The feature must only ever ADD perceived speed.
+//
+// ── WHY 2,500 AND NOT 1,200 ──
+// The old floor was set from the cover's BEST case: "the cover's own
+// fastest provider needs 0.22-0.28s". Measured across all five routes on
+// 2026-08-06, fifteen real covers, the cover's own first token actually
+// lands at 327 / 401 / 465 / 516 / 545 / 697 / 719 / 750 / 787 / 930 /
+// 1109 / 1212 / 1384 / 1545 / 1946 ms — median ~750ms, and the slow half
+// runs past a second. A 1,200ms floor therefore fired covers into gaps
+// the cover itself could not beat.
+//
+// Claude is what this looked like in the field: predicted gap 1,800ms,
+// cover fired, and the measured result was first word at 1,664ms WITH the
+// cover against 1,151ms WITHOUT it. The cover made the app HALF A SECOND
+// SLOWER and displaced the main model's own opening sentence to do it.
+//
+// 2,500ms is the smallest gap a ~750ms cover still meaningfully improves:
+// it buys ~1.7s of speech before the answer lands. Below that the honest
+// answer is that the route is fast enough to speak for itself.
+//
+// Effect on the fleet, from the same measurements: claude (gap ~1,800ms)
+// now correctly fires NOTHING; openai (~4,500ms), gemini (~3,500ms), xai
+// (9,000-20,000ms) and groq (20,000-50,000ms) are unaffected — and those
+// last two are where the cover is worth 18-27 SECONDS of silence.
+const COVER_FLOOR_MS = 2500;
 const BRIDGE_FROM_MS = 4000;
 // Raised from 8,000 once grok's real shallow number came in at 9.7s: a
 // ten-second gap needs ~22 words, which is a bridge, not a 60-word
@@ -384,6 +404,73 @@ const COVER_TTFT_ALLOWANCE_MS = 400;
 const HOLDING_MAX_WORDS = 150;
 
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PROVIDER COOLDOWN — stop paying latency for a provider that has
+//  already told us it is out of quota.
+//
+//  Measured in the running app on 2026-08-06, with both free tiers
+//  exhausted:
+//
+//    [cover] NO COVER — 3/3 provider(s) raced in 1501ms (budget 1200ms):
+//      groq: 429 Rate limit reached … / gemini: 429 You exceeded your
+//      current quota … / haiku: no first token within 900ms
+//
+//  Every request paid ~1.5s to re-discover the same two 429s, and the
+//  main model's call is queued BEHIND that (routes/ai.js awaits the cover
+//  before it calls OpenAI), so a dead cover was the single largest source
+//  of the latency the feature exists to remove. Worse, the paid backstop
+//  inherited whatever scraps of budget were left — it was starved in
+//  precisely the run that needed it.
+//
+//  A 429 is not a blip. It means a quota WINDOW: Groq's per-minute token
+//  bucket, Gemini's daily request cap. Retrying inside that window is
+//  guaranteed to fail, so the honest move is to stop asking. One minute
+//  is short enough that a per-minute bucket refills and the provider
+//  comes straight back, and long enough that an exhausted daily quota is
+//  only re-tested about once a minute instead of on every question.
+//
+//  Two things fall out of this for free:
+//    1. When the free tiers are down, they are skipped rather than tried,
+//       so the PAID backstop starts at index 0 — it gets the full budget
+//       and the first-provider deadline instead of the last-provider
+//       floor. Insurance that actually pays out.
+//    2. When ALL providers are cooling, the cover is skipped entirely and
+//       adds exactly ZERO milliseconds, instead of 1.2-3s of certain
+//       failure in front of every answer.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const PROVIDER_COOLDOWN_MS = 60_000;
+const providerCooldown = new Map();
+
+// Only quota/rate-limit answers earn a cooldown. A timeout means the
+// provider was SLOW, which the deadline already handles and which the
+// next question may not see; benching it for a minute over one slow call
+// would take a healthy provider out of the race for no reason.
+function isQuotaFailure(reason) {
+  return /\b429\b|rate.?limit|quota|too many requests|resource.?exhausted|overloaded/i.test(String(reason || ''));
+}
+
+function noteProviderFailure(name, reason) {
+  if (!name || !isQuotaFailure(reason)) return;
+  providerCooldown.set(name, Date.now() + PROVIDER_COOLDOWN_MS);
+}
+
+function providerRecovered(name) {
+  if (name) providerCooldown.delete(name);
+}
+
+/** False while a provider is serving a cooldown for a quota failure. */
+function providerReady(name) {
+  const until = providerCooldown.get(name);
+  if (!until) return true;
+  if (Date.now() >= until) { providerCooldown.delete(name); return true; }
+  return false;
+}
+
+function _resetProviderCooldowns() { providerCooldown.clear(); }
+function _providerCooldowns() {
+  return Object.fromEntries([...providerCooldown.entries()].map(([k, v]) => [k, Math.max(0, v - Date.now())]));
+}
 
 // Pick the cover plan for a predicted gap. Returns null when the main
 // model is fast enough that no cover should be spent.
@@ -436,7 +523,11 @@ Rules:
 - Do not use markdown, headings, bullets or numbered lists — every word
   of this is SPOKEN. If you have two or three things to say, say them the
   way a person does out loud ("...and the other half of it is...").
-- Do not give the conclusion.
+- Do not deliver the WORKED solution — no step lists, no full design, no
+  final recommendation with its reasoning. That is the full answer's job
+  and it is seconds behind you.
+  This is NOT licence to be vague: say the one true, load-bearing thing
+  and stop. A short real answer, not a long empty one.
 - Output the spoken words only — no quotes, no meta, no preamble.
 
 CRITICAL — GROUND EVERY SPECIFIC IN THE CANDIDATE BACKGROUND PROVIDED.
@@ -469,30 +560,52 @@ were asked before you write a word.
    background. This is the only place the employment history belongs.
 
 2. A PROBLEM TO SOLVE — a scenario, a failure to diagnose, a design, an
-   algorithm. Open with WHAT YOU WOULD ESTABLISH FIRST, never with the
-   solution, and never with their employment history.
-   - "Before I change anything I'd want to confirm what's actually
-     happening —", "First thing I'd establish is whether this starts at
-     ingestion or downstream —", "I'd want to see one concrete example
-     before I touch it —"
-   - NOT "First thing I'd look at is the partitioning", NOT "I'd use
-     Kafka's exactly-once semantics", NOT "I'd start with the data model"
+   algorithm. Say THE ONE THING THAT IS ALREADY TRUE ABOUT THIS PROBLEM —
+   the judgement a senior engineer can make the instant they hear it,
+   before anyone has looked at anything. That is a real answer, and it is
+   what you are here to produce.
 
-   This is not timidity, it is the only thing that can be true. You are
-   answering in under a second, before anyone has diagnosed anything —
-   so a named cause or mechanism is a GUESS, and the full answer that
-   follows will have actually reasoned. When they disagree the candidate
-   has already said the wrong thing out loud and has to walk it back
-   mid-sentence: "First thing I'd look at is the partitioning… before
-   tuning anything, I'd confirm the slowdown is real." Incoherent, and
-   the interviewer hears both halves.
-   Naming what you would ESTABLISH cannot be contradicted, and the full
-   answer continues from it naturally, because working out what is true
-   before acting is what a senior engineer does anyway.
+   It is one of these three, whichever the question invites:
+   - THE CONSTRAINT that decides the whole answer — the thing that is or
+     is not achievable given what they just described, and why.
+   - THE DISTINCTION the question turns on — two things being conflated,
+     separated in one sentence.
+   - THE REFRAME — what kind of problem this actually is, when the
+     framing in the question is the wrong one.
+
+   Illustrations of the SHAPE only. Never reuse this wording; the words
+   must come from THEIR question:
+   - a guarantee being asked for at a boundary that cannot enforce it →
+     name that it cannot, and what can be done instead
+   - a success signal being read as a correctness signal → separate them
+   - a number quoted as if it were one thing when it could be three →
+     say which three, because they do not mean the same thing
+
+   ⚠️ THIS IS NOT A GUESS AT THE CAUSE. Never name the culprit, the
+   mechanism, or the fix — "it's the partitioning", "I'd use exactly-once
+   semantics", "I'd start with the data model". Those CAN be wrong, and
+   the reasoning model behind you will contradict them one sentence
+   later, out loud, mid-answer.
+   The difference: a CAUSE is a claim about this specific system, which
+   you have not seen. A CONSTRAINT, a DISTINCTION or a REFRAME is a claim
+   about the problem AS STATED, which you have just heard in full. The
+   first can be contradicted. The second cannot.
+
+   ⚠️ AND IT IS NOT A DESCRIPTION OF YOUR PROCESS. "I'd verify the
+   current metrics", "I'd want to confirm what's happening", "I'd
+   establish a baseline first", "I'd look at the architecture" — these
+   are the single most common failure here. They are true of every
+   question ever asked, they commit to nothing, and they tell the
+   interviewer nothing. Anyone can say them without understanding the
+   question. If your sentence would still make sense pasted under a
+   completely different question, it is filler — delete it and say the
+   thing that is actually true about THIS one.
 
    Never assume their stack. If the question did not name a technology,
    do not introduce one from the background — the tool they use is not
-   necessarily the tool in the question.
+   necessarily the tool in the question. And never open a problem
+   question with their employment history: they were asked about a
+   problem, not about themselves.
 
 3. A KNOWLEDGE QUESTION — "what is X", "what do you know about X",
    "explain X", "how does X work", "the difference between X and Y".
@@ -516,9 +629,12 @@ has to be retracted, which is worse than saying nothing. So:
 - the angle-bracket forms above (<THEIR PROJECT>, <THEIR EMPLOYER>) are
   placeholders naming what to look FOR in the background. They are not
   this candidate's details and must never be echoed or guessed at.
-- if the background is missing or does not cover the question, fall back
-  to a stance about your APPROACH ("First thing I'd look at is —")
-  rather than inventing a memory.
+- if the background is missing or does not cover the question, speak
+  about the SUBJECT of the question instead — the constraint, the
+  distinction, the definition. Never invent a memory, and never retreat
+  to narrating your approach ("First thing I'd look at is —"): the
+  background being thin says nothing about the topic, and the topic is
+  always something you can say a true thing about.
 
 NEVER DENY KNOWING SOMETHING THE INTERVIEWER NAMED.
 The background is the candidate's own history; it says nothing about the
@@ -535,12 +651,22 @@ outside the background, open neutrally and let the full answer carry it
 // instruction that made the opener guess a mechanism the reasoning model
 // then contradicted. Each now asks for the thing that comes BEFORE a
 // solution and therefore cannot be walked back.
+// ── THESE ASK FOR A JUDGEMENT, NOT A PROCESS ──
+// Every one of these used to say "say what you would verify / pin down /
+// break down first". Measured live, that instruction is what produced
+// "I'd verify the current ETL pipeline's performance metrics" in front of
+// a question about exactly-once delivery: true of any question, an answer
+// to none, and the reasoning model behind it opened with the real point
+// one sentence later. Each now asks for the thing that is ALREADY TRUE
+// about the problem as stated — which is substantive and still cannot be
+// contradicted, because it is a claim about the question, not about a
+// system nobody has looked at yet.
 const CATEGORY_HINTS = {
-  coding: 'It is a coding question — say what you would clarify or check about the input first, or name the shape of the approach only if it is unmistakable from the question itself.',
-  system_design: 'It is a system-design question — say which constraint or requirement you would pin down first, not the architecture.',
-  ml_data: 'It is an ML/data question — say what you would verify or measure first, not the fix.',
-  quantitative: 'It is an estimation question — say which direction you would size it from (top-down or bottom-up).',
-  strategy_case: 'It is a case question — say how you would break the problem down first.',
+  coding: 'It is a coding question — say the property of the input or the invariant that decides the approach (sorted or not, bounded or not, can it be mutated). Name the technique only if the question makes it unmistakable. Do not say what you would clarify.',
+  system_design: 'It is a system-design question — name the constraint the whole design turns on and what it rules out, or the trade-off being forced. Not the architecture, and not which requirement you would gather.',
+  ml_data: 'It is an ML/data question — say what is or is not achievable given what they described, or separate two things the question is treating as one (a job succeeding vs its output being correct; a metric moving vs a metric being right). Never "I would verify/measure/baseline first".',
+  quantitative: 'It is an estimation question — state the quantity the estimate actually hinges on, the one that moves the answer by an order of magnitude.',
+  strategy_case: 'It is a case question — say which of the possible readings of this problem you think it actually is, and what that changes. Not how you would break it down.',
   // Knowledge questions had NO hint, so they fell through to the
   // problem-solving shape and opened by stalling — "First thing I'd look
   // at is defining concurrency", said to someone who just asked what
@@ -599,6 +725,65 @@ function isExperientialQuestion(question) {
   return EXPERIENTIAL_Q.test(q) || EXPERIENTIAL_Q2.test(q);
 }
 
+// ── "TELL ME ABOUT YOURSELF" IS NOT AN EXPERIENTIAL QUESTION ──
+// EXPERIENTIAL_Q keys on "have you / do you know / are you familiar", so
+// the single most common opening question in every interview does not
+// match it, and neither do "walk me through your background" or "what
+// have you worked on". Normally that costs nothing: the client's instant
+// opener answers those locally from the fact ledger and the live cover is
+// never asked. But when the résumé does not parse — measured at roughly
+// half of real documents — those questions fall through to HERE, and
+// without this predicate they would arrive with the background stripped
+// out by `aboutThem` and be answered from thin air. This is the safety
+// net for exactly that case.
+// ⚠️ THE COST HERE IS ASYMMETRIC, AND THAT DECIDES THE DEFAULT.
+//
+// Withholding the background from a question that IS about the candidate
+// does not produce a cautious answer — it produces an invented one, or a
+// denial, spoken out loud. Measured over the real question corpus on
+// 2026-08-06, with an earlier and narrower version of this predicate:
+//
+//   "can you explain about your peojects?"
+//     -> "I need the CANDIDATE BACKGROUND section to answer this
+//         question accurately."          (the model breaking character)
+//   "What is the largest data volume you have personally handled?"
+//     -> "around two terabytes"          (invented; the truth is 3M/day)
+//   "Which Azure services have you used for LLM workloads?"
+//     -> "I haven't worked with Azure directly"   (a false denial)
+//
+// Sending it to a problem question, by contrast, costs résumé recitation —
+// bad, but survivable, and the prompt already forbids it. So this is
+// deliberately GENEROUS: any hint that the question is about them wins.
+//
+// The one thing it must NOT catch is hypothetical framing. "How would you
+// design exactly-once delivery" contains "you" and is not about them at
+// all — which is why "would you" is absent from every alternative below,
+// and why the test pins that case.
+const BACKGROUND_Q = new RegExp([
+  // Possessive, and second-person perfect/past — the grammar of a
+  // question about someone's own history.
+  '\\byour\\b|\\byourself\\b|\\byou\'?ve\\b|\\byou\\s+have\\b',
+  // Past and perfect only — these ask what they DID. Bare "do you" and
+  // "are you" are excluded on purpose: "Where do you start?" and "how
+  // would you approach it" are problem framing wearing the same pronoun,
+  // and an earlier version of this line handed the résumé to a Snowflake
+  // cost question because of it. Present tense earns its place only with
+  // a verb that is actually about their history.
+  '|\\b(?:have|has|had|did|were|was)\\s+you\\b',
+  '|\\bdo\\s+you\\s+(?:know|have|use|own|manage|prefer|work)\\b',
+  '|\\bare\\s+you\\s+(?:familiar|comfortable|experienced)\\b',
+  // "…a decision you made", "…something you built" — the verb is the tell.
+  '|\\byou\\s+(?:made|worked|used|built|owned|led|ran|managed|handled|shipped|debugged|chose|designed|wrote|fixed|faced|dealt)\\b',
+  '|\\btell\\s+me\\s+about\\s+a\\s+time\\b',
+  '|\\bintroduce\\s+yourself\\b',
+  '|\\b(?:walk|take)\\s+me\\s+through\\s+your\\b',
+].join(''), 'i');
+
+/** True when the question is asking them to describe themselves or their career. */
+function isBackgroundQuestion(question) {
+  return BACKGROUND_Q.test(String(question || ''));
+}
+
 // The one instruction that changes per question. It lives in the USER
 // turn, not COVER_SYSTEM, on purpose: COVER_SYSTEM stays byte-identical
 // across every call so Groq's prefix cache keeps hitting, and a length
@@ -642,10 +827,31 @@ const RECENT_TURNS_CHARS = 1_200;
 function userPrompt(question, category, candidateContext, plan, recentTurns) {
   const tier = plan || COVER_TIERS[0];
   // Shape first, topic second — see the EXPERIENTIAL_Q note.
-  const hint = isExperientialQuestion(question)
+  const hint = (isExperientialQuestion(question) || isBackgroundQuestion(question))
     ? EXPERIENTIAL_HINT
     : (CATEGORY_HINTS[category] || '');
-  const bg = String(candidateContext || '').trim();
+  // ── THE BACKGROUND IS ONLY SENT WHEN THE QUESTION IS ABOUT THEM ──
+  // Measured live: on "how would you design exactly-once delivery…" the
+  // cover answered "I'd verify the current ETL pipeline's performance
+  // metrics… the 30% lower latency", and on a question about the
+  // INTERVIEWER's 400-DAG Airflow it answered "I'd verify the current
+  // data processing workflows at Indiana University and Apollo
+  // Hospitals". Neither had anything to do with what was asked. A fast
+  // model handed a résumé and a hard question reaches for the résumé,
+  // because that is the concrete text in front of it — no prompt rule
+  // survives that pull, and the rules above had already forbidden it.
+  // So the résumé is simply not in the room unless the question is about
+  // the candidate. Kinds 2 and 3 (a problem, a topic) are answered from
+  // the QUESTION, which is the only thing they were ever about.
+  //
+  // `clarifier` and `behavioral` are about them as surely as an
+  // experiential question is — a degree, a certification list, a time
+  // they shipped something — and their hints say to answer straight from
+  // the background, so they keep it.
+  const aboutThem = isExperientialQuestion(question)
+    || isBackgroundQuestion(question)
+    || category === 'clarifier' || category === 'behavioral';
+  const bg = aboutThem ? String(candidateContext || '').trim() : '';
   const recent = String(recentTurns || '').trim().slice(-RECENT_TURNS_CHARS);
   return [
     // 9,000 matches COVER_CONTEXT_CHARS on the client, and the two must
@@ -1082,19 +1288,48 @@ async function streamCoverAnswer({
   // no longer has to FAIL before the next one is allowed to exist.
   const providers = [];
   const names = [];
+  // Names dropped for a live cooldown, so the "skipped, cost nothing"
+  // line can say who. Collected on BOTH the injected and the real path —
+  // a seam that cannot report the skip cannot test it.
+  const injectedCooling = [];
   // Test seam: race an injected field instead of the real vendors, so
   // the hedge, the claim gate and the backstop's reachability can be
   // proven deterministically without spending a provider call.
   if (Array.isArray(_providerFns) && _providerFns.length) {
-    providers.push(..._providerFns);
-    names.push(...(_names || _providerFns.map((_, i) => `p${i + 1}`)));
+    // The cooldown applies to injected providers too. A seam that skips
+    // the skipping cannot prove the skipping — and this is the branch
+    // every deterministic test of the race runs through.
+    const injectedNames = _names || _providerFns.map((_, i) => `p${i + 1}`);
+    _providerFns.forEach((fn, i) => {
+      if (providerReady(injectedNames[i])) { providers.push(fn); names.push(injectedNames[i]); }
+      else injectedCooling.push(injectedNames[i]);
+    });
   }
-  if (!providers.length && groqKey) { providers.push((sig) => groqCoverFactory(question, category, candidateContext, groqKey, sig, tier, recentTurns)()); names.push('groq'); }
-  if (geminiKey) { providers.push((sig) => geminiCoverFactory(question, category, candidateContext, geminiKey, sig, tier, recentTurns)()); names.push('gemini'); }
-  // Paid, and last — reached only when the free tiers are slow, exhausted
-  // or down, which is exactly when it matters.
-  if (anthropicKey) { providers.push((sig) => anthropicCoverFactory(question, category, candidateContext, anthropicKey, sig, tier, recentTurns)()); names.push('haiku'); }
-  if (providers.length === 0) return '';
+  // `providerReady` drops anyone still serving a quota cooldown. Skipping
+  // is not the same as failing: a skipped provider costs nothing, and its
+  // absence promotes whoever is left — which is how the paid backstop ends
+  // up FIRST on a day the free tiers are exhausted.
+  const cooling = injectedCooling;
+  if (!providers.length && groqKey) {
+    if (providerReady('groq')) { providers.push((sig) => groqCoverFactory(question, category, candidateContext, groqKey, sig, tier, recentTurns)()); names.push('groq'); } else cooling.push('groq');
+  }
+  if (geminiKey) {
+    if (providerReady('gemini')) { providers.push((sig) => geminiCoverFactory(question, category, candidateContext, geminiKey, sig, tier, recentTurns)()); names.push('gemini'); } else cooling.push('gemini');
+  }
+  // Paid, and last in the ORDER — reached only when the free tiers are
+  // slow, exhausted or down, which is exactly when it matters.
+  if (anthropicKey) {
+    if (providerReady('haiku')) { providers.push((sig) => anthropicCoverFactory(question, category, candidateContext, anthropicKey, sig, tier, recentTurns)()); names.push('haiku'); } else cooling.push('haiku');
+  }
+  if (providers.length === 0) {
+    // Nothing to try. Return NOW rather than after the budget: the main
+    // model's call is queued behind this await, so every millisecond spent
+    // here is dead air in front of an answer that was ready to start.
+    if (cooling.length) {
+      console.warn(`[cover] SKIPPED — every provider is cooling down after a quota failure (${cooling.join(', ')}); 0ms added`);
+    }
+    return '';
+  }
 
   // ── THE HEDGED RACE ──
   //
@@ -1225,7 +1460,11 @@ async function streamCoverAnswer({
 
   const everyoneSettled = Promise.all(attempts).then((results) => {
     for (const r of results) {
-      if (!r.text && r.failure && r.failure !== 'lost the race' && r.failure !== 'not needed') {
+      // A provider that answered is healthy — clear any cooldown it was
+      // serving, so one bad minute never outlives itself.
+      if (r.text) { providerRecovered(names[r.i]); continue; }
+      if (r.failure && r.failure !== 'lost the race' && r.failure !== 'not needed') {
+        noteProviderFailure(names[r.i], r.failure);
         failures.push(`${names[r.i] || r.i}: ${r.failure}`);
       }
     }
@@ -1252,6 +1491,12 @@ IMPORTANT: that opening was spoken before the speaker recalled the specifics, so
 
 module.exports = {
   streamCoverAnswer,
+  // Provider cooldown — exported so a test can prove a 429 benches a
+  // provider, that the paid backstop is promoted when the free tiers are
+  // benched, and that an all-cooling chain costs zero added latency.
+  _resetProviderCooldowns,
+  _providerCooldowns,
+  isQuotaFailure,
   buildCoverContinuation,
   userPrompt,
   COVER_SYSTEM,
