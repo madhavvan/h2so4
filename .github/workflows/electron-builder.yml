@@ -49,12 +49,6 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
-    # Job-level so the mirror step's `if:` can test it. A step's own `env:`
-    # block is not reliably in scope for that step's own conditional, and a
-    # secret cannot be referenced from an `if:` directly.
-    env:
-      FEED_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
-
     steps:
       - name: Decide if this matrix entry should build
         id: gate
@@ -172,33 +166,27 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # THE ONE THAT REACHES USERS. secrets.GITHUB_TOKEN is scoped to this
-      # repo only, so the step above physically cannot write to the update-
-      # feed repo — without this step, CI-built macOS and Linux artifacts
-      # (and, critically, latest-mac.yml / latest-linux.yml) never reach the
-      # feed that every shipped app-update.yml points at, and Mac/Linux users
-      # stay stranded even though Windows works. Requires a PAT with
-      # `contents: write` on madhavvan/interviewcopilot-releases, stored as
-      # the RELEASES_REPO_TOKEN secret on THIS repo.
+      # ── HOW THESE ARTIFACTS REACH USERS ──
+      # They do NOT reach them from here. secrets.GITHUB_TOKEN is scoped to
+      # this repository, so no step in this workflow can write to the
+      # update-feed repo — which is where every installed app looks, and
+      # the reason CI-built macOS and Linux artifacts could never get there
+      # on their own.
       #
-      # Gated on the secret being present so a fork or a fresh clone without
-      # the secret still completes the legacy upload instead of failing red.
-      # If it is skipped, `npm run release:mirror -- <tag>` does the same job
-      # from a workstation. Either way, `npm run release:verify` is what
-      # proves the feed is actually serving before you call a release done.
-      - name: Mirror artifacts to the update-feed repo (what users update from)
-        uses: softprops/action-gh-release@v2
-        if: steps.gate.outputs.go == '1' && github.event_name == 'release' && env.FEED_TOKEN != ''
-        with:
-          repository: madhavvan/interviewcopilot-releases
-          token: ${{ secrets.RELEASES_REPO_TOKEN }}
-          tag_name: ${{ github.event.release.tag_name }}
-          fail_on_unmatched_files: false
-          files: |
-            dist-electron/*.yml
-            dist-electron/*.exe
-            dist-electron/*.dmg
-            dist-electron/*.zip
-            dist-electron/*.AppImage
-            dist-electron/*.deb
-            dist-electron/*.blockmap
+      # That is inverted instead of worked around: the feed repo runs its
+      # own scheduled workflow (.github/workflows/mirror-from-source.yml in
+      # madhavvan/interviewcopilot-releases) that pulls the latest release
+      # from here every 15 minutes. Its GITHUB_TOKEN can write its own
+      # releases, and this repo is public so it needs no permission to read
+      # us. No cross-repo secret exists, so none can be missing.
+      #
+      # It is deliberately a timer and not a hand-off. The 2026-07 outage
+      # came from a release process whose last step — "sync the releases
+      # repo and flip the draft to published" — was manual, and a manual
+      # step in an auto-update path is one that eventually does not happen.
+      # A timer is idempotent, self-healing, and forgets nothing.
+      #
+      # So after this job finishes, macOS and Linux land on the feed within
+      # ~15 minutes. `npm run release:verify` proves it actually serves;
+      # `npm run release:mirror -- <tag>` forces it immediately if you do
+      # not want to wait.
