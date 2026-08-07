@@ -18,7 +18,9 @@
     "icons": "node scripts/build-icons.mjs",
     "electron:start": "concurrently -k \"npm run dev\" \"wait-on tcp:3005 && electron .\"",
     "electron:build": "npm run build && electron-builder",
-    "electron:publish": "npm run build && electron-builder --publish=always"
+    "electron:publish": "npm run build && electron-builder --publish=always",
+    "release:verify": "node scripts/verify-release-feed.mjs",
+    "release:mirror": "node scripts/mirror-release.mjs"
   },
   "build": {
     "appId": "com.interviewcopilot.app",
@@ -32,6 +34,12 @@
       "electron/**/*"
     ],
     "publish": [
+      {
+        "provider": "github",
+        "owner": "madhavvan",
+        "repo": "interviewcopilot-releases",
+        "releaseType": "release"
+      },
       {
         "provider": "github",
         "owner": "madhavvan",
