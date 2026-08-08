@@ -202,3 +202,71 @@ jobs:
             dist-electron/*.AppImage
             dist-electron/*.deb
             dist-electron/*.blockmap
+
+  # ────────────────────────────────────────────────────────────────────
+  #  THE GATE THAT WAS MISSING
+  #
+  #  Everything above can go green while the fleet sees nothing. That is
+  #  not hypothetical — it is what happened to v4.0.11 through v4.0.16:
+  #  each build succeeded, each release was tagged, and every installed
+  #  app polled a feed repo that did not exist. Nobody found out from CI,
+  #  because CI only ever asserted that the BUILD worked.
+  #
+  #  `release:verify` walks the four anonymous HTTP steps a shipped app
+  #  actually performs — releases.atom, /releases/latest, the per-platform
+  #  channel file, then a ranged GET of every asset it names — against
+  #  every configured feed. It is the only check here that can tell the
+  #  difference between "we published a release" and "users can install
+  #  it".
+  #
+  #  It existed before this job did, as a manual step documented in a
+  #  comment. A manual step is exactly the kind that stops happening, so
+  #  it runs here instead.
+  #
+  #  needs: release — must not start until every matrix entry has
+  #  uploaded, or it would fail on artifacts that are merely not there
+  #  yet. Retries absorb GitHub's CDN propagation delay on top of that.
+  # ────────────────────────────────────────────────────────────────────
+  verify-feed:
+    name: Verify the update feed actually serves this release
+    needs: release
+    # `always()` so a skipped Windows entry (buildOnDispatch=false) does
+    # not skip the gate. A genuinely FAILED build still short-circuits:
+    # there is nothing to verify, and a red feed report on top of a red
+    # build only obscures the real cause.
+    if: always() && github.event_name == 'release' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # No `npm ci` — the verifier is dependency-free by design (node:
+      # built-ins plus fetch) precisely so this gate cannot be broken by
+      # an install failure.
+      - name: Verify every feed serves ${{ github.event.release.tag_name }}
+        run: node scripts/verify-release-feed.mjs --tag "${{ github.event.release.tag_name }}" --retries 6 --retry-wait 30
+
+      - name: Explain what a failure here means
+        if: failure()
+        run: |
+          echo "::error title=Release is not reachable by users::The build succeeded but the update feed does not serve ${{ github.event.release.tag_name }}."
+          echo ""
+          echo "Installed apps read the FIRST entry of build.publish in package.json."
+          echo "If that feed cannot serve the release, every existing install stays"
+          echo "on its current version forever and cannot self-heal — the feed URL"
+          echo "is baked into each installation at build time."
+          echo ""
+          echo "Most likely causes, in order:"
+          echo "  1. the mirror step was skipped (RELEASES_REPO_TOKEN secret missing)"
+          echo "     -> fix: npm run release:mirror -- ${{ github.event.release.tag_name }}"
+          echo "  2. the feed repo does not exist, or is private"
+          echo "  3. the release is still a draft (drafts are invisible to the feed)"
+          echo "  4. a platform's channel file (latest-mac.yml / latest-linux.yml)"
+          echo "     never reached the feed repo"
+          echo ""
+          echo "Re-run this job after fixing; it is safe to run any number of times."

@@ -40,6 +40,13 @@ const ROOT = join(HERE, '..', '..');
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 const downloadsSrc = readFileSync(join(ROOT, 'server', 'src', 'routes', 'downloads.js'), 'utf8');
 const indexSrc = readFileSync(join(ROOT, 'server', 'src', 'index.js'), 'utf8');
+// GITHUB_RELEASES_URL moved out of index.js into services/versionSource.js
+// so that /license/version could reach the same live answer as
+// /app-version without an import cycle — they had drifted to 4.0.8 vs
+// 4.0.17. Search both: this assertion is about the CONSTANT agreeing with
+// build.publish, not about which file happens to hold it.
+const versionSourceSrc = readFileSync(join(ROOT, 'server', 'src', 'services', 'versionSource.js'), 'utf8');
+const serverVersionSrc = indexSrc + '\n' + versionSourceSrc;
 
 const publish = Array.isArray(pkg.build.publish) ? pkg.build.publish : [pkg.build.publish];
 const repoNames = publish.map((t) => `${t.owner}/${t.repo}`);
@@ -85,12 +92,21 @@ describe('the three copies of "which repo" agree', () => {
     expect(repoNames, `downloads.js serves binaries from ${m[1]}, which no publish target writes to`).toContain(m[1]);
   });
 
-  it('index.js GITHUB_RELEASES_URL is a repo that releases are published to', () => {
-    const m = /GITHUB_RELEASES_URL = '([^']+)'/.exec(indexSrc);
-    expect(m, 'could not find GITHUB_RELEASES_URL in index.js').toBeTruthy();
+  it('the server GITHUB_RELEASES_URL is a repo that releases are published to', () => {
+    const m = /GITHUB_RELEASES_URL = '([^']+)'/.exec(serverVersionSrc);
+    expect(m, 'could not find GITHUB_RELEASES_URL in index.js or services/versionSource.js').toBeTruthy();
     const repo = /api\.github\.com\/repos\/([^/]+\/[^/]+)\//.exec(m[1]);
     expect(repo, `GITHUB_RELEASES_URL is not a /repos/<owner>/<repo>/ URL: ${m[1]}`).toBeTruthy();
-    expect(repoNames, `index.js reads versions from ${repo[1]}, which no publish target writes to`).toContain(repo[1]);
+    expect(repoNames, `the server reads versions from ${repo[1]}, which no publish target writes to`).toContain(repo[1]);
+  });
+
+  it('there is exactly ONE server-side copy of the releases URL', () => {
+    // The refactor that created versionSource.js must not have left a
+    // second copy behind in index.js — two constants naming the same
+    // thing is how this drifted in the first place.
+    const inIndex = (indexSrc.match(/GITHUB_RELEASES_URL = '/g) || []).length;
+    const inService = (versionSourceSrc.match(/GITHUB_RELEASES_URL = '/g) || []).length;
+    expect(inIndex + inService, 'the releases URL is declared in more than one place').toBe(1);
   });
 });
 

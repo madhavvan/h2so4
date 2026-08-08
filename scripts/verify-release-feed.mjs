@@ -55,6 +55,16 @@ const val = (name) => {
 const WANT_TAG = val('tag');
 const PRIMARY_ONLY = opt('primary');
 const QUICK = opt('quick');
+// ── Retry, for use as a CI gate ──
+// Run straight after an upload this is a race, not a verdict: GitHub does
+// not publish a release's assets to the anonymous CDN the instant the API
+// call returns, so a single immediate check can report a feed as broken
+// that is merely seconds young. Without retries a release gate either
+// flakes red or gets switched off — and a gate that gets switched off is
+// how the 4.0.11–4.0.16 fleet ended up stranded in the first place.
+// Interactive runs keep the old single-shot behaviour.
+const RETRIES = Number(val('retries') || 0);
+const RETRY_WAIT_S = Number(val('retry-wait') || 20);
 
 // The channel file each platform's updater asks for. electron-updater derives
 // these from process.platform; we check all three because a release is only
@@ -211,15 +221,29 @@ if (!targets.length) {
 }
 
 console.log('Verifying the update feed ANONYMOUSLY, as a shipped app sees it.');
-console.log(`Tag: ${WANT_TAG || '(latest)'}${QUICK ? '  [--quick]' : ''}`);
+console.log(`Tag: ${WANT_TAG || '(latest)'}${QUICK ? '  [--quick]' : ''}${RETRIES ? `  [up to ${RETRIES} retr${RETRIES === 1 ? 'y' : 'ies'}, ${RETRY_WAIT_S}s apart]` : ''}`);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // The FIRST publish entry is what electron-builder writes into every
 // artifact's app-update.yml — it is the only feed shipped clients read.
 // Later entries are mirrors for older fleets and are checked, but a failure
 // on entry #1 is what strands users.
-for (const [i, t] of targets.entries()) {
-  if (PRIMARY_ONLY && i > 0) break;
-  await checkTarget(t, i === 0 ? 'PRIMARY (baked into app-update.yml)' : `mirror #${i}`);
+//
+// Retried as a whole rather than per-request: propagation is per-release,
+// so if one asset is not visible yet the others are worth re-checking too,
+// and a clean re-run is what we actually want to assert.
+for (let attempt = 0; ; attempt++) {
+  problems.length = 0;
+  notes.length = 0;
+  for (const [i, t] of targets.entries()) {
+    if (PRIMARY_ONLY && i > 0) break;
+    await checkTarget(t, i === 0 ? 'PRIMARY (baked into app-update.yml)' : `mirror #${i}`);
+  }
+  if (!problems.length || attempt >= RETRIES) break;
+  console.log(`\n  … ${problems.length} problem(s) — GitHub may still be propagating this release.`);
+  console.log(`  … retry ${attempt + 1}/${RETRIES} in ${RETRY_WAIT_S}s\n`);
+  await sleep(RETRY_WAIT_S * 1000);
 }
 
 // ── Cross-check the built artifact, when there is one ──
