@@ -186,7 +186,7 @@ const TIER_INFO: Record<string, {
     color: 'text-emerald-400',
     gradient: 'from-emerald-600/40 to-emerald-800/40',
     icon: Zap,
-    blurb: 'One 30-min interview · Gemini, GPT-5.5, Grok, Groq (no Claude). Extendable +30 min.',
+    blurb: 'One 30-min interview · Gemini, GPT-5.6, Grok, Groq (no Claude). Extendable +30 min.',
   },
   pro: {
     label: 'Pro',
@@ -303,7 +303,7 @@ const TIER_ORDER = ['free', 'basic', 'pro', 'max', 'ultra'] as const;
 // row chrome — gold hairline for the metals, violet glow for the Ultra jewel.
 type BuyTier = 'basic' | 'pro' | 'max' | 'ultra';
 const PLAN_ROW_META: Record<BuyTier, { title: string; blurb: string; Icon: React.ComponentType<{ size?: number }>; accent: 'gold' | 'violet' }> = {
-  basic: { title: 'Get Basic', Icon: BasicMark, accent: 'gold',   blurb: 'One 30-min interview · Gemini, GPT-5.5, Grok, Groq (no Claude)' },
+  basic: { title: 'Get Basic', Icon: BasicMark, accent: 'gold',   blurb: 'One 30-min interview · Gemini, GPT-5.6, Grok, Groq (no Claude)' },
   pro:   { title: 'Get Pro',   Icon: ProMark,   accent: 'gold',   blurb: 'One 1-hour interview · all 5 models incl. Claude Sonnet 5' },
   max:   { title: 'Get Max',   Icon: MaxMark,   accent: 'gold',   blurb: 'Three 1-hour interviews · all 5 models · Train Model' },
   ultra: { title: 'Go Ultra',  Icon: UltraMark,  accent: 'violet', blurb: 'Unlimited interviews · Auto-Type · all 5 models · billed monthly' },

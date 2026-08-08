@@ -674,7 +674,25 @@ const CATEGORY_HINTS = {
   concept: 'It is a knowledge question — start on the topic itself: the one-line answer or the distinction that matters. Do not open by saying you would define it, and do not open with the resume.',
   // A behavioral question wants a specific from their life, immediately —
   // the situation, not a preamble about how they approach situations.
-  behavioral: 'It is a behavioral question — open on the actual situation from the background (where, what was happening), not on how you generally handle such things.',
+  //
+  // The no-invented-metrics clause lives HERE rather than in COVER_SYSTEM
+  // deliberately. It is only relevant to this shape of question, and
+  // COVER_SYSTEM ships on every single cover request — adding it there cost
+  // enough tokens to drop Groq's budget from 4.4 to 3.68 covers per minute,
+  // below the 4/min an interview needs (a question every 20s is 3/min, and
+  // the rest is headroom before the primary provider 429s mid-conversation).
+  // Pinned by cover-token-budget.test.js.
+  //
+  // Why it is needed at all: a résumé contains no failures, so on "a mistake
+  // you made" the model has nothing true to ground in and reaches for a
+  // figure — "causing a 24-hour data loss" was measured in a real interview.
+  // The grounding guard now catches invented numbers, so such a cover is
+  // REJECTED and the candidate gets silence on the question where holding
+  // the floor matters most. Telling the model the rule converts a discarded
+  // cover into a speakable one. (The main answer already has this rule, in
+  // aiProxyService buildUserRulesBlock — this is the cover's half.)
+  behavioral: 'It is a behavioral question — open on the actual situation from the background (where, what was happening), not on how you generally handle such things. '
+    + 'If the background holds no such story (mistakes, failures, disagreements are never on a CV), still open: set it in a real place and system from the background, keep the misstep an ordinary judgement call, and use NO invented numbers — no outage durations, hours, ticket counts or dollar figures. A number is allowed only if the background already states it.',
   // "What certifications do you have", "what was your degree" — a lookup,
   // not a problem. Had no hint, so it fell through to the problem-solving
   // shape and opened with "First, I'd establish the relevance of each

@@ -4993,7 +4993,7 @@ const TUTORIAL_STEPS = [
   { step: '04', title: 'Start an Interview',  desc: 'Share system audio, enable auto-mode, and let minicaai listen.', duration: '2 min' },
   { step: '05', title: 'Pop-out Mode',        desc: 'Launch the invisible overlay that floats over Zoom, Meet, Teams. (Pro)', duration: '1 min' },
   { step: '06', title: 'Auto-Solve',          desc: 'Capture the editor and let AI solve coding problems on demand. (Pro)', duration: '2 min' },
-  { step: '07', title: 'Switch AI Models',    desc: 'Pick between Gemini 3.5, GPT-5.5, Claude Sonnet 5, Grok 4.3, Groq for different strengths.', duration: '1 min' },
+  { step: '07', title: 'Switch AI Models',    desc: 'Pick between Gemini 3.6, GPT-5.6, Claude Sonnet 5, Grok 4.5, Groq for different strengths.', duration: '1 min' },
   { step: '08', title: 'Manage Subscription', desc: 'Upgrade, manage billing, and view usage stats.', duration: '1 min' },
 ] as const;
 
@@ -6857,7 +6857,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
         key: 'upgrade-basic',
         Icon: Zap, iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857',
         title: 'Get Basic',
-        subtitle: 'One 30-min interview · Gemini, GPT-5.5, Grok, Groq (no Claude)',
+        subtitle: 'One 30-min interview · Gemini, GPT-5.6, Grok, Groq (no Claude)',
         price: basicPrice || undefined,
         onClick: wrapAction('upgrade-basic', () => initiateCheckout('basic')),
       });
@@ -7850,7 +7850,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         // tier without it). Pro = one full-hour interview + the complete
         // five-model lineup. Auto-Type stays Ultra-exclusive, so it's not
         // named here.
-        return 'Payment successful — Pro activated. A full hour plus every model — Claude Sonnet 5, GPT-5.5, Grok 4.3, Gemini 3.5, and Groq — now unlocked.';
+        return 'Payment successful — Pro activated. A full hour plus every model — Claude Sonnet 5, GPT-5.6, Grok 4.5, Gemini 3.6, and Groq — now unlocked.';
       case 'max':
         // Max = three full-hour interviews, same complete model lineup as
         // Pro. No Auto-Type (Ultra only) — the value is the extra hours.
@@ -10278,7 +10278,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               {
                 Icon: PhCpu,
                 title: 'Reasons in your voice',
-                body: 'Picks the model that fits the question — GPT-5.5, Claude Sonnet 5, Gemini 3.5, Grok 4.3, Groq — and shapes the answer to your résumé and the role.',
+                body: 'Picks the model that fits the question — GPT-5.6, Claude Sonnet 5, Gemini 3.6, Grok 4.5, Groq — and shapes the answer to your résumé and the role.',
               },
               {
                 Icon: PhShield,

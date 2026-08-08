@@ -239,6 +239,18 @@ class PricingService {
             id: 'free', name: 'Starter', price: 0,
             currency: 'INR', currencySymbol: '₹', period: 'month',
             features: BASE_FEATURES_FREE, cta: 'Get Started Free',
+            // Every other tier carries a subtitle; without one here the Starter
+            // card's whole stack rides 40px high and its CTA 53px high, so the
+            // price row and the buttons do not line up across the pricing grid —
+            // measured in the rendered page, not eyeballed. The card renders it as
+            // `{t.subtitle && <p>}`, so an absent subtitle collapses the row
+            // rather than reserving it. Present in ALL THREE currency blocks: the
+            // fallback block below serves every country without a specific one.
+            //
+            // The text is not filler to plug a gap — it is the two things a visitor
+            // most wants before clicking, and it echoes the hero ("Start free — 10
+            // minutes", "No card to start").
+            subtitle: '10-minute trial · no card',
           },
           {
             id: 'basic', name: 'Basic', price: 2499,
@@ -280,6 +292,18 @@ class PricingService {
             id: 'free', name: 'Starter', price: 0,
             currency: 'USD', currencySymbol: '$', period: 'month',
             features: BASE_FEATURES_FREE, cta: 'Get Started Free',
+            // Every other tier carries a subtitle; without one here the Starter
+            // card's whole stack rides 40px high and its CTA 53px high, so the
+            // price row and the buttons do not line up across the pricing grid —
+            // measured in the rendered page, not eyeballed. The card renders it as
+            // `{t.subtitle && <p>}`, so an absent subtitle collapses the row
+            // rather than reserving it. Present in ALL THREE currency blocks: the
+            // fallback block below serves every country without a specific one.
+            //
+            // The text is not filler to plug a gap — it is the two things a visitor
+            // most wants before clicking, and it echoes the hero ("Start free — 10
+            // minutes", "No card to start").
+            subtitle: '10-minute trial · no card',
           },
           {
             id: 'basic', name: 'Basic', price: USD_PRICES.basic,
@@ -326,6 +350,18 @@ class PricingService {
           id: 'free', name: 'Starter', price: 0,
           currency: 'USD', currencySymbol: '$', period: 'month',
           features: BASE_FEATURES_FREE, cta: 'Get Started Free',
+          // Every other tier carries a subtitle; without one here the Starter
+          // card's whole stack rides 40px high and its CTA 53px high, so the
+          // price row and the buttons do not line up across the pricing grid —
+          // measured in the rendered page, not eyeballed. The card renders it as
+          // `{t.subtitle && <p>}`, so an absent subtitle collapses the row
+          // rather than reserving it. Present in ALL THREE currency blocks: the
+          // fallback block below serves every country without a specific one.
+          //
+          // The text is not filler to plug a gap — it is the two things a visitor
+          // most wants before clicking, and it echoes the hero ("Start free — 10
+          // minutes", "No card to start").
+          subtitle: '10-minute trial · no card',
         },
         {
           id: 'basic', name: 'Basic', price: USD_PRICES.basic,

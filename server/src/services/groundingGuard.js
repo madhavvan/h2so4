@@ -163,10 +163,35 @@ function collectProperNouns(text, into) {
 }
 
 /** Parse the client's space-separated vocabulary string into a set. */
+/**
+ * The known-word set the checks look words up in.
+ *
+ * ⚠️ IT MUST NORMALISE EXACTLY AS THE LOOKUP DOES. This used to lowercase
+ * and nothing else, while every lookup site strips punctuation first
+ * (`replace(/[^A-Za-z0-9+#'’-]/g,'')`, three places below). So a vocabulary
+ * of "Skills: Airflow, Python, MongoDB." stored `airflow,` `python,`
+ * `mongodb.` — with the punctuation — and a sentence saying "Airflow" asked
+ * for `airflow`, missed, and was reported as an INVENTED name. The guard
+ * then threw away a true cover, and a thrown-away cover is silence in a
+ * live interview.
+ *
+ * That did not bite the main path, because the client sends
+ * `ledgerVocabulary(ledger)` — already-normalised tokens joined by spaces.
+ * It bit the FALLBACK: with no knowledge base uploaded, routes/ai.js passes
+ * `allowed` instead, which is the question and the interviewer's turns, and
+ * that is ordinary punctuated prose. "Have you used Airflow, Kafka, or
+ * Spark?" hid all three behind their own commas, so answering the question
+ * honestly got the answer rejected.
+ *
+ * Widening this can only ever ADD words the candidate's own background or
+ * the interviewer actually said — it never lets in a name that appears in
+ * neither, which is the thing the guard exists to catch. Pinned by
+ * vocab-roundtrip.test.js.
+ */
 function parseVocabulary(vocabulary) {
   const set = new Set();
   for (const raw of String(vocabulary || '').split(/\s+/)) {
-    const w = raw.trim().toLowerCase();
+    const w = raw.replace(/[^A-Za-z0-9+#'’-]/g, '').toLowerCase();
     if (w.length >= 2) set.add(w);
   }
   return set;

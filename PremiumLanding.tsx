@@ -4623,11 +4623,13 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
                   {pop && (
                     <span style={{ position: 'absolute', top: -9, left: 20, fontSize: 9, fontWeight: 700, letterSpacing: '.14em', textTransform: 'uppercase', color: '#231c0c', background: 'linear-gradient(100deg,var(--gold-1),var(--gold-3))', padding: '2px 8px', borderRadius: 999 }}>Most chosen</span>
                   )}
-                  {Mark && (
-                    <div style={{ marginBottom: 8, height: 24, display: 'flex', alignItems: 'center' }}>
-                      <Mark size={24} />
-                    </div>
-                  )}
+                  {/* The row is reserved whether or not this tier has an icon.
+                      TIER_MARK has no `free`, and rendering the box conditionally
+                      made the Starter card 32px shorter at the top, so its price and
+                      CTA sat 40px and 53px above the other three across the grid. */}
+                  <div style={{ marginBottom: 8, height: 24, display: 'flex', alignItems: 'center' }}>
+                    {Mark && <Mark size={24} />}
+                  </div>
                   <h3 className="pl-serif" style={{ fontSize: 18, fontWeight: 500 }}>{t.name}</h3>
                   {t.subtitle && <p style={{ fontSize: 11, color: 'var(--faint)', marginTop: 1 }}>{t.subtitle}</p>}
                   <div style={{ margin: '12px 0 10px' }}>{priceBlock(t)}</div>

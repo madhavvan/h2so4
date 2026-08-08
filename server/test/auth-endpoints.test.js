@@ -247,7 +247,7 @@ describe('PUT /password', () => {
     // ...and the new password is the one that works from here on.
     expect((await request('POST', '/login', { body: { email, password } })).status).toBe(401);
     expect((await request('POST', '/login', { body: { email, password: 'a-brand-new-password-1' } })).status).toBe(200);
-  });
+  }, 20_000); // bcrypt x5-7 over real HTTP — see the note above the file
 });
 
 describe('POST /forgot-password', () => {
@@ -310,7 +310,7 @@ describe('POST /reset-password', () => {
     expect((await request('GET', '/me', { token: live })).status).toBe(401);
     expect((await request('POST', '/login', { body: { email, password: 'reset-password-value-1' } })).status).toBe(200);
     expect((await request('POST', '/login', { body: { email, password: 'attacker-password-1' } })).status).toBe(401);
-  });
+  }, 20_000); // bcrypt x5-7 over real HTTP — see the note above the file
 });
 
 describe('DELETE /account', () => {
