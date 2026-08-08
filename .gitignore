@@ -119,6 +119,14 @@ Desktop.ini
 .autotype-test/
 server/scripts/.autotype-test/
 
+# ── Phone-as-remote capture harness — NEVER commit ──
+# `.phone-shots/` is a full Chrome user-data-dir (253 MB), cookies and all,
+# plus screenshots of live phone/desktop pairing runs. It was the single
+# largest thing a dirty-tree build packed into app.asar on 2026-08-08. It
+# was the ONLY scratch directory here that git did not already ignore, so a
+# stray `git add -A` would have published a browser profile to a public repo.
+.phone-shots/
+
 # Local dev CDP probes + design-iteration screenshots (not for commit)
 /cdp-*.mjs
 /current-*.png
