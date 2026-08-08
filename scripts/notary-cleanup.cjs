@@ -19,7 +19,14 @@ function dirSize(dir) {
   return total;
 }
 
+const { guardAfterPack } = require('./asar-guard.cjs');
+
 exports.default = async function afterPack(context) {
+  // Runs FIRST and throws on a dirty-tree build. electron-builder has only
+  // one afterPack slot, so the guard is chained here rather than configured
+  // separately — see scripts/asar-guard.cjs for why it exists at all.
+  await guardAfterPack(context);
+
   const { appOutDir, electronPlatformName, packager } = context;
   const appName = packager.appInfo.productFilename;
 

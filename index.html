@@ -100,6 +100,33 @@
         --border-color: #e8e2d1;        /* --cream-line — warm border */
         --text-color: #141413;          /* --ink — warm near-black */
 
+        /* ── GOLD, WHEN IT IS TEXT ───────────────────────────────────
+           The brand gold is a LIGHT colour. As a background with dark
+           type on it (#241b08) it is correct in either theme, and it is
+           left alone everywhere it is used that way. As TEXT or as an
+           icon it only works on obsidian — measured on the cream page:
+
+             #d3ac63  1.98:1      #cba966  2.07:1
+             #f0d78a  1.32:1      #e6d29c  1.38:1
+
+           which is the "bright and barely visible yellow" in light mode.
+
+           So gold-as-ink is its own token. Same hue, blended toward black
+           until it clears 5:1 on cream, which keeps it recognisably gold
+           rather than turning it into another black. Dark mode keeps the
+           original exactly.
+
+           It is a VARIABLE and not just a CSS override because several of
+           these are written as inline styles (style={{ color: '#d3ac63' }}),
+           and no stylesheet rule can beat an inline style without
+           !important. Those sites now reference this token instead. */
+        --gold-ink: #7e673b;            /* 5.0:1 on cream */
+        /* Dialog backdrop. 92% black is correct on obsidian; on cream it
+           blacks out the app behind a cream modal. 38% warm dims without
+           extinguishing. */
+        --modal-scrim: rgba(20, 20, 19, 0.38);
+        --gold-ink-strong: #6b562f;     /* 6.6:1 — small/bold gold text */
+
         /* Theme-aware popover surfaces (model picker, dropdowns, tooltips).
            Default = light cream translucent. .dark overrides below set
            the dark navy used by the original popout-design popover. */
@@ -122,6 +149,34 @@
         --ink-faint:    #9b988e;
         --accent:       #c96342;  /* Anthropic terracotta */
         --accent-soft:  #f4ddd2;
+
+        /* ── Minica support chat — LIGHT (warm cream + gold) ──
+           Scoped to --mc-* on purpose. The support panel used to mix the
+           app's neutral surface tokens with hardcoded cool greys
+           (#6b7280 / #9ca3af) that never flipped with the theme, so it
+           read as a different product sitting inside a warm app. These
+           give it the same warm material as everything else WITHOUT
+           touching --cream/--ink/--accent, which the landing and the
+           auth views share globally — re-pointing those would re-skin
+           surfaces this change has no business touching. */
+        --mc-bg:          #f6f1e5;   /* panel ground */
+        --mc-raise:       #fffdf8;   /* bubbles, elevated rows */
+        --mc-input:       #fffdf8;
+        --mc-line:        #e5dcc7;
+        --mc-ink:         #141413;
+        --mc-ink-soft:    #35332c;
+        --mc-ink-muted:   #6b6a64;
+        --mc-ink-faint:   #7d7869;   /* 3.91:1 on --mc-bg (was #9b988e, 2.56:1) */
+        --mc-accent:      #8a6120;   /* gold, deepened for cream — 4.89:1 (AA) */
+        --mc-accent-soft: rgba(138, 97, 32, 0.12);
+        --mc-invert-bg:   #1a1710;   /* customer bubble: obsidian on cream */
+        --mc-invert-ink:  #f7f3e9;
+        --mc-ok:          #2a6f52;   /* agent-online — warm, 5.33:1 (AA) */
+        --mc-warn:        #b0741f;
+        --mc-danger:      #b0442f;
+        --mc-glass:       rgba(250, 247, 240, 0.92);
+        --mc-shadow:      0 18px 48px -24px rgba(20, 20, 19, 0.34),
+                          0 2px 8px -4px rgba(20, 20, 19, 0.16);
 
         /* ── Obsidian & Gold (shared with the marketing landing) ──
            The premium landing (PremiumLanding.tsx) is built on warm
@@ -203,12 +258,44 @@
         --border-color: #221f17;  /* faint warm hairline — softer, less "boxed" */
         --text-color: #ece7dc;    /* warm paper text (was zinc-200) */
 
+        /* Gold-as-ink: on obsidian the brand gold IS the right colour, so
+           dark mode keeps it unchanged. See the note in :root above. */
+        --gold-ink: #d3ac63;
+        --modal-scrim: rgba(0, 0, 0, 0.92);   /* unchanged */
+        --gold-ink-strong: #f0d78a;
+
         /* Dark-mode popover surfaces — warm obsidian glass with a gold
            hairline (was deep navy + white border), so the model picker /
            dropdowns match the pop-out and landing. */
         --model-menu-bg:     rgba(16, 14, 10, 0.95);
         --model-menu-border: rgba(211, 172, 99, 0.28);
         --model-menu-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 26px 64px -22px rgba(0, 0, 0, 0.88), 0 2px 10px -4px rgba(0, 0, 0, 0.5);
+
+        /* ── Minica support chat — DARK (obsidian + gold) ──
+           Same material as the model picker above and the auth views:
+           warm obsidian glass, a gold hairline instead of a grey box, and
+           a layered shadow rather than a flat drop. The customer's own
+           bubble inverts to gold — it is the one element that should read
+           as "you", and gold on obsidian is the product's signature. */
+        --mc-bg:          #100e0a;
+        --mc-raise:       #17140e;
+        --mc-input:       #14120d;
+        --mc-line:        rgba(211, 172, 99, 0.16);
+        --mc-ink:         #f2efe6;
+        --mc-ink-soft:    #d9d3c6;
+        --mc-ink-muted:   #9d968a;
+        --mc-ink-faint:   #6a6355;
+        --mc-accent:      #d3ac63;
+        --mc-accent-soft: rgba(211, 172, 99, 0.14);
+        --mc-invert-bg:   #d3ac63;   /* customer bubble: gold on obsidian */
+        --mc-invert-ink:  #14120d;
+        --mc-ok:          #6fcf9a;
+        --mc-warn:        #e0a94a;
+        --mc-danger:      #e8836b;
+        --mc-glass:       rgba(16, 14, 10, 0.94);
+        --mc-shadow:      inset 0 1px 0 rgba(255, 255, 255, 0.05),
+                          0 26px 64px -22px rgba(0, 0, 0, 0.88),
+                          0 2px 10px -4px rgba(0, 0, 0, 0.5);
       }
 
       /* ── Typography: SF-family, -webkit-font-smoothing for iOS feel ── */

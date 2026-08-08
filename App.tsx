@@ -8,6 +8,10 @@ import { Settings, Mic, MicOff, FileText, Upload, Trash2, Cpu, FileCheck, Refres
 // to fill the modal body and inherit the user's light/dark theme.
 import SupportBot from './SupportBot';
 import { WizardHat } from './WizardHat';
+// The Ultra tier mark — the same glyph the landing's pricing table uses, so
+// the badge in the app reads as the same product. Ultra was the one tier the
+// pop-out header never drew (see the chips below).
+import { UltraMark } from './UltraMark';
 import { PaperAirplane } from './GitHubIcons';
 import { GeminiIcon, OpenAIIcon, ClaudeIcon, GrokIcon, GroqIcon } from './ProviderIcons';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -15,14 +19,18 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { generateGemini, generateOpenAI, generateXAI, generateGroq, streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT, prewarmIdentity, generateConversationTitle } from './services/aiProxyService';
-import { generateClaude, streamClaude, prewarmClaudeIdentity, trainClaudeModel, trainClaudeModelBeast, hasCachedTechState, type TrainingProgress } from './services/claudeService';
+import { streamGemini, streamOpenAI, streamXAI, streamGroq, AUTO_SOLVE_PROMPT, generateConversationTitle } from './services/aiProxyService';
+import { syncKnowledge, warmKnowledgeNetwork, forgetKnowledge } from './services/knowledgeCache';
+import { RemoteHost, remoteWsUrl } from './services/remoteHost';
+import { remoteHostRef, publishRemote, registerAutoTypeBlock, extractCodeBlocks, runAutoTypeForCode } from './services/remoteBridge';
+import { streamClaude, prewarmClaudeIdentity, trainClaudeModel, trainClaudeModelBeast, hasCachedTechState, type TrainingProgress } from './services/claudeService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { usePrefetchContext } from './hooks/usePrefetchContext';
 import { extractTextFromPdf } from './services/pdfService';
 import { extractTextFromDocx } from './services/docxService';
 import { useDatabase, SessionSummary } from './hooks/useDatabase';
 import { Message, AppSettings, ContextFile } from './types';
+import { isBackchannelOnly, buildInterruptionContext } from './services/interruption';
 import { SubscriptionGate, AdminDashboard } from './SubscriptionGate';
 import { Tutorial, shouldShowTutorial, markTutorialCompleted, clearTutorialCompletion } from './Tutorial';
 import { DownloadGuide } from './DownloadGuide';
@@ -566,9 +574,35 @@ const CodeBlock: React.FC<{
         }
     };
 
+    // ── Reachable from the phone ──
+    // Registering the runner rather than reimplementing it on the host
+    // side means a tap on the phone enters this exact function: same
+    // permission check, same editor scan, same countdown, and the
+    // desktop's own button animates through the phases because it is
+    // genuinely the one running. See services/remoteBridge.ts.
+    useEffect(() => {
+        if (!isElectron || !canAutoType) return;
+        return registerAutoTypeBlock(code, () => { void handleAutoType(); });
+        // handleAutoType closes over `code`/`language`, both stable for a
+        // given block; re-registering on phase changes would churn the map
+        // on every countdown tick.
+    }, [code, canAutoType]);
+
+    // Mirror the run to the phone. Ephemeral — "typing in 3…" is only
+    // true right now, so it is never replayed to a device that joins
+    // later. The phone shows the same words the desktop button shows.
+    useEffect(() => {
+        if (!isElectron) return;
+        publishRemote('autotype_status', {
+            phase: atPhase,
+            countdown: atPhase === 'countdown' ? atCountdown : 0,
+            error: atError || null,
+        });
+    }, [atPhase, atCountdown, atError]);
+
     const autoTypeLabel =
         atPhase === 'preparing'       ? 'Scanning editor…' :
-        // 'thinking' is the new agentic phase — Sonnet 4.6 is reasoning
+        // 'thinking' is the new agentic phase — Sonnet 5 is reasoning
         // about the editor state via tool_use. Takes 3-8s on hard cases
         // (HackerRank templates with __main__ blocks, mid-file inserts).
         atPhase === 'thinking'        ? 'Thinking…  (click to cancel)' :
@@ -610,7 +644,11 @@ const CodeBlock: React.FC<{
                                 ? <Loader2 size={12} className="animate-spin" />
                                 : <Zap size={12} className={atPhase !== 'idle' ? 'animate-pulse' : ''} />}
                             <span>{autoTypeLabel}</span>
-                            {!canAutoType && atPhase === 'idle' && <WizardHat size={10} className="text-amber-400" />}
+                            {/* UltraMark, not WizardHat. Auto-Type is Ultra-only
+                            (ULTRA_ONLY in server/src/routes/ai.js), but the
+                            lock badge drew Max's wizard hat — telling a user
+                            that buying Max would unlock it. It would not. */}
+                        {!canAutoType && atPhase === 'idle' && <UltraMark size={10} className="text-violet-300" />}
                         </button>
                     ) : (
                         // Web: never invoke auto-type:* IPC — upsell desktop instead.
@@ -791,7 +829,13 @@ const MessageRenderer = React.memo(({ content, fontSize, canAutoType, isStreamin
 
 // --- Components ---
 
-const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: any) => {
+// `hideHeader` suppresses the title bar for children that ship their own
+// (the support panel has a richer one: avatar, live agent-presence line,
+// and the admin Inbox button). Without it that modal rendered TWO headers
+// and TWO close buttons stacked on each other. Defaults false so every
+// other modal is untouched; `title` is still used for aria-label either
+// way, so hiding the bar costs nothing in accessibility.
+const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true, hideHeader = false }: any) => {
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const lastFocusRef = useRef<HTMLElement | null>(null);
   // Hold onClose in a ref so the focus-trap effect below does NOT depend on
@@ -877,7 +921,13 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
     <div
       className="fixed inset-0 flex items-center justify-center p-4"
       style={{
-        background: inPopout ? 'rgba(11,10,8,0.82)' : (inElectron ? 'rgba(0,0,0,0.92)' : 'rgba(0,0,0,0.5)'),
+        // 0.92 black is right on obsidian — the app behind simply recedes.
+        // On cream it drops a near-black sheet behind a cream modal, so the
+        // product looks like it changed theme when a dialog opens. Themed via
+        // --modal-scrim (index.html): dark keeps 0.92 exactly, light uses a
+        // warm 38% that dims without extinguishing. An inline style cannot be
+        // reached by a stylesheet, which is why this is a token and not a rule.
+        background: inPopout ? 'rgba(11,10,8,0.82)' : (inElectron ? 'var(--modal-scrim)' : 'rgba(0,0,0,0.5)'),
         borderRadius: inPopout ? '18px' : undefined,
         zIndex: 99999,
         WebkitAppRegion: 'no-drag',
@@ -893,6 +943,7 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
         style={{ background: 'var(--surface-color)' }}
         onClick={(e) => e.stopPropagation()}
       >
+        {!hideHeader && (
         <div className="p-4 border-b border-border flex justify-between items-center bg-gray-500/5">
           <h2 className="text-lg font-bold flex items-center gap-2">{title}</h2>
           <button
@@ -903,6 +954,7 @@ const Modal = ({ isOpen, onClose, title, children, dismissOnBackdrop = true }: a
              <X size={20} />
           </button>
         </div>
+        )}
         <div className="p-4 overflow-y-auto custom-scrollbar flex-1">
           {children}
         </div>
@@ -1168,6 +1220,23 @@ const ChatInterface = ({
                         {/* Tier & credit chips — only at M/L sizes so the S preset
                             (340px) doesn't wrap the controls onto two rows.
                             Web PiP always shows tier (no size cycle). */}
+                        {/* ── Ultra ──
+                            This chip did not exist. The pop-out drew a badge
+                            for max, pro and basic and nothing at all for
+                            ultra, so the ONE subscription tier — the most
+                            expensive plan, and the only one that unlocks
+                            Auto-Type — was the single tier that rendered
+                            unbadged, while a $30 Basic pass got a green pill.
+                            `effectiveTier` genuinely carries 'ultra'
+                            (LicenseData.tier's union includes it), so this
+                            was a missing branch, not an impossible state.
+                            Same family as the audit's H54; that fix landed in
+                            SubscriptionGate and stopped here. */}
+                        {(sizeIndex >= 1 || !inElectron) && effectiveTier === 'ultra' && (
+                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-gradient-to-r from-violet-500/20 to-amber-500/10 text-violet-300">
+                            <UltraMark size={9} /> ULTRA
+                          </div>
+                        )}
                         {(sizeIndex >= 1 || !inElectron) && effectiveTier === 'max' && (
                           <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-gradient-to-r from-amber-500/15 to-purple-500/10 text-amber-400">
                             <WizardHat size={9} /> MAX
@@ -1354,7 +1423,7 @@ const ChatInterface = ({
                             >
                                 {!inElectron
                                   ? <>Share the meeting tab's audio, or try a sample below</>
-                                  : <>Turn on the mic and set <span style={{ color: '#d3ac63' }}>Manual → Auto</span> for the best experience</>
+                                  : <>Turn on the mic and set <span style={{ color: 'var(--gold-ink)' }}>Manual → Auto</span> for the best experience</>
                                 }
                             </p>
                             {!inElectron && handlePlaySampleQuestion && (
@@ -1602,7 +1671,19 @@ const ChatInterface = ({
                         now removed. The badge itself is always visible
                         regardless of breakpoint so users on narrow widths
                         still see and can click it. */}
-                    {userLicense && userLicense.tier === 'max' ? (
+                    {/* ── Ultra ──
+                        Without this branch an Ultra subscriber fell past
+                        max/pro/basic into the `userLicense ?` else, which
+                        renders an **"Upgrade"** button — the top plan, in
+                        the main window header, being sold an upgrade. This
+                        is the H54 symptom ("Ultra renders as Free and is
+                        offered Upgrade to Pro") surviving in the one place
+                        the user looks at most. */}
+                    {userLicense && userLicense.tier === 'ultra' ? (
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-gradient-to-r from-violet-500/20 to-amber-500/10 text-violet-300 hover:from-violet-500/30 hover:to-amber-500/20 transition-all cursor-pointer">
+                        <UltraMark size={10} /> ULTRA
+                      </button>
+                    ) : userLicense && userLicense.tier === 'max' ? (
                       <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-gradient-to-r from-amber-500/15 to-purple-500/10 text-amber-400 hover:from-amber-500/25 hover:to-purple-500/20 transition-all cursor-pointer">
                         <WizardHat size={10} /> MAX
                       </button>
@@ -1734,7 +1815,7 @@ const ChatInterface = ({
                             <p className="text-center text-lg md:text-xl px-8 leading-relaxed select-none pointer-events-none" style={{ fontFamily: 'var(--serif)', letterSpacing: '0.01em', color: 'var(--text-color)', opacity: 0.22 }}>
                                 {!isElectron
                                   ? <>Share the meeting tab's audio, or play a sample question below</>
-                                  : <>Turn on the mic and set <span style={{ color: '#d3ac63' }}>Manual → Auto</span> for the best experience</>
+                                  : <>Turn on the mic and set <span style={{ color: 'var(--gold-ink)' }}>Manual → Auto</span> for the best experience</>
                                 }
                             </p>
                             {!isElectron && handlePlaySampleQuestion && (
@@ -1898,7 +1979,7 @@ const ChatInterface = ({
                                             aria-haspopup="listbox"
                                             aria-expanded={isModelMenuOpen}
                                         >
-                                            {MODEL_REGISTRY[settings.selectedModel as ModelKey]?.label ?? 'Gemini 3.1 Flash'}
+                                            {MODEL_REGISTRY[settings.selectedModel as ModelKey]?.label ?? 'Gemini 3.6 Flash'}
                                         </button>
                                         <ChevronDown size={10} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500" />
                                         {isModelMenuOpen && modelMenuPos && createPortal(
@@ -2202,6 +2283,11 @@ function useFeatureGate(license: LicenseData | null) {
     actualTier,
     planLapsed: planState === 'lapsed',
     timeExhausted: planState === 'time_exhausted',
+    // isUltra was missing from this set even though 'ultra' is a real tier,
+    // so every consumer that branched on isMax/isPro/isBasic fell through to
+    // its Free-shaped `else` for the TOP plan — see the model-picker hint,
+    // which told an Ultra subscriber "Basic: 4 models · Pro adds Claude".
+    isUltra: tier === 'ultra',
     isMax: tier === 'max',
     isPro: tier === 'pro',
     isBasic: tier === 'basic',
@@ -2260,7 +2346,7 @@ interface ModelMeta {
 const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
   gemini: {
     short: 'Gemini',
-    label: 'Gemini 3.5 Flash',
+    label: 'Gemini 3.6 Flash',
     monogram: 'G',
     Icon: GeminiIcon,
     tier: 'free',
@@ -2278,7 +2364,7 @@ const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
   },
   openai: {
     short: 'GPT',
-    label: 'GPT-5.5',
+    label: 'GPT-5.6',
     monogram: '5',
     Icon: OpenAIIcon,
     tier: 'basic',
@@ -2288,7 +2374,7 @@ const MODEL_REGISTRY: Record<ModelKey, ModelMeta> = {
   },
   xai: {
     short: 'Grok',
-    label: 'Grok 4.3',
+    label: 'Grok 4.5',
     monogram: 'X',
     Icon: GrokIcon,
     tier: 'basic',
@@ -2328,7 +2414,11 @@ function looksLikeProviderOutage(rawMessage: string | undefined): boolean {
   if (!rawMessage) return false;
   const m = rawMessage.toLowerCase();
   // Never treat these as outages — they have their own handled paths.
-  if (m.includes('tier_required') || m.includes('requires') ||
+  // "start your session" especially: every model would refuse it
+  // identically, so falling back through the chain would burn four more
+  // round-trips to arrive at the same sentence.
+  if (m.includes('start your session') ||
+      m.includes('tier_required') || m.includes('requires') ||
       m.includes('upgrade') || m.includes('trial') ||
       m.includes('used up') || m.includes('paywall') ||
       m.includes('no active license') || m.includes('not active') ||
@@ -2362,8 +2452,9 @@ function pickFallbackModel(failed: string, allowedModels: string[], cooling?: (m
   for (const cand of FALLBACK_PREFERENCE) {
     if (cand === failed) continue;
     if (!allowedModels.includes(cand)) continue;
-    // Skip a provider we already know is refusing, or the fallback hands the
-    // question straight back to the model that failed a moment ago.
+    // Skip a provider we already know is refusing. Without this the
+    // fallback happily hands the question to the model that failed two
+    // questions ago and the user pays that round-trip again.
     if (cooling && cooling(cand)) continue;
     return cand;
   }
@@ -2371,11 +2462,25 @@ function pickFallbackModel(failed: string, allowedModels: string[], cooling?: (m
 }
 
 // ── THE MODEL THE USER CHOSE IS THEIRS ──
-// The outage fallback used to WRITE its pick into settings and localStorage,
-// permanently replacing the user's model. The oscillation follows from
-// FALLBACK_PREFERENCE: GPT 429s -> first pref != openai = xai (SAVED); later
-// Grok 429s -> first pref != xai = openai (SAVED). Two providers, forever.
-// Reported verbatim as "changing from gpt to grok and grok to gpt".
+//
+// Reported by a live user as "changing from gpt to grok and grok to gpt".
+// The outage fallback used to WRITE its choice back into settings and
+// localStorage, so a transient 429 permanently rewrote the user's model.
+// The bounce follows mechanically from FALLBACK_PREFERENCE:
+//
+//   user picks GPT -> GPT 429s -> fallback picks xai, SAVES it
+//   later Grok 429s -> first preference that isn't xai is openai
+//                   -> back to GPT, SAVED again -> repeat
+//
+// So the app oscillated between two providers and the user's real choice
+// was gone after the first hiccup. The fallback is now per-REQUEST: the
+// retry is told which model to use, nothing is persisted, and the picker
+// keeps showing what the user actually selected.
+//
+// A short cooldown stops the obvious cost of that — reverting to a
+// genuinely-down provider on every question. Same shape and same 60s as
+// the server's cover-provider cooldown in coverAnswer.js, and keyed the
+// same way: only a provider that REFUSED gets benched, never a slow one.
 const PROVIDER_COOLDOWN_MS = 60_000;
 
 // Lock-badge text shown on a model the current user cannot access. We
@@ -3262,6 +3367,37 @@ const PlanExpiryNotice = ({ message, cta, onCta, onDismiss }: {
   </div>
 );
 
+// ── Unreadable-upload notice ─────────────────────────────────────────
+//
+// An extraction failure used to be swallowed entirely, and for a defensible
+// reason: a native alert() showing the filename is not covered by
+// setContentProtection, so it would leak a resume filename to anyone on a
+// screen-share. The conclusion drawn from that was silence, and silence is
+// what let a password-protected PDF look attached while contributing nothing
+// — the app then answered from a persona with no history and never said why.
+//
+// This is the same information delivered inside the protected window, and
+// deliberately WITHOUT the filename: the count is what the user needs, and
+// the name is the part that must not appear. Nothing here traps focus.
+const UnreadableFilesNotice = ({ count, onDismiss }: { count: number; onDismiss: () => void }) => (
+  <div
+    role="status"
+    className="fixed top-20 right-6 z-[94] max-w-xs px-4 py-3 rounded-xl bg-rose-500/[0.12] border border-rose-500/40 text-rose-200 text-sm font-medium shadow-xl backdrop-blur-sm"
+  >
+    <div className="flex items-start gap-3">
+      <AlertTriangle size={16} className="shrink-0 mt-0.5 text-rose-300" />
+      <span className="leading-snug">
+        {count === 1 ? "Couldn't read that file" : `Couldn't read ${count} of those files`} — no
+        selectable text. If it's a scan or password-protected, export a text-based copy or paste
+        the text in instead. {count === 1 ? 'It was' : 'They were'} not attached.
+      </span>
+      <button onClick={onDismiss} className="text-rose-400 hover:text-rose-200 ml-auto shrink-0" aria-label="Dismiss">
+        <X size={14} />
+      </button>
+    </div>
+  </div>
+);
+
 // ── Exhausted modal — blocking; offers the PLAN-SPECIFIC extension for
 // Basic/Pro/Max (Basic +30 min · $25, Pro/Max +1 hour · $45 — see
 // pricingService.getRenewalPrice), plan picker for everyone (2026-07
@@ -3356,6 +3492,7 @@ let externalCheckoutPollActive = false;
 async function pollForExternalUpgrade(
   targetTier: 'basic' | 'pro' | 'max' | 'ultra',
   onSuccess?: (info: { tier: string }) => void,
+  sessionId?: string,
 ) {
   if (externalCheckoutPollActive) return;
   externalCheckoutPollActive = true;
@@ -3367,6 +3504,17 @@ async function pollForExternalUpgrade(
     await new Promise<void>(r => setTimeout(r, POLL_INTERVAL_MS));
     while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
       try {
+        // Ask the server to confirm the checkout directly before falling
+        // back to "has the webhook landed yet?". The webhook used to be
+        // the ONLY way a Stripe payment became an entitlement — if it
+        // never arrived, this poll span 10 minutes and gave up on a
+        // customer who had already been charged. /verify-stripe checks
+        // the session against Stripe and grants idempotently, so this is
+        // safe to call on every tick and turns a lost webhook into a
+        // few seconds of delay instead of a support ticket.
+        if (sessionId) {
+          await licenseService.verifyStripeCheckout(sessionId);
+        }
         const updated = await licenseService.validateWithServer();
         if (updated && updated.tier === targetTier && updated.status === 'active') {
           // validateWithServer already wrote to localStorage. Mark the
@@ -3404,7 +3552,7 @@ async function pollForExternalUpgrade(
 // tier-sized credit locally as soon as the matching delta is detected.
 // 15-min lower bound on the delta absorbs clock skew but stays well
 // below the smallest unit (30 min) and well above non-extension noise.
-async function pollForExternalRenewal(onSuccess?: () => void) {
+async function pollForExternalRenewal(onSuccess?: () => void, sessionId?: string) {
   if (externalCheckoutPollActive) return;
   externalCheckoutPollActive = true;
   const POLL_INTERVAL_MS = 4000;
@@ -3416,6 +3564,10 @@ async function pollForExternalRenewal(onSuccess?: () => void) {
     await new Promise<void>(r => setTimeout(r, POLL_INTERVAL_MS));
     while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
       try {
+        // Same webhook-independent confirmation as the upgrade poll.
+        if (sessionId) {
+          await licenseService.verifyStripeCheckout(sessionId);
+        }
         const updated = await licenseService.validateWithServer();
         if (updated && (updated.expires_at || 0) >= baselineExpires + RENEWAL_THRESHOLD_MS) {
           onSuccess?.();
@@ -3600,6 +3752,35 @@ async function openProUpgrade(
       return;
     }
 
+    // ── Razorpay: no redirect URL, an in-app sheet ──
+    // /create-checkout returns { provider:'razorpay', order_id | subscription_id,
+    // key_id, amount… } — there is no checkout_url. Without this branch the
+    // flow fell straight through to the "missing a payment URL" error, so
+    // every Indian tier purchase started from ManageSubscription's Upgrade
+    // button dead-ended. Unreachable today (India routes to Stripe while the
+    // Razorpay account is pending) and required the moment that flips.
+    if (data.provider === 'razorpay' && (data.order_id || data.subscription_id)) {
+      const openedSheet = await openRazorpaySheetInApp(data, token, () => {
+        onSuccess?.({ tier: data.tier || targetTier, message: data.message });
+      });
+      if (openedSheet) {
+        emitCheckoutStatus({
+          kind: 'opened',
+          tier: targetTier,
+          mode: 'subscription',
+          message: `Complete the payment in the ${tierLabel} sheet — your plan activates here immediately after.`,
+        });
+      } else {
+        emitCheckoutStatus({
+          kind: 'error',
+          tier: targetTier,
+          mode: 'subscription',
+          message: 'Could not open the payment sheet. Check your connection and try again.',
+        });
+      }
+      return;
+    }
+
     if (data.checkout_url) {
       // Try the robust opener (shell.openExternal w/ 6s timeout, then
       // child_process `cmd /c start` fallback). The legacy openExternal
@@ -3635,7 +3816,7 @@ async function openProUpgrade(
       // redirect (it lands in the user's browser), so we have to learn
       // about the upgrade from the server. See pollForExternalUpgrade
       // for the rationale and timing.
-      pollForExternalUpgrade(targetTier, onSuccess);
+      pollForExternalUpgrade(targetTier, onSuccess, data.session_id);
     } else {
       // Server returned 200 but with neither a sync-grant provider nor a
       // checkout_url. Without this branch the user would see no feedback
@@ -3685,13 +3866,19 @@ async function openRazorpaySheetInApp(payload: any, token: string, onSuccess?: (
   if (!ok || !(window as any).Razorpay) return false;
   const { licenseService } = await import('./services/licenseService');
   try {
+    // Ultra is a Razorpay SUBSCRIPTION (subscription_id); passes and
+    // top-ups are one-time ORDERS (order_id). Razorpay's checkout takes
+    // one or the other — sending neither silently produces a payment that
+    // /verify-razorpay must then refuse for want of a signature target.
     const rzp = new (window as any).Razorpay({
       key: payload.key_id,
       amount: payload.amount,
       currency: payload.currency,
       name: payload.name,
       description: payload.description,
-      order_id: payload.order_id,
+      ...(payload.subscription_id
+        ? { subscription_id: payload.subscription_id }
+        : { order_id: payload.order_id }),
       prefill: { email: payload.user_email, name: payload.user_name },
       theme: { color: '#10b981' },
       handler: async (resp: any) => {
@@ -3702,22 +3889,37 @@ async function openRazorpaySheetInApp(payload: any, token: string, onSuccess?: (
             body: JSON.stringify(resp),
           });
           const vd = await v.json().catch(() => null);
+          // The same sheet now serves top-ups AND tier purchases (the
+          // Ultra subscription included), so the status copy has to follow
+          // what was actually bought — a buyer of the ₹12,999 Ultra plan
+          // being told "Extra time added" reads as the wrong purchase.
+          const statusMode: 'renewal' | 'subscription' =
+            (vd?.mode === 'renewal' || payload.mode === 'extension' || payload.mode === 'renewal')
+              ? 'renewal' : 'subscription';
           if (v.ok && vd?.success) {
             // Server message names the tier-correct amount ("+30 minutes"
             // / "+1 hour"); the fallback stays amount-neutral so it can
             // never state the wrong figure.
             await licenseService.validateWithServer().catch(() => {});
-            emitCheckoutStatus({ kind: 'completed', mode: 'renewal', message: vd.message || 'Extra time added. Keep going.' });
+            emitCheckoutStatus({
+              kind: 'completed',
+              mode: statusMode,
+              tier: vd.tier || payload.tier,
+              message: vd.message || (statusMode === 'renewal'
+                ? 'Extra time added. Keep going.'
+                : 'Payment confirmed — your plan is active.'),
+            });
             onSuccess?.();
           } else {
             emitCheckoutStatus({
-              kind: 'error', mode: 'renewal',
-              message: vd?.error || 'Payment verification is pending — if you were charged, the time will land automatically in a moment.',
+              kind: 'error', mode: statusMode,
+              message: vd?.error || 'Payment verification is pending — if you were charged, it will land automatically in a moment.',
             });
           }
         } catch {
           emitCheckoutStatus({
-            kind: 'error', mode: 'renewal',
+            kind: 'error',
+            mode: (payload.mode === 'extension' || payload.mode === 'renewal') ? 'renewal' : 'subscription',
             message: 'Payment made — verification will complete automatically in a moment.',
           });
         }
@@ -3734,7 +3936,7 @@ async function openRazorpaySheetInApp(payload: any, token: string, onSuccess?: (
 // Open a top-up checkout URL in the system browser + poll for the grant.
 // Shared by the legacy /create-renewal path and /extend-now's degraded
 // responses (no card on file yet, or the bank demanded 3DS).
-async function openRenewalCheckoutUrl(checkoutUrl: string, onSuccess?: () => void) {
+async function openRenewalCheckoutUrl(checkoutUrl: string, onSuccess?: () => void, sessionId?: string) {
   const opened = await tryOpenCheckoutUrl(checkoutUrl);
   if (!opened.ok) {
     const detail = opened.attempts?.length
@@ -3755,7 +3957,7 @@ async function openRenewalCheckoutUrl(checkoutUrl: string, onSuccess?: () => voi
       url: checkoutUrl,
     });
   }
-  pollForExternalRenewal(onSuccess);
+  pollForExternalRenewal(onSuccess, sessionId);
 }
 
 // ── Plan-specific top-up — ONE CLICK first, checkout only as fallback ──
@@ -3767,6 +3969,31 @@ async function openRenewalCheckoutUrl(checkoutUrl: string, onSuccess?: () => voi
 //   · no saved card / bank demands 3DS → browser checkout (which saves
 //     the card via setup_future_usage, so NEXT time is one-click)
 //   · /extend-now unreachable (older server) → legacy /create-renewal
+// ── Stable top-up attempt ids, one per pack ──
+// The server turns attempt_id into the Stripe idempotency key
+// (`extend_<user>_<attempt>`), so a RETRY has to send the SAME id. Minting
+// a fresh uuid inside the function body defeated that: a lost response
+// (dropped socket, timeout, 5xx) made the retry a SECOND PaymentIntent —
+// a real double charge.
+//
+// ManageSubscription fixed its copy of this with a component ref. This
+// path could not use one — openProRenewal is a module-level function
+// reached from LowWarningToast's onExtend, ExhaustedModal's onRenew and
+// the popout relay's 'cmd-credit-renew', none of which share a component
+// instance. Hence a module-level store, which is also what makes the id
+// survive the surface the user retries from.
+//
+// This is the WORSE of the two paths to get wrong: it fires mid-interview,
+// when the user has just run out of time and will retry immediately.
+// Keyed by pack because Stripe rejects a replayed key whose parameters
+// changed. Cleared once the outcome is definitively known.
+const extendAttemptIds: Record<string, string> = {};
+
+function newAttemptId(): string {
+  return (globalThis.crypto as any)?.randomUUID?.()
+    || `a_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+
 async function openProRenewal(onSuccess?: () => void, packId?: string) {
   const { licenseService } = await import('./services/licenseService');
   const token = licenseService.getToken();
@@ -3789,17 +4016,28 @@ async function openProRenewal(onSuccess?: () => void, packId?: string) {
     const countryCode = saved.user?.country_code || 'US';
 
     // ── One-click path ──
+    const packKey = packId || 'm30';
     try {
-      const attemptId = (globalThis.crypto as any)?.randomUUID?.()
-        || `a_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      // Reuse the id from a previous attempt at this pack if one is still
+      // outstanding — that reuse IS the double-charge protection.
+      const attemptId = extendAttemptIds[packKey] || newAttemptId();
+      extendAttemptIds[packKey] = attemptId;
       const ext = await fetch(`${licenseService.getApiBase()}/api/v1/payments/extend-now`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ attempt_id: attemptId, pack: packId || 'm30' }),
+        body: JSON.stringify({ attempt_id: attemptId, pack: packKey }),
       });
       const extendData: any = await ext.json().catch(() => null);
 
+      // Outcome is known — a 4xx means this attempt will never become a
+      // charge, so holding its id would only make the NEXT deliberate
+      // purchase collide with a key Stripe has already seen. A 5xx or a
+      // network error deliberately does NOT clear: that is the case where
+      // the charge may have happened without us hearing about it.
+      if (ext.status >= 400 && ext.status < 500) delete extendAttemptIds[packKey];
+
       if (ext.ok && extendData?.success && extendData?.flow === 'off_session') {
+        delete extendAttemptIds[packKey];
         // Charged the card on file; time already landed server-side. Pull
         // the authoritative balance into local state and refresh the UI.
         // Server message carries the tier-correct amount; the fallback
@@ -3810,18 +4048,25 @@ async function openProRenewal(onSuccess?: () => void, packId?: string) {
         return;
       }
       if (extendData?.already_unlimited) {
+        delete extendAttemptIds[packKey];
         onSuccess?.();
         return;
       }
       if (extendData?.provider === 'razorpay' && extendData?.flow === 'in_app_sheet') {
+        // Razorpay mints its own order per call and never sees attempt_id,
+        // so the Stripe key is spent either way once we hand off.
+        delete extendAttemptIds[packKey];
         const openedSheet = await openRazorpaySheetInApp(extendData, token, onSuccess);
         if (openedSheet) return; // the sheet's handler completes the flow
         // checkout.js unavailable — fall through to the browser path below.
       }
       if (ext.ok && extendData?.checkout_url) {
         // extend-now degraded itself to a checkout session (first purchase
-        // pre-dates card saving, or the bank wants 3DS).
-        return await openRenewalCheckoutUrl(extendData.checkout_url, onSuccess);
+        // pre-dates card saving, or the bank wants 3DS). No off-session
+        // charge was made against this key, and the checkout session
+        // carries its own idempotency — release it.
+        delete extendAttemptIds[packKey];
+        return await openRenewalCheckoutUrl(extendData.checkout_url, onSuccess, extendData.session_id);
       }
       if (ext.status === 402 && extendData?.error === 'charge_failed') {
         emitCheckoutStatus({ kind: 'error', mode: 'renewal', message: extendData.message || 'Your card was declined.' });
@@ -3843,7 +4088,7 @@ async function openProRenewal(onSuccess?: () => void, packId?: string) {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Failed to start renewal');
     if (data.checkout_url) {
-      await openRenewalCheckoutUrl(data.checkout_url, onSuccess);
+      await openRenewalCheckoutUrl(data.checkout_url, onSuccess, data.session_id);
     } else {
       emitCheckoutStatus({
         kind: 'error',
@@ -4249,6 +4494,17 @@ const PopoutResizeHandles: React.FC = () => {
   );
 };
 
+// Auto-Solve's whole premise is that the model can SEE the screen. captureScreenshot
+// returns null on four perfectly ordinary paths — the feature gate, an empty
+// desktop-source list, a dead/absent video track, and any throw (a revoked macOS
+// screen-recording permission lands there). Sending AUTO_SOLVE_PROMPT anyway asks the
+// model to solve a problem that isn't attached, so it invents one — and because the
+// auto-solve system instruction forces a single fenced code block, that invention
+// renders as an ordinary code block that Auto-Type will type into the candidate's live
+// editor. Every auto-solve path therefore bails on a null capture and says so out loud.
+// One shared string so the call sites can't drift apart.
+const SCREEN_CAPTURE_FAILED_MESSAGE = 'Could not capture the screen — check screen-recording permission for this app, then try Auto-Solve again.';
+
 function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLicense }: { userProfile: UserProfile | null; userLicense: LicenseData | null; onLogout: () => void; setUserProfile: (u: UserProfile | null) => void; setUserLicense: (l: LicenseData | null) => void }) {
   // --- Feature Gates ---
   const gate = useFeatureGate(userLicense);
@@ -4325,6 +4581,28 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       return false;
     };
 
+    // ── One-time repair of poisoned retro_skipped_* stamps ────────────
+    // Until v4.0.14 the fetch below omitted userId, so _ownsSession failed
+    // closed and getMessages returned [] for EVERY session. Each one then
+    // hit the "no usable transcript" branch and got stamped
+    // retro_skipped_<sid> — permanently, since nothing ever removes those
+    // keys. Fixing the call alone is not enough: the stamps outlive the
+    // fix and the filter below would still skip every affected session.
+    // Clear them exactly once so the corrected pass gets its chance.
+    const RETRO_REPAIR_KEY = 'retro_skip_repair_v1';
+    try {
+      if (localStorage.getItem(RETRO_REPAIR_KEY) !== '1') {
+        const stale: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith('retro_skipped_')) stale.push(k);
+        }
+        stale.forEach(k => localStorage.removeItem(k));
+        localStorage.setItem(RETRO_REPAIR_KEY, '1');
+        if (stale.length) console.log(`[auto-title] cleared ${stale.length} stale retro_skipped flag(s)`);
+      }
+    } catch {}
+
     const placeholderSessions = (db.sessions as any[]).filter((s) => {
       if (!isPlaceholderName(s.name)) return false;
       try {
@@ -4358,7 +4636,13 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         if (titlingInFlightRef.current.has(sid)) { skipped++; continue; }
         titlingInFlightRef.current.add(sid);
         try {
-          const messages = await electronIPC.invoke('db:get-messages', sid);
+          // userId is REQUIRED — db:get-messages ownership-checks via
+          // _ownsSession, which fails closed on a null userId and returns
+          // [] rather than throwing. Omitting it here (as this call did
+          // until v4.0.14) made every session look like an empty
+          // transcript, so the branch below stamped retro_skipped_<sid>
+          // on all of them and retro-titling could never run again.
+          const messages = await electronIPC.invoke('db:get-messages', sid, userProfile.id);
           if (!Array.isArray(messages) || messages.length < 2) {
             try { localStorage.setItem(`retro_skipped_${sid}`, '1'); } catch {}
             skipped++;
@@ -4404,14 +4688,30 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     return () => { cancelled = true; };
   }, [db.isElectron, db.ready, db.sessions, userProfile?.id]);
 
-  // Keep contextFilesRef in sync with db.contextFiles. Also fire the
-  // identity-extraction preflight here so the first interview question
-  // doesn't pay the ~2-5s round-trip — by the time the user starts, the
-  // WHO-YOU-ARE + WHAT-THIS-ROLE-REWARDS cards are already cached.
+  // Keep contextFilesRef in sync with db.contextFiles, and make the KB
+  // ANSWERABLE the instant it lands.
+  //
+  // This is the free half of readiness — no network, no model call, no
+  // quota — so it runs eagerly with no debounce: the BM25 index over the
+  // bulk files and the cover's resume slice, both of which the first
+  // question used to build from scratch on the UI thread while the user
+  // waited. Measured worst case at 800 files: 71ms index + 18ms cover
+  // context, moved off question one entirely.
+  //
+  // The paid half (context-store upload, identity extraction) is
+  // debounced in the prewarmContext effect below; the two were merged
+  // here before, which meant the free work inherited the paid work's
+  // debounce and the paid work inherited the free work's eagerness.
+  // syncKnowledge replaces the bare prewarmRetrieval call and is the single
+  // place that means "the knowledge base changed": it rebuilds the fact
+  // ledger (2-5ms for a resume) so the very first question can compose its
+  // spoken opener locally instead of waiting on a model, warms the BM25
+  // index and the cover slice, and — the part that was missing entirely —
+  // drops the offloaded bytes of any document that is no longer attached.
+  // See services/knowledgeCache.ts for why one owner rather than six.
   useEffect(() => {
       contextFilesRef.current = db.contextFiles;
-      prewarmIdentity(db.contextFiles);
-      prewarmClaudeIdentity(db.contextFiles);
+      syncKnowledge(db.contextFiles);
   }, [db.contextFiles]);
 
   // --- "Train Model" pipeline state (Max-tier only) ---
@@ -4541,6 +4841,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     expiresAt: number;
   };
   const [checkoutToast, setCheckoutToast] = useState<CheckoutToast | null>(null);
+  // How many files in the last upload could not be read. See
+  // UnreadableFilesNotice for why the count and not the filename.
+  const [unreadableCount, setUnreadableCount] = useState(0);
   const [checkoutUrlCopied, setCheckoutUrlCopied] = useState(false);
   useEffect(() => {
     const handler = (e: Event) => {
@@ -4901,18 +5204,27 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     if (ctrl) {
       // Do NOT null the ref here. Every stream owner (executeSend,
       // handleRegenerate) resets isProcessing in a `finally` guarded by
-      // `streamAbortRef.current === abort`. Clearing the ref BEFORE the abort
-      // lands makes that guard fail, so the aborted run never flips
-      // isProcessing back off and the app wedges on "thinking" — reported from
-      // a live interview as "in between the interview it's getting stuck".
-      // Reachable from New Chat, a conversation switch, or Stop on the phone
-      // mid-answer, after which Send, Auto-Solve and Regenerate are dead in
-      // BOTH windows until the app is restarted. The owning run nulls the ref
-      // itself in its finally; callers that immediately start a replacement
-      // stream overwrite it on the very next line.
+      // `streamAbortRef.current === abort`. Clearing the ref BEFORE the
+      // abort lands makes that guard fail, so the aborted run never flips
+      // isProcessing back off and the app wedges on "thinking" after New
+      // Chat / conversation switch / phone Stop mid-answer. The owning run
+      // nulls the ref itself in its finally; callers that immediately start
+      // a replacement stream overwrite it on the very next line.
       try { ctrl.abort(); } catch {}
     }
   }, []);
+
+  // ── Live-interruption bookkeeping ──
+  // Ref mirrors of the in-flight stream, read at INTERRUPT time (a new
+  // send while streaming). streamingMsg state lags behind the wire via
+  // rAF coalescing, so the ref — updated on every chunk — is the source
+  // of truth for "what was on screen". streamStartAt drives the
+  // spoken-words estimate (~2.3 w/s) in buildInterruptionContext;
+  // activeQuestion is the question the interrupted answer belonged to.
+  const streamingTextRef = useRef('');
+  const streamingIdRef = useRef<string | null>(null);
+  const streamStartAtRef = useRef(0);
+  const activeQuestionRef = useRef('');
 
   // ─────────────────────────────────────────────────────────────
   //  STREAM CHUNK COALESCING
@@ -4927,28 +5239,75 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   //  Used by main's streaming callback AND by the popout's IPC chunk
   //  handler so both windows get the same smooth rendering regardless of
   //  how fast the upstream model is pushing tokens.
+  //
+  //  ⚠️ requestAnimationFrame ALONE IS NOT A SAFE SCHEDULER FOR THIS APP.
+  //
+  //  Chromium stops firing rAF entirely for a window it considers not
+  //  visible — hidden, minimised, or fully occluded by another window.
+  //  Measured in the running app (scripts/audit-raf.mjs):
+  //
+  //      document.visibilityState : "hidden"
+  //      rAF callbacks in 2000ms  : 0
+  //      setTimeout(0) latency    : 0ms
+  //
+  //  And this product HIDES ITS OWN WINDOW on purpose — quick-hide from
+  //  screen share, the tray, the pop-out, or simply a full-screen Teams
+  //  call on top of it. In that state the first chunk scheduled a
+  //  callback that never ran, `pendingChunkRAFRef` stayed non-null
+  //  forever, and the guard on the next line silently discarded EVERY
+  //  subsequent token. Nothing painted until the stream ended and the
+  //  final commit went through a different code path — measured at
+  //  11.9s / 12.9s / 11.1s to first paint on answers whose first token
+  //  had reached the client at ~420ms.
+  //
+  //  That is fatal specifically for the cover: its entire job is words
+  //  on screen inside a second, and it was being generated in ~600ms and
+  //  shown eleven seconds later. So: schedule BOTH, first one wins.
+  //  rAF still does the coalescing whenever it is alive (the common,
+  //  visible case); the timer is what guarantees the paint happens at
+  //  all when it is not.
   // ─────────────────────────────────────────────────────────────
   const pendingChunkRAFRef = useRef<number | null>(null);
+  const pendingChunkTimerRef = useRef<number | null>(null);
   const latestChunkRef = useRef<{ id: string; content: string } | null>(null);
 
+  // Long enough that a live rAF (~16.7ms at 60Hz) essentially always wins
+  // and the coalescing behaviour is unchanged; short enough that a hidden
+  // window still repaints ~20×/sec, which is far faster than anyone reads.
+  const STREAM_PAINT_FALLBACK_MS = 50;
+
   const applyStreamChunk = useCallback((id: string, full: string) => {
+    streamingTextRef.current = full;
     latestChunkRef.current = { id, content: full };
-    if (pendingChunkRAFRef.current !== null) return;
-    pendingChunkRAFRef.current = requestAnimationFrame(() => {
+    if (pendingChunkRAFRef.current !== null || pendingChunkTimerRef.current !== null) return;
+
+    const commit = () => {
+      // Cancel whichever of the pair did not fire, so the losing handle
+      // cannot commit a second time or block the next chunk.
+      if (pendingChunkRAFRef.current !== null) cancelAnimationFrame(pendingChunkRAFRef.current);
+      if (pendingChunkTimerRef.current !== null) window.clearTimeout(pendingChunkTimerRef.current);
       pendingChunkRAFRef.current = null;
+      pendingChunkTimerRef.current = null;
       const latest = latestChunkRef.current;
       latestChunkRef.current = null;
       if (!latest) return;
       // `prev.id === latest.id` guards against out-of-order or late frames
       // from a cancelled run landing in a newer stream's bubble.
       setStreamingMsg(prev => prev && prev.id === latest.id ? { ...prev, content: latest.content } : prev);
-    });
+    };
+
+    pendingChunkRAFRef.current = requestAnimationFrame(commit);
+    pendingChunkTimerRef.current = window.setTimeout(commit, STREAM_PAINT_FALLBACK_MS);
   }, []);
 
   const flushStreamChunk = useCallback(() => {
     if (pendingChunkRAFRef.current !== null) {
       cancelAnimationFrame(pendingChunkRAFRef.current);
       pendingChunkRAFRef.current = null;
+    }
+    if (pendingChunkTimerRef.current !== null) {
+      window.clearTimeout(pendingChunkTimerRef.current);
+      pendingChunkTimerRef.current = null;
     }
     latestChunkRef.current = null;
   }, []);
@@ -4995,6 +5354,53 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     releaseNotes?: string;
     downloadUrl?: { windows: string; mac: string; linux: string };
   } | null>(null);
+
+  // ── Which update offer the user has already waved off ──
+  //
+  // The auto-updater can be broken in ways this app cannot repair from here.
+  // v4.0.11-v4.0.16 each shipped with an app-update.yml naming a repo that
+  // was never created, so `checkForUpdates` 404s on its first request on
+  // every launch and those installs can NEVER pull an update themselves —
+  // the feed URL lives in their installed resources, not on any server we
+  // control. This server-driven check is the only channel that still reaches
+  // them, and its result used to render *solely* inside the Settings modal
+  // under "App Updates", a section a user has no reason to ever open. So the
+  // one working signal was shown where nobody looks, and the fleet sat
+  // stranded for three weeks without a word.
+  //
+  // Dismissal is deliberately keyed to the version being OFFERED, not a
+  // boolean: waving this away silences that one release, and the next one
+  // asks again. A sticky "don't show me updates" would recreate exactly the
+  // silent stranding this banner exists to end.
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string>(() => {
+    try { return localStorage.getItem('dismissed_update_version') || ''; } catch { return ''; }
+  });
+  const dismissUpdateBanner = useCallback((version: string) => {
+    setDismissedUpdateVersion(version);
+    try { localStorage.setItem('dismissed_update_version', version); } catch {}
+  }, []);
+
+  // The auto-updater is going to deliver it — say nothing and let it work.
+  // Only 'error' / 'idle' / 'up-to-date' mean nothing is inbound. ('idle'
+  // covers the window before the first check resolves AND the state the
+  // 'ready' banner's own dismiss button resets to.)
+  const updaterIsHandlingIt =
+    updateStatus.status === 'checking' ||
+    updateStatus.status === 'available' ||
+    updateStatus.status === 'downloading' ||
+    updateStatus.status === 'ready';
+
+  // Pick the one link that matches this machine rather than offering three.
+  const platformDownloadUrl = useMemo(() => {
+    const urls = serverVersionInfo?.downloadUrl;
+    if (!urls) return null;
+    switch (licenseService.getPlatform()) {
+      case 'macOS': return urls.mac;
+      case 'Linux': return urls.linux;
+      case 'Windows': return urls.windows;
+      default: return urls.windows;
+    }
+  }, [serverVersionInfo]);
 
   // Injected by Vite from package.json (see vite.config.ts). Single source
   // of truth — no more version drift between manifest and the server check.
@@ -5231,6 +5637,55 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   useEffect(() => {
       localStorage.setItem("CUSTOM_INSTRUCTIONS", settings.customInstructions || '');
   }, [settings.customInstructions]);
+
+  // ── Context prewarm (network + paid half) ──
+  // Warm the two things the first question would otherwise pay for: the
+  // context-store UPLOAD (so the first offload is a cache hit) and
+  // identity EXTRACTION (so the card is ready for question 2).
+  // Deliberately NOT a full model generation anymore — the old 'OK'
+  // prewarm baked the provider cache but its big call CONTENDED with the
+  // user's first real question (measured: it raced Q1 and slowed the
+  // cover). The instant-cover + context store now mask the main model's
+  // cold prefill, so the contending generation isn't worth it.
+  //
+  // ⚠️ THE SIZE GATE THAT USED TO BE HERE MADE THE UPLOAD PREWARM DEAD
+  // CODE. It read `if (totalText < 20_000) return`, so prewarmContext was
+  // called only for LARGE knowledge bases — while the offload branch
+  // inside prewarmContext runs only for SMALL ones. Exactly inverted, so
+  // in the whole life of the feature the context-store prewarm never once
+  // executed, and the most ordinary upload in the product (a resume plus
+  // a job description, ~12K chars) paid the full upload round-trip inline
+  // on question one. The size decision now lives in exactly one place —
+  // prewarmContext, next to the branch it decides.
+  //
+  // Debounce also cut 3.5s → 900ms. Its job is to coalesce a multi-file
+  // upload into one identity extraction, and files in a batch land
+  // milliseconds apart; the remaining 2.6s was pure delay on being ready.
+  const modelPrewarmTimerRef = useRef<number | null>(null);
+  const modelPrewarmKeyRef = useRef<string>('');
+  useEffect(() => {
+    if (isPopoutMode) return;
+    const files = db.contextFiles;
+    if (files.length === 0) return;
+    const totalText = files.reduce((n, f) => n + (f.base64 ? 0 : (f.content?.length || 0)), 0);
+    const key = `${settings.generalMode}|${files.map(f => f.id).join(',')}|${totalText}`;
+    if (key === modelPrewarmKeyRef.current) return;
+    if (modelPrewarmTimerRef.current !== null) window.clearTimeout(modelPrewarmTimerRef.current);
+    modelPrewarmTimerRef.current = window.setTimeout(() => {
+      modelPrewarmKeyRef.current = key;
+      warmKnowledgeNetwork(files);
+      // Identity extraction for BOTH prompt pipelines. These used to run
+      // undebounced on every contextFiles change, which meant a five-file
+      // upload fired five extractions — five different KB hashes, five
+      // model calls, four of them for a knowledge base that no longer
+      // existed by the time they returned, all contending with the user's
+      // first question. Debounced with the rest of the paid work.
+      prewarmClaudeIdentity(files);
+    }, 900);
+    return () => {
+      if (modelPrewarmTimerRef.current !== null) window.clearTimeout(modelPrewarmTimerRef.current);
+    };
+  }, [db.contextFiles, settings.generalMode, isPopoutMode]);
 
   // Sync temp state when settings open
   useEffect(() => {
@@ -5632,6 +6087,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     cancelActiveStream();
     flushStreamChunk();
     setStreamingMsg(null);
+    // Interruption mirrors are per-session too — a stale partial from the
+    // old session must never leak into the new session's interrupt path.
+    streamingTextRef.current = '';
+    streamingIdRef.current = null;
     // Reset any pending stream-end bookkeeping — a stale id + length
     // snapshot from the previous session could otherwise fire spuriously
     // against the new session's messages.
@@ -5685,6 +6144,28 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const executeSend = useCallback(async (textToSend: string, imageBase64?: string, isAutoSolve?: boolean, _fallbackAttempt?: number, _modelOverride?: ModelKey) => {
       if (!textToSend.trim()) return;
 
+      // ── Auto-Solve consistency assert ──
+      // isAutoSolve swaps in a system instruction whose entire job is "solve
+      // the coding problem visible in the attached screenshot", forced to a
+      // single fenced code block — the exact shape Auto-Type types into the
+      // candidate's editor. With no image the model has nothing to read and
+      // fabricates a problem, so this pairing is never a request worth
+      // sending. Both current call sites already bail on a null capture; this
+      // is the belt-and-braces stop that makes a call site added later safe
+      // too. Sits ahead of the plan preflight because a refused send should
+      // burn nothing.
+      if (isAutoSolve && !imageBase64) {
+        console.error('[auto-solve] refused — screen capture returned nothing, not sending a screenshot-less solve');
+        const captureFailMsg: Message = {
+          id: Date.now().toString(),
+          role: 'system',
+          content: SCREEN_CAPTURE_FAILED_MESSAGE,
+          timestamp: Date.now()
+        };
+        if (db.isElectron) { db.addMessage(captureFailMsg); } else { setMessages(prev => [...prev, captureFailMsg]); }
+        return;
+      }
+
       // ── Live-time preflight (2026-07 plan-handling fix) ──
       // Tier FEATURES persist at a 0 balance (a time-exhausted Pro is
       // still Pro: models selectable, Pop-out open) — only live USE is
@@ -5718,16 +6199,24 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       }
 
       // ── Feature Gate: Block disallowed models ──
-      // The retry is TOLD which model to use rather than us writing it into
-      // settings. And when the user's own choice is benched by a recent
-      // refusal we route around it for THIS send only, silently, without
-      // touching their saved preference.
+      // The fallback retry passes the model explicitly rather than writing it
+      // into settings — see the DO NOT PERSIST note in the catch below. When
+      // the user's own choice is benched by a recent refusal we also route
+      // around it for THIS send, silently, without touching their preference.
       const chosenModel = settingsRef.current.selectedModel as ModelKey;
       const currentModel: ModelKey = _modelOverride
         || (isModelCooling(chosenModel)
               ? (pickFallbackModel(chosenModel, gateRef.current?.allowedModels || [], isModelCooling) || chosenModel)
               : chosenModel);
-      if (!gate.canUseModel(currentModel)) {
+      // Read the LIVE gate, not the render-time closure. executeSend is
+      // memoised on [cancelActiveStream], so the `gate` captured here is
+      // whatever the FIRST render computed — a user who upgrades or renews
+      // mid-session would otherwise keep being refused off a stale
+      // allowedModels: []. gateRef mirrors `gate` on every render (see its
+      // declaration + syncing effect below), so it is always the current
+      // plan; the closure is only a fail-soft fallback.
+      const liveGate = gateRef.current || gate;
+      if (!liveGate.canUseModel(currentModel)) {
         // Post-trial free users have NO usable models —
         // FEATURE_GATES.free.models is empty under the 2026-07 policy and
         // the server 402s every model route. (Time-exhausted paid users
@@ -5736,19 +6225,19 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         // the belt-and-braces fallback for auth-state races.) Show the
         // paywall message instead of "switching" to a model that's just
         // as locked (and would error server-side mid-interview).
-        if (gate.allowedModels.length === 0) {
+        if (liveGate.allowedModels.length === 0) {
           const wallMsg: Message = {
             id: Date.now().toString(),
             role: 'model',
-            content: gate.actualTier === 'free'
+            content: liveGate.actualTier === 'free'
               ? 'Your **10-minute free trial** is used up — pick a plan to keep going. [See plans](upgrade)'
-              : `Your **${gate.actualTier.charAt(0).toUpperCase() + gate.actualTier.slice(1)} plan** has ended. [Renew your plan](upgrade) to continue.`,
+              : `Your **${liveGate.actualTier.charAt(0).toUpperCase() + liveGate.actualTier.slice(1)} plan** has ended. [Renew your plan](upgrade) to continue.`,
             timestamp: Date.now()
           };
           if (db.isElectron) { db.addMessage(wallMsg); } else { setMessages(prev => [...prev, wallMsg]); }
           return;
         }
-        const fallback = gate.getDefaultModel();
+        const fallback = liveGate.getDefaultModel();
         setSettings(prev => ({ ...prev, selectedModel: fallback as any }));
         localStorage.setItem("SELECTED_MODEL", fallback);
         // Notify user — tier-aware so we don't promise the wrong upgrade.
@@ -5770,6 +6259,40 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         };
         if (db.isElectron) { db.addMessage(gateMsg); } else { setMessages(prev => [...prev, gateMsg]); }
         return;
+      }
+
+      // ── Interruption capture ──
+      // A new send while an answer is still streaming = the interviewer
+      // spoke mid-answer. Two obligations before we cancel that stream:
+      //  1. PRESERVE what was shown — commit the partial answer to the
+      //     transcript BEFORE the new question, so the user's half-spoken
+      //     answer doesn't vanish off the screen mid-sentence.
+      //  2. GIVE THE MODEL THE SCENE — an INTERRUPTION CONTEXT block
+      //     (prior question, on-screen partial, elapsed seconds, and the
+      //     estimated spoken-aloud prefix at ~2.3 words/sec) rides on the
+      //     OUTGOING query only. The visible bubble and DB keep the clean
+      //     transcript; the system prompt stays untouched (prompt-cache
+      //     stability). The model then decides: follow-up, narrowing,
+      //     redirect, or continue — and answers without re-delivering
+      //     anything already said.
+      // Auto-solve is exempt (fresh single-turn code task by design), and
+      // outage-fallback retries are exempt (same question, not an
+      // interruption).
+      let interruptionBlock = '';
+      if (!isAutoSolve && !_fallbackAttempt && streamAbortRef.current !== null && streamingTextRef.current.trim()) {
+        const partial = streamingTextRef.current;
+        const partialMsg: Message = {
+          id: streamingIdRef.current || Date.now().toString(),
+          role: 'model',
+          content: partial,
+          timestamp: Date.now(),
+        };
+        if (db.isElectron) { db.addMessage(partialMsg); } else { setMessages(prev => [...prev, partialMsg]); }
+        interruptionBlock = buildInterruptionContext({
+          prevQuestion: activeQuestionRef.current,
+          answerSoFar: partial,
+          elapsedMs: Date.now() - (streamStartAtRef.current || Date.now()),
+        });
       }
 
       const userMsg: Message = {
@@ -5827,12 +6350,22 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         // character instead of the popout seeing one final pop.
         const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini, claude: streamClaude };
         const gen = streamers[currentSettings.selectedModel] || streamGemini;
+        streamingIdRef.current = pendingId;
+        streamingTextRef.current = '';
+        streamStartAtRef.current = Date.now();
+        activeQuestionRef.current = userMsg.content;
         setStreamingMsg({ id: pendingId, role: 'model', content: '', timestamp: Date.now() });
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-start', id: pendingId });
+          remoteHostRef.current?.publish('answer_start', { id: pendingId });
         }
+        // The visible bubble + DB keep the clean transcript; only the
+        // outgoing model query carries the interruption context.
+        const queryForModel = interruptionBlock
+          ? `${userMsg.content}\n\n${interruptionBlock}`
+          : userMsg.content;
         responseText = await gen(
-          userMsg.content,
+          queryForModel,
           messagesRef.current,
           contextFiles,
           currentSettings.generalMode,
@@ -5846,6 +6379,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             applyStreamChunk(pendingId, full);
             if (!inPopout) {
               electronIPC.send('relay-to-popout', { type: 'stream-chunk', id: pendingId, full });
+              // Throttled inside the host: the phone reads as typing
+              // without paying cellular for frames no eye resolves.
+              remoteHostRef.current?.publishTokens(full);
             }
           },
           abort.signal,
@@ -5946,6 +6482,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         setStreamingMsg(null);
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
+          remoteHostRef.current?.finishAnswer(pendingId);
         }
       } catch (err: any) {
         // Swallow aborts: they're user-initiated cancellations, not
@@ -5959,6 +6496,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         setStreamingMsg(null);
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
+          remoteHostRef.current?.finishAnswer(pendingId);
         }
 
         const actualError = err?.message || 'Unknown error';
@@ -5974,15 +6512,21 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           // Bench the provider that just refused so the NEXT question routes
           // around it instead of paying the same dead round-trip again.
           providerCooldownRef.current.set(failedModel as ModelKey, Date.now() + PROVIDER_COOLDOWN_MS);
-          const next = pickFallbackModel(failedModel, gate.allowedModels, isModelCooling);
+          const next = pickFallbackModel(failedModel, liveGate.allowedModels, isModelCooling);
           if (next) {
             const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
             const failedLabel = MODEL_REGISTRY[failedModel as ModelKey]?.short ?? cap(failedModel);
             const nextLabel = MODEL_REGISTRY[next]?.short ?? cap(next);
-            // ── DO NOT PERSIST THE SWITCH ── (see PROVIDER_COOLDOWN_MS above)
+            // ── DO NOT PERSIST THE SWITCH ──
             // This used to setSettings + write SELECTED_MODEL to localStorage,
-            // which is what produced the reported gpt -> grok -> gpt loop and
-            // silently replaced the user's own choice after one hiccup.
+            // permanently replacing the model the user picked. Because
+            // FALLBACK_PREFERENCE starts at 'openai', the NEXT failure then chose
+            // GPT back again — so the app oscillated gpt -> grok -> gpt, exactly as
+            // reported from a live interview, and the user's own choice was gone
+            // after the first hiccup. The retry is now TOLD which model to use and
+            // nothing is written down: the picker keeps showing what the user
+            // selected, and the cooldown above is what stops us walking back into
+            // a provider that is genuinely down.
             const noticeMsg: Message = {
               id: Date.now().toString(),
               role: 'model',
@@ -6002,7 +6546,12 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         // For a known provider outage with no alternative model, phrase it as a
         // service problem rather than a raw JSON dump; otherwise show the
         // message as-is. Never suggest logging out (catastrophic mid-interview).
-        const errorContent = looksLikeProviderOutage(actualError)
+        // "Start your session" is an instruction, not a fault — prefixing
+        // it with "Error:" would make a one-tap fix read like something
+        // broke.
+        const errorContent = err?.name === 'SessionRequiredError'
+          ? `🎙️ ${actualError}`
+          : looksLikeProviderOutage(actualError)
           ? `⚠️ ${MODEL_REGISTRY[failedModel as ModelKey]?.short ?? failedModel} is having a temporary service problem. Please try again in a moment, or pick another model.`
           : `Error: ${actualError}`;
 
@@ -6024,9 +6573,49 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         if (streamAbortRef.current === abort) {
           streamAbortRef.current = null;
           setIsProcessing(false);
+          // Same ownership rule for the interruption mirrors — an
+          // interrupted (older) run must not wipe the refs the new run
+          // is already writing.
+          streamingTextRef.current = '';
+          streamingIdRef.current = null;
         }
       }
   }, [cancelActiveStream]);
+
+  // DEV-only automation hook. The voice path (auto-send silence timer)
+  // calls executeSend directly — including while a stream is in flight,
+  // which is exactly how a real interviewer follow-up interrupts an
+  // answer. The UI send paths are deliberately disabled during
+  // streaming, so the CDP end-to-end drive (server/scripts/drive-app.mjs)
+  // needs this handle to exercise the interruption engine the same way
+  // speech does. import.meta.env.DEV is compile-time — production
+  // bundles contain neither the branch nor the hook.
+  useEffect(() => {
+    if ((import.meta as any).env?.DEV) {
+      (window as any).__dev_executeSend = (t: string) => executeSend(t);
+      (window as any).__dev_newSession = () => { try { db.newSession(); } catch {} };
+      (window as any).__dev_isProcessing = () => isProcessing;
+      // Inject context files in one batch (no per-file IPC) so the CDP
+      // harness can exercise the large-knowledge-base path.
+      (window as any).__dev_setContextFiles = (files: ContextFile[]) => { try { db.setContextFiles(files as any); } catch {} };
+      (window as any).__dev_addContextFile = async (f: ContextFile) => { try { await db.addContextFile(f); } catch {} };
+      (window as any).__dev_contextInfo = () => {
+        const f = contextFilesRef.current || [];
+        return { count: f.length, totalChars: f.reduce((n, x) => n + (x.base64 ? 0 : (x.content?.length || 0)), 0) };
+      };
+    }
+  }, [executeSend, isProcessing]);
+
+  // ── Device sync: this machine hosts, the phone mirrors ────────────
+  // The computer is the instrument. It publishes what it is doing so a
+  // phone can watch, and it executes the buttons pressed there. The
+  // phone never captures audio and never calls a model — everything it
+  // shows originated here.
+  //
+  // The wiring lives further down, next to the pop-out relay, because
+  // both are the same job — "tell another screen what this one is
+  // doing" — and everything they need (mic state, settings, the speech
+  // hook) is only in scope down there. See "Main window → phone".
 
   // --- Speech Handling ---
   const handleSpeechResult = useCallback(({ final, interim }: { final: string, interim: string }) => {
@@ -6045,9 +6634,24 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             silenceTimerRef.current = setTimeout(() => {
                 const currentBuffer = inputTextRef.current;
                 if (currentBuffer && currentBuffer.trim().length > 0) {
+                     // ── Backchannel gate ──
+                     // "hmm" / "okay" / "got it" while the candidate is
+                     // mid-answer are listening sounds, not questions.
+                     // Sending them used to CANCEL the in-flight answer
+                     // (executeSend aborts the active stream) and burn a
+                     // model call for a noise-gate "...". Drop them
+                     // client-side. STRICT filter: the entire buffer must
+                     // be acknowledgment tokens (≤4 words) — anything
+                     // with real content ("okay, now design a cache")
+                     // sends normally. Server noise gate remains the
+                     // backstop for whatever this misses.
+                     if (isBackchannelOnly(currentBuffer)) {
+                         setInputText('');
+                         return;
+                     }
                      executeSend(currentBuffer);
                 }
-            }, 1200); 
+            }, 1200);
         }
     }
   }, [executeSend]);
@@ -6142,9 +6746,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const isProcessingRef = useRef(isProcessing);
   const interimTextRef = useRef(interimText);
   const rawSpeechErrorRef = useRef(_rawSpeechError);
-  // model -> epoch ms until which that provider is benched. A ref, not state:
-  // nothing renders off it, and re-rendering the tree on every 429 during a
-  // live interview is exactly the wrong moment to churn.
+  // ── Provider cooldown (see PROVIDER_COOLDOWN_MS) ──
+  // model -> epoch ms until which that provider is benched. A ref, not
+  // state: nothing renders off it, and a re-render per 429 during a live
+  // interview is exactly the wrong time to churn the tree.
   const providerCooldownRef = useRef<Map<ModelKey, number>>(new Map());
   const isModelCooling = useCallback((m: ModelKey): boolean => {
     const until = providerCooldownRef.current.get(m);
@@ -6220,6 +6825,334 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       selectedModel: settings.selectedModel,
     });
   }, [_rawIsListening, isProcessing, interimText, inputText, settings.autoSend, _rawSpeechError, settings.selectedModel]);
+
+  // ══ Main window → phone ═══════════════════════════════════════════
+  //
+  // Same job as the pop-out relay above, over a socket instead of IPC,
+  // and with one extra rule the pop-out doesn't need: the phone may be
+  // ASLEEP, or in a tunnel, or shut. So this doesn't broadcast — it
+  // publishes to a durable log the phone reads from a cursor, and a
+  // device that missed six hours replays exactly what it missed.
+  //
+  // Only the MAIN window hosts. The pop-out is another view of this same
+  // session; if it also claimed host the two would fight for control and
+  // every Auto-Solve would run twice.
+
+  // How much conversation a joining phone gets. Enough to scroll back
+  // through an interview, bounded so a marathon session can't push a
+  // megabyte through a cellular link on connect.
+  const MIRROR_TAIL = 40;
+
+  // The phone's model picker is derived, never re-listed. `allowedModels`
+  // is the gate's own answer to "what may this account use", and
+  // MODEL_REGISTRY is the app's one source of display names — a second
+  // hand-written list on the phone is exactly how "GPT" and "GPT-5.5"
+  // ended up disagreeing across the three desktop pickers.
+  const remoteModelList = (g: typeof gate | null) =>
+    ((g?.allowedModels || []) as ModelKey[]).map(k => ({
+      key: k,
+      short: MODEL_REGISTRY[k]?.short || k,
+      label: MODEL_REGISTRY[k]?.label || k,
+    }));
+
+  // Unlimited plans carry `Infinity` seconds, and JSON.stringify(Infinity)
+  // is the string "null" — so publishing it raw meant the phone received
+  // null, could not tell "unlimited" from "the host didn't say", and kept
+  // whatever number it had. It only ever looked right because the phone
+  // independently fetches /usage/balance; before that lands, an unlimited
+  // user watching a running session saw "0:00".
+  //
+  // -1 is not an invention: it is exactly what /usage/balance already
+  // returns for unlimited, so the phone decodes one convention, not two.
+  const wireSeconds = (s: number) => (Number.isFinite(s) ? s : -1);
+
+  // Refs, not values, because the host is constructed once per sign-in
+  // and its handlers would otherwise hold the first render's callbacks
+  // forever — the phone would set a model using a gate from ten minutes
+  // ago.
+  const remoteSnapshotFnRef = useRef<() => Record<string, any>>(() => ({}));
+  const remoteActionsRef = useRef<Record<string, (...a: any[]) => void>>({});
+  // Read by the countdown beat below, which runs on a plain interval and
+  // therefore cannot close over state.
+  const listeningRef = useRef(false);
+  listeningRef.current = _rawIsListening;
+  // Which message ids the phone already has, and for which conversation.
+  // Seeded whole by the snapshot; the incremental publisher below trusts
+  // it completely, which is why the two are written in one place.
+  const syncedMsgIdsRef = useRef<Set<string>>(new Set());
+  const syncedSessionRef = useRef<string | null>(null);
+
+  remoteSnapshotFnRef.current = () => {
+    const all = messagesRef.current;
+    const tail = all.slice(-MIRROR_TAIL);
+    // Seed from ALL ids, not just the ones we're sending. Older messages
+    // are deliberately withheld, and marking only the tail as synced
+    // would make the incremental publisher re-send the entire history
+    // one message at a time on the very next render.
+    syncedMsgIdsRef.current = new Set(all.map(m => m.id));
+    syncedSessionRef.current = db.sessionId || 'live';
+    return {
+      sessionId: db.sessionId || 'live',
+      busy: isProcessingRef.current,
+      listening: _rawIsListening,
+      autoSend: settingsRef.current.autoSend,
+      model: settingsRef.current.selectedModel,
+      canAutoType: gateRef.current?.canAutoType ?? false,
+      models: remoteModelList(gateRef.current),
+      // The phone shows the SAME countdown this machine is showing. It
+      // must never run its own: only one device may hold the session, and
+      // two independent clocks on one balance would disagree within a
+      // minute and make the user distrust both.
+      remaining: wireSeconds(creditTimerRef.current.remaining),
+      timeSource: creditTimerRef.current.source,
+      input: inputTextRef.current,
+      // The phone shows "earlier messages are on your computer" rather
+      // than pretending this is the whole conversation.
+      truncated: all.length > tail.length,
+      messages: tail.map(m => ({ id: m.id, role: m.role, content: m.content, timestamp: m.timestamp })),
+      sessions: (db.sessions || []).slice(0, 25).map(s => ({
+        id: s.id, name: s.name, messageCount: s.message_count, createdAt: s.created_at,
+      })),
+    };
+  };
+
+  remoteActionsRef.current = {
+    startListening: () => _rawStartListening(),
+    stopListening: () => _rawStopListening(),
+    setAutoSend: (on: boolean) => setSettings(prev => prev.autoSend === on ? prev : { ...prev, autoSend: on }),
+    setModel: (m: AppSettings['selectedModel']) => {
+      // The same gate the desktop's own picker enforces. A phone must not
+      // be a way around tier limits.
+      if (!m || !gateRef.current?.canUseModel?.(m)) throw new Error('model_not_available_on_your_plan');
+      setSettings(prev => prev.selectedModel === m ? prev : { ...prev, selectedModel: m });
+      localStorage.setItem('SELECTED_MODEL', m);
+    },
+    switchSession: (id: string) => { if (id) db.switchSession(id); },
+    addContextFile: (name: string, content: string) => {
+      // Replace rather than duplicate when the same document is sent
+      // again — a corrected resume alongside the old one would put two
+      // disagreeing versions in the same prompt.
+      const existing = (db.contextFiles || []).find(f => f.name === name);
+      if (existing) { try { db.removeContextFile(existing.id); } catch { /* re-added below anyway */ } }
+      db.addContextFile({
+        id: `phone-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        name,
+        content,
+        // 'custom' rather than guessing 'resume' from the filename: the
+        // type steers how the prompt frames it, and being wrong about
+        // that is worse than being unspecific.
+        type: 'custom',
+      });
+    },
+  };
+
+  useEffect(() => {
+    if (isPopoutMode) return;
+    const token = licenseService.getToken();
+    if (!token) return;                       // signed out — nothing to host
+
+    const host = new RemoteHost({
+      wsUrl: remoteWsUrl(licenseService.getApiBase()),
+      token,
+      // A session id only exists once Electron has claimed one. Before
+      // that — a fresh launch, or the web build — publish() would drop
+      // every event silently and the phone would sit blank while the
+      // desktop worked. Fall back to a stable per-user channel; the
+      // server scopes everything by the JWT's user, so 'live' is not
+      // shared between accounts. Real sessions take over the moment
+      // one exists.
+      getSessionId: () => db.sessionId || 'live',
+      isBusy: () => isProcessingRef.current,
+      getSnapshot: () => remoteSnapshotFnRef.current(),
+      // A refused join is terminal: an expired token, an admin force-logout,
+      // or a rotated signing secret will be refused again a second later,
+      // and forever. The host used to ignore the refusal and reconnect ~1x/s
+      // for the life of the process. It now stops — but stopping quietly
+      // only moves the failure, because the phone just goes dead with no
+      // reason given. Say it once, in the transcript they're already reading.
+      onFatal: (reason) => {
+        const syncDead: Message = {
+          id: Date.now().toString(),
+          role: 'system',
+          content: reason === 'revoked'
+            ? 'Phone sync stopped — this device was signed out remotely. Sign in again to reconnect it.'
+            : 'Phone sync stopped — the sign-in on this device is no longer valid. Sign in again to reconnect it.',
+          timestamp: Date.now(),
+        };
+        if (db.isElectron) { db.addMessage(syncDead); } else { setMessages(prev => [...prev, syncDead]); }
+      },
+    });
+
+    // Every button the phone can press maps to the SAME function the
+    // desktop's own button calls — so there is one implementation of
+    // Auto-Solve, not a second one that can drift from it.
+    host.on('auto_solve', () => { void handleAutoSolve(); });
+    host.on('send', (p) => {
+      const text = String(p?.text || '').trim();
+      if (text) void executeSend(text);
+    });
+    host.on('stop', () => { cancelActiveStream(); });
+    host.on('new_session', () => { try { db.newSession(); } catch { /* nothing to do */ } });
+    host.on('switch_session', (p) => { remoteActionsRef.current.switchSession(String(p?.sessionId || '')); });
+    host.on('set_model', (p) => { remoteActionsRef.current.setModel(p?.model); });
+    host.on('set_auto_send', (p) => { remoteActionsRef.current.setAutoSend(!!p?.on); });
+
+    // A document the phone read, arriving as text. It lands in this
+    // machine's Files exactly as a local upload would, so every answer
+    // from here on is grounded in it too — the phone and the computer
+    // stop having different pictures of who the candidate is.
+    host.on('add_context_file', (p) => {
+      const name = String(p?.name || '').trim().slice(0, 120);
+      const content = String(p?.content || '');
+      if (!name || !content.trim()) throw new Error('empty_file');
+      // Bounded here as well as on the phone. The phone is a client and a
+      // client's limits are a courtesy, not a guarantee.
+      if (content.length > 60_000) throw new Error('file_too_large');
+      remoteActionsRef.current.addContextFile(name, content);
+    });
+
+    // Starts THE COMPUTER'S microphone. Worth being explicit about,
+    // because it is the one command whose name could be misread: the
+    // phone's own mic is never opened, on any code path, ever.
+    host.on('toggle_listening', (p) => {
+      if (p?.on) remoteActionsRef.current.startListening();
+      else remoteActionsRef.current.stopListening();
+    });
+
+    // The phone names a block — "the 2nd code block of the newest
+    // answer" — and the desktop resolves it against its own messages.
+    // Code is never sent from the phone: it has no authority over what
+    // gets typed, only over when.
+    host.on('auto_type', (p) => {
+      const index = Math.max(0, Number(p?.index) || 0);
+      const msgs = messagesRef.current;
+      const target = p?.messageId
+        ? msgs.find(m => m.id === String(p.messageId))
+        : [...msgs].reverse().find(m => m.role === 'model' && m.content.includes('```'));
+      if (!target) throw new Error('no_answer_with_code');
+      const code = extractCodeBlocks(target.content)[index];
+      if (!code) throw new Error('no_such_code_block');
+      const r = runAutoTypeForCode(code);
+      // Fails when the answer has scrolled out of the DOM. Better a
+      // clear refusal than typing yesterday's solution into a live
+      // editor.
+      if (!r.ok) throw new Error(r.reason || 'auto_type_unavailable');
+    });
+
+    host.start();
+    remoteHostRef.current = host;
+    if ((import.meta as any).env?.DEV) (window as any).__remoteHost = host;
+    return () => { host.stop(); remoteHostRef.current = null; };
+    // Re-created when the signed-in identity changes; the handlers read
+    // through refs so this does not churn per render.
+  }, [licenseService.getToken()]);
+
+  // Busy state drives the phone's button states — a remote that offers a
+  // live button while the computer is mid-answer invites a double-send.
+  useEffect(() => {
+    remoteHostRef.current?.publish('processing', { busy: isProcessing });
+  }, [isProcessing]);
+
+  // The live control surface. Ephemeral by design: it says what is true
+  // right now, and a device joining later reads all of it out of the
+  // snapshot instead. Persisting it would write a database row every
+  // time the user toggles the mic.
+  useEffect(() => {
+    publishRemote('control_state', {
+      busy: isProcessing,
+      listening: _rawIsListening,
+      autoSend: settings.autoSend,
+      model: settings.selectedModel,
+      canAutoType: gate.canAutoType,
+      models: remoteModelList(gate),
+      remaining: wireSeconds(creditTimerRef.current.remaining),
+      timeSource: creditTimerRef.current.source,
+    });
+  }, [isProcessing, _rawIsListening, settings.autoSend, settings.selectedModel, gate.canAutoType]);
+
+  // The countdown itself, pushed on its own beat. It is not in the effect
+  // above because `remaining` ticks every second and would re-fire the
+  // whole control frame at 1Hz; a phone only needs the number often
+  // enough to look live, and this event is ephemeral so it costs nothing
+  // but bandwidth.
+  useEffect(() => {
+    if (isPopoutMode) return;
+    const t = setInterval(() => {
+      if (!remoteHostRef.current?.isConnected) return;
+      publishRemote('control_state', {
+        busy: isProcessingRef.current,
+        listening: listeningRef.current,
+        autoSend: settingsRef.current.autoSend,
+        model: settingsRef.current.selectedModel,
+        canAutoType: gateRef.current?.canAutoType ?? false,
+        models: remoteModelList(gateRef.current),
+        remaining: wireSeconds(creditTimerRef.current.remaining),
+        timeSource: creditTimerRef.current.source,
+      });
+    }, 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  // What the computer is hearing. Ephemeral and throttled — this ticks
+  // at speech rate and its only job is to look alive on the phone.
+  const lastTranscriptPushRef = useRef(0);
+  useEffect(() => {
+    const now = Date.now();
+    // Never throttle the frame that clears the interim text: an utterance
+    // always ends that way, so the phone can't be left showing half a
+    // sentence that the desktop finished ten seconds ago.
+    if (interimText && now - lastTranscriptPushRef.current < 150) return;
+    lastTranscriptPushRef.current = now;
+    publishRemote('transcript_delta', { interim: interimText, input: inputText });
+  }, [interimText, inputText]);
+
+  // Committed turns, incrementally. ONE publisher instead of thirteen
+  // db.addMessage() call sites — a call site added next year cannot
+  // forget to mirror, because it doesn't have to remember.
+  useEffect(() => {
+    const host = remoteHostRef.current;
+    // Before the server accepts us, publish() drops silently. Marking
+    // messages synced here would lose them permanently; the snapshot at
+    // join time covers everything that exists by then anyway.
+    if (!host?.isConnected) return;
+
+    const sid = db.sessionId || 'live';
+    if (syncedSessionRef.current !== sid) {
+      // A different conversation entirely. Re-baseline, rather than
+      // publishing someone else's history as brand-new messages.
+      //
+      // Order matters: tell the server which session we are on FIRST, so
+      // the presence frame it fans out to the phone names the new one and
+      // the phone re-joins immediately. The snapshot then lands in the
+      // log the phone is about to read.
+      host.announceSession();
+      host.publish('session_switched', { sessionId: sid });
+      host.publishSnapshot();
+      return;
+    }
+    for (const m of messages) {
+      if (syncedMsgIdsRef.current.has(m.id)) continue;
+      syncedMsgIdsRef.current.add(m.id);
+      host.publish('message_added', { id: m.id, role: m.role, content: m.content, timestamp: m.timestamp });
+    }
+  }, [messages, db.sessionId]);
+
+  // The desktop's conversations, so the phone can jump between them.
+  useEffect(() => {
+    publishRemote('session_list', {
+      sessions: (db.sessions || []).slice(0, 25).map(s => ({
+        id: s.id, name: s.name, messageCount: s.message_count, createdAt: s.created_at,
+      })),
+      activeId: db.sessionId || null,
+    });
+  }, [db.sessions, db.sessionId]);
+
+  // A microphone that failed on the computer must not read as "the phone
+  // is broken". Errors the desktop shows, the phone shows.
+  useEffect(() => {
+    if (!_rawSpeechError) return;
+    publishRemote('error', { scope: 'speech', message: String(_rawSpeechError) });
+  }, [_rawSpeechError]);
 
   // Pop-out: receive state from main window
   useEffect(() => {
@@ -6654,10 +7587,30 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           break;
         case 'cmd-auto-solve':
           captureScreenshot().then(screenshot => {
+            if (!screenshot) {
+              // Capture happens HERE, on main, even though the button was
+              // pressed in the popout — so the failure has to be reported
+              // from here too. There is no "show a message" relay type (the
+              // popout's from-main handler only knows state-sync/credit-sync/
+              // stream-*): committed turns reach the popout over the
+              // db:messages-updated IPC, which is exactly what db.addMessage
+              // fires. So the popout renders this system bubble in the same
+              // transcript it renders every other message in, and the phone
+              // gets it too via the message publisher. Sending anyway would
+              // hand Auto-Type an invented solution.
+              const captureFailMsg: Message = {
+                id: Date.now().toString(),
+                role: 'system',
+                content: SCREEN_CAPTURE_FAILED_MESSAGE,
+                timestamp: Date.now()
+              };
+              if (db.isElectron) { db.addMessage(captureFailMsg); } else { setMessages(prev => [...prev, captureFailMsg]); }
+              return;
+            }
             // isAutoSolve=true swaps the system prompt to code-only output
             // and skips the candidate-persona voice rules, so CodeBlock's
             // auto-type receives pure code instead of prose-as-comments.
-            executeSend(AUTO_SOLVE_PROMPT, screenshot || undefined, true);
+            executeSend(AUTO_SOLVE_PROMPT, screenshot, true);
           });
           break;
         case 'cmd-clear':
@@ -6764,7 +7717,22 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     // skips the candidate-persona voice rules, so CodeBlock's auto-type
     // receives pure code instead of prose-as-comments.
     const screenshot = await captureScreenshot();
-    executeSend(AUTO_SOLVE_PROMPT, screenshot || undefined, true);
+    if (!screenshot) {
+      // No image, no send — see SCREEN_CAPTURE_FAILED_MESSAGE. Nothing in the
+      // UI used to say the capture had failed, so a revoked screen-recording
+      // permission read to the candidate as a normal answer that happened to
+      // solve a different problem. Say it plainly instead, in the transcript
+      // they're already watching.
+      const captureFailMsg: Message = {
+        id: Date.now().toString(),
+        role: 'system',
+        content: SCREEN_CAPTURE_FAILED_MESSAGE,
+        timestamp: Date.now()
+      };
+      if (db.isElectron) { db.addMessage(captureFailMsg); } else { setMessages(prev => [...prev, captureFailMsg]); }
+      return;
+    }
+    executeSend(AUTO_SOLVE_PROMPT, screenshot, true);
   };
 
   const handleClear = () => {
@@ -6806,9 +7774,16 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
 
         const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini, claude: streamClaude };
         const gen = streamers[currentSettings.selectedModel] || streamGemini;
+        // Keep the interruption mirrors accurate for regenerated streams
+        // too — an interviewer can cut into a regeneration just as well.
+        streamingIdRef.current = pendingId;
+        streamingTextRef.current = '';
+        streamStartAtRef.current = Date.now();
+        activeQuestionRef.current = lastUserMsg.content;
         setStreamingMsg({ id: pendingId, role: 'model', content: '', timestamp: Date.now() });
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-start', id: pendingId });
+          remoteHostRef.current?.publish('answer_start', { id: pendingId });
         }
         responseText = await gen(
           lastUserMsg.content,
@@ -6820,6 +7795,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             applyStreamChunk(pendingId, full);
             if (!inPopout) {
               electronIPC.send('relay-to-popout', { type: 'stream-chunk', id: pendingId, full });
+              // Throttled inside the host: the phone reads as typing
+              // without paying cellular for frames no eye resolves.
+              remoteHostRef.current?.publishTokens(full);
             }
           },
           abort.signal
@@ -6838,6 +7816,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         setStreamingMsg(null);
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
+          remoteHostRef.current?.finishAnswer(pendingId);
         }
     } catch (err: any) {
         if (err?.name === 'AbortError' || streamAbortRef.current !== abort) return;
@@ -6846,6 +7825,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         setStreamingMsg(null);
         if (!inPopout) {
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
+          remoteHostRef.current?.finishAnswer(pendingId);
         }
     } finally {
         if (streamAbortRef.current === abort) {
@@ -6885,6 +7865,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       return;
     }
 
+    // Reset the per-batch failure count: the notice describes THIS upload.
+    setUnreadableCount(0);
+    let unreadable = 0;
+
     // Process each file
     const processFile = async (file: File, index: number) => {
       const isText = file.type.startsWith('text/') ||
@@ -6914,10 +7898,11 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             base64: undefined
           });
         } catch (err) {
-          // Silent skip on extraction failure — a native alert() showing
-          // the filename would leak a resume/JD filename to screen-share.
-          // The file simply is not attached; user sees it is absent from
-          // the Attached Files list.
+          // Not attached — and now COUNTED. A native alert() showing the
+          // filename would leak it to a screen-share, which is why this was
+          // silent; the notice reports the count inside the protected
+          // window instead, so an unreadable file is no longer invisible.
+          unreadable++;
           console.error('[context] PDF extract failed:', err);
         } finally {
           setIsProcessing(false);
@@ -6935,6 +7920,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
             base64: undefined
           });
         } catch (err) {
+          unreadable++;
           console.error('[context] DOCX extract failed:', err);
         } finally {
           setIsProcessing(false);
@@ -6991,6 +7977,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       await processFile(fileArray[i], i);
       filesProcessed++;
     }
+    if (unreadable > 0) setUnreadableCount(unreadable);
   };
   
   const handleAddPasteText = () => {
@@ -7420,6 +8407,50 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           </div>
         )}
 
+        {/* ── Manual-update banner: the updater is NOT going to deliver this ──
+            Shown when the server knows about a newer version and nothing is
+            inbound from the auto-updater. That combination means this install
+            cannot heal itself — either the update check is erroring, or it is
+            cheerfully reporting "up to date" against a feed that no longer
+            carries releases. Both were true of the entire v4.0.11-v4.0.16
+            fleet, and neither produced a single word of UI outside a Settings
+            panel nobody opens.
+
+            Amber, not blue: the blue banner above is "we did the work, press
+            the button"; this one is "you have to go get it". Different ask,
+            different colour. */}
+        {!isPopoutElectron && isElectron && serverVersionInfo?.isOutdated
+          && !updaterIsHandlingIt
+          && dismissedUpdateVersion !== serverVersionInfo.latest && (
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[9999] animate-in fade-in slide-in-from-top-2">
+            <div className="flex items-center gap-3 bg-amber-500/10 border border-amber-500/30 backdrop-blur-sm rounded-lg px-4 py-2.5 shadow-lg">
+              <Download size={14} className="text-amber-400 shrink-0" />
+              <span className="text-sm text-amber-200">
+                v{serverVersionInfo.latest} is available
+                <span className="text-amber-300/60"> — this copy can’t install it automatically</span>
+              </span>
+              {platformDownloadUrl && (
+                <a
+                  href={platformDownloadUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => dismissUpdateBanner(serverVersionInfo.latest)}
+                  className="px-3 py-1 rounded-md text-xs font-bold bg-amber-500 text-white hover:bg-amber-600 transition-colors flex items-center gap-1.5"
+                >
+                  Download <ExternalLink size={11} />
+                </a>
+              )}
+              <button
+                onClick={() => dismissUpdateBanner(serverVersionInfo.latest)}
+                className="text-amber-300/60 hover:text-amber-100 text-lg leading-none ml-1"
+                aria-label="Dismiss"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* ── CONTENT AREA ── */}
         {isPopoutElectron ? (
             /* Electron pop-out: always show compact chat + custom
@@ -7595,7 +8626,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                         the old single-pill "Upgrade to Max for all models"
                         which was misleading because Pro also has 4 models —
                         the only model going from Pro→Max unlocks is Claude. */}
-                    {gate.isMax ? (
+                    {gate.isUltra ? (
+                      <span className="mp-hint"><UltraMark size={9} /> Full access</span>
+                    ) : gate.isMax ? (
                       <span className="mp-hint"><WizardHat size={9} /> Full access</span>
                     ) : gate.isPro ? (
                       <span className="mp-hint"><Crown size={9} /> Max adds Train Model + reasoning</span>
@@ -7729,14 +8762,19 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                 )}
 
                 {/* ── GPT Reasoning Speed ──
-                    Switch bar: None / Low / Medium / High. Max-tier only —
-                    lower tiers see the bar but only None is enabled, with
-                    Crown badges on the locked levels.
+                    Switch bar: Auto / Low / Medium / High. The first notch
+                    stores 'none' but the request layer SENDS 'auto'
+                    (aiProxyService.getReasoningEffort): the server
+                    classifies the question and picks 'low' for deep shapes
+                    (coding, system design, ML, cases — TTFT ≤~3.2s) and
+                    'none' for the rest. Manual notches are Max-tier only —
+                    lower tiers see the bar but only Auto is enabled, with
+                    Crown badges on the locked levels (server forces their
+                    resolved effort to 'none' via the JWT tier gate).
                     Server enforces tier-gating via JWT regardless of what
                     the client sends, so this UI is affordance-only. The
                     contextual help below adapts to (a) tier and (b) whether
-                    the user has trained their model — explaining how
-                    Train Model + None gives instant high-quality answers. */}
+                    the user has trained their model. */}
                 <div className="flex flex-col gap-2 pt-1">
                     <div className="flex items-center justify-between">
                         <span className="text-sm font-medium text-text">GPT Reasoning Speed</span>
@@ -7759,7 +8797,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                                     }}
                                     disabled={isLockedForTier}
                                     title={
-                                        level === 'none' ? 'Skip chain-of-thought · ~1-3s answers' :
+                                        level === 'none' ? 'Auto — depth-matched: shallow ~1-3s, deep questions think briefly (≤4s)' :
                                         level === 'low' ? 'Light reasoning · ~3-6s answers' :
                                         level === 'medium' ? 'Balanced reasoning · ~5-10s answers' :
                                         'Deep reasoning · ~10-25s answers'
@@ -7772,7 +8810,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                                                 : 'text-gray-400 hover:text-gray-200'
                                     }`}
                                 >
-                                    {level.charAt(0).toUpperCase() + level.slice(1)}
+                                    {level === 'none' ? 'Auto' : level.charAt(0).toUpperCase() + level.slice(1)}
                                     {isLockedForTier && (
                                         <WizardHat size={8} className="absolute top-0.5 right-0.5 text-amber-400/70" />
                                     )}
@@ -7792,18 +8830,18 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                     }`}>
                         {!gate.canChooseReasoningEffort ? (
                             <>
-                                <span className="font-semibold">Locked to None.</span>{' '}
-                                Upgrade to Max to control reasoning depth and unlock Train Model — pre-research your resume + JD for instant high-quality answers on None.
+                                <span className="font-semibold">Locked to the fastest setting.</span>{' '}
+                                Upgrade to Max to unlock depth-matched Auto reasoning, the manual dial, and Train Model — pre-research your resume + JD for instant high-quality answers.
                             </>
                         ) : hasTrainedCache && settings.reasoningEffort === 'none' ? (
                             <>
-                                <span className="font-semibold">⚡ Instant mode active.</span>{' '}
-                                Your trained tech-state card supplies the depth GPT skips — answers in ~1-3s with full grounding from your researched stack.
+                                <span className="font-semibold">⚡ Auto depth active.</span>{' '}
+                                Shallow questions answer in ~1-3s; deep ones (coding, design, cases) think briefly and start within ~3s. Your trained tech-state card supplies researched grounding on top.
                             </>
                         ) : !hasTrainedCache && settings.reasoningEffort === 'none' ? (
                             <>
-                                <span className="font-semibold">Fast but shallow.</span>{' '}
-                                You haven't trained yet — answers come back quickly but only from GPT's base knowledge. Train your model (above) to get instant <em>and</em> deeply-grounded answers, or pick a higher reasoning level for live deeper thinking (slower).
+                                <span className="font-semibold">Auto depth.</span>{' '}
+                                Deep questions (coding, design, cases) get light reasoning within the ~4s live budget; everything else stays instant. Train your model (above) to add researched grounding, or pick a manual level for uniformly deeper thinking (slower).
                             </>
                         ) : settings.reasoningEffort === 'high' ? (
                             <>
@@ -7947,6 +8985,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           browser registration corrupted, AV blocking, OS shell process
           busy). The user can copy the URL into the browser of their
           choice instead of being stranded. */}
+      {unreadableCount > 0 && (
+        <UnreadableFilesNotice count={unreadableCount} onDismiss={() => setUnreadableCount(0)} />
+      )}
+
       {checkoutToast && (
         <div
           className="fixed left-1/2 top-4 -translate-x-1/2 z-[100000] max-w-lg w-[92vw] sm:w-auto pointer-events-none"
@@ -8462,8 +9504,15 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           tokens so it auto-themes with the user's light/dark choice. Pinning
           a fixed height keeps the chat scrollable inside the modal instead of
           letting the modal grow with the conversation. */}
-      <Modal isOpen={showSupport} onClose={() => setShowSupport(false)} title="Chat with Minica">
-        <div className="h-[min(70vh,720px)] -mx-6 -mb-6 -mt-2 border-t border-border">
+      {/* hideHeader: the panel brings its own header (avatar, live agent
+          presence, admin Inbox), so the modal's title bar was a second
+          header with a second close button stacked above it.
+          Bleed is -m-4 to match the body's p-4 EXACTLY. It was
+          `-mx-6 -mb-6 -mt-2`: -24px against 16px of padding, so the panel
+          overhung the modal by 8px per side and the body scrolled by 8px —
+          the residual sliver left after the min-height fix. */}
+      <Modal isOpen={showSupport} onClose={() => setShowSupport(false)} title="Chat with Minica" hideHeader>
+        <div className="h-[min(70vh,720px)] -m-4">
           <SupportBot
             mode="panel"
             currentUser={userProfile ? { email: userProfile.email, name: userProfile.name, id: (userProfile as any).id } : null}
@@ -8826,6 +9875,13 @@ export default function App() {
   }, [authenticated]);
 
   const handleLogout = () => {
+    // The knowledge caches are module-level singletons, so they outlive
+    // this component. New-chat and last-file-deleted already reach
+    // forgetKnowledge through the syncKnowledge effect (an empty file list
+    // means there is no knowledge base); signing out does not change the
+    // file list, so it has to say so itself. Otherwise the next account on
+    // this machine starts with the previous one's resume still resident.
+    forgetKnowledge();
     licenseService.logout();
     setAuthenticated(false);
     setUser(null);

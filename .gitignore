@@ -44,6 +44,16 @@ server/.env.*
 # back to public docs only, which is the safe default.
 docs/private/
 
+# ── Generated test transcripts ──
+# server/scripts/test-{models,sequential,coding-design}.mjs write these next
+# to server/. They are RUN OUTPUT, not source: several thousand lines of real
+# model responses, prompts and internal reasoning traces, regenerated on every
+# run. They were tracked by accident and sat in a public repo. Keep them on
+# disk (the scripts rewrite them in place), out of git.
+server/test-results.md
+server/test-sequential-results.md
+server/test-coding-design-results.md
+
 # ── Database files ──
 server/data/
 *.db
@@ -113,3 +123,6 @@ server/scripts/.autotype-test/
 /cdp-*.mjs
 /current-*.png
 /globe-*.png
+
+# Cross-session coordination scratch file (two Claude Code tabs). Never commit.
+.claude-session-coordination.md

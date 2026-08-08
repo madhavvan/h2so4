@@ -45,7 +45,7 @@ function detectOS(): OSKey {
 const ClickChip = ({ children }: { children: React.ReactNode }) => (
   <span
     className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px] font-bold whitespace-nowrap align-middle"
-    style={{ background: GOLD_SOFT, color: '#f0d78a', border: `1px solid ${GOLD_LINE}` }}
+    style={{ background: GOLD_SOFT, color: 'var(--gold-ink-strong)', border: `1px solid ${GOLD_LINE}` }}
   >
     <MousePointerClick size={10} />
     {children}
@@ -77,7 +77,7 @@ const SmartScreenMock = () => (
       </div>
       <div className="text-[10.5px] mt-1.5 underline font-semibold" style={{ color: '#fff' }}>
         More info
-        <span className="ml-1 not-italic no-underline inline-flex align-middle" style={{ color: '#f0d78a' }}>← click this first</span>
+        <span className="ml-1 not-italic no-underline inline-flex align-middle" style={{ color: 'var(--gold-ink-strong)' }}>← click this first</span>
       </div>
       <div className="flex justify-end gap-2 mt-3">
         <span
@@ -114,7 +114,7 @@ const DownloadBarMock = ({ browser }: { browser: 'edge' | 'chrome' }) => (
     >
       ⋯
     </span>
-    <span className="text-[9.5px] font-semibold flex-shrink-0" style={{ color: '#f0d78a' }}>← the three dots</span>
+    <span className="text-[9.5px] font-semibold flex-shrink-0" style={{ color: 'var(--gold-ink-strong)' }}>← the three dots</span>
   </div>
 );
 

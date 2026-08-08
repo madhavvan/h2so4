@@ -1,5 +1,5 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  CLAUDE SERVICE — Self-contained Anthropic Sonnet 4.6 module
+//  CLAUDE SERVICE — Self-contained Anthropic Sonnet 5 module
 //
 //  Sibling of aiProxyService.ts but Claude-only. Imports shared
 //  HTTP plumbing + persona builders from aiProxyService.ts; owns
@@ -30,10 +30,14 @@ import {
   buildSystemInstruction,
   buildSystemInstructionNew,
   buildAutoSolveSystemInstruction,
+  assembleEvidence,
+  buildCoverContext,
+  buildOpenerPayload,
   SUBSTANCE_PREPEND,
   type ExtractedCards,
   type OnToken,
 } from './aiProxyService';
+import { registerForgetHook } from './knowledgeCache';
 import {
   readTechStateCache,
   writeTechStateCache,
@@ -88,7 +92,7 @@ NEVER say: "I searched", "let me check", "according to", "based on the search re
 //  CLAUDE-ONLY DEPTH + VOICE + ADAPTATION + TIME LAYER
 //
 //  Claude is positioned as the smartest model in the lineup —
-//  Sonnet 4.6 with web_search, no token budget concerns. The base
+//  Sonnet 5 with web_search, no token budget concerns. The base
 //  persona prompt (shared across all 5 providers) gets the candidate
 //  framing right but doesn't push for the senior-engineer voice or
 //  interview-type adaptation that differentiates Claude's answers
@@ -131,6 +135,22 @@ HUMAN FILLERS (rare, sparing): About 1 in 6 answers, open with ONE short natural
 //  can read them too without a circular dep.
 // ─────────────────────────────────────────────────────────────
 
+// ── Where Train Model's Claude calls go ──────────────────────────────
+// NOT /chat/claude. That route is the live-answer path: gated Pro+ and
+// behind requireActiveSession, i.e. "the interview clock is running".
+// Training is the opposite of that on both counts —
+//   · it is the Max/Ultra differentiator, so the SERVER has to enforce
+//     Max+ (FEATURE_GATES.trainModel is a render gate; it stops honest
+//     clients, not a hand-written request), and
+//   · it runs BEFORE the interview, which is the entire feature. Routing
+//     it through the live-answer gate meant every pre-interview train
+//     came back 428 and surfaced as "Couldn't read resume — try again",
+//     and the only workaround was starting the clock the user paid for.
+// /chat/claude-train is the same Claude handler with requireTier(max,
+// ultra) + requireTimeRemaining and no session requirement. See
+// server/src/routes/ai.js.
+const TRAIN_ENDPOINT = '/chat/claude-train';
+
 // Public: tells the UI whether a session already has a cached tech state.
 export function hasCachedTechState(contextFiles: ContextFile[]): boolean {
   if (!contextFiles || contextFiles.length === 0) return false;
@@ -159,7 +179,7 @@ ${jd}
 
 Output ONLY the JSON array of 15 items.`;
 
-  const text = await proxyRequest('/chat/claude', {
+  const text = await proxyRequest(TRAIN_ENDPOINT, {
     messages: [{ role: 'user', content: prompt }],
     systemInstruction: undefined,
     enableWebSearch: false,
@@ -236,7 +256,7 @@ Tech names in keys must EXACTLY match: ${techList}.`;
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const text = await proxyRequest('/chat/claude', {
+      const text = await proxyRequest(TRAIN_ENDPOINT, {
         messages: [{ role: 'user', content: prompt }],
         systemInstruction: undefined,
         enableWebSearch: true,
@@ -348,7 +368,7 @@ START with "${tech}:" — no other prefix. Output ONLY the paragraph.`;
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const text = await proxyRequest('/chat/claude', {
+      const text = await proxyRequest(TRAIN_ENDPOINT, {
         messages: [{ role: 'user', content: prompt }],
         systemInstruction: undefined,
         enableWebSearch: true,
@@ -387,7 +407,7 @@ ${jd}
 
 Output ONLY the JSON array of up to 25 items.`;
 
-  const text = await proxyRequest('/chat/claude', {
+  const text = await proxyRequest(TRAIN_ENDPOINT, {
     messages: [{ role: 'user', content: prompt }],
     systemInstruction: undefined,
     enableWebSearch: false,
@@ -433,7 +453,7 @@ ${factsheets.join('\n')}
 Output ONE paragraph starting with "INTERVIEW LEVERAGE:" — no markdown, no preamble.`;
 
   try {
-    const text = await proxyRequest('/chat/claude', {
+    const text = await proxyRequest(TRAIN_ENDPOINT, {
       messages: [{ role: 'user', content: prompt }],
       systemInstruction: undefined,
       enableWebSearch: false,
@@ -511,6 +531,24 @@ export async function trainClaudeModelBeast(
   };
 
   await Promise.all(Array.from({ length: Math.min(3, keywords.length) }, worker));
+
+  // Same "never cache a run that learned nothing" rule as standard mode, and
+  // for the same reason — researchOneTechBeast returns null on every failure
+  // branch, so a fan-out that gets rate-limited across the board leaves results
+  // empty and the card would be nothing but a header claiming authority over
+  // the model's training data. The floor is zero-only here on purpose: beast
+  // research is per-tech rather than batched, so a partial yield is genuinely
+  // partial — eight real deep factsheets, not one batch that happened to
+  // survive — and it cost $3-6 to buy. Discarding that would hurt more than
+  // keeping it, and beast is admin-only where the 24h lockout doesn't bite
+  // because the re-train confirm is always offered. We bail here rather than
+  // after Stage 3 so a dead run doesn't pay for one more Claude call to
+  // synthesize an empty factsheet list.
+  if (results.length === 0) {
+    const failMsg = 'Research failed — nothing was learned. Try again in a few minutes.';
+    onProgress({ stage: 'error', done: 0, total: keywords.length, pct: 0, message: failMsg });
+    return { success: false, techCount: 0, cardLength: 0, cached: false, message: failMsg };
+  }
 
   // Stage 3: synthesis pass
   onProgress({
@@ -597,6 +635,28 @@ export async function trainClaudeModel(
     });
   });
 
+  // A run that learned nothing must never be cached. researchBatch returns {}
+  // on every failure branch — no JSON in the reply, a parse throw, or the call
+  // itself throwing, each after exactly one 2.5s retry — and batchResearch only
+  // pushes the techs it actually got back, so when Anthropic's web_search rate
+  // limiter takes out every batch (the very fan-out failure the 15-keyword cap
+  // above exists to soften) this comes back []. Persisting that wrote a
+  // header-only card which still told the model "these CURRENT facts override
+  // your training data" while carrying zero facts, flipped hasTechStateCache
+  // true for the full 24h TTL, and — since the Train button is hidden while a
+  // cache is fresh — locked a Max-tier feature for a day on the strength of a
+  // run that produced nothing. Below the floor we write nothing, so the next
+  // click is a real retry. Floor is 3 factsheets but never more than we asked
+  // for: a thin resume that only yields two keywords must still be trainable.
+  const minCards = Math.min(3, keywords.length);
+  if (cards.length < minCards) {
+    const failMsg = cards.length === 0
+      ? 'Research failed — nothing was learned. Try again in a few minutes.'
+      : `Research mostly failed — only ${cards.length}/${keywords.length} came back. Try again in a few minutes.`;
+    onProgress({ stage: 'error', done: cards.length, total: keywords.length, pct: 0, message: failMsg });
+    return { success: false, techCount: cards.length, cardLength: 0, cached: false, message: failMsg };
+  }
+
   onProgress({
     stage: 'finalizing',
     done: keywords.length,
@@ -677,12 +737,11 @@ function buildClaudeSystemInstruction(
 function buildClaudeSystemInstructionNew(
   identity: string,
   jdPriorities: string,
-  resume: string,
-  jd: string,
+  evidence: string,
   contextFiles?: ContextFile[],
 ): string {
   return injectClaudeAugments(
-    buildSystemInstructionNew(identity, jdPriorities, resume, jd),
+    buildSystemInstructionNew(identity, jdPriorities, evidence),
     NEW_PROMPT_ANCHOR,
     contextFiles,
   );
@@ -704,11 +763,15 @@ function buildClaudeSystemInstructionNew(
 // ─────────────────────────────────────────────────────────────
 const IDENTITY_CACHE_MAX = 32;
 const claudeIdentityCache = new Map<string, Promise<ExtractedCards | null>>();
+// Synchronously-readable resolved cards (see aiProxyService's resolvedCards)
+// so the answer path never awaits the ~3-9s extraction preflight.
+const claudeResolvedCards = new Map<string, ExtractedCards>();
 
-async function getClaudeExtractedCards(
+function ensureClaudeExtraction(
   contextFiles: ContextFile[],
+  knownHash?: string,
 ): Promise<ExtractedCards | null> {
-  const hash = hashContextFiles(contextFiles);
+  const hash = knownHash || hashContextFiles(contextFiles);
   const cached = claudeIdentityCache.get(hash);
   if (cached) return cached;
 
@@ -751,12 +814,35 @@ async function getClaudeExtractedCards(
     const oldest = claudeIdentityCache.keys().next().value;
     if (oldest !== undefined && oldest !== hash) claudeIdentityCache.delete(oldest);
   }
-  // Drop rejected/null promises so the next call retries instead
-  // of serving stale null indefinitely.
+  // On settle: drop null/rejected (retry next time); publish a non-null
+  // card to the synchronous map for answer-time pickup.
   promise.then(cards => {
-    if (cards === null) claudeIdentityCache.delete(hash);
+    if (cards === null) { claudeIdentityCache.delete(hash); return; }
+    claudeResolvedCards.set(hash, cards);
+    if (claudeResolvedCards.size > IDENTITY_CACHE_MAX) {
+      const oldest = claudeResolvedCards.keys().next().value;
+      if (oldest !== undefined && oldest !== hash) claudeResolvedCards.delete(oldest);
+    }
   });
   return promise;
+}
+
+// Background/blocking accessor — for the prewarm path only.
+async function getClaudeExtractedCards(
+  contextFiles: ContextFile[],
+): Promise<ExtractedCards | null> {
+  return ensureClaudeExtraction(contextFiles);
+}
+
+// ANSWER-TIME accessor — NON-BLOCKING (see aiProxyService's
+// getResolvedCardsOrKickoff). Returns the card only if ready; otherwise
+// kicks off extraction and returns null so this turn uses the raw-KB path.
+function getClaudeResolvedCardsOrKickoff(contextFiles: ContextFile[]): ExtractedCards | null {
+  const hash = hashContextFiles(contextFiles);
+  const ready = claudeResolvedCards.get(hash);
+  if (ready) return ready;
+  void ensureClaudeExtraction(contextFiles, hash);
+  return null;
 }
 
 // Build the user rules block, optionally substance-augmented for
@@ -794,6 +880,7 @@ ${raw}
 }
 
 async function prepareClaudeStreamPrompts(
+  query: string,
   contextFiles: ContextFile[],
   generalMode: boolean,
 ): Promise<PromptContext> {
@@ -801,24 +888,23 @@ async function prepareClaudeStreamPrompts(
   // Empty string when none — cheap no-op concat.
   const customBlock = getClaudeCustomInstructionsBlock();
 
-  // General mode opts out of resume/JD grounding — skip extraction.
+  // assembleEvidence is the shared ADAPTIVE KB layer from aiProxyService:
+  // whole KB when small (offloaded, byte-stable), or only the BM25-retrieved
+  // passages relevant to THIS question when large — the cost fix that stops
+  // a 100-file session shipping ~100K tokens per turn. See
+  // services/kbRetrieval.ts.
   if (generalMode) {
-    const textContext = contextFiles
-      .filter(f => !f.base64)
-      .map(f => `[[SOURCE: ${f.type.toUpperCase()} - ${f.name}]]\n${f.content}\n[[END SOURCE]]`)
-      .join('\n\n');
+    const textContext = await assembleEvidence(query, contextFiles);
     return {
       systemInstruction: customBlock + buildClaudeSystemInstruction(textContext, true, contextFiles),
       userRulesBlock: buildClaudeUserRulesBlock(false),
       kbHint: '',
     };
   }
-  const cards = await getClaudeExtractedCards(contextFiles);
+  // NON-BLOCKING at answer time — see aiProxyService.prepareStreamPrompts.
+  const cards = getClaudeResolvedCardsOrKickoff(contextFiles);
   if (!cards) {
-    const textContext = contextFiles
-      .filter(f => !f.base64)
-      .map(f => `[[SOURCE: ${f.type.toUpperCase()} - ${f.name}]]\n${f.content}\n[[END SOURCE]]`)
-      .join('\n\n');
+    const textContext = await assembleEvidence(query, contextFiles);
     return {
       systemInstruction: customBlock + buildClaudeSystemInstruction(textContext, false, contextFiles),
       userRulesBlock: buildClaudeUserRulesBlock(false),
@@ -829,8 +915,7 @@ async function prepareClaudeStreamPrompts(
     systemInstruction: customBlock + buildClaudeSystemInstructionNew(
       cards.identity,
       cards.jdPriorities,
-      cards.resume,
-      cards.jd,
+      await assembleEvidence(query, contextFiles),
       contextFiles,
     ),
     userRulesBlock: buildClaudeUserRulesBlock(true),
@@ -884,6 +969,7 @@ export async function generateClaude(
   generalMode: boolean,
 ): Promise<string> {
   const { systemInstruction, userRulesBlock, kbHint } = await prepareClaudeStreamPrompts(
+    query,
     contextFiles,
     generalMode,
   );
@@ -922,7 +1008,7 @@ export async function streamClaude(
     systemInstruction = buildAutoSolveSystemInstruction();
     userText = query;
   } else {
-    const prompts = await prepareClaudeStreamPrompts(contextFiles, generalMode);
+    const prompts = await prepareClaudeStreamPrompts(query, contextFiles, generalMode);
     systemInstruction = prompts.systemInstruction;
     userText = `${prompts.userRulesBlock}Interviewer (Current Audio): ${query}${prompts.kbHint}\n\nTask:\n- If this is the Interviewer asking a question, provide the Candidate's response.\n- If this is the Candidate speaking, output "..."\n\nRemember: the RESPONSE RULES above are the highest-priority instructions. Obey them literally.`;
   }
@@ -934,7 +1020,10 @@ export async function streamClaude(
 
   const full = await proxyStream(
     '/stream/claude',
-    { messages, systemInstruction, enableWebSearch },
+    { messages, systemInstruction, enableWebSearch,
+      ...(isAutoSolve
+        ? { instantOpener: '', coverPolicy: 'suppress', coverShape: 'auto-solve', coverContext: '', coverVocabulary: '', recentTurns: '' }
+        : buildOpenerPayload(query, contextFiles, history)) },
     onToken,
     signal,
   );
@@ -949,6 +1038,18 @@ export async function streamClaude(
 // ~2-5s preflight cost. Fire-and-forget; safe to call repeatedly
 // (hits the cache after the first run). Noop when there's nothing
 // useful to extract.
+// Claude's briefing-card caches are the fourth and fifth copies of the
+// uploaded knowledge base in memory. knowledgeCache owns when they are
+// emptied, but it cannot import this file — claudeService imports
+// aiProxyService, which knowledgeCache also imports, so a direct import
+// would close a cycle. Registering the reset inverts the dependency: this
+// module knows about knowledgeCache, and knowledgeCache knows only that
+// something asked to be told.
+registerForgetHook(() => {
+  claudeIdentityCache.clear();
+  claudeResolvedCards.clear();
+});
+
 export function prewarmClaudeIdentity(contextFiles: ContextFile[]): void {
   if (!contextFiles || contextFiles.length === 0) return;
   const { resume, jd } = splitResumeAndJd(contextFiles);

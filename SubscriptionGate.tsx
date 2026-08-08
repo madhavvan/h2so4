@@ -6,6 +6,9 @@ import PremiumLanding from './PremiumLanding';
 import { RefundPolicy } from './RefundPolicy';
 import { Shield, Zap, Crown, Check, X, ArrowRight, ArrowLeft, Globe, Lock, Sparkles, ChevronRight, Eye, EyeOff, AlertTriangle, Loader2, Star, Users, Cpu, Headphones, Bot, BarChart3, Monitor, Download, Play, BookOpen, ChevronDown, LogOut, MessageCircle, Send, Mail, Settings, ExternalLink, XCircle, Clock, DollarSign, RefreshCw, Trash2, Edit2, Key, UserCheck, Activity, FileDown, Filter, Ban, TrendingUp, Gift, Database, Search, Copy, ChevronUp, FileText } from 'lucide-react';
 import { WizardHat } from './WizardHat';
+// Ultra's amethyst-brilliant mark — the admin console's tier theming needs it
+// so Ultra never renders with Max's hat or the free tier's grey fallback.
+import { UltraMark } from './UltraMark';
 // Phosphor duotone — used on the public landing + auth surfaces for the
 // editorial, premium feel that lucide's flat strokes can't quite reach.
 // In-app utility icons stay on lucide so dense toolbars don't get heavy.
@@ -354,27 +357,88 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
 const RefundModal = ({
   payment,
   fmtAmount,
+  ineligible,
+  stepUpOpen,
   onCancel,
   onSubmit,
 }: {
   payment: any;
   fmtAmount: (amt: number, ccy: string) => string;
+  // Set when the server rejected this refund on policy grounds. The modal then
+  // collects an override reason, which the API requires to be ≥10 chars and
+  // stamps into the audit row.
+  ineligible?: { code: string; reason: string } | null;
+  // True while the step-up password modal is stacked ON TOP of this one. Its
+  // password input handles Enter itself, but the SAME keydown then bubbles to
+  // the document listener below — which used to read it as "confirm the
+  // refund" and fire a second /refund POST.
+  stepUpOpen?: boolean;
   onCancel: () => void;
-  onSubmit: (amount: number, reason: string) => void;
+  // May return a promise (the console's submitRefund is async). It is awaited
+  // so the in-flight guard clears only once the request has actually settled
+  // — including the step-up password round-trip that happens mid-flight.
+  onSubmit: (amount: number, reason: string, overrideReason?: string) => void | Promise<void>;
 }) => {
   const [amount, setAmount] = useState<number>(payment.amount || 0);
   const [reason, setReason] = useState<string>('requested_by_customer');
   const [confirming, setConfirming] = useState(false);
+  const [overrideReason, setOverrideReason] = useState('');
+  // In-flight guard for the money path. Enter-plus-click, a double-click, or
+  // the step-up modal's Enter bubbling into our document listener each used to
+  // issue TWO refunds; the server's "already refunded" check is a
+  // read-then-act with an await in the middle, so both requests clear it
+  // before either records a row. The REF is what the handlers test — it flips
+  // synchronously, so a second event in the same tick is rejected before React
+  // re-renders. The state exists only to drive the disabled/spinner UI.
+  const submittingRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  // A policy rejection means the submit we just made didn't happen. Drop back
+  // out of the confirm step so the admin sees the verdict and the override
+  // field rather than a stale "Refund X" button that looks like it worked.
+  useEffect(() => {
+    if (ineligible) setConfirming(false);
+  }, [ineligible]);
+
+  // The server floor is 10 characters; mirror it so Submit isn't offered for
+  // an override the API will reject.
+  const OVERRIDE_MIN = 10;
+  const overrideOk = overrideReason.trim().length >= OVERRIDE_MIN;
+  const blockedByPolicy = !!ineligible && !overrideOk;
+
+  // The ONE path that issues a refund. Both the confirm button and the Enter
+  // key route through here so the in-flight guard cannot be stepped around.
+  const runSubmit = async () => {
+    if (submittingRef.current || blockedByPolicy) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    try {
+      await onSubmit(amount, reason, ineligible ? overrideReason.trim() : undefined);
+    } finally {
+      // On success the parent closes this modal; on a policy rejection or a
+      // cancelled step-up it stays open, so the guard MUST be released or the
+      // admin is left staring at a permanently dead confirm button.
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
+  };
 
   // Esc closes; Enter advances on the confirm step.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') { e.stopPropagation(); onCancel(); }
-      if (e.key === 'Enter' && confirming) { e.preventDefault(); onSubmit(amount, reason); }
+      // Enter is inert while a refund is already in flight and while the
+      // step-up password modal is on top of us — that modal owns the key at
+      // that moment, and honoring the bubbled event here duplicated the POST.
+      if (submittingRef.current || stepUpOpen) return;
+      if (e.key === 'Enter' && confirming && !blockedByPolicy) {
+        e.preventDefault();
+        void runSubmit();
+      }
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [confirming, amount, reason, onCancel, onSubmit]);
+  }, [confirming, amount, reason, onCancel, onSubmit, blockedByPolicy, ineligible, overrideReason, stepUpOpen]);
 
   const isPartial = amount > 0 && amount < payment.amount;
   const isFull = amount === payment.amount;
@@ -407,6 +471,38 @@ const RefundModal = ({
             <p className="text-xs text-gray-400 mb-4 p-3 rounded-lg bg-amber-500/[0.04] border border-amber-500/20">
               Refund hits the provider immediately. A webhook will downgrade this user's tier shortly after. Partial refunds are supported — enter a smaller amount to refund less than the full charge.
             </p>
+
+            {/* Policy verdict from the server, plus the documented override.
+                Without this the refund simply failed with a bare error code
+                and there was no way to proceed from the console. */}
+            {ineligible && (
+              <div className="mb-4 p-3 rounded-lg bg-red-500/[0.07] border border-red-500/30">
+                <div className="flex items-start gap-2 mb-2">
+                  <Lock size={13} className="text-red-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-xs font-semibold text-red-200">Refund policy blocks this refund</p>
+                    <p className="text-[11px] text-red-300/90 mt-0.5">{ineligible.reason}</p>
+                    <p className="text-[10px] text-gray-500 mt-1 font-mono">code: {ineligible.code}</p>
+                  </div>
+                </div>
+                <label className="text-[10px] text-gray-400 uppercase tracking-wider font-semibold block mb-1">
+                  Override reason (min {OVERRIDE_MIN} chars — recorded in the audit log)
+                </label>
+                <textarea
+                  autoFocus
+                  value={overrideReason}
+                  onChange={e => setOverrideReason(e.target.value)}
+                  rows={2}
+                  placeholder="e.g. goodwill after the 2026-07-28 outage; approved by founder"
+                  className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-xs focus:outline-none focus:border-red-500/50 resize-none"
+                />
+                <p className={`text-[10px] mt-1 ${overrideOk ? 'text-emerald-400' : 'text-gray-500'}`}>
+                  {overrideOk
+                    ? 'Override will be logged against your admin account.'
+                    : `${overrideReason.trim().length}/${OVERRIDE_MIN} characters.`}
+                </p>
+              </div>
+            )}
             <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">
               Amount ({payment.currency.toUpperCase()} · minor units, e.g. cents/paise)
             </label>
@@ -439,10 +535,11 @@ const RefundModal = ({
               <button onClick={onCancel} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Cancel</button>
               <button
                 onClick={() => setConfirming(true)}
-                disabled={isInvalid}
+                disabled={isInvalid || blockedByPolicy}
+                title={blockedByPolicy ? `Write at least ${OVERRIDE_MIN} characters of override reason to proceed` : undefined}
                 className="px-4 py-2 rounded-lg text-sm font-semibold bg-pink-500/20 text-pink-200 hover:bg-pink-500/30 border border-pink-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Review refund
+                {ineligible ? 'Review override' : 'Review refund'}
               </button>
             </div>
           </>
@@ -462,12 +559,28 @@ const RefundModal = ({
                   <span className="text-red-300 font-bold">{fmtAmount(amount, payment.currency)} {isPartial ? '(partial)' : '(full)'}</span>
                 </div>
                 <div><span className="text-gray-500">Reason:</span> <span className="text-white">{reason}</span></div>
+                {ineligible && (
+                  <div className="pt-1 mt-1 border-t border-red-500/20">
+                    <span className="text-gray-500">Policy override:</span>{' '}
+                    <span className="text-amber-300">{ineligible.code}</span>
+                    <p className="text-[11px] text-amber-200/80 mt-0.5 whitespace-pre-wrap break-words">“{overrideReason.trim()}”</p>
+                  </div>
+                )}
               </div>
             </div>
             <p className="text-[11px] text-gray-500 mt-3">After confirming, you'll be asked for your step-up admin password.</p>
             <div className="mt-5 flex items-center justify-end gap-2">
-              <button onClick={() => setConfirming(false)} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Back</button>
-              <button onClick={() => onSubmit(amount, reason)} className="px-4 py-2 rounded-lg text-sm font-semibold bg-red-500 text-white hover:bg-red-600 transition-all">Refund {fmtAmount(amount, payment.currency)}</button>
+              <button onClick={() => setConfirming(false)} disabled={submitting} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all disabled:opacity-50 disabled:cursor-not-allowed">Back</button>
+              <button
+                onClick={runSubmit}
+                disabled={blockedByPolicy || submitting}
+                className="px-4 py-2 rounded-lg text-sm font-semibold bg-red-500 text-white hover:bg-red-600 transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
+              >
+                {submitting && <Loader2 size={14} className="animate-spin" />}
+                {submitting
+                  ? 'Refunding…'
+                  : `${ineligible ? 'Override & refund ' : 'Refund '}${fmtAmount(amount, payment.currency)}`}
+              </button>
             </div>
           </>
         )}
@@ -622,19 +735,89 @@ const API_BASE = (import.meta as any).env?.PROD
   ? 'https://api.minicaai.com'
   : ((import.meta as any).env?.VITE_SERVER_URL || 'https://api.minicaai.com');
 
-type Tier = 'free' | 'basic' | 'pro' | 'max';
-const TIERS: Tier[] = ['free', 'basic', 'pro', 'max'];
+// `ultra` is a real, purchasable tier — the $159/mo (₹12,999) flagship, see
+// routes/payments.js TIER_PRICES — and the server has accepted it in
+// VALID_TIERS all along. It was missing from this list, and the omission was
+// invisible rather than loud: the Tier Distribution grid had no Ultra card,
+// the Users tab could neither count nor filter Ultra, an Ultra customer's
+// badge fell through to the grey FREE theme, Ultra revenue never appeared on
+// the tier cards, and the change-tier dropdown could not send `ultra` at all —
+// so the console could not put a customer on the top plan.
+type Tier = 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+const TIERS: Tier[] = ['free', 'basic', 'pro', 'max', 'ultra'];
+// Tiers an admin can grant as a comp / move a user to. Free is excluded from
+// comps (the server rejects it — use change-tier to downgrade).
+const PAID_TIERS: Tier[] = ['basic', 'pro', 'max', 'ultra'];
 
 // Single source of truth for tier color-coding. Any place that shows a tier
-// pulls its Tailwind classes from here so Free/Basic/Pro/Max always look the
-// same across badges, cards, tables, and the action panel.
+// pulls its Tailwind classes from here so Free/Basic/Pro/Max/Ultra always look
+// the same across badges, cards, tables, and the action panel.
 const TIER_THEME: Record<Tier, { bg: string; text: string; border: string; bar: string; dot: string; Icon: any }> = {
   free:  { bg: 'bg-slate-500/10',   text: 'text-slate-300',   border: 'border-slate-500/25',   bar: 'bg-slate-400',    dot: 'bg-slate-400',    Icon: Zap },
   basic: { bg: 'bg-emerald-500/10', text: 'text-emerald-300', border: 'border-emerald-500/25', bar: 'bg-emerald-400',  dot: 'bg-emerald-400',  Icon: Sparkles },
   pro:   { bg: 'bg-indigo-500/10',  text: 'text-indigo-300',  border: 'border-indigo-500/25',  bar: 'bg-indigo-400',   dot: 'bg-indigo-400',   Icon: Crown },
   max:   { bg: 'bg-amber-500/10',   text: 'text-amber-300',   border: 'border-amber-500/25',   bar: 'bg-amber-400',    dot: 'bg-amber-400',    Icon: WizardHat },
+  // Violet, distinct from Max's amber — Ultra is the top plan and must not be
+  // mistaken for Max at a glance.
+  ultra: { bg: 'bg-violet-500/10',  text: 'text-violet-300',  border: 'border-violet-500/30',  bar: 'bg-violet-400',   dot: 'bg-violet-400',   Icon: UltraMark },
 };
 const tierOf = (t?: string): (typeof TIER_THEME)[Tier] => (TIER_THEME as any)[t || ''] || TIER_THEME.free;
+
+// Currency-aware money formatter. Every `amount` in the payments table is in
+// the provider's SMALLEST unit — Stripe USD cents, Razorpay INR paise — so
+// rendering money always means dividing by 100 and naming the currency. Other
+// currencies follow the ISO 4217 minor-unit convention, so /100 holds for the
+// cases we sell in. Module-scope because MoneyByCurrency needs it too.
+const fmtAmount = (amount: number | null | undefined, currency: string | null | undefined) => {
+  if (amount == null) return '—';
+  const sign = amount < 0 ? '-' : '';
+  const abs = Math.abs(amount);
+  const major = abs / 100;
+  const c = (currency || 'USD').toUpperCase();
+  const symbol = c === 'INR' ? '₹' : c === 'USD' ? '$' : c === 'EUR' ? '€' : c === 'GBP' ? '£' : '';
+  return `${sign}${symbol}${major.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${symbol ? '' : ' ' + c}`;
+};
+
+// Renders a { USD: 12900, INR: 1299900 } minor-unit map as real money, one
+// line per currency, largest first. It never adds currencies together: USD
+// cents and INR paise are different units and a single total across them is
+// not an amount of money in any currency. That conflation is exactly what
+// made the old revenue headline both 100× too large and meaningless.
+const MoneyByCurrency = ({
+  map,
+  className = '',
+  subClassName = '',
+  emptyLabel = '—',
+}: {
+  map?: Record<string, number> | null;
+  className?: string;
+  subClassName?: string;
+  emptyLabel?: string;
+}) => {
+  const entries = Object.entries(map || {})
+    .map(([cur, v]) => [cur, Number(v) || 0] as [string, number])
+    .filter(([, v]) => v !== 0)
+    .sort((a, b) => b[1] - a[1]);
+
+  if (entries.length === 0) return <p className={className}>{emptyLabel}</p>;
+
+  // Single currency (the common case) reads as one clean figure.
+  if (entries.length === 1) {
+    return <p className={className}>{fmtAmount(entries[0][1], entries[0][0])}</p>;
+  }
+  // Multi-currency: stack them. The primary line keeps the headline size so
+  // the layout doesn't jump when a second currency first appears.
+  return (
+    <div>
+      <p className={className}>{fmtAmount(entries[0][1], entries[0][0])}</p>
+      {entries.slice(1).map(([cur, v]) => (
+        <p key={cur} className={subClassName || 'text-sm font-semibold text-gray-400 tabular-nums'}>
+          {fmtAmount(v, cur)}
+        </p>
+      ))}
+    </div>
+  );
+};
 
 const TierBadge = ({ tier }: { tier?: string }) => {
   const th = tierOf(tier);
@@ -642,6 +825,7 @@ const TierBadge = ({ tier }: { tier?: string }) => {
   return (
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase border ${th.bg} ${th.text} ${th.border}`}>
       {label === 'MAX' && <WizardHat size={9} />}
+      {label === 'ULTRA' && <UltraMark size={9} />}
       {label}
     </span>
   );
@@ -977,16 +1161,34 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
   const [recentConvsLoading, setRecentConvsLoading] = useState(false);
   const [recentConvsQuery, setRecentConvsQuery] = useState('');
 
-  // Step-up reauth state. stepUpToken takes precedence over the base token
-  // for destructive admin calls. stepUpExpiresAt is a client-side clock we
-  // use to hide the "reauth" badge — the backend enforces the real TTL.
+  // Step-up reauth state. The step-up token takes precedence over the base
+  // token for destructive admin calls.
+  //
+  // It lives in a REF as well as in state, and the ref is the one every
+  // fetch reads. That is not redundancy — it is the whole fix. `activeToken`
+  // is re-created on each render and closes over that render's `useState`
+  // values, so callMutation's retry-after-reauth read the token from the
+  // render that STARTED the call: still null. Every step-up-gated action
+  // (ban, delete, tier change, refund, comp, impersonate, config save, DSAR)
+  // therefore failed on first click with a raw "step_up_required" toast even
+  // though the password had just been accepted, and only worked on a second
+  // click once a later render had closed over the new value. A ref is not
+  // captured per-render, so the retry sees the token the modal just stored.
+  //
+  // State still exists because the "Step-up" badge in the nav has to re-render
+  // when elevation is gained; the two are written together in submitReauth.
+  const stepUpRef = useRef<{ token: string | null; expiresAt: number }>({ token: null, expiresAt: 0 });
   const [stepUpToken, setStepUpToken] = useState<string | null>(null);
   const [stepUpExpiresAt, setStepUpExpiresAt] = useState<number>(0);
+  // In-flight step-up promise. Shared by every caller that arrives while the
+  // password modal is open — see requireStepUp.
+  const reauthPendingRef = useRef<Promise<void> | null>(null);
   const [reauthPrompt, setReauthPrompt] = useState<{
     password: string;
     busy: boolean;
     error: string;
-    pending: (() => void) | null;
+    resolve: () => void;
+    reject: (err: Error) => void;
   } | null>(null);
 
   // Reusable confirm modal for destructive admin actions. We can't use the
@@ -1007,6 +1209,10 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
   const [editProfileFor, setEditProfileFor] = useState<{ id: string; email: string; name: string; country_code: string; original_country_code: string } | null>(null);
   const [compGrantFor, setCompGrantFor] = useState<{ id: string; email: string } | null>(null);
   const [refundFor, setRefundFor] = useState<{ payment: any } | null>(null);
+  // Server-side refund-eligibility verdict for the payment currently open in
+  // the refund modal. Non-null means the policy blocked it and the modal
+  // should collect an `override_reason` (audit-logged) to proceed anyway.
+  const [refundIneligible, setRefundIneligible] = useState<{ code: string; reason: string } | null>(null);
   const [banFor, setBanFor] = useState<{ email: string } | null>(null);
   // Impersonation token modal — separate from the confirm dialog because the
   // token is long, must be selectable, and the copy action must succeed even
@@ -1015,9 +1221,11 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
 
   const baseToken = licenseService.getToken();
   // `activeToken` picks the step-up token when it's still valid, otherwise the
-  // base token. Pushed into a helper so every fetch uses the latest.
+  // base token. Reads the REF, never the state value, so a call that began
+  // before elevation still sends the elevated token on its retry.
   const activeToken = () => {
-    if (stepUpToken && Date.now() < stepUpExpiresAt) return stepUpToken;
+    const s = stepUpRef.current;
+    if (s.token && Date.now() < s.expiresAt) return s.token;
     return baseToken;
   };
   const authHeaders = () => ({
@@ -1048,8 +1256,29 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
         ]);
         if (!statsRes.ok) throw new Error('Failed to load admin data. Are you authorized?');
         setStats(await statsRes.json());
-        setUsers(await usersRes.json());
-        setLogins(await loginsRes.json());
+
+        // Only `stats` was checked before. When /users or /logins failed, the
+        // error BODY ({ error: '…' }) was handed to setUsers/setLogins, and the
+        // next render called .filter/.map on a plain object — a TypeError that
+        // took the whole console down to the error boundary with no clue why.
+        // Land whatever succeeded, and say plainly what didn't.
+        const failed: string[] = [];
+
+        if (usersRes.ok) {
+          const body = await usersRes.json().catch(() => null);
+          if (Array.isArray(body)) setUsers(body);
+          else { setUsers([]); failed.push('users'); }
+        } else { setUsers([]); failed.push('users'); }
+
+        if (loginsRes.ok) {
+          const body = await loginsRes.json().catch(() => null);
+          if (Array.isArray(body)) setLogins(body);
+          else { setLogins([]); failed.push('logins'); }
+        } else { setLogins([]); failed.push('logins'); }
+
+        if (failed.length) {
+          showMsg(`Could not load: ${failed.join(', ')}. Other tabs still work.`, 'error');
+        }
       } catch (err: any) {
         setAdminError(err.message);
       } finally {
@@ -1075,29 +1304,57 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
   // has re-entered their password (or rejects on cancel). Used by any action
   // guarded by stepUpOnly on the server. Keeps a single password prompt in
   // flight at a time — callers wait on `pending`.
+  // Resolves once the admin has re-entered their password; rejects if they
+  // dismiss the modal. Both settlers are held in the prompt's own state, so
+  // the modal's buttons settle exactly the promise that opened them —
+  // `reject` used to be stashed on `window.__reauthReject`, which meant two
+  // overlapping prompts clobbered each other and the first action's await
+  // hung forever with its busy state stuck on.
   const requireStepUp = (): Promise<void> => {
-    if (stepUpToken && Date.now() < stepUpExpiresAt) return Promise.resolve();
-    return new Promise<void>((resolve, reject) => {
+    const s = stepUpRef.current;
+    if (s.token && Date.now() < s.expiresAt) return Promise.resolve();
+    // One password prompt at a time. Concurrent callers share the in-flight
+    // promise instead of overwriting the open modal.
+    if (reauthPendingRef.current) return reauthPendingRef.current;
+    const pending = new Promise<void>((resolve, reject) => {
       setReauthPrompt({
         password: '',
         busy: false,
         error: '',
-        pending: () => resolve(),
+        resolve: () => { reauthPendingRef.current = null; resolve(); },
+        reject: (err: Error) => { reauthPendingRef.current = null; reject(err); },
       });
-      // Reject if the modal is dismissed. We detect dismissal by a null
-      // pending in a later setter. The cancel button calls reject directly
-      // via its onClick; no leak.
-      (reauthPrompt as any)?.reject?.(); // no-op; retained for clarity
-      // We stash reject on the window so the cancel button can invoke it.
-      (window as any).__reauthReject = () => reject(new Error('Reauth cancelled'));
     });
+    reauthPendingRef.current = pending;
+    return pending;
+  };
+
+  // Closes the prompt and settles its promise. Used by Cancel, the backdrop,
+  // and Escape so no dismissal path can leave a caller awaiting forever.
+  const cancelReauth = () => {
+    setReauthPrompt(p => { p?.reject(new Error('Reauth cancelled')); return null; });
+  };
+
+  // Shared submit path for the modal's Enter key and its Verify button —
+  // they had drifted into two copies of the same logic.
+  const runReauthSubmit = async () => {
+    if (!reauthPrompt || reauthPrompt.busy) return;
+    const { password, resolve } = reauthPrompt;
+    setReauthPrompt(p => (p ? { ...p, busy: true, error: '' } : null));
+    const ok = await submitReauth(password);
+    if (ok) {
+      setReauthPrompt(null);
+      resolve();
+    } else {
+      setReauthPrompt(p => (p ? { ...p, busy: false, error: 'Invalid password' } : null));
+    }
   };
 
   // Shared POST-mutation path. Handles fetch, JSON parse, error toast,
   // busy-state, and returns the parsed body (or null on error) so callers
   // can update local state only on success. Retries once after a fresh
   // step-up if the server responds with step_up_required / step_up_expired.
-  async function callMutation(path: string, body: any, successMsg: string, opts: { method?: string } = {}) {
+  async function callMutation(path: string, body: any, successMsg: string, opts: { method?: string; returnErrorBody?: boolean } = {}) {
     const method = opts.method || 'POST';
     setPanelBusy(`${method}:${path}`);
     try {
@@ -1110,7 +1367,14 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
       };
 
       let { res, data } = await attempt();
-      if (!res.ok && (data?.error === 'step_up_required' || data?.error === 'step_up_expired')) {
+      const needsStepUp = (d: any) => d?.error === 'step_up_required' || d?.error === 'step_up_expired';
+      if (!res.ok && needsStepUp(data)) {
+        // The token we hold is either absent or past its 15-min TTL. Drop it
+        // so activeToken() stops sending a token the server has already
+        // rejected, then prompt and retry.
+        stepUpRef.current = { token: null, expiresAt: 0 };
+        setStepUpToken(null);
+        setStepUpExpiresAt(0);
         try {
           await requireStepUp();
         } catch {
@@ -1119,7 +1383,15 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
         }
         ({ res, data } = await attempt());
       }
-      if (!res.ok) throw new Error(data?.error || data?.message || 'Request failed');
+      if (!res.ok) {
+        // Don't surface raw protocol codes to the operator.
+        if (needsStepUp(data)) throw new Error('Password verification failed — action not applied.');
+        // Structured rejections some callers must handle themselves rather
+        // than have flattened into a toast — e.g. the refund-eligibility
+        // verdict, which carries a policy code the admin can override.
+        if (opts.returnErrorBody) return { __error: data, __status: res.status };
+        throw new Error(data?.error || data?.message || 'Request failed');
+      }
       if (successMsg) showMsg(successMsg);
       return data;
     } catch (err: any) {
@@ -1154,8 +1426,15 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Reauth failed');
+      // Ref FIRST and synchronously — the caller that triggered this reauth is
+      // about to retry its request from a closure that predates this render,
+      // and activeToken() reads the ref. Then state, for the nav badge.
+      // Fall back to a locally-computed expiry if the server omits one, so a
+      // missing field can't leave the token permanently "expired" client-side.
+      const expiresAt = Number(data.step_up_expires_at) || (Date.now() + 15 * 60 * 1000);
+      stepUpRef.current = { token: data.token, expiresAt };
       setStepUpToken(data.token);
-      setStepUpExpiresAt(data.step_up_expires_at);
+      setStepUpExpiresAt(expiresAt);
       return true;
     } catch (err: any) {
       showMsg(`Reauth failed: ${err.message}`, 'error');
@@ -1163,35 +1442,54 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
     }
   }
 
-  // ── Quick actions (unchanged) ──
+  // ── Quick actions ──
+  //
+  // Both of these hit /api/v1/license/* routes that are guarded by
+  // `stepUpOnly` (see routes/license.js). They used to post the BASE token
+  // with a bare fetch and no reauth path, so the server rejected them every
+  // single time and both cards were permanently dead — "Revoke License" and
+  // "Kill App Version" could not be used from this console at all. Routing
+  // them through callMutation gives them the same password-prompt-and-retry
+  // treatment as every other privileged action.
   const handleRevoke = async () => {
-    if (!revokeKey.trim()) return;
-    setActionLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/license/revoke`, {
-        method: 'POST', headers, body: JSON.stringify({ key: revokeKey.trim() }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      showMsg(`License ${revokeKey} revoked`);
-      setRevokeKey('');
-    } catch (err: any) { showMsg(`Error: ${err.message}`, 'error'); }
-    finally { setActionLoading(false); }
+    const key = revokeKey.trim();
+    if (!key) return;
+    setConfirmDialog({
+      title: 'Revoke this license key?',
+      body: `${key} will be invalidated immediately. Any device using it loses access on its next license check. A step-up password prompt will appear.`,
+      confirmLabel: 'Revoke license',
+      danger: true,
+      onConfirm: async () => {
+        const data = await callMutation('/api/v1/license/revoke', { key }, `License ${key} revoked`);
+        if (!data) return;
+        setRevokeKey('');
+        // Keep the Revoked tab honest if it's already been loaded.
+        if (revokedKeys.length > 0) loadRevoked();
+      },
+    });
   };
 
   const handleKillVersion = async () => {
-    if (!killVersion.trim()) return;
-    setActionLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/license/set-min-version`, {
-        method: 'POST', headers, body: JSON.stringify({ version: killVersion.trim() }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      showMsg(`Min version set to ${killVersion}`);
-      setKillVersion('');
-    } catch (err: any) { showMsg(`Error: ${err.message}`, 'error'); }
-    finally { setActionLoading(false); }
+    const version = killVersion.trim();
+    if (!version) return;
+    // Guard the shape here — a typo'd min version locks EVERY user out of the
+    // app on their next launch, and the server takes the string as given.
+    if (!/^\d+\.\d+\.\d+$/.test(version)) {
+      return showMsg('Version must be semver, e.g. 4.0.13', 'error');
+    }
+    setConfirmDialog({
+      title: `Force minimum app version to ${version}?`,
+      body: `Every client older than ${version} is blocked from authenticating and forced to upgrade on next launch. Setting this ABOVE your latest published build locks out all users, including you. A step-up password prompt will appear.`,
+      confirmLabel: `Set min version ${version}`,
+      danger: true,
+      onConfirm: async () => {
+        const data = await callMutation('/api/v1/license/set-min-version', { version }, `Min version set to ${version}`);
+        if (!data) return;
+        setKillVersion('');
+        // min_app_version is an app_config row — refresh Settings if loaded.
+        if (configRows.length > 0) loadConfig();
+      },
+    });
   };
 
   const handleSearch = async (emailOverride?: string) => {
@@ -1451,27 +1749,86 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
   };
 
   const handleRefund = (payment: any) => {
+    // Clear any verdict left over from a previous payment — otherwise the
+    // modal would open already demanding an override for a different charge.
+    setRefundIneligible(null);
     setRefundFor({ payment });
   };
 
-  const submitRefund = async (amount: number, reason: string) => {
+  // The server enforces REFUND_POLICY.md and answers 400 { error:
+  // 'refund_ineligible', code, reason } for a refund the policy blocks,
+  // together with a documented escape hatch: resend with `override_reason`
+  // (min 10 chars) and the bypass is recorded in the audit trail. None of
+  // that was reachable from this console — callMutation flattened the verdict
+  // into "Error: refund_ineligible" and there was no field to send an
+  // override in, so a legitimate goodwill refund had to be done from the
+  // Stripe dashboard instead. Now the verdict comes back into the modal.
+  const submitRefund = async (amount: number, reason: string, overrideReason?: string) => {
     if (!refundFor) return;
+    const body: any = { amount, reason };
+    if (overrideReason && overrideReason.trim()) body.override_reason = overrideReason.trim();
+
     const data = await callMutation(
       `/api/v1/admin/payments/${refundFor.payment.id}/refund`,
-      { amount, reason },
-      `Refund of ${amount} ${refundFor.payment.currency} issued`,
+      body,
+      '', // success toast is issued below so it can name the formatted amount
+      { returnErrorBody: true },
     );
-    if (!data) return;
+    if (!data) return; // hard failure or cancelled reauth — already toasted
+
+    if ((data as any).__error) {
+      const e = (data as any).__error || {};
+      if (e.error === 'refund_ineligible') {
+        setRefundIneligible({
+          code: e.code || 'ineligible',
+          reason: e.reason || 'The refund policy blocks this refund.',
+        });
+        return; // modal stays open and now shows the override field
+      }
+      showMsg(`Error: ${e.error || e.message || 'Refund failed'}`, 'error');
+      return;
+    }
+
+    showMsg(`Refund of ${fmtAmount(amount, refundFor.payment.currency)} issued`);
     // Reload payments so the refund row appears. Keep user context untouched
     // — webhook will land the downgrade momentarily.
     setRefundFor(null);
+    setRefundIneligible(null);
     loadPayments();
   };
 
+  // GDPR Article 15 bundle download. The route is `stepUpOnly`, but this can't
+  // go through callMutation because the response is a file, not JSON — so it
+  // repeats the prompt-and-retry by hand. Before this, the first click always
+  // died with "Export failed: HTTP 403" and never offered the password prompt.
   const handleDsarExport = async (userId: string, email: string) => {
+    setPanelBusy(`dsar:${userId}`);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/admin/users/${userId}/export`, { headers: authHeaders() });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const attempt = () => fetch(`${API_BASE}/api/v1/admin/users/${userId}/export`, { headers: authHeaders() });
+
+      let res = await attempt();
+      if (res.status === 403) {
+        // Could be step-up, could be a genuine authz failure. Read the body to
+        // tell them apart — only prompt when the server asked us to.
+        const why = await res.clone().json().catch(() => ({}));
+        if (why?.error === 'step_up_required' || why?.error === 'step_up_expired') {
+          stepUpRef.current = { token: null, expiresAt: 0 };
+          setStepUpToken(null);
+          setStepUpExpiresAt(0);
+          try {
+            await requireStepUp();
+          } catch {
+            showMsg('Reauth cancelled', 'error');
+            return;
+          }
+          res = await attempt();
+        }
+      }
+      if (!res.ok) {
+        const why = await res.json().catch(() => ({}));
+        throw new Error(why?.error || why?.message || `HTTP ${res.status}`);
+      }
+
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -1484,6 +1841,8 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
       showMsg(`DSAR export downloaded for ${email}`);
     } catch (err: any) {
       showMsg(`Export failed: ${err.message}`, 'error');
+    } finally {
+      setPanelBusy(null);
     }
   };
 
@@ -1602,19 +1961,11 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
   }, [adminTab]);
 
   const fmtDate = (ts: number) => ts ? new Date(ts).toLocaleString() : '—';
-  const fmtMoney = (n: number | null | undefined) => n == null ? '$0' : `$${Math.round(n).toLocaleString()}`;
-  // Currency-aware formatter. Stripe stores USD in cents (divide by 100);
-  // Razorpay stores INR in paise (divide by 100). Other currencies follow
-  // ISO 4217 minor-unit convention, so /100 works for the common cases.
-  const fmtAmount = (amount: number | null | undefined, currency: string | null | undefined) => {
-    if (amount == null) return '—';
-    const sign = amount < 0 ? '-' : '';
-    const abs = Math.abs(amount);
-    const major = abs / 100;
-    const c = (currency || 'USD').toUpperCase();
-    const symbol = c === 'INR' ? '₹' : c === 'USD' ? '$' : c === 'EUR' ? '€' : c === 'GBP' ? '£' : '';
-    return `${sign}${symbol}${major.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${symbol ? '' : ' ' + c}`;
-  };
+  // NOTE: there is deliberately no `fmtMoney(n)` helper any more. It formatted
+  // a bare number as `$${n}` with no minor-unit divide and no currency, and it
+  // was pointed at cross-currency SUMs of cents+paise — so the Command Center
+  // hero showed a single $129 sale as "$12,900". Every money value now goes
+  // through fmtAmount (which needs an explicit currency) or MoneyByCurrency.
   const openUserInPanel = (email: string) => { setAdminTab('overview'); handleSearch(email); };
 
   // Filtered users for the Users tab — applied at render time so tier/status
@@ -1736,15 +2087,31 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                     <h1 className="text-3xl font-bold tracking-tight mb-1 bg-gradient-to-r from-white via-white to-blue-200 bg-clip-text text-transparent">Command Center</h1>
                     <p className="text-gray-500 text-sm">Live intelligence · {currentUser.email}</p>
                   </div>
+                  {/* Revenue is rendered per currency, in real money. Both
+                      figures used to read `revenue_this_month` /
+                      `total_revenue` — cross-currency sums of cents and paise
+                      printed with a bare `$` and no divide, so one $129 sale
+                      displayed as "$12,900" and every ₹ payment inflated the
+                      same number again. */}
                   <div className="flex items-center gap-4">
                     <div className="text-right">
-                      <p className="text-[10px] text-gray-600 uppercase tracking-widest">Monthly Revenue</p>
-                      <p className="text-3xl font-bold text-emerald-400 tracking-tight">{fmtMoney(stats?.revenue_this_month)}</p>
+                      <p className="text-[10px] text-gray-600 uppercase tracking-widest">Revenue · 30d</p>
+                      <MoneyByCurrency
+                        map={stats?.revenue_this_month_by_currency}
+                        className="text-3xl font-bold text-emerald-400 tracking-tight tabular-nums"
+                        subClassName="text-base font-bold text-emerald-300/70 tracking-tight tabular-nums"
+                        emptyLabel="—"
+                      />
                     </div>
                     <div className="h-10 w-px bg-white/10" />
                     <div className="text-right">
                       <p className="text-[10px] text-gray-600 uppercase tracking-widest">All Time</p>
-                      <p className="text-2xl font-bold text-white tracking-tight">{fmtMoney(stats?.total_revenue)}</p>
+                      <MoneyByCurrency
+                        map={stats?.total_revenue_by_currency}
+                        className="text-2xl font-bold text-white tracking-tight tabular-nums"
+                        subClassName="text-sm font-bold text-gray-400 tracking-tight tabular-nums"
+                        emptyLabel="—"
+                      />
                     </div>
                   </div>
                 </div>
@@ -1764,20 +2131,24 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                   </div>
                 </div>
 
-                {/* 4-Tier distribution */}
+                {/* Tier distribution — 5 cards (Ultra included). The grid is
+                    md:grid-cols-5 so Ultra doesn't wrap onto a lonely row. */}
                 <div>
                   <div className="flex items-center justify-between mb-3">
                     <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold">Tier Distribution</h2>
                     <p className="text-[10px] text-gray-600">{stats?.total_users ?? 0} total users</p>
                   </div>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
                     {TIERS.map(tier => {
                       const th = TIER_THEME[tier];
                       const Icon = th.Icon;
                       const count = stats?.tiers?.[tier] ?? 0;
                       const total = stats?.total_users || 1;
                       const pct = Math.round((count / total) * 100);
-                      const revenue = stats?.revenue_by_tier?.[tier];
+                      // Per-currency 30-day revenue for this tier. Reading the
+                      // flat `revenue_by_tier` here printed cents-as-dollars.
+                      const revenueMap = stats?.revenue_by_tier_by_currency?.[tier];
+                      const hasRevenue = revenueMap && Object.values(revenueMap).some((v: any) => Number(v) > 0);
                       const signups = stats?.signups_by_tier?.[tier] ?? 0;
                       return (
                         <div key={tier} className={`p-4 rounded-2xl border ${th.border} ${th.bg} relative overflow-hidden hover:scale-[1.02] transition-transform`}>
@@ -1786,10 +2157,14 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                             <span className={`text-[10px] font-bold uppercase tracking-widest ${th.text}`}>{tier}</span>
                           </div>
                           <p className="text-3xl font-bold text-white tracking-tight">{count.toLocaleString()}</p>
-                          <div className="flex items-baseline justify-between mt-1 mb-2">
+                          <div className="mt-1 mb-2">
                             <p className="text-[10px] text-gray-500">{pct}% · +{signups} this month</p>
-                            {revenue != null && revenue > 0 && (
-                              <p className={`text-[11px] font-bold ${th.text}`}>{fmtMoney(revenue)}</p>
+                            {hasRevenue && (
+                              <MoneyByCurrency
+                                map={revenueMap}
+                                className={`text-[11px] font-bold ${th.text} tabular-nums`}
+                                subClassName={`text-[10px] font-semibold ${th.text} opacity-70 tabular-nums`}
+                              />
                             )}
                           </div>
                           <div className="h-1 bg-white/[0.05] rounded-full overflow-hidden">
@@ -2592,9 +2967,30 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                 <div className="flex items-center justify-between flex-wrap gap-3">
                   <div>
                     <h1 className="text-2xl font-bold mb-1">Payments</h1>
-                    <p className="text-gray-500 text-sm">
-                      {paymentStats ? `${(paymentStats.count ?? 0).toLocaleString()} rows · gross ${(paymentStats.gross / 100).toFixed(2)} · refunded/disputed ${(paymentStats.refunded_or_disputed / 100).toFixed(2)}` : 'Filter, inspect, refund.'}
-                    </p>
+                    {/* Gross / refunded are per currency. The old line divided
+                        a cross-currency minor-unit sum by 100 and printed it
+                        with no symbol at all — "gross 1428.00" of nothing. */}
+                    {paymentStats ? (
+                      <div className="text-gray-500 text-sm flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <span>{(paymentStats.count ?? 0).toLocaleString()} rows</span>
+                        <span className="text-gray-700">·</span>
+                        <span>gross</span>
+                        {Object.keys(paymentStats.gross_by_currency || {}).length === 0
+                          ? <span className="text-gray-600">—</span>
+                          : Object.entries(paymentStats.gross_by_currency).map(([cur, v]: any) => (
+                              <span key={`g-${cur}`} className="text-emerald-400 font-semibold tabular-nums">{fmtAmount(v, cur)}</span>
+                            ))}
+                        <span className="text-gray-700">·</span>
+                        <span>refunded/disputed</span>
+                        {Object.keys(paymentStats.refunded_or_disputed_by_currency || {}).length === 0
+                          ? <span className="text-gray-600">—</span>
+                          : Object.entries(paymentStats.refunded_or_disputed_by_currency).map(([cur, v]: any) => (
+                              <span key={`r-${cur}`} className="text-pink-400 font-semibold tabular-nums">{fmtAmount(v, cur)}</span>
+                            ))}
+                      </div>
+                    ) : (
+                      <p className="text-gray-500 text-sm">Filter, inspect, refund.</p>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <button onClick={loadPayments} disabled={paymentsLoading} className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-white/[0.04] text-gray-300 hover:bg-white/[0.08] border border-white/[0.08] flex items-center gap-1.5 transition-all disabled:opacity-50">
@@ -2769,23 +3165,41 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                   </button>
                 </div>
 
-                {/* Enterprise metrics — MRR, ARPU, churn, engagement */}
+                {/* Enterprise metrics — MRR, ARR, ARPU.
+                    getMRRBreakdown() returns { USD: { amount, count } } and
+                    getARPUBreakdown() returns { USD: { arpu, payers } } — an
+                    OBJECT per currency, not a number. These four cards passed
+                    the object straight into fmtAmount, so Math.abs({}) gave
+                    NaN and all four headline SaaS figures rendered "$NaN"
+                    (and "ARR: $NaN", since {} * 12 is also NaN). Read the
+                    fields, and show the counts now that we're here. */}
                 <div>
                   <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold mb-3">Recurring Revenue</h2>
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                    {Object.entries(stats?.mrr_by_currency || {}).map(([cur, mrr]: any) => (
-                      <div key={cur} className="p-4 rounded-xl border border-emerald-500/20 bg-emerald-500/[0.04]">
-                        <p className="text-[10px] text-emerald-400 uppercase tracking-wider font-semibold mb-1">MRR · {cur}</p>
-                        <p className="text-2xl font-bold text-white tracking-tight">{fmtAmount(mrr, cur)}</p>
-                        <p className="text-[10px] text-gray-500 mt-1">ARR: {fmtAmount((mrr as number) * 12, cur)}</p>
-                      </div>
-                    ))}
-                    {Object.entries(stats?.arpu_by_currency || {}).map(([cur, arpu]: any) => (
-                      <div key={`arpu-${cur}`} className="p-4 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04]">
-                        <p className="text-[10px] text-cyan-400 uppercase tracking-wider font-semibold mb-1">ARPU · {cur}</p>
-                        <p className="text-2xl font-bold text-white tracking-tight">{fmtAmount(arpu, cur)}</p>
-                      </div>
-                    ))}
+                    {Object.entries(stats?.mrr_by_currency || {}).map(([cur, m]: any) => {
+                      const amount = Number(m?.amount ?? m ?? 0) || 0;
+                      const count = Number(m?.count ?? 0) || 0;
+                      return (
+                        <div key={cur} className="p-4 rounded-xl border border-emerald-500/20 bg-emerald-500/[0.04]">
+                          <p className="text-[10px] text-emerald-400 uppercase tracking-wider font-semibold mb-1">MRR · {cur}</p>
+                          <p className="text-2xl font-bold text-white tracking-tight tabular-nums">{fmtAmount(amount, cur)}</p>
+                          <p className="text-[10px] text-gray-500 mt-1">
+                            ARR: {fmtAmount(amount * 12, cur)}{count ? ` · ${count} payment${count === 1 ? '' : 's'}` : ''}
+                          </p>
+                        </div>
+                      );
+                    })}
+                    {Object.entries(stats?.arpu_by_currency || {}).map(([cur, a]: any) => {
+                      const arpu = Number(a?.arpu ?? a ?? 0) || 0;
+                      const payers = Number(a?.payers ?? 0) || 0;
+                      return (
+                        <div key={`arpu-${cur}`} className="p-4 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04]">
+                          <p className="text-[10px] text-cyan-400 uppercase tracking-wider font-semibold mb-1">ARPU · {cur}</p>
+                          <p className="text-2xl font-bold text-white tracking-tight tabular-nums">{fmtAmount(arpu, cur)}</p>
+                          <p className="text-[10px] text-gray-500 mt-1">{payers ? `${payers} paying user${payers === 1 ? '' : 's'}` : 'no payers yet'}</p>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -2811,7 +3225,12 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                     </div>
                     <div className="p-4 rounded-xl border border-red-500/20 bg-red-500/[0.04]">
                       <p className="text-[10px] text-red-400 uppercase tracking-wider mb-1">30d Churn</p>
-                      <p className="text-2xl font-bold text-red-400 tracking-tight">{stats?.churn_rate_30d != null ? `${(stats.churn_rate_30d * 100).toFixed(1)}%` : '—'}</p>
+                      {/* NO ×100 — database.js getChurnRate() already returns a
+                    percent, and says so: `// Percent, 2 decimal places` above
+                    `Math.round((churned / existing) * 10000) / 100`. Scaling
+                    it again rendered 5.26% churn as "526.0%", which is not a
+                    number anyone can act on. */}
+                <p className="text-2xl font-bold text-red-400 tracking-tight">{stats?.churn_rate_30d != null ? `${Number(stats.churn_rate_30d).toFixed(1)}%` : '—'}</p>
                     </div>
                   </div>
                 </div>
@@ -3086,17 +3505,21 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
               autoFocus
               value={reauthPrompt.password}
               onChange={e => setReauthPrompt(p => p ? { ...p, password: e.target.value, error: '' } : null)}
-              onKeyDown={async (e) => {
-                if (e.key === 'Enter' && !reauthPrompt.busy) {
-                  setReauthPrompt(p => p ? { ...p, busy: true } : null);
-                  const ok = await submitReauth(reauthPrompt.password);
-                  if (ok && reauthPrompt.pending) {
-                    reauthPrompt.pending();
-                    setReauthPrompt(null);
-                  } else {
-                    setReauthPrompt(p => p ? { ...p, busy: false, error: 'Invalid password' } : null);
-                  }
-                }
+              onKeyDown={(e) => {
+                // stopPropagation, not merely preventDefault. React 19 attaches
+                // its listeners to the #root container, which is a DESCENDANT
+                // of document — so preventDefault here settles nothing for the
+                // native event, which carried on bubbling up to RefundModal's
+                // document-level keydown listener sitting underneath us. There,
+                // Enter read as "confirm the refund" and Escape as "close the
+                // modal", so the very keystroke that submitted this password
+                // also re-fired the refund it was verifying. Killing the native
+                // event means the dialog beneath never sees a password
+                // keystroke at all; the stepUpOpen flag it also consults is the
+                // second line of the same defence, and the in-flight ref inside
+                // RefundModal is the third.
+                if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); runReauthSubmit(); }
+                if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancelReauth(); }
               }}
               placeholder={`Password for ${currentUser.email}`}
               className="w-full px-4 py-2.5 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-purple-500/60"
@@ -3106,26 +3529,15 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
             )}
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
-                onClick={() => {
-                  (window as any).__reauthReject?.();
-                  setReauthPrompt(null);
-                }}
-                className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all"
+                onClick={cancelReauth}
+                disabled={reauthPrompt.busy}
+                className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 disabled={!reauthPrompt.password || reauthPrompt.busy}
-                onClick={async () => {
-                  setReauthPrompt(p => p ? { ...p, busy: true } : null);
-                  const ok = await submitReauth(reauthPrompt.password);
-                  if (ok && reauthPrompt.pending) {
-                    reauthPrompt.pending();
-                    setReauthPrompt(null);
-                  } else {
-                    setReauthPrompt(p => p ? { ...p, busy: false, error: 'Invalid password' } : null);
-                  }
-                }}
+                onClick={runReauthSubmit}
                 className="px-4 py-2 rounded-lg text-sm font-semibold bg-purple-500/20 text-purple-200 hover:bg-purple-500/30 border border-purple-500/30 disabled:opacity-40 transition-all flex items-center gap-2"
               >
                 {reauthPrompt.busy && <Loader2 size={14} className="animate-spin" />}
@@ -3180,45 +3592,23 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
         </div>
       )}
 
-      {/* ── GRANT COMP MODAL ── */}
-      {compGrantFor && (() => {
-        let localTier: Tier = 'pro';
-        let localNote = '';
-        return (
-          <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/70 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={() => setCompGrantFor(null)}>
-            <div className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-emerald-500/20 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
-              <div className="flex items-start gap-3 mb-4">
-                <div className="shrink-0 p-2 rounded-lg bg-emerald-500/15 text-emerald-400"><Gift size={18} /></div>
-                <div>
-                  <h3 className="text-base font-semibold text-white">Grant Comp Tier</h3>
-                  <p className="text-xs text-gray-500">{compGrantFor.email} · $0 payment, excluded from revenue metrics</p>
-                </div>
-              </div>
-              <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Tier</label>
-              <select
-                defaultValue="pro"
-                onChange={e => { localTier = e.target.value as Tier; }}
-                className="w-full px-3 py-2 mb-3 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-emerald-500/50"
-              >
-                <option value="basic">Basic</option>
-                <option value="pro">Pro</option>
-                <option value="max">Max</option>
-              </select>
-              <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Reason / note (audit trail)</label>
-              <textarea
-                onChange={e => { localNote = e.target.value; }}
-                placeholder="e.g. refund for outage; influencer comp; support make-good"
-                rows={3}
-                className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-emerald-500/50 resize-none"
-              />
-              <div className="mt-5 flex items-center justify-end gap-2">
-                <button onClick={() => setCompGrantFor(null)} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all">Cancel</button>
-                <button onClick={() => submitGrantComp(localTier, localNote)} className="px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30 border border-emerald-500/30 transition-all">Grant</button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
+      {/* ── GRANT COMP MODAL ──
+          A real component with real state. It used to be an inline IIFE
+          holding `let localTier`/`let localNote`, which AdminDashboard
+          re-executed on every render — so any unrelated re-render (the
+          action-toast auto-dismiss fires one four seconds after the previous
+          action) silently reset the selection to 'pro' and wiped the note,
+          while the uncontrolled <select> kept displaying the tier the admin
+          had picked. Result: the console showed MAX and granted PRO, with an
+          empty audit note. Same class of bug as the one RefundModal was
+          extracted to fix. */}
+      {compGrantFor && (
+        <CompGrantModal
+          email={compGrantFor.email}
+          onCancel={() => setCompGrantFor(null)}
+          onSubmit={(tier, note) => submitGrantComp(tier, note)}
+        />
+      )}
 
       {/* ── REFUND MODAL ──
           Uses React state (was using closure variables, which silently
@@ -3228,8 +3618,14 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
         <RefundModal
           payment={refundFor.payment}
           fmtAmount={fmtAmount}
-          onCancel={() => setRefundFor(null)}
-          onSubmit={(amount, reason) => submitRefund(amount, reason)}
+          ineligible={refundIneligible}
+          // The step-up prompt paints ABOVE this modal (z-70 vs z-65) and its
+          // Enter keydown bubbles to document, where RefundModal's listener
+          // still sits. Flag it so verifying the password cannot also re-fire
+          // the refund it was verifying.
+          stepUpOpen={!!reauthPrompt}
+          onCancel={() => { setRefundFor(null); setRefundIneligible(null); }}
+          onSubmit={(amount, reason, overrideReason) => submitRefund(amount, reason, overrideReason)}
         />
       )}
 
@@ -3257,6 +3653,68 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
           onMessage={showMsg}
         />
       )}
+    </div>
+  );
+};
+
+// Comp-grant modal. Grants a paid tier at zero cost (payment row with
+// provider='admin-comp', amount=0, excluded from revenue). Both fields are
+// controlled React state so what the admin sees is what gets sent — see the
+// call site for the bug this replaced. The note is the ONLY record of why a
+// comp was issued, so Grant stays disabled until one is written.
+const CompGrantModal = ({ email, onCancel, onSubmit }: { email: string; onCancel: () => void; onSubmit: (tier: Tier, note: string) => void | Promise<void> }) => {
+  const [tier, setTier] = useState<Tier>('pro');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const ok = note.trim().length > 0 && !busy;
+  const th = tierOf(tier);
+  return (
+    <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/70 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={busy ? undefined : onCancel}>
+      <div className="relative w-full max-w-md mx-4 rounded-2xl bg-[#0b0b0f] border border-emerald-500/20 shadow-2xl p-6" onClick={e => e.stopPropagation()}>
+        <div className="flex items-start gap-3 mb-4">
+          <div className="shrink-0 p-2 rounded-lg bg-emerald-500/15 text-emerald-400"><Gift size={18} /></div>
+          <div>
+            <h3 className="text-base font-semibold text-white">Grant Comp Tier</h3>
+            <p className="text-xs text-gray-500">{email} · $0 payment, excluded from revenue metrics</p>
+          </div>
+        </div>
+        <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Tier</label>
+        <div className="flex items-center gap-2 mb-3">
+          <select
+            value={tier}
+            onChange={e => setTier(e.target.value as Tier)}
+            className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-emerald-500/50"
+          >
+            {/* Ultra was missing here, so the top plan could not be comped. */}
+            {PAID_TIERS.map(t => <option key={t} value={t}>{t.toUpperCase()}</option>)}
+          </select>
+          {/* Live echo of what will actually be granted — the previous version
+              could show one tier and send another, so make it unambiguous. */}
+          <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase border ${th.bg} ${th.text} ${th.border}`}>
+            grants {tier}
+          </span>
+        </div>
+        <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-1">Reason / note (required — audit trail)</label>
+        <textarea
+          autoFocus
+          value={note}
+          onChange={e => setNote(e.target.value)}
+          placeholder="e.g. refund for outage; influencer comp; support make-good"
+          rows={3}
+          className="w-full px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-sm focus:outline-none focus:border-emerald-500/50 resize-none"
+        />
+        <div className="mt-5 flex items-center justify-end gap-2">
+          <button onClick={onCancel} disabled={busy} className="px-4 py-2 rounded-lg text-sm font-medium text-gray-300 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all disabled:opacity-50">Cancel</button>
+          <button
+            disabled={!ok}
+            onClick={async () => { setBusy(true); try { await onSubmit(tier, note.trim()); } finally { setBusy(false); } }}
+            className="px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30 border border-emerald-500/30 transition-all disabled:opacity-40 flex items-center gap-2"
+          >
+            {busy && <Loader2 size={14} className="animate-spin" />}
+            Grant {tier.toUpperCase()}
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
@@ -4978,12 +5436,16 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
   // webhook hasn't landed and currentLicense.tier is still 'free').
   const isAdminUser = !!currentUser && licenseService.isDeveloper(currentUser.email);
   const licenseTier = currentLicense?.tier;
+  // 'ultra' belongs in both lists — it is the apex PAID tier. Without it an
+  // Ultra licence fell through to null and this surface rendered the Free
+  // state, complete with an "Upgrade to Pro" button aimed at a subscriber
+  // already paying for the top plan.
   const paidLicense =
-    licenseTier === 'max' || licenseTier === 'pro' || licenseTier === 'basic'
+    licenseTier === 'ultra' || licenseTier === 'max' || licenseTier === 'pro' || licenseTier === 'basic'
       ? licenseTier : null;
   const fallbackTier = paidLicense
     ? paidLicense
-    : (lastSuccessfulTier === 'max' || lastSuccessfulTier === 'pro' || lastSuccessfulTier === 'basic'
+    : (lastSuccessfulTier === 'ultra' || lastSuccessfulTier === 'max' || lastSuccessfulTier === 'pro' || lastSuccessfulTier === 'basic'
         ? lastSuccessfulTier
         : null);
   const effectiveTier = isAdminUser ? 'max' : fallbackTier;
@@ -4991,8 +5453,11 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
   const tierBadge = (() => {
     if (!currentLicense) return null;
     const t = currentLicense.tier;
-    const labelMap: Record<string, string> = { max: 'MAX', pro: 'PRO', basic: 'BASIC', free: 'FREE' };
+    const labelMap: Record<string, string> = { ultra: 'ULTRA', max: 'MAX', pro: 'PRO', basic: 'BASIC', free: 'FREE' };
     const colorMap: Record<string, { bg: string; color: string }> = {
+      // Amethyst, matching TIER_THEME.ultra. Previously absent, so an Ultra
+      // badge fell through to `colorMap.free` and rendered grey FREE.
+      ultra: { bg: 'rgba(139, 92, 246, 0.15)', color: '#6d28d9' },
       max:   { bg: 'rgba(245, 158, 11, 0.15)', color: '#b45309' },
       pro:   { bg: 'rgba(59, 130, 246, 0.15)', color: '#1d4ed8' },
       basic: { bg: 'rgba(16, 185, 129, 0.15)', color: '#047857' },
@@ -5204,26 +5669,29 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
       {/* Tier-aware action */}
       <section className="px-5 pb-10">
         {(() => {
-          if (effectiveTier === 'max' || effectiveTier === 'pro') {
+          if (effectiveTier === 'max' || effectiveTier === 'pro' || effectiveTier === 'ultra') {
+            const isUltra = effectiveTier === 'ultra';
             const isMax = effectiveTier === 'max';
             return (
               <div className="space-y-3">
                 <div
                   className="px-5 py-3.5 rounded-full text-center text-[14px] font-medium inline-flex items-center justify-center gap-2 w-full"
                   style={{
-                    background: isMax ? 'rgba(245, 158, 11, 0.12)' : 'rgba(59, 130, 246, 0.12)',
-                    border: '1px solid ' + (isMax ? 'rgba(245, 158, 11, 0.35)' : 'rgba(59, 130, 246, 0.35)'),
-                    color: isMax ? '#b45309' : '#1d4ed8',
+                    background: isUltra ? 'rgba(139, 92, 246, 0.12)' : isMax ? 'rgba(245, 158, 11, 0.12)' : 'rgba(59, 130, 246, 0.12)',
+                    border: '1px solid ' + (isUltra ? 'rgba(139, 92, 246, 0.35)' : isMax ? 'rgba(245, 158, 11, 0.35)' : 'rgba(59, 130, 246, 0.35)'),
+                    color: isUltra ? '#6d28d9' : isMax ? '#b45309' : '#1d4ed8',
                   }}
                 >
-                  {isMax ? <WizardHat size={14} /> : <Check size={14} />}
-                  {isAdminUser ? 'Admin · Max Active' : (isMax ? 'Max Active' : 'Pro Active')}
+                  {isUltra ? <UltraMark size={14} /> : isMax ? <WizardHat size={14} /> : <Check size={14} />}
+                  {isAdminUser ? 'Admin · Max Active' : (isUltra ? 'Ultra Active' : isMax ? 'Max Active' : 'Pro Active')}
                 </div>
                 {/* Inline Pro→Max upgrade — one-tap path to the highest tier
                     without leaving the page. Routes through initiateCheckout
                     which detects the existing Pro sub and posts to
                     /upgrade-tier instead of creating a second subscription. */}
-                {!isAdminUser && !isMax && (
+                {/* Never offered to Ultra — Max is BELOW Ultra, so this row
+                    would be a downgrade sold as an upgrade. */}
+                {!isAdminUser && !isMax && !isUltra && (
                   <button
                     onClick={() => initiateCheckout('max')}
                     disabled={paymentLoading}
@@ -6046,7 +6514,11 @@ const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
               className="shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center"
               style={{ background: tierMeta.bg }}
             >
-              {currentLicense?.tier === 'max'
+              {/* Ultra had no branch here, so the top plan fell to the
+                  final `else` and drew Zap — Basic's glyph. */}
+              {currentLicense?.tier === 'ultra'
+                ? <UltraMark size={20} style={{ color: tierMeta.color }} />
+                : currentLicense?.tier === 'max'
                 ? <WizardHat size={20} style={{ color: tierMeta.color }} />
                 : currentLicense?.tier === 'pro'
                 ? <Crown size={20} style={{ color: tierMeta.color }} />
@@ -6218,6 +6690,16 @@ interface PlanRow {
 
 function tierMetaForPlanSheet(tier: string) {
   switch (tier) {
+    // ── Ultra ──
+    // This case did not exist, so 'ultra' hit `default` and the mobile
+    // plan sheet told a paying Ultra subscriber their plan was **Free**,
+    // in Free's grey. That is the same defect the badge helper above
+    // already carries a comment about fixing ("Previously absent, so an
+    // Ultra badge fell through to colorMap.free and rendered grey FREE")
+    // — the fix landed there and never reached this switch.
+    // Amethyst, matching TIER_THEME.ultra and that badge map, so Ultra
+    // reads as Ultra everywhere rather than as Max's amber.
+    case 'ultra': return { label: 'Ultra', bg: 'rgba(139, 92, 246, 0.12)', color: '#6d28d9', accent: '#7c3aed' };
     case 'max':   return { label: 'Max',   bg: 'rgba(245, 158, 11, 0.12)', color: '#b45309', accent: '#d97706' };
     case 'pro':   return { label: 'Pro',   bg: 'rgba(59, 130, 246, 0.12)', color: '#1d4ed8', accent: '#2563eb' };
     case 'basic': return { label: 'Basic', bg: 'rgba(16, 185, 129, 0.12)', color: '#047857', accent: '#059669' };
@@ -6580,7 +7062,13 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
                 className="shrink-0 w-12 h-12 rounded-2xl flex items-center justify-center"
                 style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)' }}
               >
-                {tier === 'max' ? (
+                {/* Ultra first — without its own branch it fell to the
+                    generic Sparkles, the same glyph a Free account gets.
+                    UltraMark is the mark the landing's pricing table and
+                    TIER_THEME.ultra both use. */}
+                {tier === 'ultra' ? (
+                  <UltraMark size={22} style={{ color: tierMeta.color }} />
+                ) : tier === 'max' ? (
                   <WizardHat size={22} style={{ color: tierMeta.color }} />
                 ) : tier === 'pro' ? (
                   <Crown size={22} style={{ color: tierMeta.color }} />
@@ -6611,7 +7099,24 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
                       border: '1px solid var(--cream-line)',
                     }}
                   >
-                    {status === 'active' ? 'Active' : status === 'trial' ? 'Trial' : status === 'expired' ? 'Expired' : status === 'revoked' ? 'Revoked' : 'Free'}
+                    {/* LicenseData.status has NINE values; this chain named
+                        four and sent the other five to 'Free'. So a paying
+                        subscriber mid-cancellation (status='canceling', still
+                        has full access until cycle end) read their plan as
+                        **Free** on the billing screen — as did past_due (card
+                        retrying, access continues), paused, refunded and
+                        disputed. 'Free' is now reserved for the tier that
+                        actually is free. */}
+                    {status === 'active' ? 'Active'
+                      : status === 'trial' ? 'Trial'
+                      : status === 'canceling' ? 'Cancels at period end'
+                      : status === 'past_due' ? 'Payment retrying'
+                      : status === 'paused' ? 'Paused'
+                      : status === 'refunded' ? 'Refunded'
+                      : status === 'disputed' ? 'Payment disputed'
+                      : status === 'expired' ? 'Expired'
+                      : status === 'revoked' ? 'Revoked'
+                      : 'Free'}
                   </span>
                   {provider && tier !== 'free' && !isAdminUser && (
                     <span
@@ -7244,6 +7749,24 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // also need a remount to recover). Set to true by the Cancel button; the
   // poll loop checks it on every tick.
   const googlePollAbortRef = useRef(false);
+  // ── Google sign-in handoff code ──
+  // /google/poll will not release the session without the code minted at
+  // consent time and delivered to THIS machine (deep link, or typed by
+  // the user from the browser page). Holding session_id proves nothing —
+  // the caller picked it — so without this the token was redeemable by
+  // whoever sent the user the sign-in link. See server/src/routes/auth.js.
+  //
+  // A ref, not state: the poll loop is a plain recursive closure and has
+  // to read the value the deep link delivered mid-flight, not the one
+  // captured when it started.
+  const googleHandoffCodeRef = useRef<string | null>(null);
+  const googleSessionIdRef = useRef<string | null>(null);
+  // Drives the "type the code from your browser" fallback, shown only
+  // once the server has told us consent completed and it is waiting on a
+  // code we never received (protocol handler unavailable/blocked).
+  const [googleCodePrompt, setGoogleCodePrompt] = useState(false);
+  const [googleCodeInput, setGoogleCodeInput] = useState('');
+  const [googleCodeInvalid, setGoogleCodeInvalid] = useState(false);
   const [forgotSent, setForgotSent] = useState(false);
 
   // Authenticated user (for download/dashboard views)
@@ -7277,7 +7800,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   useEffect(() => {
     if (!lastSuccessfulTier) return;
     if (!currentLicense) return;
-    const rank: Record<string, number> = { free: 0, basic: 1, pro: 2, max: 3 };
+    // Ultra outranks Max. While it was missing, `?? 0` scored it as FREE:
+    // an ultra live tier read as a downgrade from a cached 'max' and wiped
+    // the just-purchased banner, while a cached 'ultra' could never trip the
+    // downgrade clear at all.
+    const rank: Record<string, number> = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4 };
     const liveRank = rank[String(currentLicense.tier).toLowerCase()] ?? 0;
     const cachedRank = rank[String(lastSuccessfulTier).toLowerCase()] ?? 0;
     if (liveRank < cachedRank) {
@@ -8318,7 +8845,48 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setGoogleManualUrl(null);
     setGoogleUrlCopied(false);
     setAuthError(null);
+    setGoogleCodePrompt(false);
+    setGoogleCodeInput('');
+    setGoogleCodeInvalid(false);
+    googleHandoffCodeRef.current = null;
+    googleSessionIdRef.current = null;
   };
+
+  // The deep link lands in the main process, which broadcasts it here and
+  // also buffers it. Both are needed: the broadcast covers the warm case,
+  // the buffer covers a cold start where the OS launched the app with the
+  // URL before this component existed. Mounted for the life of the gate
+  // so a handoff that arrives early is never dropped on the floor.
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api?.on) return;
+    const dispose = api.on('auth:google-handoff', (payload: any) => {
+      if (!payload?.code) return;
+      // Ignore a handoff for a sign-in we are not running — a leftover
+      // from an abandoned attempt would otherwise burn itself against the
+      // current session and surface as a spurious "incorrect code".
+      if (googleSessionIdRef.current && payload.sessionId !== googleSessionIdRef.current) return;
+      googleHandoffCodeRef.current = payload.code;
+      // The code arrived on its own; the typed fallback is moot.
+      setGoogleCodePrompt(false);
+      setGoogleCodeInvalid(false);
+    });
+    return () => { try { dispose?.(); } catch { /* already disposed */ } };
+  }, []);
+
+  // The code prompt and the code itself only mean anything while a sign-in
+  // is actually running. Hanging them off googleSubmitting means every
+  // teardown path — success, server error, poll timeout, Cancel, logout —
+  // clears them without having to remember to, which is precisely what
+  // eleven separate teardown sites get wrong over time.
+  useEffect(() => {
+    if (googleSubmitting) return;
+    setGoogleCodePrompt(false);
+    setGoogleCodeInput('');
+    setGoogleCodeInvalid(false);
+    googleHandoffCodeRef.current = null;
+    googleSessionIdRef.current = null;
+  }, [googleSubmitting]);
 
   const handleGoogleElectron = async () => {
     setGoogleSubmitting(true);
@@ -8326,8 +8894,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setGoogleManualUrl(null);
     setGoogleUrlCopied(false);
     googlePollAbortRef.current = false;
+    setGoogleCodePrompt(false);
+    setGoogleCodeInput('');
+    setGoogleCodeInvalid(false);
+    googleHandoffCodeRef.current = null;
 
     const sessionId = crypto.randomUUID();
+    googleSessionIdRef.current = sessionId;
     // Env-aware: in dev (vite serves on :3005) we point at VITE_SERVER_URL
     // so Google OAuth lands on the local server's /auth/google/callback,
     // not on prod. PROD short-circuit guards against a stray env var
@@ -8430,6 +9003,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     let attempts = 0;
     const maxAttempts = 60; // 60 * 2s = 2 minutes
     const pollInterval = 2000;
+    // Once we're waiting on a typed code the user has to switch to the
+    // browser, read it and come back, and two minutes is not enough for
+    // that. Extend to the server's own 5-minute pending-session TTL —
+    // past that the session is gone anyway, so waiting longer would only
+    // trade a clear timeout for a confusing "incorrect code".
+    const startedAt = Date.now();
+    const withinCodeEntryWindow = () => Date.now() < startedAt + 5 * 60 * 1000;
 
     const poll = async (): Promise<void> => {
       // Three abort conditions:
@@ -8440,10 +9020,53 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       if (!mountedRef.current) return;
       attempts++;
       try {
-        const res = await fetch(`${serverUrl}/api/v1/auth/google/poll?session_id=${sessionId}`);
+        // Drain any handoff the main process buffered before our listener
+        // existed (cold start). Cheap, read-once, and a no-op once we
+        // already hold a code.
+        if (!googleHandoffCodeRef.current && (window as any).electronAPI?.invoke) {
+          try {
+            const buffered = await (window as any).electronAPI.invoke('auth:consume-google-handoff');
+            if (buffered?.code && (!buffered.sessionId || buffered.sessionId === sessionId)) {
+              googleHandoffCodeRef.current = buffered.code;
+            }
+          } catch { /* older preload without the channel — typed code still works */ }
+        }
+        if (googlePollAbortRef.current) return;
+        if (!mountedRef.current) return;
+
+        const handoffCode = googleHandoffCodeRef.current;
+        const codeParam = handoffCode ? `&code=${encodeURIComponent(handoffCode)}` : '';
+        const res = await fetch(`${serverUrl}/api/v1/auth/google/poll?session_id=${sessionId}${codeParam}`);
         const data = await res.json();
         if (googlePollAbortRef.current) return;
         if (!mountedRef.current) return;
+
+        if (data.status === 'awaiting_code') {
+          // Consent succeeded but the code never reached this machine, so
+          // the protocol handoff didn't take (OS registration denied,
+          // sandboxed browser, portable install). The browser page is
+          // showing the code — ask for it rather than spinning to timeout.
+          if (data.invalid_code) {
+            // The code we sent was wrong. Drop it so a stale deep link
+            // can't keep re-submitting itself into the attempt cap.
+            googleHandoffCodeRef.current = null;
+            setGoogleCodeInvalid(true);
+          }
+          setGoogleCodePrompt(true);
+          setGoogleManualUrl(null);
+          if (!withinCodeEntryWindow()) {
+            setAuthError('Sign-in timed out. Please try again.');
+            setGoogleSubmitting(false);
+            return;
+          }
+          // Same await-and-recurse shape as the pending branch below, so
+          // the whole loop stays one promise chain under the caller's
+          // try/catch rather than a detached timer.
+          await new Promise(r => setTimeout(r, pollInterval));
+          if (googlePollAbortRef.current) return;
+          if (!mountedRef.current) return;
+          return poll();
+        }
 
         if (data.status === 'success') {
           // Defensive: server should always return a license on success,
@@ -8545,9 +9168,74 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // here so it captures the latest state via closure and renders identically
   // in both the login and signup views.
   const renderGoogleFallback = () => {
-    if (!googleSubmitting && !googleManualUrl) return null;
+    if (!googleSubmitting && !googleManualUrl && !googleCodePrompt) return null;
     return (
       <div className="mt-3 space-y-2">
+        {/* Consent finished, but the code never reached this machine — the
+            OS protocol handoff is unavailable (registration denied,
+            sandboxed browser, portable install; see the catch around
+            setAsDefaultProtocolClient in electron/main.cjs). The browser
+            tab is displaying the code, so take it by hand. Without this
+            the user would sit on a spinner until the 2-minute timeout. */}
+        {googleCodePrompt && (
+          <div
+            className="rounded-xl px-3 py-2.5"
+            style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink-muted)' }}
+          >
+            <div className="text-[12px] mb-2" style={{ color: 'var(--ink)' }}>
+              Almost there — enter the code shown in your browser.
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                inputMode="text"
+                autoComplete="one-time-code"
+                spellCheck={false}
+                value={googleCodeInput}
+                onChange={(e) => {
+                  setGoogleCodeInput(e.target.value.toUpperCase().slice(0, 12));
+                  setGoogleCodeInvalid(false);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter') return;
+                  e.preventDefault();
+                  // Hand it to the running poll loop rather than fetching
+                  // here — one redemption path means one place that can
+                  // consume the single-use code.
+                  const cleaned = googleCodeInput.replace(/[^0-9A-Za-z]/g, '');
+                  if (cleaned.length !== 10) { setGoogleCodeInvalid(true); return; }
+                  googleHandoffCodeRef.current = cleaned;
+                  setGoogleCodeInvalid(false);
+                }}
+                placeholder="XXXXX-XXXXX"
+                className="flex-1 px-3 py-1.5 rounded-lg font-mono text-[13px] tracking-widest outline-none"
+                style={{
+                  background: 'var(--cream-soft)',
+                  border: `1px solid ${googleCodeInvalid ? 'var(--danger, #ef4444)' : 'var(--cream-line)'}`,
+                  color: 'var(--ink)',
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const cleaned = googleCodeInput.replace(/[^0-9A-Za-z]/g, '');
+                  if (cleaned.length !== 10) { setGoogleCodeInvalid(true); return; }
+                  googleHandoffCodeRef.current = cleaned;
+                  setGoogleCodeInvalid(false);
+                }}
+                className="px-3 py-1.5 rounded-full text-[11.5px] font-medium transition-all hover:opacity-90"
+                style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+              >
+                Continue
+              </button>
+            </div>
+            <div className="text-[11px] mt-2">
+              {googleCodeInvalid
+                ? "That code didn't match. Check the browser tab and try again."
+                : 'It expires in 5 minutes and works once.'}
+            </div>
+          </div>
+        )}
         {googleManualUrl && (
           <div
             className="rounded-xl px-3 py-2.5 text-[12px] break-all"
@@ -8903,7 +9591,9 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   )}
                   {currentUser.email}
                 </button>
-                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${currentLicense?.tier === 'max' ? 'bg-amber-500/20 text-amber-400' : currentLicense?.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : currentLicense?.tier === 'basic' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-500/20 text-gray-400'}`}>
+                {/* ultra was absent, so the top tier rendered in the same
+                    grey as free — violet matches TIER_THEME.ultra. */}
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${currentLicense?.tier === 'ultra' ? 'bg-violet-500/20 text-violet-300' : currentLicense?.tier === 'max' ? 'bg-amber-500/20 text-amber-400' : currentLicense?.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : currentLicense?.tier === 'basic' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-500/20 text-gray-400'}`}>
                   {currentLicense?.tier || 'free'}
                 </span>
                 {/* Explicit "Subscription" link in the nav — labeled, not
@@ -9166,21 +9856,28 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               //    above identify a paid tier.
               const isAdminUser = !!currentUser && licenseService.isDeveloper(currentUser.email);
               const licenseTier = currentLicense?.tier;
+              // 'ultra' is a paid tier and must be recognised here, or the
+              // apex subscriber falls through to the Free CTA below and is
+              // sold "Upgrade to Pro".
               const paidLicense =
-                licenseTier === 'max' || licenseTier === 'pro' || licenseTier === 'basic'
+                licenseTier === 'ultra' || licenseTier === 'max' || licenseTier === 'pro' || licenseTier === 'basic'
                   ? licenseTier
                   : null;
               const fallbackTier = paidLicense
                 ? paidLicense
-                : (lastSuccessfulTier === 'max' || lastSuccessfulTier === 'pro' || lastSuccessfulTier === 'basic'
+                : (lastSuccessfulTier === 'ultra' || lastSuccessfulTier === 'max' || lastSuccessfulTier === 'pro' || lastSuccessfulTier === 'basic'
                     ? lastSuccessfulTier
                     : null);
               const effectiveTier = isAdminUser ? 'max' : fallbackTier;
 
-              if (effectiveTier === 'max' || effectiveTier === 'pro') {
+              if (effectiveTier === 'max' || effectiveTier === 'pro' || effectiveTier === 'ultra') {
                 return (
                   <>
-                    {effectiveTier === 'max' ? (
+                    {effectiveTier === 'ultra' ? (
+                      <div className="px-6 py-2.5 rounded-xl bg-violet-500/10 border border-violet-500/30 text-violet-300 text-sm font-semibold flex items-center gap-2">
+                        <UltraMark size={14} /> Ultra Active
+                      </div>
+                    ) : effectiveTier === 'max' ? (
                       <div className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-amber-500/10 to-purple-500/10 border border-amber-500/30 text-amber-400 text-sm font-semibold flex items-center gap-2">
                         <WizardHat size={14} /> {isAdminUser ? 'Admin · Max Active' : 'Max Active'}
                       </div>

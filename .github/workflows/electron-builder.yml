@@ -49,6 +49,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # Job-level so the mirror step's `if:` can test it. A step's own `env:`
+    # block is not reliably in scope for that step's own conditional, and a
+    # secret cannot be referenced from an `if:` directly.
+    env:
+      FEED_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+
     steps:
       - name: Decide if this matrix entry should build
         id: gate
@@ -166,27 +172,101 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── HOW THESE ARTIFACTS REACH USERS ──
-      # They do NOT reach them from here. secrets.GITHUB_TOKEN is scoped to
-      # this repository, so no step in this workflow can write to the
-      # update-feed repo — which is where every installed app looks, and
-      # the reason CI-built macOS and Linux artifacts could never get there
-      # on their own.
+      # THE ONE THAT REACHES USERS. secrets.GITHUB_TOKEN is scoped to this
+      # repo only, so the step above physically cannot write to the update-
+      # feed repo — without this step, CI-built macOS and Linux artifacts
+      # (and, critically, latest-mac.yml / latest-linux.yml) never reach the
+      # feed that every shipped app-update.yml points at, and Mac/Linux users
+      # stay stranded even though Windows works. Requires a PAT with
+      # `contents: write` on madhavvan/interviewcopilot-releases, stored as
+      # the RELEASES_REPO_TOKEN secret on THIS repo.
       #
-      # That is inverted instead of worked around: the feed repo runs its
-      # own scheduled workflow (.github/workflows/mirror-from-source.yml in
-      # madhavvan/interviewcopilot-releases) that pulls the latest release
-      # from here every 15 minutes. Its GITHUB_TOKEN can write its own
-      # releases, and this repo is public so it needs no permission to read
-      # us. No cross-repo secret exists, so none can be missing.
-      #
-      # It is deliberately a timer and not a hand-off. The 2026-07 outage
-      # came from a release process whose last step — "sync the releases
-      # repo and flip the draft to published" — was manual, and a manual
-      # step in an auto-update path is one that eventually does not happen.
-      # A timer is idempotent, self-healing, and forgets nothing.
-      #
-      # So after this job finishes, macOS and Linux land on the feed within
-      # ~15 minutes. `npm run release:verify` proves it actually serves;
-      # `npm run release:mirror -- <tag>` forces it immediately if you do
-      # not want to wait.
+      # Gated on the secret being present so a fork or a fresh clone without
+      # the secret still completes the legacy upload instead of failing red.
+      # If it is skipped, `npm run release:mirror -- <tag>` does the same job
+      # from a workstation. Either way, `npm run release:verify` is what
+      # proves the feed is actually serving before you call a release done.
+      - name: Mirror artifacts to the update-feed repo (what users update from)
+        uses: softprops/action-gh-release@v2
+        if: steps.gate.outputs.go == '1' && github.event_name == 'release' && env.FEED_TOKEN != ''
+        with:
+          repository: madhavvan/interviewcopilot-releases
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
+          tag_name: ${{ github.event.release.tag_name }}
+          fail_on_unmatched_files: false
+          files: |
+            dist-electron/*.yml
+            dist-electron/*.exe
+            dist-electron/*.dmg
+            dist-electron/*.zip
+            dist-electron/*.AppImage
+            dist-electron/*.deb
+            dist-electron/*.blockmap
+
+  # ────────────────────────────────────────────────────────────────────
+  #  THE GATE THAT WAS MISSING
+  #
+  #  Everything above can go green while the fleet sees nothing. That is
+  #  not hypothetical — it is what happened to v4.0.11 through v4.0.16:
+  #  each build succeeded, each release was tagged, and every installed
+  #  app polled a feed repo that did not exist. Nobody found out from CI,
+  #  because CI only ever asserted that the BUILD worked.
+  #
+  #  `release:verify` walks the four anonymous HTTP steps a shipped app
+  #  actually performs — releases.atom, /releases/latest, the per-platform
+  #  channel file, then a ranged GET of every asset it names — against
+  #  every configured feed. It is the only check here that can tell the
+  #  difference between "we published a release" and "users can install
+  #  it".
+  #
+  #  It existed before this job did, as a manual step documented in a
+  #  comment. A manual step is exactly the kind that stops happening, so
+  #  it runs here instead.
+  #
+  #  needs: release — must not start until every matrix entry has
+  #  uploaded, or it would fail on artifacts that are merely not there
+  #  yet. Retries absorb GitHub's CDN propagation delay on top of that.
+  # ────────────────────────────────────────────────────────────────────
+  verify-feed:
+    name: Verify the update feed actually serves this release
+    needs: release
+    # `always()` so a skipped Windows entry (buildOnDispatch=false) does
+    # not skip the gate. A genuinely FAILED build still short-circuits:
+    # there is nothing to verify, and a red feed report on top of a red
+    # build only obscures the real cause.
+    if: always() && github.event_name == 'release' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # No `npm ci` — the verifier is dependency-free by design (node:
+      # built-ins plus fetch) precisely so this gate cannot be broken by
+      # an install failure.
+      - name: Verify every feed serves ${{ github.event.release.tag_name }}
+        run: node scripts/verify-release-feed.mjs --tag "${{ github.event.release.tag_name }}" --retries 6 --retry-wait 30
+
+      - name: Explain what a failure here means
+        if: failure()
+        run: |
+          echo "::error title=Release is not reachable by users::The build succeeded but the update feed does not serve ${{ github.event.release.tag_name }}."
+          echo ""
+          echo "Installed apps read the FIRST entry of build.publish in package.json."
+          echo "If that feed cannot serve the release, every existing install stays"
+          echo "on its current version forever and cannot self-heal — the feed URL"
+          echo "is baked into each installation at build time."
+          echo ""
+          echo "Most likely causes, in order:"
+          echo "  1. the mirror step was skipped (RELEASES_REPO_TOKEN secret missing)"
+          echo "     -> fix: npm run release:mirror -- ${{ github.event.release.tag_name }}"
+          echo "  2. the feed repo does not exist, or is private"
+          echo "  3. the release is still a draft (drafts are invisible to the feed)"
+          echo "  4. a platform's channel file (latest-mac.yml / latest-linux.yml)"
+          echo "     never reached the feed repo"
+          echo ""
+          echo "Re-run this job after fixing; it is safe to run any number of times."

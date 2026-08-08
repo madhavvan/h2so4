@@ -1,0 +1,47 @@
+# Line endings.
+#
+# Git compares bytes. This repo is edited from Windows, but every committed
+# blob is LF — so a file that gets saved with CRLF reads as "every line
+# changed". That is not theoretical: App.tsx once showed 19,205 changed lines
+# for a 205-line edit, which makes a diff impossible to review and hides real
+# changes inside the noise.
+#
+# `text=auto eol=lf` fixes it at both ends: git normalizes to LF when it
+# stores a file, and checks it out as LF, so the working tree and HEAD agree
+# no matter which editor wrote it.
+* text=auto eol=lf
+
+# Files that are genuinely binary — git must never rewrite a byte of these.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.icns  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.eot   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.7z    binary
+*.exe   binary
+*.dll   binary
+*.node  binary
+*.asar  binary
+*.dmg   binary
+*.blockmap binary
+*.mp3   binary
+*.mp4   binary
+*.wav   binary
+*.docx  binary
+*.xlsx  binary
+*.pptx  binary
+
+# cmd.exe reads a .bat/.cmd line-by-line and a bare LF can truncate the last
+# command, so these must stay CRLF on disk.
+*.bat text eol=crlf
+*.cmd text eol=crlf

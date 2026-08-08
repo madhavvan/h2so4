@@ -180,8 +180,14 @@ function _resolveScreenshotDir(app) {
 
 function _rotateScreenshotsIfNeeded(dir) {
   try {
+    // Must match every extension saveScreenshot can write. It branches to
+    // '.jpg' on a JPEG mediaType, and this filter only ever looked at
+    // '.png' — so the moment capture returns anything but PNG, full-screen
+    // captures accumulate here forever with no cap. PRIVACY.md promises
+    // the 50 most recent and no more; keep that true by construction
+    // rather than by capture happening to stay PNG today.
     const files = fs.readdirSync(dir)
-      .filter(f => f.endsWith('.png'))
+      .filter(f => f.endsWith('.png') || f.endsWith('.jpg'))
       .map(f => ({ name: f, mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
       .sort((a, b) => a.mtime - b.mtime); // oldest first
     if (files.length <= MAX_SCREENSHOTS) return;

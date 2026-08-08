@@ -40,6 +40,13 @@ const ROOT = join(HERE, '..', '..');
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 const downloadsSrc = readFileSync(join(ROOT, 'server', 'src', 'routes', 'downloads.js'), 'utf8');
 const indexSrc = readFileSync(join(ROOT, 'server', 'src', 'index.js'), 'utf8');
+// GITHUB_RELEASES_URL moved out of index.js into services/versionSource.js
+// so that /license/version could reach the same live answer as
+// /app-version without an import cycle — they had drifted to 4.0.8 vs
+// 4.0.17. Search both: this assertion is about the CONSTANT agreeing with
+// build.publish, not about which file happens to hold it.
+const versionSourceSrc = readFileSync(join(ROOT, 'server', 'src', 'services', 'versionSource.js'), 'utf8');
+const serverVersionSrc = indexSrc + '\n' + versionSourceSrc;
 
 const publish = Array.isArray(pkg.build.publish) ? pkg.build.publish : [pkg.build.publish];
 const repoNames = publish.map((t) => `${t.owner}/${t.repo}`);
@@ -85,26 +92,34 @@ describe('the three copies of "which repo" agree', () => {
     expect(repoNames, `downloads.js serves binaries from ${m[1]}, which no publish target writes to`).toContain(m[1]);
   });
 
-  it('index.js GITHUB_RELEASES_URL is a repo that releases are published to', () => {
-    const m = /GITHUB_RELEASES_URL = '([^']+)'/.exec(indexSrc);
-    expect(m, 'could not find GITHUB_RELEASES_URL in index.js').toBeTruthy();
+  it('the server GITHUB_RELEASES_URL is a repo that releases are published to', () => {
+    const m = /GITHUB_RELEASES_URL = '([^']+)'/.exec(serverVersionSrc);
+    expect(m, 'could not find GITHUB_RELEASES_URL in index.js or services/versionSource.js').toBeTruthy();
     const repo = /api\.github\.com\/repos\/([^/]+\/[^/]+)\//.exec(m[1]);
     expect(repo, `GITHUB_RELEASES_URL is not a /repos/<owner>/<repo>/ URL: ${m[1]}`).toBeTruthy();
-    expect(repoNames, `index.js reads versions from ${repo[1]}, which no publish target writes to`).toContain(repo[1]);
+    expect(repoNames, `the server reads versions from ${repo[1]}, which no publish target writes to`).toContain(repo[1]);
+  });
+
+  it('there is exactly ONE server-side copy of the releases URL', () => {
+    // The refactor that created versionSource.js must not have left a
+    // second copy behind in index.js — two constants naming the same
+    // thing is how this drifted in the first place.
+    const inIndex = (indexSrc.match(/GITHUB_RELEASES_URL = '/g) || []).length;
+    const inService = (versionSourceSrc.match(/GITHUB_RELEASES_URL = '/g) || []).length;
+    expect(inIndex + inService, 'the releases URL is declared in more than one place').toBe(1);
   });
 });
 
 describe('the two copies of "which version is latest" agree', () => {
-  // The repo-name drift above had a twin that cost just as much, and this
-  // file did not cover it.
+  // The repo-name drift above had a twin that cost just as much.
   //
   // There are TWO independent answers to "what is the latest version":
   //
   //   1. package.json `version` — what electron-builder stamps into the
   //      build and writes into latest.yml on the release.
-  //   2. index.js FALLBACK_VERSION.version — what /app-version serves to
-  //      every client when the GitHub fetch fails AND the in-memory cache
-  //      is cold, i.e. on every fresh server boot.
+  //   2. FALLBACK_VERSION.version in services/versionSource.js — what
+  //      /app-version serves when the GitHub fetch fails AND the cache is
+  //      cold, i.e. on every fresh server boot.
   //
   // While GITHUB_RELEASES_URL pointed at a repo that did not exist, the
   // fetch failed on EVERY refresh, so (2) was not a fallback at all — it
@@ -113,14 +128,18 @@ describe('the two copies of "which version is latest" agree', () => {
   // four releases behind. Nothing failed. Nothing logged. The endpoint
   // returned 200 with a confident, wrong number.
   //
-  // index.js's own comment already states the policy — "Bump it in the
+  // versionSource.js's own comment states the policy — "bump it in the
   // same commit as every version bump" — but a comment is not a guard,
   // and the drift it warns about is exactly what happened. This is the
-  // guard.
-  const declared = /version: process\.env\.LATEST_APP_VERSION \|\| '([^']+)'/.exec(indexSrc);
+  // guard. It reads the concatenated server sources so it keeps working
+  // whichever file the constant lives in.
+  const declared = /version: process\.env\.LATEST_APP_VERSION \|\| '([^']+)'/.exec(serverVersionSrc);
 
-  it('finds FALLBACK_VERSION.version in index.js', () => {
-    expect(declared, 'could not find the LATEST_APP_VERSION fallback literal in index.js').toBeTruthy();
+  it('finds the LATEST_APP_VERSION fallback literal', () => {
+    expect(
+      declared,
+      'could not find the LATEST_APP_VERSION fallback in index.js or services/versionSource.js'
+    ).toBeTruthy();
   });
 
   it('the offline fallback is exactly the version being shipped', () => {
@@ -130,7 +149,7 @@ describe('the two copies of "which version is latest" agree', () => {
     // correct, and it is trivially satisfiable: bump both together.
     expect(
       declared[1],
-      `package.json is ${pkg.version} but index.js FALLBACK_VERSION.version is ${declared[1]}. ` +
+      `package.json is ${pkg.version} but the server fallback is ${declared[1]}. ` +
         'A cold-started server serves the fallback, so this number IS what the fleet is told. ' +
         'Bump both in the same commit.'
     ).toBe(pkg.version);

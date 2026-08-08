@@ -22,8 +22,27 @@
 //  build's app-update.yml. Changing the release repo means changing all
 //  THREE, and the third one only takes effect for future installs.
 //
-//  Before making h2so4 private, create the public releases repo FIRST,
-//  publish a release to it, and only then repoint these three.
+//  ── AS OF 2026-08-07: RELEASES GO TO BOTH REPOS ──
+//  build.publish now lists TWO targets, and every release is published to
+//  both:
+//    [0] madhavvan/interviewcopilot-releases — baked into app-update.yml,
+//        so it is the feed every NEW build phones home to. It is also the
+//        feed the stranded v4.0.11-v4.0.16 fleet already points at, which
+//        is why creating it (rather than repointing them, which is
+//        impossible — the URL is baked into their installed resources) is
+//        what brings them back.
+//    [1] madhavvan/h2so4 — the legacy feed still read by <=v4.0.9 installs.
+//
+//  Because BOTH receive every artifact, this constant is correct pointing
+//  at either one. It stays on h2so4 until the releases repo has a release
+//  carrying all four artifacts below; repointing it before that would
+//  re-break downloads, which is the exact failure this file's header
+//  documents above. Flip it (and GITHUB_RELEASES_URL) as the LAST step of
+//  making h2so4 private — at that moment h2so4 stops being publicly
+//  fetchable and this must already point elsewhere.
+//
+//  `npm run release:verify` walks the real anonymous HTTP steps against
+//  both targets and fails if either cannot serve.
 //
 //  Routes are explicit (one handler per platform) instead of /:platform
 //  with a lookup table — this keeps the router from swallowing every

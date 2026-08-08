@@ -11,7 +11,13 @@
 //  also add it here or it'll silently no-op.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-const { contextBridge, ipcRenderer, shell } = require('electron');
+// Note there's no `shell` here on purpose — this preload runs sandboxed
+// (neither window sets sandbox:false), and a sandboxed preload's
+// require('electron') only hands back contextBridge, crashReporter,
+// ipcRenderer, nativeImage, sharedTexture, webFrame and webUtils. Asking
+// for shell would just get you `undefined` and a TypeError at call time.
+// Anything that needs shell goes through IPC to main.
+const { contextBridge, ipcRenderer } = require('electron');
 
 // Renderer → main, fire-and-forget (ipcRenderer.send)
 const SEND_CHANNELS = new Set([
@@ -70,10 +76,16 @@ const INVOKE_CHANNELS = new Set([
   // Robust external-URL opener with shell.openExternal + child_process
   // fallback. Used by Google sign-in to survive ShellExecute hiccups.
   'open-external-robust',
+  // Drain a buffered `interview-copilot://signin-complete` handoff. Read-
+  // once. Covers the cold start, where the protocol URL reaches main
+  // before any renderer exists to hear the broadcast.
+  'auth:consume-google-handoff',
   // Local SQLite (Electron-side conversation/session/message DB)
   'db:claim-orphan-sessions',
   'db:get-active-session',
   'db:list-sessions',
+  'db:known-session-ids',
+  'db:import-remote-session',
   'db:new-session',
   'db:switch-session',
   'db:rename-session',
@@ -118,6 +130,12 @@ const RECEIVE_CHANNELS = new Set([
   // state is handled separately via the existing db:active-session-changed
   // broadcast that endSessionCleanly also emits.
   'cmd-end-session',
+  // Google OAuth handoff from the browser that completed consent, routed
+  // to us by the OS via the `interview-copilot://` protocol. Payload:
+  // { sessionId, code }. The code is the ONLY proof /google/poll accepts,
+  // and it reaches this machine and no other — that is what stops someone
+  // who picked the session_id from redeeming a stranger's sign-in.
+  'auth:google-handoff',
 ]);
 
 function send(channel, data) {
@@ -158,7 +176,18 @@ function on(channel, callback) {
 // Open external URL — only http/https/mailto. Everything else (file://,
 // javascript:, data:) is blocked because shell.openExternal will happily
 // execute file:// or weird custom protocols on Windows that can lead to
-// command execution.
+// command execution. Main re-checks the exact same allowlist before it
+// launches anything; we keep the check here as well so a bad protocol
+// never even reaches IPC — defence in depth, and the log line tells you
+// which renderer tried it.
+//
+// The actual launch is delegated to main over 'open-external-robust',
+// because this preload is sandboxed and therefore has no shell to call
+// (see the require at the top of the file). Contract note: the robust
+// helper below RESOLVES with { ok:false, ... } when a launch fails, but
+// callers of this one expect the older, simpler promise that REJECTS on
+// failure so their catch/fallback path runs — so we translate ok:false
+// into a rejection here and leave openExternalRobust's shape alone.
 const SAFE_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
 function openExternal(url) {
   try {
@@ -167,7 +196,11 @@ function openExternal(url) {
       console.warn('[preload] blocked openExternal with protocol:', u.protocol);
       return Promise.reject(new Error('Protocol not allowed'));
     }
-    return shell.openExternal(url);
+    return invoke('open-external-robust', url).then((result) => {
+      if (result && result.ok) return undefined;
+      const detail = (result && result.error) || 'unknown error';
+      throw new Error('Failed to open external URL — ' + detail);
+    });
   } catch (e) {
     return Promise.reject(e);
   }

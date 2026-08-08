@@ -6,10 +6,16 @@
 //  2026-05-13:
 //
 //    t+0s   : Slack webhook (fired immediately from the WS handler)
-//    t+30s  : ntfy.sh push to every online agent's topic
+//    t+30s  : ntfy.sh push to every NOTIFIABLE agent's topic
 //    t+2m   : Resend email to support@minicaai.com
 //    t+5m   : Twilio SMS (only if agent has twilio_phone + SMS enabled)
 //    t+24h  : Auto-fallback bot reply to the customer ("we'll email you")
+//
+//  "Notifiable" is deliberate and is not "online". The push rungs target
+//  agents who have not muted themselves, whether or not they currently
+//  have the inbox open — an alert that only reaches someone already
+//  watching the screen is not an alert. See listNotifiableSupportAgents in
+//  database.js for the bug this replaced.
 //
 //  Each rung in the ladder fires INDEPENDENTLY — losing the ntfy push
 //  doesn't prevent the email; losing the email doesn't prevent the SMS.
@@ -55,14 +61,18 @@ function buildEscalationsFor(thread) {
 // ─── Channel dispatchers ──────────────────────────────────────────
 
 async function fireNtfy(row) {
-  // Send to every online agent's topic. If the topic field is empty
-  // (older agent without setup), skip silently — they get the Slack/
-  // email/desktop rungs anyway. We don't fail the row in that case.
-  const agents = db.listOnlineSupportAgents();
+  // Notifiable, NOT online. This used listOnlineSupportAgents, which needs
+  // a heartbeat inside 90s — and the heartbeat only ticks while an agent
+  // has the inbox open on a live socket. So the push that exists to buzz a
+  // phone when nobody is watching was skipped precisely then, and fired
+  // only when the agent was already looking at the customer. On the live
+  // database that meant three agents with topics configured and zero
+  // reachable. See listNotifiableSupportAgents in database.js.
+  const agents = db.listNotifiableSupportAgents();
   const targets = agents.filter(a => a.ntfy_topic && a.ntfy_topic.length > 0);
   if (targets.length === 0) {
     console.log(`[escalation] ntfy skip thread=${row.thread_id} reason=no_agents_with_topic`);
-    return { ok: true, skipped: true };
+    return { ok: true, skipped: true, reason: 'no_agents_with_topic' };
   }
   const results = await Promise.all(targets.map(a =>
     sendNewCustomerAlert(a.ntfy_topic, {
@@ -130,9 +140,12 @@ async function fireSms(row) {
   // case. We never error this rung: a missing Twilio config is normal.
   if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_FROM) {
     console.log(`[escalation] sms skip thread=${row.thread_id} reason=twilio_not_configured`);
-    return { ok: true, skipped: true };
+    return { ok: true, skipped: true, reason: 'twilio_not_configured' };
   }
-  const agents = db.listOnlineSupportAgents();
+  // Notifiable, not online — same reasoning as fireNtfy. An SMS rung that
+  // only fires when the agent is already at the keyboard is not an SMS
+  // rung at all.
+  const agents = db.listNotifiableSupportAgents();
   const targets = agents.filter(a => {
     if (!a.twilio_phone) return false;
     try {
@@ -142,7 +155,7 @@ async function fireSms(row) {
   });
   if (targets.length === 0) {
     console.log(`[escalation] sms skip thread=${row.thread_id} reason=no_agents_with_sms_pref`);
-    return { ok: true, skipped: true };
+    return { ok: true, skipped: true, reason: 'no_agents_with_sms_pref' };
   }
   // Lazy-load Twilio so the dependency is only required when actually
   // used in production. If the package isn't installed yet, log and
@@ -151,7 +164,7 @@ async function fireSms(row) {
   try { twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); }
   catch (e) {
     console.warn(`[escalation] twilio SDK not installed — npm install twilio. Skipping SMS.`);
-    return { ok: true, skipped: true };
+    return { ok: true, skipped: true, reason: 'twilio_sdk_missing' };
   }
   const body = `[minicaai] ${row.customer_name || row.customer_email} waiting >5min: "${(row.initial_question || '').slice(0, 100)}"`;
   const results = await Promise.allSettled(targets.map(a =>
@@ -204,9 +217,19 @@ async function tick() {
       db.markSupportEscalationFired(row.thread_id, row.channel);
       continue;
     }
+    // Record WHAT HAPPENED, not just that we looked. Without this a
+    // skipped alert and a delivered one are indistinguishable afterwards,
+    // which is how a notification path that reached nobody for weeks still
+    // showed a table full of tidy `fired` timestamps.
+    let outcome;
     try {
-      await fn(row);
+      const r = await fn(row);
+      if (r && r.skipped) outcome = `skipped:${r.reason || 'unspecified'}`;
+      else if (r && r.ok === false) outcome = `failed:${r.error || 'unspecified'}`;
+      else if (r && typeof r.ok_count === 'number') outcome = `sent:${r.ok_count}/${r.fanout}`;
+      else outcome = 'sent';
     } catch (e) {
+      outcome = `failed:${(e.message || 'threw').slice(0, 80)}`;
       console.error(`[escalation] dispatch ${row.channel} threw for thread=${row.thread_id}: ${e.message}`);
     }
     // ALWAYS mark fired, even on dispatcher errors — we don't want a
@@ -214,7 +237,7 @@ async function tick() {
     // hammer ntfy/email retry attempts in a loop. The escalation row
     // is a one-shot; the underlying support_threads row stays open
     // for the agent to handle when they're back.
-    db.markSupportEscalationFired(row.thread_id, row.channel);
+    db.markSupportEscalationFired(row.thread_id, row.channel, outcome);
   }
 }
 

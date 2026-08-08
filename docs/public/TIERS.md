@@ -35,7 +35,7 @@ Because Basic/Pro/Max are one-time buys, there's nothing recurring on them to "d
 | Feature | Free | Basic | Pro | Max | Ultra |
 |---|---|---|---|---|---|
 | Interview time | 10-min trial total | One 30-min interview | One 1-hour interview | Three 1-hour interviews | Unlimited |
-| AI models | 4 during trial (no Claude) | Gemini, GPT-5.5, Grok, Groq | + Claude Sonnet 5 (all 5) | All 5 | All 5 |
+| AI models | 4 during trial (no Claude) | Gemini, GPT-5.6, Grok, Groq | + Claude Sonnet 5 (all 5) | All 5 | All 5 |
 | Context files | 1 | Unlimited | Unlimited | Unlimited | Unlimited |
 | Pop-out window | — | ✓ | ✓ | ✓ | ✓ |
 | Screen capture (Auto-Solve) | — | ✓ | ✓ | ✓ | ✓ |
@@ -68,7 +68,7 @@ Pricing depends on your country. We use IP-based geolocation to detect your regi
 The current price list is shown on the **[Pricing page](https://minicaai.com/#pricing)**. The two main regional bands:
 
 - **United States and most countries**: USD pricing via Stripe — Basic/Pro/Max as one-time charges, Ultra as a monthly subscription
-- **India**: INR pricing via Razorpay — Basic/Pro/Max as one-time charges, Ultra as a monthly subscription
+- **India**: INR pricing via Razorpay — Basic/Pro/Max as one-time charges, Ultra as a monthly subscription. While our Razorpay merchant account is being provisioned, Indian checkouts temporarily run through Stripe in USD; UPI and NetBanking return the moment it clears.
 
 Indian customers must have an active paid subscription to access the AI features. The Free tier is not available in India due to regional licensing constraints; this is enforced server-side and applies regardless of the app you install.
 

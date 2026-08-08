@@ -111,13 +111,702 @@
   color: #141413;  /* --ink */
 }
 
-/* Dim-text variants → warm ink hierarchy. */
-:root:not(.dark) .text-white\/40 { color: #b8b4a5; }   /* faint */
-:root:not(.dark) .text-white\/50 { color: #9b988e; }   /* --ink-faint */
-:root:not(.dark) .text-white\/60 { color: #807c70; }
-:root:not(.dark) .text-white\/70 { color: #6b6a64; }   /* --ink-muted */
-:root:not(.dark) .text-white\/80 { color: #4a4842; }
-:root:not(.dark) .text-white\/90 { color: #2a2925; }   /* --ink-soft */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   GENERATED LIGHT-MODE REMAP (2026-07-29)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   WHY THIS BLOCK EXISTS, AND WHY IT IS GENERATED
+
+   The layer above remaps dark utilities to cream by LITERAL CLASS NAME.
+   That works for every name somebody remembered to add, and fails
+   silently for every one they did not — and the app uses far more than
+   were on the list. Audited against the compiled stylesheet:
+
+     text-white/*   15 alphas used,  8 remapped   -> 7 stayed white on cream
+     bg-white/*     28 variants used, 12 remapped -> 16 stayed invisible
+     border-white/* 13 variants used,  7 remapped ->  6 invisible lines
+     divide/ring/placeholder-white    0 remapped
+     70 gradient stops                0 remapped
+
+   The clearest symptom of a by-name list: `bg-white/[0.1]` WAS remapped
+   and `bg-white/10` — the identical colour, the other spelling Tailwind
+   accepts — was not. Both are used in this codebase.
+
+   And the rules that did exist were not all sound. Measured on the cream
+   page, the old scale bottomed out below readability:
+
+     text-white/40  #b8b4a5  1.92:1   invisible
+     text-white/50  #9b988e  2.67:1   too faint
+
+   which is the "some are invisible" half of the report. The other half —
+   "some are very bright" — is the pale semantic tints: text-amber-200/90
+   measured 1.13:1, text-cyan-200/90 1.15:1, text-emerald-200/80 1.15:1.
+   Those are light-on-dark colours being used for warnings, links and
+   success states; on cream they are a bright smear.
+
+   HOW THESE VALUES WERE CHOSEN
+   Every one is solved, not picked: a binary search on the blend between
+   the target hue and the page cream until it hits a contrast target.
+   · text-white: the four alphas that already worked (/90 /80 /70 /60) are
+     PINNED to their existing colours so nothing that looks right today
+     moves. The rest are solved so anything carrying information clears
+     3:1 and the scale stays monotonic.
+   · surfaces and lines follow the established cream progression.
+   · semantic hues are re-solved to >= 4.5:1 in the SAME hue, and ONLY
+     where the class measurably fails today — five that already clear 3:1
+     (text-amber-800, text-blue-600, text-emerald-800, text-orange-800,
+     text-red-500) are deliberately left alone. Restyling what works is
+     churn, not a fix.
+
+   KEEPING IT CLOSED
+   test/light-theme.test.js re-derives this audit from the source and
+   fails when a component introduces a dark-surface utility with no light
+   rule. That is the part that matters: the gap did not open because
+   anyone was careless, it opened because nothing could tell.
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+/* GENERATED-LIGHT-START — do not hand-edit; see scripts note above */
+
+/* ── A. text-white: the scale stopped at /40, and its low end was unreadable ──
+   Measured on cream before this: /40 = 1.92:1 (invisible), /50 = 2.67:1.
+   Seven more alphas the app uses had no rule at all (/20 /30 /35 /55 /65
+   /75 /85), so they stayed white-on-cream. The four values that already
+   worked (/90 /80 /70 /60) are pinned to their existing colours so nothing
+   that looks right today moves; the rest are solved so that anything
+   carrying information clears 3:1. */
+:root:not(.dark) .text-white\/90 { color: #2a2925; }   /* 13.49:1 */
+:root:not(.dark) .text-white\/85 { color: #3b3a38; }   /* 10.53:1 */
+:root:not(.dark) .text-white\/80 { color: #4a4842; }   /* 8.47:1 */
+:root:not(.dark) .text-white\/75 { color: #595854; }   /* 6.60:1 */
+:root:not(.dark) .text-white\/70 { color: #6b6a64; }   /* 5.03:1 */
+:root:not(.dark) .text-white\/65 { color: #73716d; }   /* 4.51:1 */
+:root:not(.dark) .text-white\/60 { color: #807c70; }   /* 3.86:1 */
+:root:not(.dark) .text-white\/55 { color: #83817c; }   /* 3.61:1 */
+:root:not(.dark) .text-white\/50 { color: #898681; }   /* 3.36:1 */
+:root:not(.dark) .text-white\/40 { color: #908e88; }   /* 3.04:1 */
+:root:not(.dark) .text-white\/35 { color: #95938d; }   /* 2.85:1 */
+:root:not(.dark) .text-white\/30 { color: #999791; }   /* 2.71:1 */
+:root:not(.dark) .text-white\/20 { color: #a3a19a; }   /* 2.40:1 */
+
+/* ── B. bg-white surfaces: the same colour written two ways ──
+   `bg-white/[0.1]` was remapped; `bg-white/10` — identical colour — was
+   not, so it stayed a 10%-white wash measuring 1.01:1 against the page.
+   Tailwind accepts both spellings and the app used both. Both are mapped
+   now, and the light-theme test fails if a new alpha appears unmapped. */
+:root:not(.dark) .bg-white\/\[0\.01\] { background-color: #fdfbf5; }
+:root:not(.dark) .bg-white\/\[0\.015\] { background-color: #fcfaf3; }
+:root:not(.dark) .bg-white\/\[0\.02\] { background-color: #fefcf7; }
+:root:not(.dark) .hover\:bg-white\/\[0\.02\]:hover { background-color: #f7f1e2; }
+:root:not(.dark) .bg-white\/\[0\.03\] { background-color: #fbf7ec; }
+:root:not(.dark) .hover\:bg-white\/\[0\.03\]:hover { background-color: #f5efdf; }
+:root:not(.dark) .bg-white\/\[0\.04\] { background-color: #f7f1e2; }
+:root:not(.dark) .hover\:bg-white\/\[0\.04\]:hover { background-color: #f3eee2; }
+:root:not(.dark) .bg-white\/\[0\.05\] { background-color: #f5efdf; }
+:root:not(.dark) .hover\:bg-white\/\[0\.05\]:hover { background-color: #f0e9d9; }
+:root:not(.dark) .hover\:bg-white\/5:hover { background-color: #f0e9d9; }
+:root:not(.dark) .bg-white\/\[0\.06\] { background-color: #f3eee2; }
+:root:not(.dark) .hover\:bg-white\/\[0\.06\]:hover { background-color: #ede6d2; }
+:root:not(.dark) .hover\:bg-white\/\[0\.07\]:hover { background-color: #ebe3ce; }
+:root:not(.dark) .bg-white\/\[0\.08\] { background-color: #ede6d2; }
+:root:not(.dark) .hover\:bg-white\/\[0\.08\]:hover { background-color: #e8e0c8; }
+:root:not(.dark) .hover\:bg-white\/\[0\.09\]:hover { background-color: #e1d8bd; }
+:root:not(.dark) .bg-white\/\[0\.1\] { background-color: #e8e0c8; }
+:root:not(.dark) .hover\:bg-white\/\[0\.1\]:hover { background-color: #d8ceae; }
+:root:not(.dark) .bg-white\/10 { background-color: #e8e0c8; }
+:root:not(.dark) .hover\:bg-white\/10:hover { background-color: #d8ceae; }
+:root:not(.dark) .hover\:bg-white\/\[0\.12\]:hover { background-color: #cdc09c; }
+:root:not(.dark) .bg-white\/15 { background-color: #d8ceae; }
+:root:not(.dark) .hover\:bg-white\/15:hover { background-color: #c3b58c; }
+:root:not(.dark) .hover\:bg-white\/25:hover { background-color: #fdfcf9; }
+:root:not(.dark) .bg-white\/80 { background-color: #fdfbf6; }
+:root:not(.dark) .bg-white\/95 { background-color: #fdfcf9; }
+
+/* ── C. borders, dividers, rings: a 5%-white line on cream is nothing ── */
+:root:not(.dark) .border-white\/\[0\.03\] { border-color: #f1ebd9; }
+:root:not(.dark) .border-white\/\[0\.04\] { border-color: #eee7d6; }
+:root:not(.dark) .divide-white\/\[0\.04\] > :not([hidden]) ~ :not([hidden]) { border-color: #eee7d6; }
+:root:not(.dark) .border-white\/\[0\.05\] { border-color: #ece5d2; }
+:root:not(.dark) .border-white\/5 { border-color: #ece5d2; }
+:root:not(.dark) .divide-white\/5 > :not([hidden]) ~ :not([hidden]) { border-color: #ece5d2; }
+:root:not(.dark) .border-white\/\[0\.06\] { border-color: #e8e2d1; }
+:root:not(.dark) .border-white\/\[0\.08\] { border-color: #e3dbc7; }
+:root:not(.dark) .border-white\/\[0\.1\] { border-color: #ddd4bc; }
+:root:not(.dark) .border-white\/10 { border-color: #ddd4bc; }
+:root:not(.dark) .ring-white\/10 { --tw-ring-color: #ddd4bc; }
+:root:not(.dark) .border-white\/\[0\.15\] { border-color: #c9bd9c; }
+:root:not(.dark) .border-white\/15 { border-color: #c9bd9c; }
+:root:not(.dark) .border-white\/20 { border-color: #bdae89; }
+:root:not(.dark) .hover\:border-white\/25:hover { border-color: #b3a279; }
+:root:not(.dark) .focus\:border-white\/30:focus { border-color: #a89670; }
+:root:not(.dark) .placeholder-white\/40::placeholder { color: #908e88; }
+
+/* ── D. semantic text colours, ONLY where they measurably fail ──
+   text-amber-200/90 measured 1.13:1 on cream, text-cyan-200/90 1.15:1,
+   text-emerald-200/80 1.15:1: pale light-on-dark tints being used for
+   warnings, links and success states. Each is re-solved to >= 4.5:1 in the
+   SAME hue, so the meaning survives and the direction flips. Anything
+   already clearing 3:1 is left alone — restyling what works is churn. */
+:root:not(.dark) .text-orange-400 { color: #c44613; }   /* was 2.10:1 -> 4.60:1 */
+:root:not(.dark) .group:hover .group-hover\:text-orange-400 { color: #c44613; }   /* was 2.10:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-200 { color: #b4540b; }   /* was 1.15:1 -> 4.60:1 */
+:root:not(.dark) .hover\:text-amber-200:hover { color: #b4540b; }   /* was 1.15:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-300 { color: #b4540b; }   /* was 1.34:1 -> 4.60:1 */
+:root:not(.dark) .hover\:text-amber-300:hover { color: #b4540b; }   /* was 1.34:1 -> 4.60:1 */
+:root:not(.dark) .hover\:text-emerald-100:hover { color: #127f5f; }   /* was 1.05:1 -> 4.60:1 */
+:root:not(.dark) .text-emerald-300 { color: #127f5f; }   /* was 1.41:1 -> 4.60:1 */
+:root:not(.dark) .hover\:text-emerald-300:hover { color: #127f5f; }   /* was 1.41:1 -> 4.60:1 */
+:root:not(.dark) .text-red-300 { color: #c54341; }   /* was 1.76:1 -> 4.60:1 */
+:root:not(.dark) .hover\:text-red-300:hover { color: #c54341; }   /* was 1.76:1 -> 4.60:1 */
+:root:not(.dark) .text-red-400 { color: #c54341; }   /* was 2.56:1 -> 4.60:1 */
+:root:not(.dark) .hover\:text-red-400:hover { color: #c54341; }   /* was 2.56:1 -> 4.60:1 */
+:root:not(.dark) .text-rose-200 { color: #c93a5b; }   /* was 1.31:1 -> 4.60:1 */
+:root:not(.dark) .hover\:text-rose-200:hover { color: #c93a5b; }   /* was 1.31:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-100\/90 { color: #b4540b; }   /* was 1.03:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-200\/70 { color: #b4540b; }   /* was 1.11:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-200\/80 { color: #b4540b; }   /* was 1.13:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-200\/90 { color: #b4540b; }   /* was 1.13:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-300\/60 { color: #b4540b; }   /* was 1.18:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-300\/90 { color: #b4540b; }   /* was 1.30:1 -> 4.60:1 */
+:root:not(.dark) .hover\:text-amber-100:hover { color: #b4540b; }   /* was 1.02:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-400 { color: #b4540b; }   /* was 1.55:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-400\/60 { color: #b4540b; }   /* was 1.31:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-400\/70 { color: #b4540b; }   /* was 1.37:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-400\/80 { color: #b4540b; }   /* was 1.43:1 -> 4.60:1 */
+:root:not(.dark) .text-amber-400\/90 { color: #b4540b; }   /* was 1.49:1 -> 4.60:1 */
+:root:not(.dark) .text-emerald-200 { color: #127f5f; }   /* was 1.19:1 -> 4.60:1 */
+:root:not(.dark) .text-emerald-200\/80 { color: #127f5f; }   /* was 1.15:1 -> 4.60:1 */
+:root:not(.dark) .text-emerald-300\/70 { color: #127f5f; }   /* was 1.29:1 -> 4.60:1 */
+:root:not(.dark) .text-emerald-300\/80 { color: #127f5f; }   /* was 1.33:1 -> 4.60:1 */
+:root:not(.dark) .text-emerald-400 { color: #127f5f; }   /* was 1.78:1 -> 4.60:1 */
+:root:not(.dark) .text-emerald-400\/90 { color: #127f5f; }   /* was 1.71:1 -> 4.60:1 */
+:root:not(.dark) .text-green-400 { color: #16813e; }   /* was 1.61:1 -> 4.60:1 */
+:root:not(.dark) .text-green-400\/70 { color: #16813e; }   /* was 1.43:1 -> 4.60:1 */
+:root:not(.dark) .text-green-500 { color: #16813e; }   /* was 2.11:1 -> 4.60:1 */
+:root:not(.dark) .text-orange-100 { color: #c44613; }   /* was 1.06:1 -> 4.60:1 */
+:root:not(.dark) .text-orange-200\/60 { color: #c44613; }   /* was 1.15:1 -> 4.60:1 */
+:root:not(.dark) .text-orange-200\/80 { color: #c44613; }   /* was 1.20:1 -> 4.60:1 */
+:root:not(.dark) .text-orange-300 { color: #c44613; }   /* was 1.56:1 -> 4.60:1 */
+:root:not(.dark) .text-orange-300\/50 { color: #c44613; }   /* was 1.25:1 -> 4.60:1 */
+:root:not(.dark) .text-orange-300\/80 { color: #c44613; }   /* was 1.43:1 -> 4.60:1 */
+:root:not(.dark) .text-orange-300\/90 { color: #c44613; }   /* was 1.49:1 -> 4.60:1 */
+:root:not(.dark) .text-pink-200 { color: #c73872; }   /* was 1.28:1 -> 4.60:1 */
+:root:not(.dark) .text-pink-300 { color: #c73872; }   /* was 1.68:1 -> 4.60:1 */
+:root:not(.dark) .text-pink-400 { color: #c73872; }   /* was 2.45:1 -> 4.60:1 */
+:root:not(.dark) .text-red-200 { color: #c54341; }   /* was 1.34:1 -> 4.60:1 */
+:root:not(.dark) .text-red-200\/80 { color: #c54341; }   /* was 1.26:1 -> 4.60:1 */
+:root:not(.dark) .text-red-300\/90 { color: #c54341; }   /* was 1.66:1 -> 4.60:1 */
+:root:not(.dark) .text-red-400\/70 { color: #c54341; }   /* was 1.94:1 -> 4.60:1 */
+:root:not(.dark) .text-red-400\/80 { color: #c54341; }   /* was 2.14:1 -> 4.60:1 */
+:root:not(.dark) .text-red-400\/90 { color: #c54341; }   /* was 2.35:1 -> 4.60:1 */
+:root:not(.dark) .text-rose-300 { color: #c93a5b; }   /* was 1.75:1 -> 4.60:1 */
+:root:not(.dark) .text-rose-400 { color: #c93a5b; }   /* was 2.49:1 -> 4.60:1 */
+:root:not(.dark) .text-yellow-200 { color: #a16207; }   /* was 1.08:1 -> 4.56:1 */
+:root:not(.dark) .text-yellow-300 { color: #a16207; }   /* was 1.22:1 -> 4.56:1 */
+:root:not(.dark) .text-yellow-400 { color: #a16207; }   /* was 1.42:1 -> 4.56:1 */
+
+/* ── E. gradients — 70 stops, none of them remapped until now ── */
+
+/* A fixed diagnostic toast built as `from-slate-900 to-slate-800`: a dark
+   card floating on a light page, which is the exact bug the whole layer
+   exists to prevent. */
+:root:not(.dark) .from-slate-900 {
+  --tw-gradient-from: #faf7f0 var(--tw-gradient-from-position);
+  --tw-gradient-to: rgb(250 247 240 / 0) var(--tw-gradient-to-position);
+  --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to);
+}
+:root:not(.dark) .to-slate-800 { --tw-gradient-to: #f3eee2 var(--tw-gradient-to-position); }
+:root:not(.dark) .from-slate-700 {
+  --tw-gradient-from: #f3eee2 var(--tw-gradient-from-position);
+  --tw-gradient-to: rgb(243 238 226 / 0) var(--tw-gradient-to-position);
+  --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to);
+}
+
+/* GRADIENT TEXT. `from-white via-white to-blue-200` + bg-clip-text +
+   text-transparent (SubscriptionGate "Command Center") paints white-into-pale-blue
+   letters, clipped to the glyphs. On cream that is very nearly nothing at
+   all. There is no gradient starting at white that reads on a light page,
+   so the clip is abandoned here and the text becomes solid ink: a heading
+   you can read beats a heading with a gradient on it. Scoped to
+   .bg-clip-text so ordinary white-to-colour gradients on BUTTONS, which
+   are correct in both themes, are untouched. */
+:root:not(.dark) .bg-clip-text.from-white,
+:root:not(.dark) .bg-clip-text.from-white\/50,
+:root:not(.dark) .bg-clip-text.from-white\/55 {
+  -webkit-text-fill-color: #141413;
+  color: #141413;
+}
+
+/* ── F. modal scrims — correct in direction, too heavy in weight ──
+   A 70%-black scrim is right on a dark app and brutal on a light one: the
+   page goes almost black behind a cream dialog. Verified as full-screen
+   scrims before softening (bg-black/70: 4 uses, all `fixed inset-0`;
+   /80: 2 of 2; /60: 2 of 3). bg-black/40 is NOT a scrim anywhere, so it is
+   left alone — a dark tint on cream is a legitimate recessed surface. */
+:root:not(.dark) .bg-black\/80 { background-color: rgba(20, 20, 19, 0.42); }
+:root:not(.dark) .bg-black\/70 { background-color: rgba(20, 20, 19, 0.36); }
+:root:not(.dark) .bg-black\/60 { background-color: rgba(20, 20, 19, 0.30); }
+/* ── G. the neutral greys ──
+   Caught by rendering 220 real in-app className strings against the real
+   stylesheet and measuring what the browser actually painted:
+   `text-gray-200` came out at 1.15:1. The existing layer maps gray-300
+   through gray-600 and stops, so the two PALEST shades — the ones used as
+   bright text on a dark surface, and therefore the ones that vanish
+   hardest on cream — had no rule.
+
+   Note the mapping INVERTS the scale, which is correct and worth stating:
+   gray-300 is a LIGHT grey used for prominent text on dark, so in light
+   mode it becomes a DARK ink (#4a4842); gray-600 is a dark grey used for
+   muted text, so it becomes a LIGHT ink (#9b988e). gray-200 sits above
+   gray-300 in brightness, so it maps below it in lightness. */
+:root:not(.dark) .text-gray-200,
+:root:not(.dark) .hover\:text-gray-200:hover { color: #2a2925; }
+:root:not(.dark) .text-slate-300 { color: #4a4842; }
+:root:not(.dark) .text-slate-200 { color: #2a2925; }
+:root:not(.dark) .text-zinc-200  { color: #2a2925; }
+:root:not(.dark) .text-zinc-300  { color: #4a4842; }
+
+/* Dark grey SURFACES — a gray-700 plate on cream is the original bug of
+   this whole layer, one palette over. Mapped onto the same cream
+   progression the white-overlay scale uses. */
+:root:not(.dark) .bg-gray-600 { background-color: #d4c9ad; }
+:root:not(.dark) .bg-gray-700 { background-color: #ddd4bc; }
+:root:not(.dark) .bg-gray-700\/50 { background-color: rgba(221, 212, 188, 0.5); }
+:root:not(.dark) .border-gray-700\/50 { border-color: #ddd4bc; }
+:root:not(.dark) .bg-slate-700 { background-color: #ddd4bc; }
+:root:not(.dark) .bg-slate-800 { background-color: #e8e2d1; }
+:root:not(.dark) .bg-zinc-800  { background-color: #e8e2d1; }
+:root:not(.dark) .bg-zinc-900  { background-color: #f3eee2; }
+
+/* ── H. the brand gold, when it is TEXT ──
+   Reported as "the yellow looks bright and barely visible". Measured on the
+   cream page: #d3ac63 is 1.98:1, #f0d78a is 1.32:1. Gold is a light colour;
+   it belongs on obsidian, and as a BACKGROUND with #241b08 type on it (the
+   CTA buttons, the toggle pills, the gradients) it is correct in both
+   themes and is deliberately untouched here.
+
+   Only the ink form is remapped, to --gold-ink (see index.html): the same
+   hue blended toward black until it clears 5:1, so it still reads as gold
+   rather than becoming a second black.
+
+   `text-[#…]` is an arbitrary-value utility, which is why the class audit
+   never saw it — it matches no palette name. */
+:root:not(.dark) .text-\[\#d3ac63\],
+:root:not(.dark) .text-\[\#c39d58\],
+:root:not(.dark) .text-\[\#cba966\] { color: var(--gold-ink); }
+:root:not(.dark) .text-\[\#f0d78a\],
+:root:not(.dark) .text-\[\#e6d29c\] { color: var(--gold-ink-strong); }
+:root:not(.dark) .hover\:text-\[\#d3ac63\]:hover { color: var(--gold-ink); }
+:root:not(.dark) .group:hover .group-hover\:text-\[\#d3ac63\] { color: var(--gold-ink); }
+
+/* Gold hairlines and focus rings read as nothing on cream at 20% alpha. */
+:root:not(.dark) .border-\[\#d3ac63\]\/20,
+:root:not(.dark) .border-\[\#d3ac63\]\/30 { border-color: rgba(126, 103, 59, 0.38); }
+
+/* ── I. THE ACCENT, IN BOTH THEMES ──
+   index.css carries a block headed "Accent remap: cool blue / primary → the
+   single gold", whose comment reads: "Blue was the app's accent (popout
+   button, active toggles, links, badges, progress). Gold is the landing's
+   accent; make them one."
+
+   It was scoped html.dark. So the two themes were not one design in two
+   values — they were two different brands: obsidian-and-gold, and the
+   original blue-and-purple that gold was meant to replace. That is why the
+   light theme did not feel like the same product, and no amount of contrast
+   work was going to fix it.
+
+   Below is the same remap for light, selector for selector, with the gold
+   that works on cream substituted for the gold that works on obsidian:
+     ink        var(--gold)  #c39d58  2.35:1  ->  var(--gold-ink)  #7e673b  5.0:1
+     hairlines  var(--gold)           ->  rgba(126,103,59,0.42)
+     washes     rgba(211,172,99,a)    ->  rgba(126,103,59,a*1.15)
+   A gold BACKGROUND carrying #231c0c type is correct on cream as well, so
+   those are deliberately left as they are.
+
+   ⚠️ This intentionally overrides the blue values an earlier pass of mine
+   put here. Making the blues readable was the wrong fix: it made the light
+   theme a well-contrasted version of the accent the product had already
+   decided to retire. */
+
+:root:not(.dark) .text-blue-300,
+:root:not(.dark) .text-blue-400,
+:root:not(.dark) .text-blue-500,
+:root:not(.dark) .text-primary,
+:root:not(.dark) .text-blue-300\/80 { color: var(--gold-ink) !important; }
+:root:not(.dark) .hover\:text-blue-300:hover { color: var(--gold-ink-strong) !important; }
+:root:not(.dark) .bg-blue-500\/5 { background-color: rgba(126, 103, 59, 0.07) !important; }
+:root:not(.dark) .bg-blue-500\/10 { background-color: rgba(126, 103, 59, 0.11) !important; }
+:root:not(.dark) .bg-blue-500\/15 { background-color: rgba(126, 103, 59, 0.16) !important; }
+:root:not(.dark) .bg-blue-500\/20 { background-color: rgba(126, 103, 59, 0.21) !important; }
+:root:not(.dark) .hover\:bg-blue-500\/10:hover { background-color: rgba(126, 103, 59, 0.14) !important; }
+:root:not(.dark) .hover\:bg-blue-500\/15:hover { background-color: rgba(126, 103, 59, 0.18) !important; }
+:root:not(.dark) .hover\:bg-blue-500\/20:hover { background-color: rgba(126, 103, 59, 0.23) !important; }
+:root:not(.dark) .border-blue-500\/15 { border-color: rgba(126, 103, 59, 0.23) !important; }
+:root:not(.dark) .border-blue-500\/20 { border-color: rgba(126, 103, 59, 0.30) !important; }
+:root:not(.dark) .border-blue-500\/30 { border-color: rgba(126, 103, 59, 0.39) !important; }
+:root:not(.dark) .border-blue-500\/40 { border-color: rgba(126, 103, 59, 0.51) !important; }
+:root:not(.dark) .hover\:border-blue-500\/40:hover { border-color: rgba(126, 103, 59, 0.55) !important; }
+:root:not(.dark) .bg-blue-500,
+:root:not(.dark) .bg-primary { background-color: var(--gold-ink) !important; color: #231c0c !important; }
+:root:not(.dark) .hover\:bg-blue-600:hover,
+:root:not(.dark) .hover\:bg-primary:hover { background-color: var(--gold-ink) !important; }
+:root:not(.dark) .fill-blue-500 { fill: var(--gold-ink) !important; }
+:root:not(.dark) .ring-blue-500 { --tw-ring-color: var(--gold-line) !important; }
+:root:not(.dark) .border-primary,
+:root:not(.dark) .hover\:border-primary:hover { border-color: var(--gold-ink) !important; }
+:root:not(.dark) .focus\:border-primary\/40:focus,
+:root:not(.dark) .focus\:border-primary:focus { border-color: var(--gold-line) !important; }
+:root:not(.dark) .ring-primary { --tw-ring-color: var(--gold-line) !important; }
+:root:not(.dark) .focus\:ring-primary:focus { --tw-ring-color: var(--gold-ink) !important; }
+:root:not(.dark) .border-blue-400 { border-color: var(--gold-ink) !important; }
+:root:not(.dark) .bg-blue-600\/95 { background-color: rgba(126, 103, 59, 0.90) !important; color: #231c0c !important; }
+:root:not(.dark) .shadow-blue-500\/30 { --tw-shadow-color: var(--gold-glow) !important; }
+:root:not(.dark) .mp-row.is-selected { background: rgba(126, 103, 59, 0.14) !important; }
+:root:not(.dark) .bg-cyan-500\/10 { background-color: rgba(126, 103, 59, 0.11) !important; }
+:root:not(.dark) .bg-cyan-500\/15 { background-color: rgba(126, 103, 59, 0.16) !important; }
+:root:not(.dark) .border-cyan-500\/30 { border-color: rgba(126, 103, 59, 0.37) !important; }
+:root:not(.dark) .text-cyan-300,
+:root:not(.dark) .text-cyan-400 { color: var(--gold-ink) !important; }
+:root:not(.dark) .bg-purple-500\/5 { background-color: rgba(126, 103, 59, 0.07) !important; }
+:root:not(.dark) .bg-purple-500\/10 { background-color: rgba(126, 103, 59, 0.11) !important; }
+:root:not(.dark) .bg-purple-500\/20 { background-color: rgba(126, 103, 59, 0.18) !important; }
+:root:not(.dark) .bg-purple-500\/25 { background-color: rgba(126, 103, 59, 0.23) !important; }
+:root:not(.dark) .hover\:bg-purple-500\/5:hover { background-color: rgba(126, 103, 59, 0.09) !important; }
+:root:not(.dark) .hover\:bg-purple-500\/20:hover { background-color: rgba(126, 103, 59, 0.21) !important; }
+:root:not(.dark) .text-purple-300,
+:root:not(.dark) .text-purple-400 { color: var(--gold-ink) !important; }
+:root:not(.dark) .border-purple-400\/40,
+:root:not(.dark) .border-purple-500\/30 { border-color: var(--gold-line) !important; }
+:root:not(.dark) .hover\:border-purple-500:hover { border-color: var(--gold-ink) !important; }
+:root:not(.dark) .group:hover .group-hover\:text-purple-400,
+:root:not(.dark) .group:hover .group-hover\:text-purple-500 { color: var(--gold-ink-strong) !important; }
+:root:not(.dark) .group:hover .group-hover\:bg-purple-500\/20 { background-color: rgba(126, 103, 59, 0.21) !important; }
+:root:not(.dark) .bg-indigo-500\/20 { background-color: rgba(126, 103, 59, 0.21) !important; }
+:root:not(.dark) .hover\:bg-indigo-500\/30:hover { background-color: rgba(126, 103, 59, 0.28) !important; }
+:root:not(.dark) .text-indigo-200 { color: var(--gold-ink-strong) !important; }
+:root:not(.dark) .border-indigo-500\/40 { border-color: var(--gold-line) !important; }
+:root:not(.dark) .to-purple-600 { --tw-gradient-to: #b58f45 var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-purple-600\/20 { --tw-gradient-to: rgb(126 103 59 / 0.26) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-purple-700\/50 { --tw-gradient-to: rgb(126 103 59 / 0.65) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-purple-700\/40 { --tw-gradient-to: rgb(126 103 59 / 0.52) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .from-blue-500\/20 { --tw-gradient-from: rgb(126 103 59 / 0.26) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0.00) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .from-blue-600\/50 { --tw-gradient-from: rgb(126 103 59 / 0.65) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0.00) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .hover\:from-blue-500\/15:hover { --tw-gradient-from: rgb(126 103 59 / 0.20) var(--tw-gradient-from-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .hover\:to-purple-500\/15:hover { --tw-gradient-to: rgb(126 103 59 / 0.20) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .shadow-blue-500\/10 { --tw-shadow-color: var(--gold-glow) !important; }
+:root:not(.dark) .hover\:shadow-blue-400\/50:hover { --tw-shadow-color: rgba(126, 103, 59, 0.46) !important; }
+:root:not(.dark) .dark\:text-blue-400 { color: var(--gold-ink) !important; }
+:root:not(.dark) .bg-orange-500\/10 { background-color: rgba(126, 103, 59, 0.11) !important; }
+:root:not(.dark) .text-orange-400 { color: var(--gold-ink) !important; }
+:root:not(.dark) .hover\:border-orange-500\/40:hover { border-color: rgba(126, 103, 59, 0.51) !important; }
+:root:not(.dark) .hover\:bg-orange-500\/\[0\.04\]:hover { background-color: rgba(126, 103, 59, 0.07) !important; }
+:root:not(.dark) .group:hover .group-hover\:bg-orange-500\/20 { background-color: rgba(126, 103, 59, 0.21) !important; }
+:root:not(.dark) .group:hover .group-hover\:text-orange-400 { color: var(--gold-ink) !important; }
+:root:not(.dark) .hover\:border-purple-500\/40:hover { border-color: rgba(126, 103, 59, 0.51) !important; }
+:root:not(.dark) .hover\:bg-purple-500\/\[0\.04\]:hover { background-color: rgba(126, 103, 59, 0.07) !important; }
+:root:not(.dark) .group:hover .group-hover\:bg-purple-500\/20 { background-color: rgba(126, 103, 59, 0.21) !important; }
+:root:not(.dark) .hover\:bg-blue-500\/\[0\.04\]:hover { background-color: rgba(126, 103, 59, 0.07) !important; }
+:root:not(.dark) .group:hover .group-hover\:bg-blue-500\/20 { background-color: rgba(126, 103, 59, 0.21) !important; }
+:root:not(.dark) .group:hover .group-hover\:text-blue-400 { color: var(--gold-ink) !important; }
+:root:not(.dark) .mp-card:not(.mp-card-max):hover { border-color: var(--gold-line) !important;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0)),
+    rgba(21,19,13,0.82) !important; }
+:root:not(.dark) .mp-card.is-selected:not(.mp-card-max) { /* Single clean hairline + a soft lift — no doubled inset ring (that
+     inset was the "huge border" heaviness). */
+  border-color: rgba(126, 103, 59, 0.48) !important;
+  box-shadow: 0 6px 22px -16px rgba(126, 103, 59, 0.32) !important; }
+:root:not(.dark) .mp-card-badge-recommended { background: none !important;
+  color: rgba(126, 103, 59, 0.83) !important;
+  border-color: transparent !important; }
+:root:not(.dark) .bg-blue-500\/\[0\.08\] { background-color: rgba(126, 103, 59, 0.09) !important; }
+:root:not(.dark) .from-blue-500\/\[0\.08\] { --tw-gradient-from: rgb(126 103 59 / 0.10) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0.00) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .to-purple-500\/\[0\.04\] { --tw-gradient-to: rgb(126 103 59 / 0.07) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .shadow-blue-500\/20 { --tw-shadow-color: var(--gold-glow) !important; box-shadow: var(--tw-ring-offset-shadow,0 0 #0000), var(--tw-ring-shadow,0 0 #0000), var(--tw-shadow) !important; }
+:root:not(.dark) .from-blue-500 { --tw-gradient-from: #d9b874 var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0.00) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .to-purple-500 { --tw-gradient-to: #b58f45 var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .from-blue-500\/10 { --tw-gradient-from: rgb(126 103 59 / 0.16) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0.00) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .to-purple-500\/10 { --tw-gradient-to: rgb(126 103 59 / 0.16) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .hover\:from-blue-400:hover { --tw-gradient-from: #f6e4b0 var(--tw-gradient-from-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .hover\:to-purple-400:hover { --tw-gradient-to: #d9b874 var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .hover\:from-blue-500\/20:hover { --tw-gradient-from: rgb(126 103 59 / 0.26) var(--tw-gradient-from-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .hover\:to-purple-500\/20:hover { --tw-gradient-to: rgb(126 103 59 / 0.26) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) :focus-visible { outline: 2px solid var(--gold-ink);
+  outline-offset: 2px;
+  border-radius: 4px; }
+:root:not(.dark) ::-webkit-scrollbar-thumb { background: color-mix(in oklab, var(--gold) 20%, transparent); }
+:root:not(.dark) ::-webkit-scrollbar-thumb:hover { background: color-mix(in oklab, var(--gold) 42%, transparent); }
+
+/* ── J. THE COMPOSER BUTTONS, AND WHY LIGHT HAD NONE ──
+   The base rule for .btn-ios-send / .btn-ios-violet is a white-alpha wash
+   (7% resting, 14% hover, 3% disabled) — a dark-surface idiom. Everything
+   that gives the composer its character lives under `.dark`: the gold
+   gradient on Send, its drop glow, the hover lift, the faded-gold disabled
+   state. Light mode inherited only the bare base.
+
+   Measured against the page, in L*:
+     .btn-ios-violet   dark +7.0    light +0.3   (invisible)
+     .btn-ios-send     dark +6.8    light +0.1   (invisible, and no gold)
+   Saturation on Send: dark 45, light 5. The composer's focal action simply
+   was not there in light mode.
+
+   Send keeps its gold gradient here — gold carrying #231c0c type is correct
+   on cream as well, and it is the one place the accent should be loudest.
+   Auto-Solve stays neutral glass so there is one gold action, not two, which
+   is the rule the dark comment states and light never got to follow. */
+:root:not(.dark) .btn-ios-send,
+:root:not(.dark) .btn-ios-violet {
+  background-color: rgba(20, 20, 19, 0.055);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+:root:not(.dark) .btn-ios-send:hover:not(:disabled),
+:root:not(.dark) .btn-ios-violet:hover:not(:disabled) {
+  background-color: rgba(20, 20, 19, 0.105);
+}
+:root:not(.dark) .btn-ios-send:disabled,
+:root:not(.dark) .btn-ios-violet:disabled {
+  background-color: rgba(20, 20, 19, 0.035);
+  box-shadow: none;
+}
+
+/* Send — the composer's focal "go", same gold gradient the dark theme uses,
+   sitting a touch deeper so it holds its weight against cream rather than
+   glowing off it. */
+:root:not(.dark) .btn-ios-send:not(:disabled) {
+  background: linear-gradient(145deg, #eddaa0 0%, #cfa964 55%, #a97f36 100%);
+  color: #231c0c;
+  box-shadow: 0 5px 14px -6px rgba(126, 103, 59, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.55);
+  transition: background 150ms ease, box-shadow 200ms ease, transform 160ms var(--ease-ios);
+}
+:root:not(.dark) .btn-ios-send:not(:disabled) svg { color: #231c0c; }
+:root:not(.dark) .btn-ios-send:hover:not(:disabled) {
+  background: linear-gradient(145deg, #f3e4b6 0%, #dcbb78 55%, #b98f42 100%);
+  transform: translateY(-1px);
+  box-shadow: 0 9px 20px -8px rgba(126, 103, 59, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+:root:not(.dark) .btn-ios-send:active:not(:disabled) { transform: translateY(0) scale(0.94); }
+:root:not(.dark) .btn-ios-send:disabled {
+  background: rgba(126, 103, 59, 0.14);
+  opacity: 0.6;
+}
+:root:not(.dark) .btn-ios-send:disabled svg { color: rgba(126, 103, 59, 0.6); }
+
+/* ── K. ELEVATION ──
+   The dark theme separates surfaces by 5-7 L*; light was doing it in 0.3-1.7
+   and reading as one flat sheet. On cream the move is downward — a surface
+   sits by being slightly deeper than the page, with a fine top highlight
+   doing the lifting instead of a lighter fill. Same perceived separation,
+   the direction a light material actually behaves in. */
+:root:not(.dark) aside button:not([class*="bg-"]),
+:root:not(.dark) .bg-white\/\[0\.04\] { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65); }
+
+/* ── L. THE ACCENT SHADES THE DARK REMAP NEVER REACHED ──
+   The html.dark accent block converts -300/-400/-500 and .text-primary. It
+   does not cover -100/-200, the alpha variants, or violet/indigo — so those
+   stay blue in BOTH themes. In dark that is nearly invisible on obsidian
+   and nobody noticed; on cream a pale blue is both wrong-brand and unreadable
+   (text-blue-200 measured 1.32:1).
+
+   Completed here for light, in the same direction the accent block chose.
+   The dark theme has the same gap, but dark is what the product ships as its
+   signature and is not mine to redesign uninvited — flagged instead. */
+:root:not(.dark) .text-blue-100,
+:root:not(.dark) .text-blue-200,
+:root:not(.dark) .text-blue-300\/60,
+:root:not(.dark) .text-blue-300\/70,
+:root:not(.dark) .text-blue-400\/60,
+:root:not(.dark) .text-cyan-200\/90,
+:root:not(.dark) .text-cyan-300,
+:root:not(.dark) .text-purple-200,
+:root:not(.dark) .text-purple-300,
+:root:not(.dark) .text-indigo-300,
+:root:not(.dark) .text-violet-300 { color: var(--gold-ink) !important; }
+:root:not(.dark) .hover\:text-blue-100:hover,
+:root:not(.dark) .hover\:text-blue-200:hover,
+:root:not(.dark) .hover\:text-blue-300:hover { color: var(--gold-ink-strong) !important; }
+
+/* ── M. SETTINGS: "Save Settings" AND THE MODEL-PICKER HINTS ──
+   Both ship `color: #f0d9a0` — a pale gold that belongs on obsidian. On the
+   cream page it measures 1.29:1, which is the "barely visible yellow" again,
+   in the two places Settings uses it:
+     .btn-gold-glass   the Save Settings primary button
+     .mp-hint          "Basic: 4 models · Pro adds Claude" and its sibling
+
+   Both now take var(--gold-ink) — the SAME value the Manage Subscription
+   pill uses (#7e673b, 5.0:1), so the three read as one accent rather than
+   three shades of gold. Their washes and hairlines move with them: a gold
+   at 8-17% alpha is invisible on cream, so the same idea is expressed with
+   the darker gold at a comparable weight. Dark mode is untouched. */
+:root:not(.dark) .btn-gold-glass {
+  color: var(--gold-ink);
+  background: linear-gradient(180deg, rgba(126, 103, 59, 0.16), rgba(126, 103, 59, 0.07));
+  border-color: rgba(126, 103, 59, 0.40);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65), 0 6px 18px -14px rgba(126, 103, 59, 0.45);
+}
+:root:not(.dark) .btn-gold-glass:hover {
+  background: linear-gradient(180deg, rgba(126, 103, 59, 0.24), rgba(126, 103, 59, 0.12));
+  border-color: rgba(126, 103, 59, 0.55);
+}
+:root:not(.dark) .btn-gold-glass svg { color: var(--gold-ink); }
+
+:root:not(.dark) .mp-hint {
+  color: var(--gold-ink);
+  background: rgba(126, 103, 59, 0.09);
+  border-color: rgba(126, 103, 59, 0.30);
+}
+
+/* ── N. THE HALF-REMAPPED GRADIENTS ──
+   The Settings "Manage subscription" button reads
+     linear-gradient(to right, rgba(59,130,246,0.15), rgba(126,103,59,0.11))
+   — its 'to' stop became gold and its 'from' stop stayed blue, so the
+   button is half lavender. The dark block remapped only the stops somebody
+   happened to hit; every stop the app uses is covered here. */
+:root:not(.dark) .from-blue-400 { --tw-gradient-from: rgb(126 103 59) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .from-blue-500\/15 { --tw-gradient-from: rgb(126 103 59 / 0.15) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .from-cyan-500 { --tw-gradient-from: rgb(126 103 59) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .from-indigo-500 { --tw-gradient-from: rgb(126 103 59) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .from-purple-500 { --tw-gradient-from: rgb(126 103 59) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .from-sky-500 { --tw-gradient-from: rgb(126 103 59) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .from-violet-600\/45 { --tw-gradient-from: rgb(126 103 59 / 0.45) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .hover\:from-blue-500\/25:hover { --tw-gradient-from: rgb(126 103 59 / 0.25) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .hover\:from-blue-500\/30:hover { --tw-gradient-from: rgb(126 103 59 / 0.3) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(126 103 59 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root:not(.dark) .hover\:to-blue-500:hover { --tw-gradient-to: rgb(126 103 59) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .hover\:to-purple-500\/30:hover { --tw-gradient-to: rgb(126 103 59 / 0.3) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-blue-200 { --tw-gradient-to: rgb(126 103 59) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-blue-500 { --tw-gradient-to: rgb(126 103 59) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-blue-600 { --tw-gradient-to: rgb(126 103 59) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-cyan-500 { --tw-gradient-to: rgb(126 103 59) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-fuchsia-700\/40 { --tw-gradient-to: rgb(126 103 59 / 0.4) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-indigo-500 { --tw-gradient-to: rgb(126 103 59) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .to-purple-500\/20 { --tw-gradient-to: rgb(126 103 59 / 0.2) var(--tw-gradient-to-position) !important; }
+:root:not(.dark) .via-blue-600 { --tw-gradient-stops: var(--tw-gradient-from), rgb(126 103 59) var(--tw-gradient-via-position), var(--tw-gradient-to) !important; }
+:root:not(.dark) .via-indigo-500\/\[0\.04\] { --tw-gradient-stops: var(--tw-gradient-from), rgb(126 103 59 / 0.04) var(--tw-gradient-via-position), var(--tw-gradient-to) !important; }
+
+/* ── O. THE COMPOSER — iOS FOLDER GLASS, IN THE APP'S OWN WARMTH ──
+   The reference is the panel behind an opened folder on the iOS home screen:
+   a real mid-light grey slab, clearly darker than the surface it floats over,
+   with what is behind coming through as soft colour rather than as image.
+
+   The value is the important part and it stays: the panel composites near
+   L* 86 against a page at L* 96.9, about eleven points down. That drop is
+   what makes it read as a physical object rather than a lightened region of
+   the screen, and it is what an earlier near-white version was missing.
+
+   What changes is temperature. iOS runs its glass cool because it floats over
+   arbitrary wallpaper and needs to belong to the system rather than to the
+   picture. This panel floats over one known surface — warm paper at hue 45 —
+   inside a product whose accent is gold. A cool panel there is a borrowed
+   detail from another design system: correct on iOS, foreign here. So the
+   veil moves to a warm taupe (~#CDC4BB) at the same value, and the whole
+   assembly follows it:
+
+     · shadows become warm brown ink, not blue-grey — blue shadows on cream
+       read as grime, and they were the second-largest cool surface left
+     · saturate(1.35) now works with the page instead of against it; when the
+       panel was cool that boost was amplifying exactly the warmth the veil
+       was trying to cancel
+     · the rim stays white. White is neutral, it is the iOS signature, and on
+       taupe it still reads as light catching an edge
+
+   The greys inside the panel move too — they were tuned cool to sit on a cool
+   surface and would import a blue cast back into a warm one. */
+/* ── THE FILL IS A WASH NOW, NOT A PANEL ──
+   This was an all-but-opaque taupe — rgba(196,178,159,0.74) down to
+   rgba(186,167,146,0.79) — so the composer read as a brown slab sitting on
+   a cream page rather than as part of it. The popout, on the same light
+   theme, does the opposite: its surfaces are transparent with a 4-6% warm
+   ink tint (see --bubble-user / --bubble-ai in pip-styles.css), which is
+   why that window looks white and this one looked muddy.
+
+   Same idea here, and deliberately the SAME HUE — rgba(74,58,38) is the
+   warm brown these shadows are already built from, so the composer keeps
+   its warmth and its family resemblance to the rest of the theme. What
+   changes is the alpha: ~0.76 of an opaque taupe becomes a ~5% wash, so
+   the cream page shows through and the box reads white-with-warmth
+   instead of brown. The blur stays — it is what makes it a surface.
+
+   Dark theme is untouched: every rule here is :root:not(.dark), and the
+   popout has its own stylesheet. */
+:root:not(.dark) .composer-shell {
+  background: linear-gradient(180deg,
+    rgba(74, 58, 38, 0.055) 0%,
+    rgba(74, 58, 38, 0.035) 45%,
+    rgba(74, 58, 38, 0.022) 100%);
+  -webkit-backdrop-filter: blur(40px) saturate(1.5);
+  backdrop-filter: blur(40px) saturate(1.5);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),          /* bright glint, 1px */
+    inset 0 0 0 1px rgba(74, 58, 38, 0.07),           /* rim — warm hairline */
+    inset 0 -24px 36px -30px rgba(74, 58, 38, 0.14),  /* inner floor, lighter */
+    0 1px 2px rgba(74, 58, 38, 0.05),                 /* contact */
+    0 5px 12px -5px rgba(74, 58, 38, 0.09),           /* tight key */
+    0 28px 62px -30px rgba(74, 58, 38, 0.22);         /* ambient float */
+}
+:root:not(.dark) .composer-shell:focus-within {
+  background: linear-gradient(180deg,
+    rgba(74, 58, 38, 0.070) 0%,
+    rgba(74, 58, 38, 0.046) 45%,
+    rgba(74, 58, 38, 0.030) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.78),
+    inset 0 0 0 1px rgba(126, 103, 59, 0.16),         /* rim warms on focus */
+    inset 0 0 56px -16px rgba(126, 103, 59, 0.13),    /* gold warmth, now native */
+    inset 0 -24px 36px -30px rgba(74, 58, 38, 0.13),
+    0 1px 2px rgba(74, 58, 38, 0.05),
+    0 5px 12px -5px rgba(74, 58, 38, 0.09),
+    0 28px 62px -30px rgba(74, 58, 38, 0.24),
+    0 0 26px -13px rgba(126, 103, 59, 0.22);          /* outer gold whisper */
+}
+
+/* The rim: brightest top-left, returning a second dimmer catch at the
+   bottom-right where light comes back off the far edge of a bevel. */
+:root:not(.dark) .composer-shell::after {
+  background: linear-gradient(135deg,
+    rgba(255, 255, 255, 0.80) 0%,
+    rgba(255, 255, 255, 0.22) 20%,
+    rgba(255, 255, 255, 0.06) 55%,
+    rgba(255, 255, 255, 0.16) 100%);
+}
+:root:not(.dark) .composer-shell:focus-within::after {
+  background: linear-gradient(135deg,
+    rgba(255, 255, 255, 0.86) 0%,
+    rgba(244, 224, 163, 0.40) 22%,
+    rgba(211, 172, 99, 0.16) 58%,
+    rgba(244, 224, 163, 0.24) 100%);
+}
+
+/* Controls on the glass. Translucent, so the panel shows through the pill and
+   the control belongs to the material rather than sitting on it — what iOS
+   does with controls on a folder. Scoped to .composer-shell: these utilities
+   are used across the app, where the surface beneath is the cream page and
+   the existing resolution is correct. */
+:root:not(.dark) .composer-shell .bg-white\/\[0\.04\] {
+  background-color: rgba(255, 255, 255, 0.42) !important;
+}
+:root:not(.dark) .composer-shell .bg-white\/\[0\.06\] {
+  background-color: rgba(74, 58, 38, 0.18) !important;
+}
+:root:not(.dark) .composer-shell .hover\:bg-white\/\[0\.07\]:hover {
+  background-color: rgba(255, 255, 255, 0.60) !important;
+}
+:root:not(.dark) .composer-shell .hover\:bg-white\/\[0\.08\]:hover {
+  background-color: rgba(255, 255, 255, 0.68) !important;
+}
+
+/* Secondary text and icons. Dropping the panel to L* 86 pulled the surface
+   out from under these — measured against it they were 2.90:1, 3.36:1 and
+   3.77:1, all below AA. Re-darkened to clear 4.5:1 with margin, and warm
+   rather than blue-grey so they read as part of this panel. */
+:root:not(.dark) .composer-shell .text-gray-400 {
+  color: rgb(74, 64, 50) !important;    /* matched to the popout chips */
+}
+:root:not(.dark) .composer-shell .text-gray-500 {
+  color: rgb(76, 66, 52) !important;    /* ~6.6:1 */
+}
+:root:not(.dark) .composer-shell .placeholder-gray-500::placeholder {
+  color: rgb(76, 66, 52) !important;    /* 5.17:1 — matched to the popout */
+}
+
+/* GENERATED-LIGHT-END */
 
 /* hover:text-white on dim text → darken to full ink on hover. */
 :root:not(.dark) .hover\:text-white:hover { color: #141413; }
@@ -128,14 +817,21 @@
 :root:not(.dark) .text-zinc-700 { color: #3a3833 !important; }
 :root:not(.dark) .text-zinc-600 { color: #6b6a64 !important; }
 :root:not(.dark) .text-zinc-500 { color: #807c70 !important; }
-:root:not(.dark) .text-zinc-400 { color: #9b988e !important; }
+/* Same 2.67:1 problem as text-gray-600 — the two palest mapped neutrals
+   both landed on #9b988e, which is under the floor for the metadata they
+   label. Raised together so the neutral scale stays consistent. */
+:root:not(.dark) .text-zinc-400 { color: #8a8882 !important; }
 
 /* Gray utilities scattered throughout — warm them in light mode
    so we don't end up with cool gray text on warm cream surfaces. */
 :root:not(.dark) .text-gray-300 { color: #4a4842; }
 :root:not(.dark) .text-gray-400 { color: #6b6a64; }
 :root:not(.dark) .text-gray-500 { color: #807c70; }
-:root:not(.dark) .text-gray-600 { color: #9b988e; }
+/* 2.67:1 on cream — measured by rendering real in-app markup, and below the
+   floor for the 10px uppercase metadata this class is used for. Raised to
+   match what text-white/50 was corrected to; the scale stays monotonic
+   (gray-300 8.5 > 400 5.0 > 500 3.9 > 600 3.3). */
+:root:not(.dark) .text-gray-600 { color: #8a8882; }
 
 /* Subtle paper-like depth on the most prominent panel surfaces.
    A faint inner highlight gives the cream a hand-finished feel

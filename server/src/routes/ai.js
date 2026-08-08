@@ -22,6 +22,88 @@ router.use(authMiddleware);
 // for the full policy + rationale.)
 router.use(requireActiveSubscriptionInRegion);
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  CONTEXT STORE — upload-once knowledge base
+//
+//  The renderer used to inline the whole uploaded KB (up to 400K chars)
+//  into the system prompt of EVERY request. Now it uploads the blob once
+//  via POST /context and sends a ⟪CTX:<sha256>⟫ placeholder instead, so
+//  request bodies stay ~4KB no matter how many files are attached. This
+//  middleware swaps the stored text back in before any handler runs, so
+//  every downstream route (and the model) sees the identical fully
+//  assembled prompt it saw before — provider prompt caches keep hitting.
+//
+//  A miss (evicted / server restarted / different instance) returns a
+//  retryable 409 `context_missing`; the client clears its upload cache
+//  and re-sends the full inline text once. Nothing breaks mid-interview.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const contextStore = require('../services/contextStore');
+
+router.post('/context', (req, res) => {
+  const { text, hash } = req.body || {};
+  const result = contextStore.put(req.user?.id, text, hash);
+  if (!result.ok) {
+    const status = result.error === 'text_too_large' ? 413 : 400;
+    return res.status(status).json({ error: result.error });
+  }
+  res.json({ ok: true, hash: result.hash, deduped: result.deduped });
+});
+
+// ── "I'm finished with those documents" ──
+//
+// The store had no way to be told this. Entries expired on a three-hour
+// TTL, so after a user deleted their files, started a new conversation or
+// signed out, their resume stayed resident on the server for the rest of
+// that window with nothing referencing it. A TTL is a backstop against
+// leaks, not a retention policy — the client knows the moment the knowledge
+// base is gone, and it should be able to say so.
+//
+// Idempotent, unauthenticated beyond the router's own auth, and scoped to
+// the caller: a user can only ever forget their own blobs.
+router.post('/context/forget', (req, res) => {
+  const dropped = contextStore.forgetUser(req.user?.id);
+  res.json({ ok: true, dropped });
+});
+
+router.use((req, res, next) => {
+  try {
+    const userId = req.user?.id;
+    const body = req.body;
+    if (!userId || !body || typeof body !== 'object') return next();
+    // ONE budget for all three fields. Per-call budgets would let a request
+    // spend the whole ceiling three times over (systemInstruction + prompt +
+    // messages), and the expansion is what we're bounding — not the field.
+    const budget = contextStore.newResolveBudget();
+    if (typeof body.systemInstruction === 'string') {
+      body.systemInstruction = contextStore.resolveText(userId, body.systemInstruction, budget);
+    }
+    if (typeof body.prompt === 'string') {
+      body.prompt = contextStore.resolveText(userId, body.prompt, budget);
+    }
+    if (Array.isArray(body.messages)) {
+      body.messages = contextStore.resolveMessages(userId, body.messages, budget);
+    }
+    next();
+  } catch (err) {
+    if (err && err.code === 'CONTEXT_MISSING') {
+      return res.status(409).json({
+        error: 'context_missing',
+        message: 'Uploaded context is no longer cached — resend it inline.',
+      });
+    }
+    // Answered here rather than by falling through to next(err): the global
+    // handler responds 500 unconditionally, and a 500 reads as "our fault,
+    // retry" — which for this one is the opposite of what the client should do.
+    if (err && err.code === 'CONTEXT_TOO_LARGE') {
+      return res.status(413).json({
+        error: 'context_too_large',
+        message: 'Too many context placeholders in one request.',
+      });
+    }
+    next(err);
+  }
+});
+
 // ─── Free-tier daily quota for Gemini ─────────────────────────────────
 // Free tier IS supposed to have Gemini access (documented), but until
 // now there was no per-user daily cap. With the JWT-signature-not-
@@ -83,6 +165,94 @@ const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
 // "server allows it but client hides it" hole.
 const { hasAccess, isPlanLapsed } = require('../services/subscriptionStates');
 
+// ── The clock must be RUNNING, not merely non-empty ──────────────────
+//
+// requireTimeRemaining below asks "does this account have time left".
+// That is not the same question as "is this account being charged right
+// now", and the gap between them was a free ride: leave the mic off, and
+// no session opens, so nothing is charged — but every model route still
+// answered, because it only ever checked the balance. A trial user could
+// type questions indefinitely and never lose a second of their ten
+// minutes.
+//
+// So: one rule, everywhere. The session switch is the mic on the desktop
+// and the Start button on the phone; while it is on you are charged, and
+// only while it is on will the models answer. There is no second
+// currency to reconcile and nothing for a client to get wrong, because
+// the answer lives here rather than in any app's UI — hiding a Send
+// button stops honest users, not a hand-written request.
+//
+// Deliberately NOT applied to the /autotype-* routes. Those are Ultra
+// only, Ultra is unlimited, so there is no free ride to close there —
+// and gating them would break typing code out of an answer you opened
+// yesterday, with the mic sensibly off.
+// Both version gates in this file (the session gate below, and the LLM
+// cover in runCover) ask the same question: is this caller new enough to
+// take part in a protocol it has to understand? That question, the header
+// it reads, and the reasoning for why it is safe to gate on a spoofable
+// value all live in one place now — two copies of a comparison is exactly
+// how the two ends of a gate drift apart.
+const { participatesInProtocol, MIN_PROTOCOL_CLIENT } = require('../middleware/clientVersion');
+
+// Kept as a named constant because the tests and the app release both refer
+// to it: the shipped app version must be >= this or every gate here stays
+// dormant forever.
+const SESSION_GATE_MIN_CLIENT = MIN_PROTOCOL_CLIENT;
+
+function requireActiveSession(req, res, next) {
+  try {
+    if (ADMIN_EMAILS.includes((req.user?.email || '').toLowerCase())) return next();
+    if (db.hasLiveUsageSession(req.user.id)) return next();
+
+    // ── DO NOT 428 A CLIENT THAT CANNOT READ IT ──
+    //
+    // This gate is new. Every install older than SESSION_GATE_MIN_CLIENT has
+    // zero handling for 428/session_required — grep v4.0.18's aiProxyService
+    // and App.tsx and you find neither string — so to those users a refusal
+    // here is not "start your session", it is a dead assistant mid-answer.
+    //
+    // The fleet updates over days, not at deploy time, so there is always a
+    // window where the server is new and the client is not. On 2026-07-29 a
+    // deploy landed in exactly that window and had to be reverted inside 14
+    // minutes. This is the same shape, so it gets the same respect: the gate
+    // enforces only where it can be understood, and stays quiet elsewhere.
+    //
+    // Cost of staying quiet: an old client with the mic off keeps getting
+    // answers it is not charged for — the free ride this gate exists to
+    // close. That leak shrinks to nothing as the fleet updates, and a
+    // temporary billing leak is strictly cheaper than a silent outage during
+    // someone's interview.
+    //
+    // Absent header = an old client (nothing before 4.0.19 sends one).
+    if (!participatesInProtocol(req)) {
+      console.warn(
+        `[requireActiveSession] not enforcing for client ${req.clientVersion || '(no version header)'} ` +
+          `user=${req.user?.id} — pre-${SESSION_GATE_MIN_CLIENT} clients cannot render a 428`
+      );
+      return next();
+    }
+    // 428 Precondition Required — literally "do this first". Distinct
+    // from no_time_remaining (402) and tier_required (403) because this
+    // user may have plenty of time and the right plan; they simply have
+    // not started. The client turns it into "start your session", never
+    // into a paywall.
+    //
+    // NOT 409: that is already taken by context_missing, which the
+    // desktop treats as "re-upload and retry automatically". A session
+    // gate answered with 409 would be retried into the same refusal.
+    return res.status(428).json({
+      error: 'session_required',
+      message: 'Start your session to use the models.',
+    });
+  } catch (err) {
+    // Fail OPEN. A database hiccup must never silence the assistant in
+    // the middle of a live interview; the worst case is a few unbilled
+    // answers, which is strictly better than the alternative.
+    console.error('[requireActiveSession] failing open:', err.message);
+    return next();
+  }
+}
+
 function requireTimeRemaining(req, res, next) {
   try {
     if (ADMIN_EMAILS.includes((req.user?.email || '').toLowerCase())) return next();
@@ -141,17 +311,72 @@ function requireTimeRemaining(req, res, next) {
 //  The caller never sees a retrieval error.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-const { enrichTranscript } = require('../services/freshContext');
+const { enrichTranscript, classify: needsLiveFacts } = require('../services/freshContext');
 
 // Pull the most recent user-role message from a messages array.
 // Used by all "messages: [...]"-shaped routes (OpenAI/xAI/Groq/Claude).
+//
+// Handles BOTH content shapes:
+//   - string (history turns)
+//   - multimodal part-array (the FINAL user turn: [{type:'text',text},
+//     {type:'image_url',...}] on OpenAI-compatible routes, or
+//     [{type:'text',text},{type:'image',...}] on the Claude route)
+// The string-only version silently skipped the final array-shaped turn
+// and fell back to the PREVIOUS turn's text — so chat-time enrichment
+// and auto-effort classification ran on the wrong question.
 function lastUserMessage(messages) {
   if (!Array.isArray(messages)) return '';
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (m && m.role === 'user' && typeof m.content === 'string') return m.content;
+    if (!m || m.role !== 'user') continue;
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) {
+      const text = m.content
+        .filter(p => p && p.type === 'text' && typeof p.text === 'string')
+        .map(p => p.text)
+        .join('\n');
+      if (text) return text;
+    }
   }
   return '';
+}
+
+// Strip a composed prompt down to the ACTUAL current question.
+//
+// The renderer wraps the live transcript in a large RESPONSE RULES block
+// plus chat history and task framing before it reaches these routes.
+// Classification (fresh-context + auto reasoning depth) must run on the
+// QUESTION, not the wrapper:
+//   - the rules block itself contains example phrases ("tell me about a
+//     time...", "what's new in Python 3.13") that misclassify every call;
+//   - the Brave cache key must equal what /prefetch-context stored, which
+//     is the RAW transcript — a rules-laden key never hits that cache.
+//
+// Shapes handled (in priority order):
+//   1. "...Interviewer (Current Audio): <q>..."   (gemini/xai/groq/claude
+//      paths — history lines say "Interviewer (Transcript):", so taking
+//      the LAST "Current Audio" marker isolates the live question)
+//   2. "...<<<END RESPONSE RULES>>>\n\n---\n\n<q>..."  (openai path — no
+//      audio marker; the question sits right after the rules terminator)
+//   3. plain text (auto-solve, internal callers) — returned unchanged
+// Trailing task framing / KB-hint blocks appended after the question are
+// cut regardless of which shape matched.
+function extractCurrentQuestion(text) {
+  let s = String(text || '');
+  const audioMarker = 'Interviewer (Current Audio):';
+  const audioIdx = s.lastIndexOf(audioMarker);
+  if (audioIdx !== -1) {
+    s = s.slice(audioIdx + audioMarker.length);
+  } else {
+    const rulesEnd = '<<<END RESPONSE RULES>>>';
+    const endIdx = s.lastIndexOf(rulesEnd);
+    if (endIdx !== -1) s = s.slice(endIdx + rulesEnd.length).replace(/^[\s-]+/, '');
+  }
+  for (const stop of ['\n\nTask:', '\n\n[Remember:', '\n\n[Anchor', '\n\nRemember:']) {
+    const i = s.indexOf(stop);
+    if (i !== -1) s = s.slice(0, i);
+  }
+  return s.trim();
 }
 
 // Wrapper that NEVER throws — callers inline-await without try/catch.
@@ -188,28 +413,58 @@ async function tryEnrich(transcript, requestId) {
   }
 }
 
-// Prepend FRESH_CONTEXT to the existing system instruction. Order
-// matters: grounding evidence first, voice rules after. The model is
-// instructed (in freshContext.formatContext) to internalize, not cite.
-function prependFreshToSystem(systemInstruction, freshContext) {
-  if (!freshContext) return systemInstruction;
-  const existing = String(systemInstruction || '');
-  return existing ? `${freshContext}\n\n${existing}` : freshContext;
+// Attach FRESH_CONTEXT to the request WITHOUT touching the system prompt.
+//
+// It used to be PREPENDED to the system instruction — which mutated the
+// byte-prefix of every call whenever fresh context appeared (or stopped
+// appearing). Every provider keys its prompt cache on a stable prefix
+// (OpenAI automatic caching, Gemini implicit caching, xAI cached-input,
+// Anthropic cache_control, Groq prefix cache) — so that prepend forced a
+// full re-prefill of the multi-thousand-token KNOWLEDGE BASE system
+// prompt on almost every turn. With big context files, that re-prefill
+// IS the multi-second "reading your files" latency users feel.
+//
+// The block now rides at the END of the final user message, adjacent to
+// the question it grounds. The static system prompt stays byte-stable
+// for the whole session (cache hits from turn 2 onward), and the
+// evidence gains salience — recency + user role outrank a system-prompt
+// preamble (same rationale as buildUserRulesBlock on the client).
+function appendFreshToPrompt(prompt, freshContext) {
+  if (!freshContext) return prompt;
+  const base = String(prompt || '');
+  return base ? `${base}\n\n${freshContext}` : freshContext;
 }
 
-// Same idea but for messages-array shape: find the system message and
-// prepend its content; if no system message exists, insert one at [0].
-function prependFreshToMessages(messages, freshContext) {
-  if (!freshContext) return messages;
+// Append a text block to the LAST user message — the ONLY sanctioned way
+// to add per-turn material (fresh context, cover-answer continuation
+// instructions) to a request. Never touch the system prompt: its
+// byte-stability is what keeps provider prompt caches hot.
+// Handles both content shapes — plain string, and the multimodal
+// part-array of the final turn ({type:'text',text} is the same key on
+// OpenAI-compatible and Anthropic shapes). Returns a shallow copy; the
+// caller's array is never mutated. Unknown shapes pass through untouched
+// (fail-open — losing an augment must never break a live interview).
+function appendTextToLastUserMessage(messages, text) {
+  if (!text) return messages;
   if (!Array.isArray(messages) || messages.length === 0) return messages;
-  const sysIdx = messages.findIndex(m => m && m.role === 'system');
-  if (sysIdx === -1) {
-    return [{ role: 'system', content: freshContext }, ...messages];
-  }
   const copy = messages.slice();
-  const cur = copy[sysIdx] || {};
-  copy[sysIdx] = { ...cur, content: prependFreshToSystem(cur.content, freshContext) };
-  return copy;
+  for (let i = copy.length - 1; i >= 0; i--) {
+    const m = copy[i];
+    if (!m || m.role !== 'user') continue;
+    if (typeof m.content === 'string') {
+      copy[i] = { ...m, content: appendFreshToPrompt(m.content, text) };
+    } else if (Array.isArray(m.content)) {
+      copy[i] = { ...m, content: [...m.content, { type: 'text', text }] };
+    } else {
+      return messages;
+    }
+    return copy;
+  }
+  return messages;
+}
+
+function appendFreshToMessages(messages, freshContext) {
+  return appendTextToLastUserMessage(messages, freshContext);
 }
 
 // ── Upstream 429 detection ──
@@ -248,7 +503,7 @@ function rateLimitedJson(provider) {
 // ── Tier gate aliases ──
 // Mirrors services/licenseService.ts FEATURE_GATES.models, in shorthand.
 // The 2026-07 pricing overhaul re-laddered model access:
-//   - TRIAL_MODELS→ free + all paid tiers      (GPT-5.5, Grok, Groq — every model
+//   - TRIAL_MODELS→ free + all paid tiers      (GPT-5.6, Grok, Groq — every model
 //                    except Claude; 'free' only counts while the one-time
 //                    10-minute trial bucket has seconds, enforced by
 //                    requireTimeRemaining → 402 at 0)
@@ -264,6 +519,10 @@ const TRIAL_MODELS = ['free', 'basic', 'pro', 'max', 'ultra'];
 const PAID = ['basic', 'pro', 'max', 'ultra'];
 const CLAUDE_TIERS = ['pro', 'max', 'ultra'];
 const ULTRA_ONLY = ['ultra'];
+//   - TRAIN_TIERS → max + ultra                 (Train Model — the Max
+//                    differentiator, sold as "Max+" on every pricing
+//                    surface and mirrored by FEATURE_GATES.trainModel)
+const TRAIN_TIERS = ['max', 'ultra'];
 
 // TODO(owner-decision): the 10-minute free trial is currently NOT available
 // in India. requireActiveSubscriptionInRegion (mounted above via router.use)
@@ -273,6 +532,54 @@ const ULTRA_ONLY = ['ultra'];
 // is a regionGate.js POLICY change (e.g. allow tier='free' while
 // trial_remaining_seconds > 0), not a change here. Deliberately left as-is per
 // the 2026-07 policy freeze: do NOT silently widen free access in IN.
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  /models — which models may THIS account use?
+//
+//  The desktop answers this for itself from its licence, and publishes
+//  the result to the phone over the mirror. That works right up to the
+//  case that matters most: a phone that has never seen a computer —
+//  someone who just installed it, or an App Store reviewer. It knows
+//  only that Gemini exists on every plan, so a rate-limited Gemini is a
+//  dead end on their very first question.
+//
+//  Answered here rather than re-derived on the phone because the tier
+//  lists below are the SAME constants the model routes gate on. Any
+//  other source — a copy of the client's feature table, a guess from the
+//  tier string — is a second opinion that can disagree with the routes,
+//  and the way it fails is offering someone a model they will be refused.
+//
+//  Display names are the phone's problem, not ours; it already has the
+//  computer's labels and falls back to the key.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+router.get('/models', (req, res) => {
+  try {
+    const email = (req.user?.email || '').toLowerCase();
+    const isAdmin = ADMIN_EMAILS.includes(email);
+    const license = db.getLicenseByUserId(req.user.id);
+    const tier = isAdmin ? 'ultra' : (license?.tier || 'free');
+
+    const allow = (tiers) => isAdmin || tiers.includes(tier);
+    // Order matters — the phone uses the first as its default and the
+    // rest, in order, as fallbacks when a provider is busy.
+    //
+    // Gemini is unconditional, and that is not a fudge: /stream/gemini
+    // carries geminiQuotaGate, NOT requireTier, so it genuinely has no
+    // tier requirement. Deriving it from TRIAL_MODELS instead would hand
+    // an unrecognised tier an EMPTY list — a phone with no models at all,
+    // which is indistinguishable from a broken app.
+    const models = ['gemini'];
+    if (allow(TRIAL_MODELS)) models.push('openai', 'xai', 'groq');
+    if (allow(CLAUDE_TIERS)) models.push('claude');
+
+    res.json({ tier, models });
+  } catch (err) {
+    console.error('[ai/models] error:', err.message);
+    // Never leave the caller with nothing: Gemini is on every plan, so
+    // the safe answer is the one the phone would have assumed anyway.
+    res.json({ tier: 'free', models: ['gemini'] });
+  }
+});
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  /prefetch-context — speculative cache warming during transcription
@@ -359,14 +666,21 @@ router.post('/prefetch-context', async (req, res) => {
 function _resetPrefetchDedup() { _prefetchDedup.clear(); }
 
 // ── Gemini ──
-router.post('/chat/gemini', geminiQuotaGate, requireTimeRemaining, async (req, res) => {
+router.post('/chat/gemini', geminiQuotaGate, requireTimeRemaining, requireActiveSession, async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Gemini not configured' });
 
   try {
     const { prompt, systemInstruction, history, fileParts } = req.body;
-    const fresh = await tryEnrich(prompt, req.headers['x-request-id']);
-    const enrichedSystem = prependFreshToSystem(systemInstruction, fresh?.context);
+    // Strip rules/history framing before classification + retrieval —
+    // both must see the raw live question (see extractCurrentQuestion).
+    const question = extractCurrentQuestion(prompt);
+    const fresh = await tryEnrich(question, req.headers['x-request-id']);
+    // Cache-preserving injection: systemInstruction stays byte-stable so
+    // Gemini's implicit prompt cache absorbs the KNOWLEDGE BASE after the
+    // first call; evidence rides with the question instead.
+    const enrichedPrompt = appendFreshToPrompt(prompt, fresh?.context);
+    const deepQuestion = DEEP_CATEGORIES.has(classifyQuestion(question).category);
 
     const { GoogleGenAI } = require('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
@@ -376,14 +690,22 @@ router.post('/chat/gemini', geminiQuotaGate, requireTimeRemaining, async (req, r
     if (fileParts && fileParts.length > 0) {
       fileParts.forEach(fp => parts.push({ inlineData: { mimeType: fp.mimeType, data: fp.data } }));
     }
-    parts.push({ text: prompt });
+    parts.push({ text: enrichedPrompt });
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.6-flash',
       contents: [{ role: 'user', parts }],
       config: {
-        systemInstruction: enrichedSystem || '',
-        temperature: 0.7,
+        systemInstruction: systemInstruction || '',
+        // Gemini 3.x: temperature/top_p/top_k are deprecated — ignored
+        // today, HTTP 400 in future generations — so they're omitted.
+        // Thinking defaults to 'medium' on 3.6-flash (seconds of dead air
+        // before a live answer). Depth-matched instead: deep analytical
+        // shapes get LOW (measured TTFT ~1.5s / total ~2.3s — inside the
+        // ≤4s live budget), everything else the MINIMAL floor (~0.7s
+        // TTFT). Uppercase values are the SDK's canonical ThinkingLevel
+        // enum wire form (@google/genai).
+        thinkingConfig: { thinkingLevel: deepQuestion ? 'LOW' : 'MINIMAL' },
       }
     });
 
@@ -399,8 +721,8 @@ router.post('/chat/gemini', geminiQuotaGate, requireTimeRemaining, async (req, r
 });
 
 // ── OpenAI (GPT) ──
-// GPT-5.5 reasoning_effort knob. Accepted values for gpt-5.5 are
-// `none, low, medium, high, xhigh` — `minimal` is gpt-5-only and
+// GPT-5.6 reasoning_effort knob. Accepted values for gpt-5.6 are
+// `none, low, medium, high, xhigh, max` — `minimal` is gpt-5-only and
 // returns HTTP 400 here. The client (App.tsx) sends the user's
 // chosen level in `req.body.reasoning_effort`; resolveReasoningEffort
 // validates the input AND tier-gates it: only Max/Ultra users (and
@@ -412,46 +734,435 @@ router.post('/chat/gemini', geminiQuotaGate, requireTimeRemaining, async (req, r
 // types only accept it inconsistently across versions. Passing it
 // would risk 400'ing every paid user. (See openai-python #2610.)
 //
-// Temperature is still omitted — GPT-5.5 rejects any non-default
-// value with HTTP 400. Same for top_p / presence_penalty /
-// frequency_penalty / logprobs.
+// Temperature is still omitted — the GPT-5.x reasoning family rejects
+// any non-default value with HTTP 400. Same for top_p /
+// presence_penalty / frequency_penalty / logprobs.
+//
+// GPT-5.6 note: on /v1/chat/completions, function tools are rejected
+// whenever reasoning_effort != 'none'. These routes never pass tools,
+// so every effort level stays valid here — but if tools are ever added
+// to the OpenAI path, move it to the Responses API first.
 
-// Allowed values for the chat.completions API on gpt-5.5. 'xhigh' is
-// supported by the model but intentionally not exposed to clients —
-// avoids surprise bills if a UI bug ever sent it. 'auto' is a special
+// Allowed values for the chat.completions API on gpt-5.6. 'xhigh' and
+// 'max' are supported by the model but intentionally not exposed to
+// clients — avoids surprise bills if a UI bug ever sent one. 'auto' is a special
 // pseudo-value that triggers question-shape-based effort selection
 // (coding→low, system design→medium, etc.); it never reaches OpenAI.
 const ALLOWED_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'auto'];
 
 // Auto-effort mapping: question category → reasoning_effort value.
-// EVERYTHING DEFAULTS TO 'none'. Rationale: the Brave-backed fresh-context
-// retrieval already supplies the model with grounded, current evidence
-// for the question shapes that previously benefited from extra reasoning
-// (system design, ML, case/strategy — all the analytical categories).
-// Once the model has authoritative source content in its prompt, extra
-// reasoning_effort buys very little quality and costs material latency
-// (+5-15s on hard categories with 'medium'). Speed wins.
+// 2026-07-22 depth-adaptive policy, measured on gpt-5.6 (streaming,
+// realistic prompt sizes, 2 rounds):
+//   'low'  → deep analytical shapes. Measured TTFT 2.5-3.2s — inside the
+//            ≤4s live-answer budget — and the brief reasoning materially
+//            improves correctness on code and multi-constraint design.
+//   'none' → conversational / recall shapes where reasoning buys nothing.
+//            Measured TTFT 0.8-1.9s.
+// 'medium'/'high' are NEVER auto-picked: measured TTFT 3.6-8.9s blows the
+// live budget. They remain available as explicit picks on the dial
+// (Max/Ultra), where the user is knowingly trading speed for depth.
 //
-// The mapping stays as a Map (not a constant 'none') so a future
-// per-category bump is a one-line change if we ever decide a specific
-// shape benefits from reasoning that fresh-context can't provide.
+// Brave fresh-context still injects current evidence on top of whatever
+// effort is chosen — freshness and depth are complementary here, not
+// substitutes (the pre-2026-07 all-'none' policy treated them as
+// substitutes; gpt-5.6's faster 'low' tier changed that math).
 //
-// Users who explicitly want 'low' / 'medium' / 'high' can still pick
-// those manually from the reasoning-effort dial — we honor explicit
-// choice and only auto-pick when the client sends 'auto' or no value.
+// Users who explicitly pick 'low' / 'medium' / 'high' on the dial are
+// honored as-is; auto-pick fires only for 'auto' or a missing value.
 const AUTO_EFFORT_BY_CATEGORY = {
-  coding:         'none',
-  system_design:  'none',  // Brave fresh-context covers the trade-off depth
-  ml_data:        'none',  // Brave fresh-context covers the model-choice depth
-  quantitative:   'none',
-  strategy_case:  'none',  // Brave fresh-context covers recent business signals
+  coding:         'low',
+  system_design:  'low',
+  ml_data:        'low',
+  quantitative:   'low',
+  strategy_case:  'low',
   behavioral:     'none',
   concept:        'none',
   clarifier:      'none',
   other:          'none',
 };
 
+// Categories whose auto effort is non-'none' — the single source of truth
+// for "deep question". The Gemini routes reuse this to pick thinkingLevel
+// LOW vs MINIMAL, so a future map tweak can't drift between providers.
+const DEEP_CATEGORIES = new Set(
+  Object.entries(AUTO_EFFORT_BY_CATEGORY)
+    .filter(([, v]) => v !== 'none')
+    .map(([k]) => k)
+);
+
+// ── Cover eligibility ──
+// A cover (instant spoken opener) is worth firing for ANY real, substantive
+// interview question — it's a cheap, fast Groq opener that kills dead air
+// while the main answer forms. Deliberately DECOUPLED from reasoning depth:
+// the classifier decides how HARD to think (coding/system-design → 'low');
+// this decides whether to open the mouth first, which is yes for essentially
+// every question. Previously the cover was tied to reasoning!=='none' OR a
+// large raw-KB prompt — but KB retrieval made prompts small, so the
+// large-prompt trigger vanished and any question the classifier scored
+// 'none' (a system-design "pipeline" question it misreads, a behavioral
+// "tell me about a challenging X") silently lost its cover. Gating on length
+// alone is robust to every classifier gap: backchannels are already dropped
+// client-side, and a sub-20-char input (one-word clarifier, stray noise)
+// neither needs nor benefits from a spoken opener. Auto-Solve is excluded —
+// its output is code typed straight into an editor.
+function coverWorthy(question) {
+  const q = String(question || '').trim();
+  if (q.length < 20) return false;
+  if (q.startsWith('Solve the coding problem')) return false;
+  return true;
+}
+
 const { classifyQuestion } = require('../services/questionClassifier');
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ONE COVER PATH, FIVE ROUTES
+//
+//  The cover used to be hand-wired into /stream/openai and /stream/claude
+//  and nowhere else, on the reasoning that the other three models were
+//  "fast enough that the main answer arrives before a cover would".
+//  Measured (scripts/ttft-matrix.mjs), that reasoning had it backwards:
+//
+//    claude-sonnet-5   1.0-1.2s   ← had a cover
+//    gpt-5.6 low       1.3-2.2s   ← had a cover
+//    gemini LOW deep   4.1s       ← had none
+//    grok-4.5 deep     18-32s     ← had none
+//
+//  The two routes with covers were the two FASTEST routes, and the model
+//  that leaves a candidate silent for twenty seconds had nothing. Two
+//  copies of the wiring is also how that kind of gap survives: a fix
+//  applied to one copy is a fix half-applied.
+//
+//  So: one helper, every route, and the depth model decides per question
+//  whether a cover is worth firing at all and how much the candidate
+//  needs to say. Returns '' whenever there is no cover — a cover failure
+//  of any kind degrades to exactly the pre-existing behavior.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE OPENER ARRIVES WITH THE REQUEST
+//
+//  The renderer composes the first sentence from its fact ledger before it
+//  sends the question — in ~35 microseconds, out of spans of the user's own
+//  documents (services/instantOpener.ts). When it does, this route has no
+//  model to wait for: it writes the sentence and issues the main call
+//  immediately.
+//
+//  That removes the whole reason the cover cost latency. `runCover` was
+//  AWAITED before the main provider call, so its chain budget was added to
+//  every answer: +1,200ms on openai and claude, +2,000ms on xai, +3,000ms
+//  on groq. A local opener costs none of it.
+//
+//  `coverPolicy: 'suppress'` is the other half, and it is the fix for the
+//  worst moment in the transcript. Asked "then why did you answer IBM?",
+//  the old chain produced "That was based on my experience with their
+//  systems at Accenture" — a second invented employer, to account for the
+//  first — because a cover model is given the question and the resume and
+//  no transcript, and is told never to deny anything. There is no opening
+//  sentence that improves being challenged about a previous answer. The
+//  client detects that shape and forbids a cover outright.
+//
+//  Length cap and control-character strip only. The text is derived from
+//  the user's own uploaded documents by the user's own client, and can only
+//  ever affect that user's answer — there is nothing here to authorise.
+const OPENER_MAX_CHARS = 400;
+
+function clientOpener(req) {
+  const raw = req.body && req.body.instantOpener;
+  if (typeof raw !== 'string') return '';
+  const clean = raw.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!clean || clean.length > OPENER_MAX_CHARS) return '';
+  return clean;
+}
+
+// The lines of the transcript the INTERVIEWER spoke, and only those.
+//
+// `recentTurns` arrives labelled from buildOpenerPayload on the client —
+// "Interviewer: …" for the human, "You already said: …" for the candidate.
+// What the interviewer said is external evidence and may widen the guard's
+// vocabulary; what the app said last turn is a claim that may itself have
+// been invented, and letting it back in is how a fabrication ends up
+// vouching for its own sequel. Anything without the interviewer's label —
+// including the head fragment a tail slice can leave behind — is not
+// trusted, because being wrong in that direction costs a dropped cover and
+// being wrong in the other costs a spoken lie.
+//
+// The mirror of interviewerLines() in services/instantOpener.ts. The two
+// have to stay identical: server/test/grounding-parity.test.js exists
+// because a client and a server that disagree about what is grounded are
+// worse than either one alone.
+function interviewerSaid(recentTurns) {
+  return String(typeof recentTurns === 'string' ? recentTurns : '')
+    .split('\n')
+    .filter((line) => /^Interviewer:/.test(line.trim()))
+    .join('\n');
+}
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async function runCover({ sse, req, question, provider, effort = 'none', webSearch = false }) {
+  // ── 1. The client already knows what to say ──
+  const local = clientOpener(req);
+  if (local) {
+    sse.send(local);
+    sse.send(' ');
+    console.log(`[cover] ${provider} user=${req.user?.id} LOCAL shape=${req.body?.coverShape || '-'} `
+      + `words=${local.split(/\s+/).filter(Boolean).length} cost=0ms model=none`);
+    return local;
+  }
+
+  // ── 2. An opener would make this moment worse ──
+  if (req.body && req.body.coverPolicy === 'suppress') {
+    console.log(`[cover] ${provider} user=${req.user?.id} SUPPRESSED shape=${req.body?.coverShape || '-'} `
+      + `— the answer model has the transcript; an opener here can only guess`);
+    return '';
+  }
+
+  if (!coverWorthy(question)) return '';
+  // Measurement escape hatch. The depth model is calibrated on how long
+  // the MAIN model takes, and once a cover is in front of it that number
+  // is no longer observable — the first token on screen is the cover's.
+  // This header turns the cover off for one request so the raw gap can be
+  // re-measured through the real route, with the real prompt, whenever
+  // the tiers need recalibrating (scripts/audit-gap-inapp.mjs). It can
+  // only ever REMOVE a cover, so there is nothing here to abuse.
+  if (req.headers['x-cover-disabled']) return '';
+
+  // ── THE LLM COVER IS NOT SPENT ON A CLIENT THAT CANNOT RENDER IT ──
+  //
+  // Everything above this line is free: a client-supplied opener costs one
+  // string lookup, and the suppress/worthiness checks are local. What
+  // follows is a real model round-trip, and runCover is AWAITED before the
+  // main model on every route — so for a client that cannot use the result
+  // it is pure dead air in front of an answer that was already ready.
+  //
+  // The cover is a collaboration. The client sends coverContext (the facts
+  // the opener may speak), coverVocabulary and coverShape, and renders the
+  // opener ahead of the answer. Grep v4.0.18's aiProxyService for
+  // `coverContext` and you get zero hits — so `candidateContext` arrives as
+  // '' and the model is asked to open with nothing to stand on. Measured on
+  // a system_design question: cost=1198ms, for a sentence that client will
+  // never show and the grounding guard would be right to reject.
+  //
+  // That is the "sometimes taking time to give the answer" complaint that
+  // started this work, about to be re-created for the whole installed fleet
+  // by the change meant to fix it. The feature must only ever ADD speed —
+  // see the `!plan` note below, which is the same rule applied to timing.
+  // For a client that cannot use it, adding speed means doing nothing.
+  //
+  // Same threshold as the session gate: a client that identifies itself as
+  // current is participating; anything older, or unidentified, is not.
+  if (!participatesInProtocol(req)) return '';
+
+  const {
+    streamCoverAnswer, planCoverFor, SPOKEN_WORDS_PER_SEC,
+  } = require('../services/coverAnswer');
+
+  const { category } = classifyQuestion(question);
+  const deep = DEEP_CATEGORIES.has(category);
+  const { gapMs, plan } = planCoverFor({ provider, deep, effort, webSearch });
+
+  // No plan means the main model is predicted to beat the cover to the
+  // screen. Firing anyway would cost the answer real milliseconds for a
+  // sentence nobody needed — the feature must only ever ADD speed.
+  if (!plan) return '';
+
+  // ── HELD BACK UNTIL IT HAS BEEN CHECKED ──
+  //
+  // This used to be `onToken: (t) => sse.send(t)` — the model's words went
+  // straight to the screen, and the screen is a person's mouth a fraction
+  // of a second later. There is no way to unsay "I've spent several years
+  // at IBM" once it has been forwarded, so the tokens are collected here
+  // and released only after the whole sentence has been checked against
+  // the knowledge base's vocabulary.
+  //
+  // The cost is the cover's own generation time before the first word,
+  // which is the right trade on the only routes that still reach this
+  // code: a plan exists here because the main answer is 9-50 seconds out
+  // (grok, groq), so several hundred milliseconds buys a guarantee. The
+  // fast routes are served by the client's local opener above and never
+  // get this far.
+  const t0 = Date.now();
+  let held = '';
+  const cover = await streamCoverAnswer({
+    question,
+    category,
+    // The ledger DIGEST — every role, project, skill and metric in the
+    // whole knowledge base in ~1-3KB, replacing the 9,000-char slice of a
+    // single document that used to be sent here.
+    candidateContext: typeof req.body?.coverContext === 'string' ? req.body.coverContext : '',
+    // The last couple of exchanges. Without them a follow-up question is
+    // unanswerable except by invention — see the RECENT_TURNS note in
+    // coverAnswer.js.
+    recentTurns: typeof req.body?.recentTurns === 'string' ? req.body.recentTurns : '',
+    plan,
+    groqKey: process.env.GROQ_API_KEY,
+    geminiKey: process.env.GEMINI_API_KEY,
+    // Paid backstop for the day both free tiers are rate-limited.
+    anthropicKey: process.env.ANTHROPIC_API_KEY,
+    onToken: (t) => { held += t; },
+    signal: sse.signal,
+  });
+  if (!cover) return '';
+
+  // ── THE GUARD ──
+  // A name the knowledge base does not contain, and that the interviewer
+  // did not just say, was invented. Dropping the cover degrades to exactly
+  // the pre-existing no-cover behaviour: the answer still arrives, a
+  // little later, and nothing false was spoken.
+  const { unverifiedProperNouns, hasBannedOpener, unverifiedNumbers } = require('../services/groundingGuard');
+  const vocab = typeof req.body?.coverVocabulary === 'string' ? req.body.coverVocabulary : '';
+  // The transcript counts as allowed vocabulary too: a name the interviewer
+  // used two turns ago is theirs, not an invention. Adding it here is what
+  // lets the cover answer a follow-up at all without being rejected for
+  // echoing the thing being followed up on.
+  //
+  // ⚠️ HALF THE TRANSCRIPT, THOUGH. The candidate's own previous ANSWER is
+  // in `recentTurns` as well, labelled "You already said:", and it was going
+  // into `allowed` with everything else — so a name the model invented last
+  // turn became trusted vocabulary this turn, and the sentence that explains
+  // the invention sailed through the guard that had rejected the invention
+  // itself. That is the IBM → Accenture cascade with the guard's own help,
+  // and it bites hardest at the `vocab.trim() ? vocab : allowed` line below,
+  // where `allowed` is not merely added to the knowledge base — it IS the
+  // knowledge base. The model still SEES its previous answer: it is passed
+  // to streamCoverAnswer above, in full, as prompt context. It just no
+  // longer gets to vouch for itself.
+  const allowed = `${question}\n${interviewerSaid(req.body?.recentTurns)}`;
+
+  // ── NO KNOWLEDGE BASE IS THE STRICTEST CASE, NOT THE LOOSEST ──
+  //
+  // The guard abstains when the vocabulary is empty, and for the main answer
+  // that is right: with nothing uploaded there is nothing to contradict, and
+  // flagging every name would suppress every cover in the app's most common
+  // state. Applied to the COVER it is exactly backwards, because a
+  // no-documents session is precisely when a fast model has nothing to draw
+  // on and reaches for a name. Measured live, with no files attached:
+  //
+  //   "At my previous role at Google, we experienced a major outage…"
+  //   "I've worked at IBM and then spent several years at Accenture…"
+  //
+  // Both passed, because there was no vocabulary to fail against.
+  //
+  // So when there is no knowledge base, the QUESTION becomes the vocabulary:
+  // any name the interviewer did not just say is, by construction, invented —
+  // the candidate's background is unknown, so no name can be supported by it.
+  // A cover in that state should be a stance about approach, which needs no
+  // proper nouns at all (COVER_SYSTEM says exactly this). Losing a cover here
+  // costs a moment of silence; keeping one costs a fabricated employer spoken
+  // out loud.
+  const invented = unverifiedProperNouns(vocab.trim() ? vocab : allowed, cover, allowed);
+
+  // Style, not just facts. Measured over the last 400 answers in the user's
+  // database, 15.3% opened with a phrase COVER_SYSTEM explicitly forbids —
+  // three separate answers began with the identical words "Most of my time's
+  // been on", one of them in front of a question about concurrency. The
+  // prompt asked for variety and did not get it, so the check is here.
+  const banned = hasBannedOpener(cover);
+  if (banned) {
+    console.warn(
+      `[cover] REJECTED ${provider} user=${req.user?.id} tier=${plan.name} `
+      + `bannedOpener="${banned}" after ${Date.now() - t0}ms — a canned opening in front of `
+      + `an unrelated question is worse than no opening. text="${cover.slice(0, 100)}"`
+    );
+    return '';
+  }
+  if (invented.length) {
+    console.warn(
+      `[cover] REJECTED ${provider} user=${req.user?.id} tier=${plan.name} `
+      + `invented=[${invented.join(', ')}] after ${Date.now() - t0}ms — dropping the opener `
+      + `rather than speaking it. text="${cover.slice(0, 120)}"`
+    );
+    return '';
+  }
+
+  // ── AND THE NUMBERS ──
+  // The check above polices NAMES. It has nothing to say about a figure, and
+  // a cover that invents one is just as unspeakable: measured live against
+  // the real providers, this was FORWARDED and would have been read aloud —
+  //   "queries on our service metadata were timing out during peak traffic.
+  //    I pulled the slow logs and ran test queries against different index
+  //    sizes..."
+  // — none of it on the résumé, every proper noun in it perfectly valid. A
+  // number the candidate then has to defend is worse than one they never
+  // said, because the REAL answer is still generating and has not seen the
+  // cover's invention; the two can contradict each other out loud.
+  // `candidateContext` is the digest the model was given, so anything it
+  // quotes from there is supported by construction, and anything it did not
+  // is a figure it made up.
+  const madeUpNumbers = unverifiedNumbers(
+    typeof req.body?.coverContext === 'string' ? req.body.coverContext : '',
+    cover,
+    allowed,
+  );
+  if (madeUpNumbers.length) {
+    console.warn(
+      `[cover] REJECTED ${provider} user=${req.user?.id} tier=${plan.name} `
+      + `fabricatedNumbers=[${madeUpNumbers.join(', ')}] after ${Date.now() - t0}ms — a metric `
+      + `the background does not contain. text="${cover.slice(0, 120)}"`
+    );
+    return '';
+  }
+
+  sse.send(held);
+  // A space so the main model's first token cannot fuse onto the cover's
+  // last word.
+  sse.send(' ');
+  const words = cover.split(/\s+/).filter(Boolean).length;
+  // Log the arithmetic, not just the outcome: seconds of SPEECH bought
+  // against the gap it has to cover is the only number that says whether
+  // the candidate runs dry, and it is what a future tuning pass needs.
+  console.log(
+    `[cover] ${provider} user=${req.user?.id} tier=${plan.name} cat=${category} `
+    + `effort=${effort} gap~${gapMs}ms cover=${Date.now() - t0}ms `
+    + `words=${words} speech~${(words / SPOKEN_WORDS_PER_SEC).toFixed(1)}s`
+  );
+  return cover;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  REPORT WHAT THE MAIN MODEL ACTUALLY DID
+//
+//  The cover is sized from a table of latencies measured on one
+//  afternoon in July. Tables do not notice a bad minute. A real
+//  question on the app's default model — "okay, on what platforms did
+//  you work?" on gpt-5.6 at effort none, predicted 1,400ms — took
+//  twenty-five seconds, and the only trace it left was the absence of a
+//  [cover] line in the log.
+//
+//  Two jobs, both cheap:
+//    1. feed the observation back so the NEXT cover on this route is
+//       sized for a provider that is currently slow (see the EWMA note
+//       in coverAnswer.js), and
+//    2. leave a line in the log when an answer blows past its
+//       prediction, so "the model just sat there" is never again
+//       something that has to be reconstructed from timestamps.
+//
+//  Timed from the moment the main call is ISSUED, which is AFTER the
+//  cover chain — so the cover's own cost is never counted as the main
+//  model's latency and fed back to make the next cover longer, which
+//  would compound on itself.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const SLOW_ANSWER_LOG_MS = 8000;
+function mainTtftReporter({ question, provider, effort = 'none', webSearch = false }) {
+  const { recordMainTtftMs, predictMainTtftMs } = require('../services/coverAnswer');
+  const { category } = classifyQuestion(question);
+  const args = { provider, deep: DEEP_CATEGORIES.has(category), effort, webSearch };
+  const predicted = predictMainTtftMs(args);
+  let issuedAt = Date.now();
+  let reported = false;
+  return {
+    // Call immediately before creating the provider stream.
+    issued() { issuedAt = Date.now(); },
+    // Call on the FIRST text delta. Idempotent.
+    firstToken() {
+      if (reported) return;
+      reported = true;
+      const ms = Date.now() - issuedAt;
+      recordMainTtftMs(args, ms);
+      if (ms >= SLOW_ANSWER_LOG_MS) {
+        console.warn(`[ttft] SLOW main answer: ${provider} ${ms}ms (predicted ${predicted}ms, cat=${category}, effort=${effort}) — next cover on this route will be sized longer`);
+      }
+    },
+  };
+}
 
 // Single source of truth for tier-gating + validation. Returns the
 // effort string to pass to OpenAI. Tiers below Max/Ultra (non-admin)
@@ -471,13 +1182,16 @@ function resolveReasoningEffort(req, transcript) {
                // explicit 'none' from clients still works (validated below)
   const requested = ALLOWED_REASONING_EFFORTS.includes(raw) ? raw : 'auto';
 
-  // Auto mode: classify the transcript and map category → effort.
+  // Auto mode: classify the CURRENT QUESTION and map category → effort.
+  // extractCurrentQuestion strips the rules block / history framing —
+  // classifying the raw composed message would match the rules block's
+  // own example phrases and mislabel every call as behavioral.
   let validated;
   if (requested === 'auto') {
-    const t = transcript || (Array.isArray(req.body?.messages)
-      ? lastUserMessage(req.body.messages) : '');
+    const t = extractCurrentQuestion(transcript || (Array.isArray(req.body?.messages)
+      ? lastUserMessage(req.body.messages) : ''));
     const { category } = classifyQuestion(t);
-    validated = AUTO_EFFORT_BY_CATEGORY[category] || 'low';
+    validated = AUTO_EFFORT_BY_CATEGORY[category] || 'none';
   } else {
     validated = requested;
   }
@@ -518,12 +1232,15 @@ function resolveReasoningEffort(req, transcript) {
 // negatives truncate STAR-method answers mid-sentence (the bug
 // we're fixing).
 //
-// Provider hard caps as of 2026-05:
-//   OpenAI gpt-5.5            16,384 max_completion_tokens
-//   Anthropic Sonnet 4.6      64,000 max_tokens
-//   xAI grok-4.3              8,000 max_tokens (model-specific)
+// Request budgets as of 2026-07. These are OUR caps, not the models'
+// (gpt-5.6 allows up to 128K output, grok-4.5 and gemini-3.6-flash
+// 65K+): interview answers never need more, and the cap bounds
+// worst-case cost per call.
+//   OpenAI gpt-5.6            16,384 max_completion_tokens (deliberate budget)
+//   Anthropic Sonnet 5        64,000 max_tokens
+//   xAI grok-4.5              8,000 max_tokens (deliberate budget)
 //   Groq openai/gpt-oss-120b  8,192 max_tokens
-//   Gemini 3-flash-preview    8,192 maxOutputTokens (SDK default)
+//   Gemini 3.6 Flash          8,192 maxOutputTokens (SDK default)
 // ─────────────────────────────────────────────────────────────
 
 function extractSystemText(messages) {
@@ -572,14 +1289,89 @@ function scaleTokensForInstructions(systemText, baseMax, hardCap) {
   return Math.min(Math.round(baseMax * multiplier), hardCap);
 }
 
-router.post('/chat/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  GROQ'S TOKEN BUDGET COUNTS THE ANSWER YOU HAVE NOT WRITTEN YET
+//
+//  Both Groq routes asked for max_tokens: 8,000. Measured 2026-07-25
+//  against the key in server/.env, `openai/gpt-oss-120b` on this org has
+//  a tokens-per-minute limit of exactly 8,000 — and Groq admits a
+//  request against TPM using input + max_tokens, BEFORE generating
+//  anything. So the reservation alone consumed the entire minute's
+//  budget and every request 413'd, with a two-word prompt:
+//
+//    "Request too large ... on tokens per minute (TPM):
+//     Limit 8000, Requested 8239"          ← 193-token system prompt
+//
+//  Not "sometimes under load" — always, by arithmetic. Asking for a
+//  reservation the size of the whole bucket cannot succeed no matter how
+//  small the prompt is. (llama-3.3-70b-versatile, which the cover uses,
+//  is on a 12,000 bucket and a cover reserves 90 — which is why covers
+//  kept working while the answers behind them never arrived.)
+//
+//  Two things were wrong and both are fixed here:
+//    1. the reservation. 8,000 was chosen as "the model's ceiling", not
+//       as "what an interview answer needs". A long STAR answer is
+//       ~1,500 tokens; 4,096 is generous and leaves the bucket room to
+//       hold a prompt as well.
+//    2. the error. is429() classified this as a rate-limit and told the
+//       user "give it a few seconds and try again" — advice that could
+//       never work, for a condition that is not transient. When the
+//       PROMPT alone exceeds the bucket, no retry and no wait helps, and
+//       saying so is the only honest thing to do.
+const GROQ_BASE_MAX_TOKENS = 4096;
+const GROQ_CAP_MAX_TOKENS = 8192;
+
+// Pull the numbers out of Groq's own message — it tells us the limit and
+// what it counted, which is everything needed to retry correctly.
+function parseGroqTpm(err) {
+  const msg = String(err?.error?.error?.message || err?.error?.message || err?.message || '');
+  if (!/tokens per minute/i.test(msg)) return null;
+  const limit = Number(/Limit\s+(\d+)/i.exec(msg)?.[1]);
+  const requested = Number(/Requested\s+(\d+)/i.exec(msg)?.[1]);
+  if (!Number.isFinite(limit) || !Number.isFinite(requested)) return null;
+  return { limit, requested, msg };
+}
+
+// One self-healing retry: `requested - max_tokens` is the prompt's real
+// token count, so we can compute the largest reservation that still fits
+// and try again. If the prompt ALONE is over the limit there is no
+// reservation that fits and we rethrow for the honest error path.
+async function callGroqWithinTpm(groq, params, opts) {
+  try {
+    return await groq.chat.completions.create(params, opts);
+  } catch (err) {
+    const tpm = parseGroqTpm(err);
+    if (!tpm) throw err;
+    const promptTokens = tpm.requested - (params.max_tokens || 0);
+    // 256 tokens of headroom: the accounting is approximate and a retry
+    // that lands one token over is a retry wasted.
+    const room = tpm.limit - promptTokens - 256;
+    if (!(room >= 512)) throw err;
+    console.warn(`[groq] TPM ${tpm.limit}: prompt ~${promptTokens} tok, retrying with max_tokens ${room} (was ${params.max_tokens})`);
+    return groq.chat.completions.create({ ...params, max_tokens: room }, opts);
+  }
+}
+
+// The message the candidate sees when even that cannot fit. Names the
+// real constraint and the two things that actually resolve it.
+function describeGroqTpmFailure(err) {
+  const tpm = parseGroqTpm(err);
+  if (!tpm) return null;
+  return {
+    log: `TPM limit ${tpm.limit} < requested ${tpm.requested} — this key cannot serve a prompt this size on this model. Upgrade the Groq plan or route this model elsewhere.`,
+    userMessage: `This Groq model is capped at ${tpm.limit.toLocaleString()} tokens/minute on the current plan and this question needs about ${tpm.requested.toLocaleString()}. Switch models for now — waiting will not clear it.`,
+  };
+}
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+router.post('/chat/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining, requireActiveSession, async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OpenAI not configured' });
 
   try {
     const { messages } = req.body;
-    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
-    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+    const fresh = await tryEnrich(extractCurrentQuestion(lastUserMessage(messages)), req.headers['x-request-id']);
+    const enrichedMessages = appendFreshToMessages(messages, fresh?.context);
 
     const reasoningEffort = resolveReasoningEffort(req);
     const OpenAI = require('openai');
@@ -594,7 +1386,7 @@ router.post('/chat/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining, 
     const maxTokens = scaleTokensForInstructions(sysText, 16000, 16384);
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-5.5',
+      model: 'gpt-5.6',
       messages: enrichedMessages,
       max_completion_tokens: maxTokens,
       reasoning_effort: reasoningEffort,
@@ -612,14 +1404,14 @@ router.post('/chat/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining, 
 });
 
 // ── xAI (Grok) ──
-router.post('/chat/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
+router.post('/chat/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, requireActiveSession, async (req, res) => {
   const apiKey = process.env.XAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'xAI not configured' });
 
   try {
     const { messages } = req.body;
-    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
-    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+    const fresh = await tryEnrich(extractCurrentQuestion(lastUserMessage(messages)), req.headers['x-request-id']);
+    const enrichedMessages = appendFreshToMessages(messages, fresh?.context);
 
     const OpenAI = require('openai');
     const client = new OpenAI({ apiKey, baseURL: 'https://api.x.ai/v1' });
@@ -631,7 +1423,9 @@ router.post('/chat/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, asy
     const maxTokens = scaleTokensForInstructions(sysText, 8000, 8000);
 
     const completion = await client.chat.completions.create({
-      model: 'grok-4.3',
+      // grok-4.5 — NOTE the dot: xAI's API takes 'grok-4.5'; 'grok-4-5'
+      // (dash form, used in URLs/slugs) returns model-not-found.
+      model: 'grok-4.5',
       messages: enrichedMessages,
       max_tokens: maxTokens,
       temperature: 0.7,
@@ -651,7 +1445,7 @@ router.post('/chat/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, asy
 // ── Groq ──
 // Upgraded May 2026 from Llama-4-Scout-17B to GPT-OSS-120B:
 //   - 7x parameter count (17B → 120B) closes the quality gap with the
-//     other chat models (Sonnet, GPT-5.5, Gemini 3 Flash). Scout-17B
+//     other chat models (Sonnet, GPT-5.6, Gemini 3.6 Flash). Scout-17B
 //     was structurally too small to follow the senior-instinct prompt
 //     reliably — it would give junior-shaped answers despite the
 //     prompt asking for non-obvious trade-offs and edge-case naming.
@@ -662,24 +1456,25 @@ router.post('/chat/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, asy
 //   - max_tokens added explicitly: Groq's default for Scout was small
 //     and was likely truncating long answers. 8000 covers any realistic
 //     interview answer with margin.
-router.post('/chat/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
+router.post('/chat/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, requireActiveSession, async (req, res) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Groq not configured' });
 
   try {
     const { messages } = req.body;
-    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
-    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+    const fresh = await tryEnrich(extractCurrentQuestion(lastUserMessage(messages)), req.headers['x-request-id']);
+    const enrichedMessages = appendFreshToMessages(messages, fresh?.context);
 
     const Groq = require('groq-sdk');
     const groq = new Groq({ apiKey });
 
     // Mirror the stream-route scaling — keeps chat + stream parity for
-    // STAR / detailed custom-instruction users hitting this path.
+    // STAR / detailed custom-instruction users hitting this path, and
+    // shares the TPM arithmetic fix (see callGroqWithinTpm).
     const sysText = extractSystemText(enrichedMessages);
-    const maxTokens = scaleTokensForInstructions(sysText, 8000, 8192);
+    const maxTokens = scaleTokensForInstructions(sysText, GROQ_BASE_MAX_TOKENS, GROQ_CAP_MAX_TOKENS);
 
-    const completion = await groq.chat.completions.create({
+    const completion = await callGroqWithinTpm(groq, {
       model: 'openai/gpt-oss-120b',
       messages: enrichedMessages,
       max_tokens: maxTokens,
@@ -688,6 +1483,11 @@ router.post('/chat/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, as
 
     res.json({ text: completion.choices[0]?.message?.content || '' });
   } catch (err) {
+    const tpm = describeGroqTpmFailure(err);
+    if (tpm) {
+      console.error(`[groq] ${tpm.log}`);
+      return res.status(413).json({ error: tpm.userMessage });
+    }
     if (is429(err)) {
       console.warn('[groq] upstream 429:', err.message);
       return res.status(429).json(rateLimitedJson('Groq'));
@@ -697,7 +1497,7 @@ router.post('/chat/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, as
   }
 });
 
-// ── Claude (Anthropic) — Sonnet 4.6 with hosted web_search tool ──
+// ── Claude (Anthropic) — Sonnet 5 with hosted web_search tool ──
 // The model decides on its own whether to invoke search. Most questions
 // skip it and answer from memory in 1.5-3s; recent/niche questions
 // search and answer in 3-5s. The system prompt is wrapped in a
@@ -718,14 +1518,18 @@ const _AnthropicMod = (() => {
 })();
 const Anthropic = _AnthropicMod && (_AnthropicMod.default || _AnthropicMod);
 
-router.post('/chat/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining, async (req, res) => {
+async function claudeChatHandler(req, res) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
 
   try {
     const { messages, systemInstruction, enableWebSearch } = req.body;
-    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
-    const enrichedSystem = prependFreshToSystem(systemInstruction, fresh?.context);
+    const fresh = await tryEnrich(extractCurrentQuestion(lastUserMessage(messages)), req.headers['x-request-id']);
+    // Cache-preserving injection: the cache_control'd system block must
+    // stay BYTE-STABLE or Anthropic re-writes the whole prompt cache
+    // (full input price + full prefill latency) on every fresh-context
+    // flip. Evidence rides with the question instead.
+    const enrichedMessages = appendFreshToMessages(messages, fresh?.context);
 
     const client = new Anthropic({ apiKey });
 
@@ -734,21 +1538,21 @@ router.post('/chat/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining, 
       tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 3 });
     }
 
-    const system = enrichedSystem
-      ? [{ type: 'text', text: enrichedSystem, cache_control: { type: 'ephemeral' } }]
+    const system = systemInstruction
+      ? [{ type: 'text', text: systemInstruction, cache_control: { type: 'ephemeral' } }]
       : undefined;
 
     // Match the stream route — non-streaming chat path also needs
     // custom-instruction-aware token scaling. Sonnet 5 supports
     // up to 64,000 max_tokens, so STAR / detailed responses can scale
     // up to 32,000 here without truncation.
-    const maxTokens = scaleTokensForInstructions(enrichedSystem || '', 16000, 64000);
+    const maxTokens = scaleTokensForInstructions(systemInstruction || '', 16000, 64000);
 
     const completion = await client.messages.create({
       model: 'claude-sonnet-5',
       max_tokens: maxTokens,
       system,
-      messages,
+      messages: enrichedMessages,
       tools: tools.length ? tools : undefined,
       // Sonnet 5 defaults effort to 'high' (more thinking → slower + pricier).
       // For live-interview answers we want speed, so pin it low. Sonnet 5 is a
@@ -775,7 +1579,36 @@ router.post('/chat/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining, 
     console.error('Claude proxy error:', err.message);
     res.status(500).json({ error: 'AI request failed', detail: err.message });
   }
-});
+}
+
+// The live-answer path: Pro+, time left, and the clock actually running.
+router.post('/chat/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining, requireActiveSession, claudeChatHandler);
+
+// ── /chat/claude-train — Train Model's Claude calls ──────────────────
+// Same handler, different gate, and both differences are the point.
+//
+// requireTier(max, ultra) instead of Pro+: Train Model is sold as the Max
+// differentiator on every pricing surface (pricingService BASE_FEATURES_MAX,
+// TIERS.md §2, the bot's tier table), but the ONLY thing enforcing it was
+// FEATURE_GATES.trainModel — a render gate in the client. The work itself
+// went to /chat/claude at Pro+, so anyone past the client gate got the
+// $50→$89 upsell for free. Enforcement belongs on the server.
+//
+// NO requireActiveSession: this is pre-interview research — that is the
+// entire product ("Train Model — pre-research the role"). Sending it
+// through the live-answer gate meant a Max user who hadn't started their
+// session got a 428, which trainClaudeModel swallowed into the misleading
+// "Couldn't read resume — try again", and the only way to make it work was
+// to turn the mic on, which starts the interview clock they paid for.
+// Nothing is charged here either way: time burns via usage_sessions
+// heartbeats, and there is no session.
+//
+// requireTimeRemaining is KEPT — training is ~15 web_search calls on
+// Sonnet, so it stays behind a live, unexhausted pass. A Max buyer has
+// their full 3 hours on the clock before the interview starts, so this
+// never blocks the real use case; it only stops a spent pass from being
+// farmed for free Claude.
+router.post('/chat/claude-train', requireTier(...TRAIN_TIERS), requireTimeRemaining, claudeChatHandler);
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  STREAMING VARIANTS — Server-Sent Events, token by token
@@ -791,10 +1624,34 @@ function openSseStream(req, res) {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
-  // Per-request AbortController: hooked to the TCP `close` event so
-  // that a client disconnect immediately stops whatever we're reading
-  // from the upstream provider. Without this we'd keep for-await'ing
-  // tokens no one will ever see — and paying for them.
+  // ── THE DISCONNECT SIGNAL IS ON THE RESPONSE, NOT THE REQUEST ──
+  //
+  // Per-request AbortController, so a client disconnect immediately stops
+  // whatever we are reading from the upstream provider — otherwise we keep
+  // for-await'ing tokens no one will ever see, and paying for them.
+  //
+  // This was `req.on('close', onClose)`, and on Node 20 that event does not
+  // mean what it reads as. `IncomingMessage` emits 'close' when the REQUEST
+  // is complete — i.e. as soon as express.json() has consumed the body,
+  // measured at ~1ms into the handler — not when the peer goes away. Two
+  // consequences, both verified by experiment:
+  //
+  //   · In production the listener attached too LATE to hear it (the
+  //     awaiting rate limiter in index.js defers the route handler past the
+  //     tick in which 'close' fires), so the abort never ran at all. A
+  //     client that hung up after 1s still had all 20 upstream tokens
+  //     generated and billed. The protection this block describes did not
+  //     exist.
+  //   · Mount the same router with only synchronous middleware ahead of it
+  //     and the listener DOES hear it: controller.abort() fires at ~3ms,
+  //     `closed` goes true, every sse.send() becomes a no-op, the provider
+  //     call throws "Request was aborted", and sse.done() early-returns so
+  //     res.end() is never called — the response hangs until the client
+  //     times out. Streaming worked only by accident of middleware order.
+  //
+  // ServerResponse 'close' is the documented disconnect signal: it fires
+  // when the response finishes OR the connection is torn down early. On a
+  // normal finish `closed` is already true and this is a no-op.
   const controller = new AbortController();
   let closed = false;
   const onClose = () => {
@@ -802,7 +1659,7 @@ function openSseStream(req, res) {
     closed = true;
     try { controller.abort(); } catch {}
   };
-  req.on('close', onClose);
+  res.on('close', onClose);
 
   return {
     signal: controller.signal,
@@ -824,15 +1681,37 @@ function openSseStream(req, res) {
 }
 
 // ── Gemini (stream) ──
-router.post('/stream/gemini', geminiQuotaGate, requireTimeRemaining, async (req, res) => {
+router.post('/stream/gemini', geminiQuotaGate, requireTimeRemaining, requireActiveSession, async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Gemini not configured' });
 
   const sse = openSseStream(req, res);
   try {
     const { prompt, systemInstruction, fileParts } = req.body;
-    const fresh = await tryEnrich(prompt, req.headers['x-request-id']);
-    const enrichedSystem = prependFreshToSystem(systemInstruction, fresh?.context);
+    // See /chat/gemini: classify + retrieve on the raw live question;
+    // fresh context rides with the question so the system prompt stays
+    // byte-stable for Gemini's implicit prompt cache.
+    const question = extractCurrentQuestion(prompt);
+    const fresh = await tryEnrich(question, req.headers['x-request-id']);
+    let enrichedPrompt = appendFreshToPrompt(prompt, fresh?.context);
+    const deepQuestion = DEEP_CATEGORIES.has(classifyQuestion(question).category);
+
+    // ── Instant cover answer ──
+    // Gemini is the fastest model in the fleet on a shallow question
+    // (0.7-0.8s at MINIMAL) and the depth model correctly fires NO cover
+    // there — racing it would only slow the answer. But a deep question
+    // lifts it to thinkingLevel LOW, which measured 4.1s to first token,
+    // and that is a real silence. Same predictor, opposite answer,
+    // decided per question rather than per route.
+    {
+      const { buildCoverContinuation } = require('../services/coverAnswer');
+      const cover = await runCover({ sse, req, question, provider: 'gemini' });
+      // Gemini's request is a single prompt string, not a message array,
+      // so the continuation rides on the end of the prompt — same rule as
+      // fresh context: never the system instruction, whose byte-stability
+      // is what keeps the implicit prompt cache hot.
+      if (cover) enrichedPrompt = appendFreshToPrompt(enrichedPrompt, buildCoverContinuation(cover));
+    }
 
     const { GoogleGenAI } = require('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
@@ -841,14 +1720,19 @@ router.post('/stream/gemini', geminiQuotaGate, requireTimeRemaining, async (req,
     if (fileParts && fileParts.length > 0) {
       fileParts.forEach(fp => parts.push({ inlineData: { mimeType: fp.mimeType, data: fp.data } }));
     }
-    parts.push({ text: prompt });
+    parts.push({ text: enrichedPrompt });
 
+    const ttft = mainTtftReporter({ question, provider: 'gemini' });
+    ttft.issued();
     const stream = await ai.models.generateContentStream({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.6-flash',
       contents: [{ role: 'user', parts }],
       config: {
-        systemInstruction: enrichedSystem || '',
-        temperature: 0.7,
+        systemInstruction: systemInstruction || '',
+        // See /chat/gemini: sampling params deprecated on 3.x (omit);
+        // thinkingLevel depth-matched — LOW on deep shapes (≈2.3s total
+        // measured), MINIMAL floor otherwise.
+        thinkingConfig: { thinkingLevel: deepQuestion ? 'LOW' : 'MINIMAL' },
         abortSignal: sse.signal,
       }
     });
@@ -856,7 +1740,7 @@ router.post('/stream/gemini', geminiQuotaGate, requireTimeRemaining, async (req,
     for await (const event of stream) {
       if (sse.closed) break;
       const piece = event?.text;
-      if (piece) sse.send(piece);
+      if (piece) { ttft.firstToken(); sse.send(piece); }
     }
     sse.done();
   } catch (err) {
@@ -879,32 +1763,70 @@ router.post('/stream/gemini', geminiQuotaGate, requireTimeRemaining, async (req,
 // Max/Ultra users and admins can opt into anything beyond 'none'). See
 // the chat handler comment block above for full rationale on which
 // params are safe to pass.
-router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
+router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining, requireActiveSession, async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OpenAI not configured' });
 
   const sse = openSseStream(req, res);
   try {
     const { messages } = req.body;
-    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
-    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+    const question = extractCurrentQuestion(lastUserMessage(messages));
+    const fresh = await tryEnrich(question, req.headers['x-request-id']);
+    let enrichedMessages = appendFreshToMessages(messages, fresh?.context);
 
-    const reasoningEffort = resolveReasoningEffort(req);
+    const reasoningEffort = resolveReasoningEffort(req, question);
+
+    // ── Instant cover answer ──
+    // The main answer's first token can be seconds away (reasoning on a
+    // deep question, a user-picked low/medium/high, cold prefill) — dead
+    // air in a live interview. Stream a 12-30-word spoken opener from the
+    // fastest model first (~0.3-0.7s to first word, sub-cent cost), then
+    // hand the opener to the main model with a continuation instruction
+    // so its answer picks up exactly where the cover stops — one seamless
+    // answer, no repetition. The candidate speaks the cover (~10s aloud)
+    // while the continuation lands underneath it.
+    // Guard: never for Auto-Solve (its output is code typed into an
+    // editor; a spoken opener would corrupt it). Cover failure of any
+    // kind degrades to normal behavior — main answer only.
+    const sysTextEarly = extractSystemText(enrichedMessages);
+    // Cost guardrail: with KB retrieval the system prompt should stay small
+    // (~8-15K chars) even for a 100-file KB. If it ever balloons past this,
+    // retrieval failed and the whole KB is leaking into every turn — warn
+    // loudly, without logging on every normal request.
+    if (sysTextEarly.length > 60_000) {
+      console.warn(`[promptsize] LARGE system prompt: ${sysTextEarly.length} chars (~${Math.round(sysTextEarly.length / 4)} tok) — retrieval may have failed`);
+    }
+    // Fire the instant cover for EVERY substantive question (coverWorthy) —
+    // robust to classifier gaps, unlike the old reasoning/big-KB gate.
+    // Depth comes from the RESOLVED effort, not the requested one: a
+    // tier-gated user whose 'high' was downgraded to 'none' gets an
+    // answer in ~1.4s and does not need a 110-word holding answer.
+    {
+      const { buildCoverContinuation } = require('../services/coverAnswer');
+      const cover = await runCover({
+        sse, req, question, provider: 'openai', effort: reasoningEffort,
+      });
+      if (cover) enrichedMessages = appendTextToLastUserMessage(enrichedMessages, buildCoverContinuation(cover));
+    }
+
     const OpenAI = require('openai');
     const openai = new OpenAI({ apiKey });
 
     // Scale max_completion_tokens based on user custom instructions
     // embedded in the system prompt (STAR method / detailed / etc.).
-    // Base 16,000 already near gpt-5.5's hard cap of 16,384, so the
-    // scaling is mostly a no-op here — but the helper is still applied
-    // for symmetry with the other 3 stream providers and so future
-    // base bumps automatically respect the cap.
-    const sysText = extractSystemText(enrichedMessages);
-    const maxTokens = scaleTokensForInstructions(sysText, 16000, 16384);
+    // Base 16,000 with a 16,384 request cap — a deliberate output
+    // budget (gpt-5.6 itself allows up to 128K, but interview answers
+    // never need it and the cap bounds worst-case cost). Helper still
+    // applied for symmetry with the other 3 stream providers. Reuses the
+    // system text extracted for the big-context cover check above — the
+    // cover only appends to the last USER message, so it is unchanged.
+    const maxTokens = scaleTokensForInstructions(sysTextEarly, 16000, 16384);
 
+    const ttft = mainTtftReporter({ question, provider: 'openai', effort: reasoningEffort });
+    ttft.issued();
     const stream = await openai.chat.completions.create(
       {
-        model: 'gpt-5.5',
+        model: 'gpt-5.6',
         messages: enrichedMessages,
         max_completion_tokens: maxTokens,
         reasoning_effort: reasoningEffort,
@@ -916,7 +1838,7 @@ router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining
     for await (const chunk of stream) {
       if (sse.closed) break;
       const piece = chunk?.choices?.[0]?.delta?.content;
-      if (piece) sse.send(piece);
+      if (piece) { ttft.firstToken(); sse.send(piece); }
     }
     sse.done();
   } catch (err) {
@@ -934,15 +1856,31 @@ router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining
 });
 
 // ── xAI Grok (stream) ──
-router.post('/stream/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
+router.post('/stream/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, requireActiveSession, async (req, res) => {
   const apiKey = process.env.XAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'xAI not configured' });
 
   const sse = openSseStream(req, res);
   try {
     const { messages } = req.body;
-    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
-    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+    const question = extractCurrentQuestion(lastUserMessage(messages));
+    const fresh = await tryEnrich(question, req.headers['x-request-id']);
+    let enrichedMessages = appendFreshToMessages(messages, fresh?.context);
+
+    // ── Instant cover answer — THE ROUTE THAT NEEDED IT MOST ──
+    //
+    // grok-4.5 measured 17.9s / 19.8s / 32.0s to first token on a
+    // system-design question (1.8s on a behavioral one). This route had
+    // no cover, so a candidate asking Grok a hard question sat in total
+    // silence for up to half a minute with the app showing nothing.
+    // At that gap the depth model picks the HOLDING tier: 60-110 words,
+    // roughly 26-48 seconds of speech, which is the only thing that
+    // actually covers it.
+    {
+      const { buildCoverContinuation } = require('../services/coverAnswer');
+      const cover = await runCover({ sse, req, question, provider: 'xai' });
+      if (cover) enrichedMessages = appendTextToLastUserMessage(enrichedMessages, buildCoverContinuation(cover));
+    }
 
     const OpenAI = require('openai');
     const client = new OpenAI({ apiKey, baseURL: 'https://api.x.ai/v1' });
@@ -956,9 +1894,12 @@ router.post('/stream/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, a
     const sysText = extractSystemText(enrichedMessages);
     const maxTokens = scaleTokensForInstructions(sysText, 8000, 8000);
 
+    const ttft = mainTtftReporter({ question, provider: 'xai' });
+    ttft.issued();
     const stream = await client.chat.completions.create(
       {
-        model: 'grok-4.3',
+        // See /chat/xai: 'grok-4.5' with the dot — the dash form 404s.
+        model: 'grok-4.5',
         messages: enrichedMessages,
         max_tokens: maxTokens,
         temperature: 0.7,
@@ -970,7 +1911,7 @@ router.post('/stream/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, a
     for await (const chunk of stream) {
       if (sse.closed) break;
       const piece = chunk?.choices?.[0]?.delta?.content;
-      if (piece) sse.send(piece);
+      if (piece) { ttft.firstToken(); sse.send(piece); }
     }
     sse.done();
   } catch (err) {
@@ -990,44 +1931,59 @@ router.post('/stream/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, a
 // ── Groq (stream) ──
 // Same model upgrade as /chat/groq: Llama-4-Scout-17B → GPT-OSS-120B.
 // See chat handler comment for full rationale.
-router.post('/stream/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, async (req, res) => {
+router.post('/stream/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, requireActiveSession, async (req, res) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Groq not configured' });
 
   const sse = openSseStream(req, res);
   try {
     const { messages } = req.body;
-    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
-    const enrichedMessages = prependFreshToMessages(messages, fresh?.context);
+    const question = extractCurrentQuestion(lastUserMessage(messages));
+    const fresh = await tryEnrich(question, req.headers['x-request-id']);
+    let enrichedMessages = appendFreshToMessages(messages, fresh?.context);
+
+    // ── Instant cover answer ──
+    // gpt-oss-120b is a reasoning model, so its first token is seconds
+    // out on anything substantive. The cover runs on llama-3.3-70b, a
+    // DIFFERENT model with its own (larger) token bucket, so it is not
+    // competing with the answer for the budget below.
+    {
+      const { buildCoverContinuation } = require('../services/coverAnswer');
+      const cover = await runCover({ sse, req, question, provider: 'groq' });
+      if (cover) enrichedMessages = appendTextToLastUserMessage(enrichedMessages, buildCoverContinuation(cover));
+    }
 
     const Groq = require('groq-sdk');
     const groq = new Groq({ apiKey });
 
-    // Groq base 8,000 with hard cap 8,192 — scaling is mostly a no-op
-    // here (already near cap) but helper is applied for symmetry with
-    // the other providers; long-form custom instructions push to 8,192.
     const sysText = extractSystemText(enrichedMessages);
-    const maxTokens = scaleTokensForInstructions(sysText, 8000, 8192);
+    const maxTokens = scaleTokensForInstructions(sysText, GROQ_BASE_MAX_TOKENS, GROQ_CAP_MAX_TOKENS);
 
-    const stream = await groq.chat.completions.create(
-      {
-        model: 'openai/gpt-oss-120b',
-        max_tokens: maxTokens,
-        messages: enrichedMessages,
-        temperature: 0.7,
-        stream: true,
-      },
-      { signal: sse.signal }
-    );
+    const ttft = mainTtftReporter({ question, provider: 'groq' });
+    ttft.issued();
+    const stream = await callGroqWithinTpm(groq, {
+      model: 'openai/gpt-oss-120b',
+      max_tokens: maxTokens,
+      messages: enrichedMessages,
+      temperature: 0.7,
+      stream: true,
+    }, { signal: sse.signal });
 
     for await (const chunk of stream) {
       if (sse.closed) break;
       const piece = chunk?.choices?.[0]?.delta?.content;
-      if (piece) sse.send(piece);
+      if (piece) { ttft.firstToken(); sse.send(piece); }
     }
     sse.done();
   } catch (err) {
     if (err?.name === 'AbortError' || sse.closed) { sse.done(); return; }
+    const tpm = describeGroqTpmFailure(err);
+    if (tpm) {
+      console.error(`[groq] ${tpm.log}`);
+      sse.error(tpm.userMessage);
+      sse.done();
+      return;
+    }
     if (is429(err)) {
       console.warn('[groq] upstream 429 (stream):', err.message);
       sse.error('Groq rate-limited — give it a few seconds and try again.');
@@ -1040,7 +1996,7 @@ router.post('/stream/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, 
   }
 });
 
-// ── Claude (stream) — Sonnet 4.6 with web_search ──
+// ── Claude (stream) — Sonnet 5 with web_search ──
 // Anthropic's `messages.stream(...)` returns a MessageStream helper with
 // a `.on('text', cb)` event that fires for every text delta, hiding the
 // raw content_block_delta filtering. Web-search activity (server_tool_use,
@@ -1048,15 +2004,46 @@ router.post('/stream/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, 
 // out by the helper, so the candidate sees only the final answer text.
 // Web search runs server-side on Anthropic's infra during a single API
 // call — no extra round-trip on our end.
-router.post('/stream/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining, async (req, res) => {
+router.post('/stream/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining, requireActiveSession, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) return res.status(503).json({ error: 'Claude not configured' });
 
   const sse = openSseStream(req, res);
   try {
     const { messages, systemInstruction, enableWebSearch } = req.body;
-    const fresh = await tryEnrich(lastUserMessage(messages), req.headers['x-request-id']);
-    const enrichedSystem = prependFreshToSystem(systemInstruction, fresh?.context);
+    const question = extractCurrentQuestion(lastUserMessage(messages));
+    const fresh = await tryEnrich(question, req.headers['x-request-id']);
+    // See /chat/claude: keep the cache_control'd system block byte-stable;
+    // fresh context rides with the question.
+    let enrichedMessages = appendFreshToMessages(messages, fresh?.context);
+
+    // ── Instant cover answer ──
+    // Same engine as /stream/openai — fire for EVERY substantive question
+    // (coverWorthy; classifier-independent). Claude's first token can lag
+    // 2-5s when web_search fires mid-answer, so the opener matters even
+    // more here. The cover text is handed to Claude with a continuation
+    // instruction so the answer picks up seamlessly where it stops.
+    // Sonnet 5 itself reaches first token in ~1.2s, so most questions here
+    // get a short opener or none. But when web_search fires the first
+    // token waits on a live search round-trip — that is where a Claude
+    // question turns into a long silence, so the plan accounts for it.
+    {
+      const { buildCoverContinuation } = require('../services/coverAnswer');
+      const cover = await runCover({
+        sse, req, question, provider: 'claude', effort: 'low',
+        // "Will this question probably send Claude to the web?", not
+        // "is the tool switched on?" — the tool is on for every request,
+        // so the raw flag would predict a 9-second silence for "tell me
+        // about a time you disagreed with your manager". needsLiveFacts
+        // is the same deterministic classifier that decides whether to
+        // spend a Brave query: a named tool AND a question shape that
+        // depends on current specifics, or an explicit update signal.
+        // ~1ms of regex, and it is already the app's answer to exactly
+        // this question.
+        webSearch: enableWebSearch !== false && needsLiveFacts(question),
+      });
+      if (cover) enrichedMessages = appendTextToLastUserMessage(enrichedMessages, buildCoverContinuation(cover));
+    }
 
     const client = new Anthropic({ apiKey });
 
@@ -1065,23 +2052,28 @@ router.post('/stream/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining
       tools.push({ type: 'web_search_20260209', name: 'web_search', max_uses: 3 });
     }
 
-    const system = enrichedSystem
-      ? [{ type: 'text', text: enrichedSystem, cache_control: { type: 'ephemeral' } }]
+    const system = systemInstruction
+      ? [{ type: 'text', text: systemInstruction, cache_control: { type: 'ephemeral' } }]
       : undefined;
 
-    // Claude Sonnet 4.6 supports up to 64,000 max_tokens. Base 16,000
+    // Claude Sonnet 5 supports up to 64,000 max_tokens. Base 16,000
     // is fine for most answers; long-form custom instructions (STAR
     // method, comprehensive deep-dives) scale up to 32,000+ here.
     // The systemInstruction is the cached static block, so the user's
     // custom instructions (prepended to it client-side) get cached
     // along with it — repeat calls read at 10% input cost.
-    const maxTokens = scaleTokensForInstructions(enrichedSystem || '', 16000, 64000);
+    const maxTokens = scaleTokensForInstructions(systemInstruction || '', 16000, 64000);
 
+    const ttft = mainTtftReporter({
+      question, provider: 'claude', effort: 'low',
+      webSearch: enableWebSearch !== false && needsLiveFacts(question),
+    });
+    ttft.issued();
     const stream = client.messages.stream({
       model: 'claude-sonnet-5',
       max_tokens: maxTokens,
       system,
-      messages,
+      messages: enrichedMessages,
       tools: tools.length ? tools : undefined,
       // See /chat/claude: pin effort low for latency, omit temperature (Sonnet 5
       // rejects sampling params).
@@ -1090,7 +2082,7 @@ router.post('/stream/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining
 
     stream.on('text', (textDelta) => {
       if (sse.closed) return;
-      if (textDelta) sse.send(textDelta);
+      if (textDelta) { ttft.firstToken(); sse.send(textDelta); }
     });
 
     // .done() resolves when the stream completes (or rejects on error).
@@ -1132,14 +2124,14 @@ router.post('/stream/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining
 // Cost: ~$0.005 per call. Latency target: ~500-800ms. Used only for
 // Auto-Type, only on Max-tier (Auto-Type is gated to Max anyway).
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  /autotype-agent — Sonnet 4.6 with tool-use (the "god-level" path)
+//  /autotype-agent — Sonnet 5 with tool-use (the "god-level" path)
 //  Replaces the v1 Haiku one-shot at /autotype-plan. Sonnet's chain-
 //  of-thought + tool_use guarantees richer plans for the hard cases
 //  (HackerRank templates, mid-file insertions, partial signatures).
 //  Caller uses this when deterministic UIA confidence < 0.85.
 //  Cost: ~$0.013/call. Max-tier only.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Two-tier planner: Sonnet 4.6 (primary) → Groq Llama-3.3-70B (fallback).
+// Two-tier planner: Sonnet 5 (primary) → Groq Llama-3.3-70B (fallback).
 // Both are AI agents with forced tool_choice, but they run on different
 // vendors so an Anthropic outage doesn't sink Tier 2 entirely. The caller
 // (electron/main.cjs) treats the response as opaque — `planner_used` in
@@ -1169,7 +2161,7 @@ router.post('/autotype-agent', requireTier(...ULTRA_ONLY), async (req, res) => {
     requestId,
   };
 
-  // ── Primary: Sonnet 4.6 ──
+  // ── Primary: Sonnet 5 ──
   // Skipped entirely if ANTHROPIC_API_KEY isn't set (Groq-only deploy).
   let sonnetErr = null;
   if (anthropicKey) {
@@ -1230,7 +2222,7 @@ router.post('/autotype-agent', requireTier(...ULTRA_ONLY), async (req, res) => {
 // Vision-grounded planner. Used when Windows UIA is blind to the target
 // editor (browser-hosted Monaco/CodeMirror — HackerRank, CoderPad,
 // CodeSignal). The caller sends a SCREENSHOT of the editor instead of a
-// text dump; Sonnet 4.6 reads the pixels, locates the caret, and returns
+// text dump; Sonnet 5 reads the pixels, locates the caret, and returns
 // the same plan shape the typing engine already consumes (plus the
 // `move_relative` / `lines_delta` fields for invisible counted-arrow
 // cursor repositioning). Falls through (caller's responsibility) to the
@@ -1278,6 +2270,16 @@ router.post('/autotype-vision', requireTier(...ULTRA_ONLY), async (req, res) => 
   }
 });
 
+// ⚠️ LOAD-BEARING ORDER — requireTier MUST stay ahead of the body checks.
+// The desktop app uses this route as its Auto-Type entitlement probe: it
+// POSTs deliberately WITHOUT `code`, so requireTier runs, the 400 below
+// fires, and main.cjs reads "400 ⇒ this account is Ultra" without spending
+// a Haiku call. Auto-Type is otherwise gated only by localStorage, which
+// the user can edit — this probe is the real gate.
+// So: a 400 from this route is an ENTITLEMENT ASSERTION, not just input
+// validation. Inserting any body-validating middleware AHEAD of requireTier
+// would make an unentitled account 400 too, and that is a paid-feature
+// bypass, not a cosmetic bug. See electron/main.cjs autoTypeVerifyEntitlement.
 router.post('/autotype-plan', requireTier(...ULTRA_ONLY), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) {
@@ -1595,6 +2597,29 @@ router.post('/deepgram-key', deepgramKeyHandler);
 
 module.exports = router;
 
+// ── WHAT THIS BUILD ACTUALLY SENDS TO EACH PROVIDER ──
+//
+// Read by /api/health so "which models are you serving?" is answerable with
+// one unauthenticated request instead of by reading a commit and trusting a
+// deployment record. It exists because the model name shown in the app is a
+// hardcoded CLIENT label (App.tsx MODEL_REGISTRY) that only changes with an
+// app release — so the UI can honestly say "GPT-5.5" while the server has
+// been calling gpt-5.6 for hours, and there was no way to tell which was
+// true from outside.
+//
+// ⚠️ These must be the SAME string literals the route handlers pass as
+// `model:`. A hand-maintained copy would drift and this would then lie
+// with confidence, which is worse than saying nothing — so
+// test/health-reports-real-models.test.js parses the handlers and fails if
+// this list and the `model:` literals in this file ever disagree.
+module.exports.servingModels = {
+  openai: 'gpt-5.6',
+  xai: 'grok-4.5',
+  gemini: 'gemini-3.6-flash',
+  groq: 'openai/gpt-oss-120b',
+  claude: 'claude-sonnet-5',
+};
+
 // ── Test surface (Vitest only) ──
 // Exposes the exact gate middlewares + tier lists the model routes are
 // wired with, so test/free-trial-gate-chain.test.js can prove the full
@@ -1604,8 +2629,31 @@ module.exports = router;
 // extra properties on the router function are invisible to app.use().
 module.exports._test = {
   requireTimeRemaining,
+  // The session gate, so its backward-compatibility contract can be tested
+  // by CALLING it rather than by grepping this file for an implementation
+  // shape. An earlier version of that test asserted the regex of an inline
+  // version check and broke the moment the check moved into shared
+  // middleware — while the behaviour was byte-for-byte identical. A test
+  // that fails on a refactor it should not notice trains people to edit the
+  // test, which is how a real regression eventually gets waved through.
+  requireActiveSession,
   geminiQuotaGate,
   resolveReasoningEffort,
+  extractCurrentQuestion,
+  lastUserMessage,
+  appendFreshToPrompt,
+  appendFreshToMessages,
+  appendTextToLastUserMessage,
+  AUTO_EFFORT_BY_CATEGORY,
+  DEEP_CATEGORIES,
+  coverWorthy,
+  // Groq's TPM accounting — the arithmetic that made every interview
+  // request on gpt-oss-120b impossible. Exported so the fix is pinned.
+  parseGroqTpm,
+  callGroqWithinTpm,
+  describeGroqTpmFailure,
+  GROQ_BASE_MAX_TOKENS,
+  GROQ_CAP_MAX_TOKENS,
   TRIAL_MODELS,
   PAID,
   CLAUDE_TIERS,

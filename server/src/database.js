@@ -9,7 +9,7 @@ const crypto = require('crypto');
 
 // ── Free-tier trial policy (2026-07) ──
 // The free "Starter" tier is a ONE-TIME 10-minute trial. During it the
-// user can use every model EXCEPT Claude (Gemini, GPT-5.5, Grok, Groq);
+// user can use every model EXCEPT Claude (Gemini, GPT-5.6, Grok, Groq);
 // once it's exhausted NOTHING is free — the paywall owns the account
 // until they buy a plan. Enforced at the AI routes via resolveTimeBucket
 // (see routes/ai.js requireTimeRemaining).
@@ -22,13 +22,41 @@ function getDB() {
 
   const dbPath = process.env.DATABASE_PATH || path.join(__dirname, '..', 'data', 'minicaai.db');
 
+  // ── Which deploys are the durability guards below binding on? ──
+  // Both of them used to hang off NODE_ENV === 'production' and nothing
+  // else, so the single likeliest operator mistake — shipping a container
+  // whose NODE_ENV was never set — was also the one thing that switched
+  // OFF every check written to catch it. The service boots clean, SQLite
+  // lands on the container's ephemeral layer, and every user, license and
+  // payment is gone at the next redeploy, in silence: precisely the
+  // outcome these guards exist to make impossible.
+  //
+  // The platform injects its own variables whether or not NODE_ENV was
+  // remembered, so "is this a real deployment" is answered from the
+  // storage/deploy topology (a mounted volume, a Railway project/service/
+  // deployment id) as well as from NODE_ENV. Anything that looks hosted is
+  // held to the production rules; a plain local `node src/index.js` sees
+  // none of this and is unaffected.
+  const volumeMount = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+  const hostedDeploy = !!(
+    volumeMount
+    || process.env.RAILWAY_ENVIRONMENT
+    || process.env.RAILWAY_ENVIRONMENT_NAME
+    || process.env.RAILWAY_PROJECT_ID
+    || process.env.RAILWAY_SERVICE_ID
+    || process.env.RAILWAY_DEPLOYMENT_ID
+    || process.env.RAILWAY_REPLICA_ID
+    || process.env.RAILWAY_PUBLIC_DOMAIN
+  );
+  const isProductionLike = process.env.NODE_ENV === 'production' || hostedDeploy;
+
   // Production: refuse to boot if DATABASE_PATH is unset. Previously this
   // was a console.warn that scrolled past in deploy logs — any deploy that
   // forgot to attach a Railway Volume would silently write to the
   // container's ephemeral filesystem, and every user/license/payment row
   // would be lost on the next restart. Fail-closed at boot is the only
   // way to make this misconfiguration impossible to ship by accident.
-  if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_PATH) {
+  if (isProductionLike && !process.env.DATABASE_PATH) {
     console.error('━'.repeat(70));
     console.error('✖  FATAL: DATABASE_PATH is not set in production.');
     console.error('   SQLite would write to the ephemeral container filesystem,');
@@ -38,7 +66,59 @@ function getDB() {
     console.error('━'.repeat(70));
     process.exit(1);
   }
-  console.log(`[db] Using SQLite at: ${dbPath}`);
+
+  // ── The same misconfiguration, one step further along ──
+  // The check above only asks whether DATABASE_PATH is SET. It can be set
+  // and still point somewhere ephemeral — DATABASE_PATH=/app/data/db.sqlite
+  // passes it cleanly and then loses every user, license and payment on the
+  // next redeploy, which is the exact outcome that guard exists to prevent.
+  //
+  // Railway publishes the mount point as RAILWAY_VOLUME_MOUNT_PATH (docs:
+  // reference/variables), so when a volume IS attached we can check the
+  // database actually lives on it rather than merely hoping.
+  //
+  // There is a second thing riding on this. Railway's volume docs state
+  // "Replicas cannot be used with volumes" — so the attached volume is
+  // ALSO what makes this service single-instance, which it needs to be:
+  // the six background sweeps in index.js, the WebSocket registries in
+  // services/remoteChannel.js, and the in-memory rate limiters all assume
+  // one process. That protection is incidental. Detach the volume and the
+  // platform will happily run replicas, and those three subsystems break
+  // quietly rather than loudly. See docs/private/RUNBOOK.md § 18.
+  if (isProductionLike) {
+    if (volumeMount) {
+      const resolvedDb = path.resolve(dbPath);
+      const resolvedMount = path.resolve(volumeMount);
+      const onVolume = resolvedDb === resolvedMount
+        || resolvedDb.startsWith(resolvedMount.endsWith(path.sep) ? resolvedMount : resolvedMount + path.sep);
+      if (!onVolume) {
+        console.error('━'.repeat(70));
+        console.error('✖  FATAL: DATABASE_PATH is not on the attached Railway Volume.');
+        console.error(`   DATABASE_PATH             = ${resolvedDb}`);
+        console.error(`   RAILWAY_VOLUME_MOUNT_PATH = ${resolvedMount}`);
+        console.error('   SQLite would write to the ephemeral container filesystem,');
+        console.error('   losing all users/licenses/payments on the next restart.');
+        console.error(`   Fix: set DATABASE_PATH to a file under ${resolvedMount}`);
+        console.error('   Refusing to start. See server/src/database.js for context.');
+        console.error('━'.repeat(70));
+        process.exit(1);
+      }
+    } else {
+      // No volume. Not fatal on its own — the deploy may legitimately not be
+      // on Railway — but both invariants above are now unenforced, so say so
+      // loudly rather than letting it pass in silence.
+      console.warn('━'.repeat(70));
+      console.warn('⚠  No RAILWAY_VOLUME_MOUNT_PATH in production.');
+      console.warn('   If this IS Railway, no volume is attached, which means:');
+      console.warn('     · the database is on ephemeral storage and dies on redeploy');
+      console.warn('     · nothing stops the service being scaled to >1 replica, which');
+      console.warn('       breaks the background sweeps, device mirroring and rate limits');
+      console.warn('   See docs/private/RUNBOOK.md § 18.');
+      console.warn('━'.repeat(70));
+    }
+  }
+
+  console.log(`[db] Using SQLite at: ${dbPath}${volumeMount ? ' (on volume)' : ''}`);
 
   // Ensure data directory exists
   const fs = require('fs');
@@ -257,6 +337,10 @@ function getDB() {
 
     CREATE TABLE IF NOT EXISTS support_agent_presence (
       agent_email TEXT PRIMARY KEY,
+      -- INTENT, not liveness. Only ever changed deliberately (POST
+      -- /inbox/presence); disconnecting does NOT set it to 'offline',
+      -- because closing the inbox is exactly when the phone should ring.
+      -- 'offline' is the mute switch. Liveness is last_heartbeat_at.
       status TEXT NOT NULL DEFAULT 'offline',    -- online / away / offline
       last_heartbeat_at INTEGER NOT NULL,
       notification_prefs TEXT,                   -- JSON: { desktop, slack, ntfy, email_after_min }
@@ -591,6 +675,21 @@ function getDB() {
     `).run(Date.now());
   }
 
+  // Escalation rows recorded only THAT they were processed, never what
+  // happened. The worker marks fired_at unconditionally — deliberately, so
+  // a permanently-failing channel can't spin in a retry loop — but with no
+  // outcome recorded, a delivered push and a silently-skipped one look
+  // identical afterwards. On the live database all 13 ntfy rows read
+  // "fired" while zero agents were reachable, so the notification gap was
+  // invisible in the data that existed to surveil it.
+  const escalationCols = db.prepare("PRAGMA table_info(support_escalation_queue)").all();
+  if (escalationCols.length && !escalationCols.find(c => c.name === 'outcome')) {
+    // 'sent' | 'skipped:<reason>' | 'failed:<reason>'. Nullable: rows
+    // written before this column existed keep NULL, which reads honestly
+    // as "we don't know".
+    db.exec('ALTER TABLE support_escalation_queue ADD COLUMN outcome TEXT');
+  }
+
   return db;
 }
 
@@ -906,6 +1005,58 @@ function updateLicenseStatus(licenseKey, status) {
 // devices. Callers that don't care about credits (e.g. the cancel-razorpay
 // path that just pins expires_at) can omit them and the existing values
 // stay in place via COALESCE on the UPDATE side.
+// Guarantees the user has a license row, creating a placeholder if not, and
+// returns it (null only if the user itself doesn't exist).
+//
+// Why this exists: every license mutation in the admin surface is a bare
+// `UPDATE licenses ... WHERE user_id = ?`. On a user with no license row that
+// affects zero rows and reports nothing, so `POST /users/change-tier` answered
+// `{ success: true, tier: 'ultra' }` after writing ONLY `users.tier` — the
+// operator saw a green toast and an ULTRA badge while the customer still had
+// no license and stayed gated out of the product. `recordCompPayment` was
+// worse: it inserted the comp payment row, updated users.tier, then returned
+// null, and the route's audit write dereferenced it into a 500 — a partial
+// write reported as a server error.
+//
+// Every signup path in routes/auth.js does create a license, so this is a
+// repair path for odd/legacy accounts rather than the common case. It is
+// deliberately conservative: if a license already exists it is returned
+// untouched, so this can never clobber real license state.
+function ensureLicenseForUser(userId) {
+  const d = getDB();
+  const existing = d.prepare('SELECT * FROM licenses WHERE user_id = ?').get(userId);
+  if (existing) return existing;
+
+  const user = d.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user) return null;
+
+  // Same key shape as signup (routes/auth.js): MNC-<8 hex>-<base36 time>.
+  const now = Date.now();
+  const rand = Math.abs(hashToInt(`${userId}:${now}`)).toString(16).toUpperCase().padStart(8, '0').slice(0, 8);
+  const key = `MNC-${rand}-${now.toString(36).toUpperCase()}`;
+  // Created in the caller's PRE-grant shape: a free/trial placeholder. The
+  // caller immediately overwrites tier/status/expiry with the grant it is
+  // applying, so these values are never what the user ends up on.
+  return createLicense({
+    key,
+    user_id: userId,
+    email: user.email,
+    tier: 'free',
+    status: 'trial',
+    country_code: user.country_code || 'US',
+    expires_at: now + 30 * DAY_MS_CONST,
+    sessions_limit: 5,
+  });
+}
+
+// Small deterministic hash — avoids pulling uuid into database.js just to
+// mint a placeholder license key.
+function hashToInt(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+  return h;
+}
+
 function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_limit, credits_remaining_seconds, credits_expire_at }) {
   // Status validation — refuse to persist an unknown status. Without this
   // a typo at a call site (e.g. 'cancling' or 'past-due') would silently
@@ -961,12 +1112,23 @@ function transitionLicenseToFree(userId, opts = {}) {
   const FREE_SESSIONS_LIMIT = 5;
   const FREE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
   const now = Date.now();
+  // Clear the PAID credit bucket on the way down. A canceled Ultra carries
+  // credits_remaining_seconds = -1 — the UNLIMITED sentinel — and leaving
+  // it on a free row is a landmine: resolveTimeBucket only consults credits
+  // for basic/pro/max today, so it is inert *only for as long as every
+  // future reader remembers to check the tier first. One that doesn't
+  // reads a churned subscriber as unlimited. The free tier draws from the
+  // trial bucket (untouched here), and any later purchase re-seeds credits
+  // from grantConfigForTier, so zeroing costs the user nothing.
   d.prepare(`
     UPDATE licenses
     SET tier = 'free',
         status = 'active',
         expires_at = ?,
-        sessions_limit = ?
+        sessions_limit = ?,
+        credits_remaining_seconds = 0,
+        credits_expire_at = 0,
+        credits_granted_seconds = 0
     WHERE user_id = ?
   `).run(now + FREE_PERIOD_MS, FREE_SESSIONS_LIMIT, userId);
 
@@ -981,6 +1143,73 @@ function transitionLicenseToFree(userId, opts = {}) {
     from: { tier: cur.tier, status: cur.status },
     reason: opts.reason || 'cycle-end',
   };
+}
+
+// Heal a row that is ALREADY tier='free' but was left in status='expired'
+// by a terminal cancellation webhook (customer.subscription.deleted,
+// subscription.updated→canceled/unpaid, Razorpay cancelled/halted/
+// completed — all of them write that exact pair).
+//
+// Why this is separate from transitionLicenseToFree: that function's
+// once-only `transitioned` flag is what gates the "your access has ended"
+// email, and it deliberately no-ops on a row that is already free. Making
+// it act here would either fire a second goodbye email for a cancellation
+// the user was already told about, or force every caller to special-case
+// the flag. No entitlement changes hands in this path — the tier was free
+// before and after — so it stays a plain status/window normalize.
+//
+// Idempotent: only touches rows that match, returns whether it did.
+function normalizeFreeLicenseRow(userId) {
+  const d = getDB();
+  const FREE_SESSIONS_LIMIT = 5;
+  const FREE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  // Same credit-bucket clear as transitionLicenseToFree, and for the same
+  // reason: the terminal webhooks set tier='free' but leave a canceled
+  // Ultra's -1 unlimited sentinel sitting in credits_remaining_seconds.
+  const info = d.prepare(`
+    UPDATE licenses
+    SET status = 'active', expires_at = ?, sessions_limit = ?,
+        credits_remaining_seconds = 0, credits_expire_at = 0, credits_granted_seconds = 0
+    WHERE user_id = ? AND tier = 'free' AND status = 'expired'
+  `).run(now + FREE_PERIOD_MS, FREE_SESSIONS_LIMIT, userId);
+  return info.changes > 0;
+}
+
+// Give a 'canceling' license a real cycle-end date when it has none.
+//
+// Only ever fires on rows written before the cancel paths started routing
+// through subscriptionStates.resolveCancelPeriodEnd — a canceled Ultra
+// pinned at expires_at = -1, which no sweeper and no gate can ever
+// terminate (they all read a non-positive value as "never expires"). The
+// +31-day bound is a strict upper bound on a monthly cycle, so this can
+// only ever END a subscription that was already canceled at the provider,
+// never shorten one the customer is still paying for.
+//
+// Deliberately narrow: status must be 'canceling' AND expires_at must be
+// non-positive. Comp/lifetime grants are written status='active' and are
+// therefore untouchable here.
+function repairCancelWindow(userId) {
+  const { CANCEL_FALLBACK_WINDOW_MS } = require('./services/subscriptionStates');
+  const info = getDB().prepare(`
+    UPDATE licenses SET expires_at = ?
+    WHERE user_id = ? AND status = 'canceling' AND (expires_at IS NULL OR expires_at <= 0)
+  `).run(Date.now() + CANCEL_FALLBACK_WINDOW_MS, userId);
+  return info.changes > 0;
+}
+
+// Server-side counterpart of repairCancelWindow: the /validate repair only
+// fires when the user's app checks in, and a churned subscriber is exactly
+// the person who never opens it again. The cycle-end sweeper calls this so
+// the fleet self-heals whether or not anyone signs in. Returns the number
+// of rows repaired (0 on a healthy database, which is the steady state).
+function repairAllCancelWindows() {
+  const { CANCEL_FALLBACK_WINDOW_MS } = require('./services/subscriptionStates');
+  const info = getDB().prepare(`
+    UPDATE licenses SET expires_at = ?
+    WHERE status = 'canceling' AND (expires_at IS NULL OR expires_at <= 0)
+  `).run(Date.now() + CANCEL_FALLBACK_WINDOW_MS);
+  return info.changes;
 }
 
 // Returns user IDs whose licenses are 'canceling' AND past their
@@ -1130,10 +1359,35 @@ function setConfig(key, value) {
 //  CONVERSATION OPERATIONS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
 
+// DEFENSIVE, not a fix for anything observed. Read this before "cleaning
+// it up" back to a bare INSERT.
+//
+// The conversation `id` is chosen by the CLIENT (it mirrors the local
+// sqlite session id) and message sync is fire-and-forget, so the first
+// messages of a new conversation hit /sync at the same time. That LOOKS
+// like a check-then-insert race in routes/conversations.js. It is not one
+// today: better-sqlite3 is synchronous and that handler has no `await`
+// between getConversationById and createConversation, so the sequence is
+// atomic with respect to the event loop, and the server runs as a single
+// process (no cluster, no workers). Verified empirically — firing 7
+// concurrent first-messages across 7 fresh conversations against a live
+// server produced 49/49 stored and zero 5xx on the bare-INSERT version.
+//
+// It is one word of insurance against the day that stops being true: an
+// `await` introduced anywhere between the check and the create, or a
+// second process sharing the DB, turns the loser of that race into a
+// SQLITE_CONSTRAINT_PRIMARYKEY -> 500 -> a message silently missing from
+// the mirror. INSERT OR IGNORE makes the create idempotent instead.
+//
+// The real cost of that idempotency is that the SELECT below returns
+// whichever row already existed, which may belong to a DIFFERENT user —
+// ids are guessable timestamps. Every caller MUST re-check `user_id`
+// against the requester before using or echoing the row. Both callers in
+// routes/conversations.js now do.
 function createConversation({ id, user_id, name }) {
   const d = getDB();
   const now = Date.now();
-  d.prepare('INSERT INTO conversations (id, user_id, name, created_at, updated_at, is_active) VALUES (?, ?, ?, ?, ?, 1)')
+  d.prepare('INSERT OR IGNORE INTO conversations (id, user_id, name, created_at, updated_at, is_active) VALUES (?, ?, ?, ?, ?, 1)')
     .run(id, user_id, name, now, now);
   return d.prepare('SELECT * FROM conversations WHERE id = ?').get(id);
 }
@@ -1185,9 +1439,36 @@ function deleteConversation(id) {
 //  CONVERSATION MESSAGE OPS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━
 
+// Message ids are CLIENT-chosen (the renderer sends Date.now().toString())
+// and the table's primary key is that id alone, globally — so INSERT OR
+// REPLACE handed any authenticated caller a write primitive over any other
+// account's stored message: same id, and REPLACE deleted the owner's row
+// and inserted the caller's content, conversation_id and user_id in its
+// place. Two people typing in the same millisecond collided by accident;
+// anyone could do it deliberately, and the admin Conversations tab reads
+// exactly these rows.
+//
+// The upsert below makes the effective key (id, user_id) without touching
+// the schema: a conflicting row is only ever updated when it already
+// belongs to the same user, and the WHERE on DO UPDATE turns a foreign row
+// into a silent no-op rather than an error or an overwrite. Re-syncing
+// your own message still updates in place (the mirror stays idempotent),
+// and user_id is never among the updated columns, so ownership cannot
+// move.
+const UPSERT_CONVERSATION_MESSAGE = `
+  INSERT INTO conversation_messages (id, conversation_id, user_id, role, content, timestamp)
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(id) DO UPDATE SET
+    conversation_id = excluded.conversation_id,
+    role            = excluded.role,
+    content         = excluded.content,
+    timestamp       = excluded.timestamp
+  WHERE conversation_messages.user_id = excluded.user_id
+`;
+
 function addConversationMessage({ id, conversation_id, user_id, role, content, timestamp }) {
   const d = getDB();
-  d.prepare('INSERT OR REPLACE INTO conversation_messages (id, conversation_id, user_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)')
+  d.prepare(UPSERT_CONVERSATION_MESSAGE)
     .run(id, conversation_id, user_id, role, content, timestamp);
   // Touch conversation updated_at
   d.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?').run(Date.now(), conversation_id);
@@ -1195,7 +1476,7 @@ function addConversationMessage({ id, conversation_id, user_id, role, content, t
 
 function addConversationMessages(messages) {
   const d = getDB();
-  const insert = d.prepare('INSERT OR REPLACE INTO conversation_messages (id, conversation_id, user_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)');
+  const insert = d.prepare(UPSERT_CONVERSATION_MESSAGE);
   const insertMany = d.transaction((msgs) => {
     for (const m of msgs) {
       insert.run(m.id, m.conversation_id, m.user_id, m.role, m.content, m.timestamp);
@@ -1289,10 +1570,46 @@ function getAllPayments(limit = 100) {
 function getPaymentStats() {
   const d = getDB();
   const monthAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+
+  // Per-currency breakdowns. `amount` is stored in the provider's SMALLEST
+  // unit (USD cents, INR paise), so the flat cross-currency SUMs below are
+  // meaningless as money — 12900 USD-cents and 99900 INR-paise added
+  // together is not a number in any currency. The admin Command Center used
+  // to render `revenue_this_month` directly with a `$` prefix and no divide,
+  // which turned a single $129 sale into "$12,900" and then added ₹ paise on
+  // top of it. Keep the flat fields (older clients read them) but ship the
+  // per-currency maps that the dashboard actually renders.
+  // Only currencies that actually carry money. A $0 admin-comp row is a
+  // 'completed' USD payment, so without this the map gained a `USD: 0` key
+  // and the dashboard would show a currency line worth nothing.
+  const byCurrency = (rows) => {
+    const out = {};
+    for (const r of rows) {
+      if (!r.total) continue;
+      out[(r.currency || 'USD').toUpperCase()] = r.total;
+    }
+    return out;
+  };
+  const monthRows = d.prepare(`
+    SELECT COALESCE(currency, 'USD') as currency, COALESCE(SUM(amount), 0) as total
+    FROM payments WHERE status = 'completed' AND created_at > ?
+    GROUP BY COALESCE(currency, 'USD')
+  `).all(monthAgo);
+  const allRows = d.prepare(`
+    SELECT COALESCE(currency, 'USD') as currency, COALESCE(SUM(amount), 0) as total
+    FROM payments WHERE status = 'completed'
+    GROUP BY COALESCE(currency, 'USD')
+  `).all();
+
   return {
     total_payments: d.prepare('SELECT COUNT(*) as c FROM payments WHERE status = ?').get('completed').c,
+    // Legacy flat totals — cross-currency minor-unit sums. Do NOT format
+    // these as money; use the *_by_currency maps instead.
     revenue_this_month: d.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'completed' AND created_at > ?").get(monthAgo).total,
     total_revenue: d.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'completed'").get().total,
+    // { USD: 12900, INR: 1299900 } — minor units, keyed by ISO 4217.
+    revenue_this_month_by_currency: byCurrency(monthRows),
+    total_revenue_by_currency: byCurrency(allRows),
   };
 }
 
@@ -1473,6 +1790,87 @@ function hasRefundBeenRecorded(provider, providerRefundId) {
       AND metadata LIKE ? ESCAPE '\\'
     LIMIT 1
   `).get(provider, needle);
+  return !!row;
+}
+
+// ── Ledger-based user resolution (webhook fallback) ────────────────────
+// Stripe webhooks used to map events to users ONLY by
+// `users.stripe_customer_id = event.customer`. That column holds exactly
+// ONE id, and it gets overwritten: by the Razorpay grant paths (which
+// stamp `rzp_…` over a live `cus_…`), and historically by every checkout
+// creating a fresh customer before the reuse fix landed. So a refund or
+// chargeback on a payment made under an EARLIER customer id resolved to
+// no user at all — the handler logged "for unknown customer" and
+// returned, meaning the money went back and the paid tier stayed. Same
+// silent no-op revoked nothing on a chargeback.
+//
+// The payments ledger doesn't have that problem: it records the provider
+// payment id at grant time and never rewrites it. These two helpers let
+// the webhook fall back to "who did we grant this exact payment to?",
+// which is the question it actually wants answered. (The Razorpay refund
+// handler already worked this way — this brings Stripe to parity.)
+function getUserByProviderPaymentId(provider, providerPaymentId) {
+  if (!provider || !providerPaymentId) return null;
+  return getDB().prepare(`
+    SELECT u.* FROM payments p
+    JOIN users u ON u.id = p.user_id
+    WHERE p.provider = ? AND p.provider_payment_id = ?
+    ORDER BY p.created_at DESC
+    LIMIT 1
+  `).get(provider, providerPaymentId) || null;
+}
+
+function getUserByProviderSubscriptionId(provider, providerSubscriptionId) {
+  if (!provider || !providerSubscriptionId) return null;
+  return getDB().prepare(`
+    SELECT u.* FROM payments p
+    JOIN users u ON u.id = p.user_id
+    WHERE p.provider = ? AND p.provider_subscription_id = ?
+    ORDER BY p.created_at DESC
+    LIMIT 1
+  `).get(provider, providerSubscriptionId) || null;
+}
+
+// The completed grant row for a provider payment id. Refund handlers read
+// its metadata.mode to tell a TIER purchase from a time TOP-UP — refunding
+// a $25 extension must not revoke the $89 pass it was added to.
+function getCompletedPaymentByProviderId(provider, providerPaymentId) {
+  if (!provider || !providerPaymentId) return null;
+  return getDB().prepare(`
+    SELECT * FROM payments
+    WHERE provider = ? AND provider_payment_id = ? AND status = 'completed'
+    ORDER BY created_at DESC LIMIT 1
+  `).get(provider, providerPaymentId) || null;
+}
+
+// Is this payment row a time TOP-UP (extension/renewal) rather than a tier
+// purchase? Reads the metadata both writers stamp: 'renewal' (legacy
+// /create-renewal + webhook grants) and 'extension' (one-click /extend-now).
+function isTopUpPayment(paymentRow) {
+  if (!paymentRow) return false;
+  try {
+    const meta = typeof paymentRow.metadata === 'string'
+      ? JSON.parse(paymentRow.metadata || '{}')
+      : (paymentRow.metadata || {});
+    return meta.mode === 'renewal' || meta.mode === 'extension';
+  } catch {
+    return false;
+  }
+}
+
+// Have we already booked a FAILED row for this provider payment id?
+// Stripe fires BOTH payment_intent.payment_failed and charge.failed for a
+// single declined card, and both land in the same handler — without this
+// the user gets two identical "payment failed" rows and two emails for one
+// decline. Scoped by payment id so genuine repeat attempts (a new
+// PaymentIntent) still record.
+function hasFailedPaymentRecorded(userId, providerPaymentId) {
+  if (!userId || !providerPaymentId) return false;
+  const row = getDB().prepare(`
+    SELECT id FROM payments
+    WHERE user_id = ? AND provider_payment_id = ? AND status = 'failed'
+    LIMIT 1
+  `).get(userId, providerPaymentId);
   return !!row;
 }
 
@@ -1680,8 +2078,17 @@ function grantTimeExtension(userId, seconds) {
 // doesn't buy free time — the session just goes stale and gets settled at
 // the LAST heartbeat, and the interview UI dies with it (self-defeating).
 
-const USAGE_HEARTBEAT_CAP_S = 45;        // max chargeable seconds per beat (~2× the 20s cadence + slack)
 const USAGE_STALE_AFTER_MS = 90 * 1000;  // silent this long → sweeper settles the session
+// The ceiling on ONE settle is the STALE WINDOW, not the beat cadence.
+// It used to be 45s while a session stayed live through 90s of silence,
+// and the gap between those two numbers was half-price interview time: a
+// client beating every ~85s stayed live, kept getting answers, and paid
+// for 45 seconds out of every 85 it used — no lying required, just a
+// slower timer. The window is the honest ceiling because past it the
+// session stops authorising answers (hasLiveUsageSession) and the sweeper
+// settles it AT its last beat, so no single gap can represent more.
+// routes/usage.js settles with the same ceiling before these helpers run.
+const USAGE_HEARTBEAT_CAP_S = Math.floor(USAGE_STALE_AFTER_MS / 1000); // max chargeable seconds per settle
 
 // Which bucket does this license draw live-interview time from?
 // Mirrors the client's getLiveTimeBalance so both sides agree on semantics:
@@ -1705,14 +2112,42 @@ function resolveTimeBucket(license) {
   return { source: 'trial', remaining: Math.max(0, license.trial_remaining_seconds || 0) };
 }
 
+// Remaining balance of ONE NAMED bucket. resolveTimeBucket answers a
+// different question — which bucket does this license's TIER draw from —
+// and the two disagree exactly where it costs money: a session opened on
+// the trial bucket whose owner upgrades mid-interview goes on charging
+// trial_remaining_seconds (that is the session's source) while
+// resolveTimeBucket reports credits, so the caller was handed a full fresh
+// balance while the column actually being drained sat at zero, and the
+// heartbeat's exhaustion check (remaining <= 0) never fired. Credit-window
+// expiry and the -1 unlimited sentinels keep resolveTimeBucket's exact
+// semantics, so nothing else shifts.
+function readBucketRemaining(license, source) {
+  if (!license) return 0;
+  if (source === 'credits') {
+    if ((license.credits_remaining_seconds ?? 0) === -1
+        || license.expires_at === -1
+        || license.credits_expire_at === -1) {
+      return -1;
+    }
+    const expireAt = license.credits_expire_at || 0;
+    if (expireAt > 0 && Date.now() > expireAt) return 0;
+    return Math.max(0, license.credits_remaining_seconds || 0);
+  }
+  if (source === 'trial') {
+    return Math.max(0, license.trial_remaining_seconds || 0);
+  }
+  // 'unlimited' / 'none' / anything unrecognised — unchanged behaviour.
+  return resolveTimeBucket(license).remaining;
+}
+
 // Charge `seconds` against the license's bucket. Returns the post-charge
-// remaining. MAX(0, ...) at the SQL layer so concurrent writers can't
-// drive the balance negative.
+// remaining OF THE BUCKET THAT WAS CHARGED. MAX(0, ...) at the SQL layer
+// so concurrent writers can't drive the balance negative.
 function chargeLicenseSeconds(userId, source, seconds) {
   const d = getDB();
   if (seconds <= 0) {
-    const lic = getLicenseByUserId(userId);
-    return resolveTimeBucket(lic).remaining;
+    return readBucketRemaining(getLicenseByUserId(userId), source);
   }
   if (source === 'credits') {
     d.prepare(`
@@ -1725,14 +2160,37 @@ function chargeLicenseSeconds(userId, source, seconds) {
       WHERE user_id = ? AND trial_remaining_seconds > 0
     `).run(seconds, userId);
   }
-  const lic = getLicenseByUserId(userId);
-  return resolveTimeBucket(lic).remaining;
+  return readBucketRemaining(getLicenseByUserId(userId), source);
 }
 
 // Open a session. Any prior open session for this user is settled first
 // (charged only through its last heartbeat) and marked 'superseded' — this
 // is what stops popout+main or a second device from double-burning the
 // clock, and it makes "sign in elsewhere and continue" just work.
+// Is this account's clock running RIGHT NOW?
+//
+// The model routes ask this before answering anything. Until 2026-07 they
+// only checked "does this account have time left", which meant a user
+// could leave the mic off — so no session, so no charging — and type
+// questions all day for free. The clock and the answering were never
+// connected to each other.
+//
+// "Live" means open AND heartbeated recently. Both halves matter: the
+// client beats every ~20s, so a session that has been silent past the
+// stale window is one whose owner has closed the laptop, and letting it
+// keep authorising answers would just move the free ride somewhere else.
+// The sweeper settles those sessions anyway; this makes them stop
+// working the moment they go quiet, not whenever the sweeper next runs.
+function hasLiveUsageSession(userId, now = Date.now()) {
+  const d = getDB();
+  const row = d.prepare(`
+    SELECT id FROM usage_sessions
+    WHERE user_id = ? AND ended_at IS NULL AND last_heartbeat_at > ?
+    LIMIT 1
+  `).get(userId, now - USAGE_STALE_AFTER_MS);
+  return !!row;
+}
+
 function startUsageSession(userId, deviceId, { unlimitedOverride = false } = {}) {
   const d = getDB();
   const license = getLicenseByUserId(userId);
@@ -1938,6 +2396,38 @@ function setRazorpaySubscriptionId(userId, subscriptionId) {
   `).run(subscriptionId, Date.now(), userId, subscriptionId);
 }
 
+// ── Provider marker write that never destroys a Stripe customer id ─────
+// `users.stripe_customer_id` doubles as the provider marker: `cus_…` means
+// Stripe, `rzp_…` means Razorpay. Every Razorpay grant path used to blind-
+// write `rzp_<id>` over whatever was there. While India routes to Stripe
+// that's unreachable — but the moment RAZORPAY_ROUTING_ENABLED flips, an
+// Indian user who bought on Stripe during this window and then pays via
+// Razorpay loses their `cus_…`, and with it: the saved card that powers
+// one-click top-ups, /payment-method, /portal, and correct provider
+// detection in /cancel-subscription (which would then aim Razorpay's API
+// at a live Stripe subscription).
+//
+// The Razorpay subscription pointer already has its own column
+// (razorpay_subscription_id), so the marker is the only thing at stake.
+// Rule: a `cus_…` marker is never overwritten by a `rzp_…` one. Stripe
+// writes still overwrite freely — a `cus_` id is authoritative for the
+// Stripe side and a later Stripe checkout legitimately replaces it.
+function setPaymentProviderMarker(userId, marker) {
+  if (!userId || !marker) return false;
+  const d = getDB();
+  if (String(marker).startsWith('rzp_')) {
+    const row = d.prepare('SELECT stripe_customer_id FROM users WHERE id = ?').get(userId);
+    if (row?.stripe_customer_id?.startsWith('cus_')) {
+      // Keep the Stripe link; the Razorpay side is fully addressable via
+      // users.razorpay_subscription_id + the payments ledger.
+      return false;
+    }
+  }
+  d.prepare('UPDATE users SET stripe_customer_id = ?, updated_at = ? WHERE id = ?')
+    .run(marker, Date.now(), userId);
+  return true;
+}
+
 // Undo a revocation. Removes the revoked_keys row and flips the license
 // status back to 'active'. Paired with revokeKey().
 function unrevokeKey(key) {
@@ -2045,18 +2535,50 @@ function getUserDataExport(userId) {
 
 // Hard-delete a user and all their owned rows. FK ON DELETE CASCADE is
 // configured so licenses/devices/conversations/messages/payments/
-// reset-tokens clean themselves up when the users row goes away, but:
-//   • login_logs.user_id is a nullable reference (no FK), so we wipe
-//     those explicitly.
-//   • We revoke the license key first so it can't be reused if the
-//     same email signs up again after deletion.
+// reset-tokens/usage_sessions clean themselves up when the users row
+// goes away, but SIX tables carry user data with no foreign key at all
+// and would be silently left behind:
+//
+//   • login_logs            — nullable reference, no FK
+//   • remote_events         — THE DEVICE-SYNC LOG. This is the one that
+//     matters most and the one easiest to miss: it holds the mirrored
+//     interview transcript, every committed message and every settled
+//     answer, keyed by user_id with no FK because the table is created
+//     by services/remoteSessionStore.js rather than in the schema block
+//     above. "Delete my account" that leaves a complete copy of your
+//     interviews on the server is not a deletion.
+//   • support_threads       — the user's own support conversations
+//     (support_messages and support_escalation_queue cascade off the
+//     thread, so removing threads is enough). Matched on BOTH
+//     customer_user_id and customer_email: threads opened before the
+//     user signed in carry only the address.
+//   • lifecycle_emails      — which lifecycle mails they have been sent
+//
+// We revoke the license key first so it can't be reused if the same
+// email signs up again after deletion.
+//
+// audit_log is deliberately KEPT. It is the record that moderation
+// actions — including this deletion — happened, and erasing the
+// evidence of a deletion along with the account is how you end up
+// unable to answer "did we actually delete them?".
+//
 // Wrapped in a transaction so a partial failure leaves the user intact
-// rather than orphaned (e.g. users row deleted but login_logs still
-// reference a gone id).
+// rather than orphaned (e.g. users row deleted but remote_events still
+// holding their transcripts).
 function deleteUser(userId) {
   const d = getDB();
   const user = d.prepare('SELECT * FROM users WHERE id = ?').get(userId);
   if (!user) return false;
+
+  // remote_events is created lazily by services/remoteSessionStore.js the
+  // first time a device syncs, so on a server where nobody has ever
+  // paired a phone it does not exist. Checked BEFORE the transaction: a
+  // "no such table" inside it would roll the whole thing back and leave
+  // an account that cannot be deleted at all.
+  const hasRemoteEvents = !!d.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_events'"
+  ).get();
+
   const tx = d.transaction(() => {
     const licenses = d.prepare('SELECT key FROM licenses WHERE user_id = ?').all(userId);
     for (const lic of licenses) {
@@ -2064,9 +2586,38 @@ function deleteUser(userId) {
         .run(lic.key, 'system', 'user account deleted', Date.now());
     }
     d.prepare('DELETE FROM login_logs WHERE user_id = ?').run(userId);
+    if (hasRemoteEvents) d.prepare('DELETE FROM remote_events WHERE user_id = ?').run(userId);
+    d.prepare('DELETE FROM support_threads WHERE customer_user_id = ? OR customer_email = ?')
+      .run(userId, user.email);
+    d.prepare('DELETE FROM lifecycle_emails WHERE user_id = ?').run(userId);
     d.prepare('DELETE FROM users WHERE id = ?').run(userId);
   });
   tx();
+
+  // ── The résumé is not only in SQLite ──
+  // services/contextStore.js holds the uploaded knowledge base — résumé,
+  // job description, notes — in memory for up to 3 hours so the client
+  // can send a hash instead of 400KB per question. Deleting the rows left
+  // that copy sitting there, so an account deleted under a policy that
+  // promises deletion is "immediate and permanent" kept its résumé
+  // readable server-side for the rest of the TTL.
+  //
+  // Done here rather than at the four call sites (routes/auth.js
+  // delete-account, routes/admin.js, and both botTools.js paths) so a
+  // fifth caller added later cannot forget it. After the transaction on
+  // purpose: a rolled-back delete must not drop a live user's cache.
+  //
+  // Failure is logged, never thrown — the account IS deleted at this
+  // point, and turning a cache-eviction problem into an exception would
+  // report a completed deletion as a failure.
+  try {
+    const contextStore = require('./services/contextStore');
+    const dropped = contextStore.forgetUser(userId);
+    if (dropped) console.log(`[deleteUser] purged ${dropped} cached context entr${dropped === 1 ? 'y' : 'ies'} for ${userId}`);
+  } catch (err) {
+    console.error(`[deleteUser] FAILED to purge cached context for ${userId} — it will expire on its own TTL:`, err.message);
+  }
+
   return true;
 }
 
@@ -2217,6 +2768,24 @@ function queryPayments({ provider, status, email, tier, from, to, limit }) {
     FROM payments ${where}
   `).get(...args);
 
+  // Same split as getPaymentStats: the flat `gross` above adds USD cents to
+  // INR paise, and the admin Payments header printed it as a bare number with
+  // no symbol. Per-currency maps let the header name what it's showing.
+  const perCurrency = d.prepare(`
+    SELECT COALESCE(currency, 'USD') as currency,
+      COALESCE(SUM(CASE WHEN amount > 0 AND status = 'completed' THEN amount ELSE 0 END), 0) as gross,
+      COALESCE(SUM(CASE WHEN status IN ('refunded','partially_refunded','disputed') THEN amount ELSE 0 END), 0) as refunded_or_disputed
+    FROM payments ${where}
+    GROUP BY COALESCE(currency, 'USD')
+  `).all(...args);
+  stats.gross_by_currency = {};
+  stats.refunded_or_disputed_by_currency = {};
+  for (const r of perCurrency) {
+    const cur = (r.currency || 'USD').toUpperCase();
+    if (r.gross) stats.gross_by_currency[cur] = r.gross;
+    if (r.refunded_or_disputed) stats.refunded_or_disputed_by_currency[cur] = r.refunded_or_disputed;
+  }
+
   return { payments: rows, stats };
 }
 
@@ -2276,20 +2845,34 @@ function getTrends(days) {
     FROM login_logs WHERE created_at >= ? AND success = 1 GROUP BY day
   `).all(startMs);
 
+  // Revenue per day AND per currency. USD cents and INR paise cannot share a
+  // column, and the admin Analytics tab charts them separately, so group by
+  // both. The flat `revenue` field below is kept for back-compat only.
   const revenue = d.prepare(`
     SELECT strftime('%Y-%m-%d', created_at/1000, 'unixepoch') as day,
+           COALESCE(currency, 'USD') as currency,
            COALESCE(SUM(amount), 0) as total
-    FROM payments WHERE status = 'completed' AND amount > 0 AND created_at >= ? GROUP BY day
+    FROM payments WHERE status = 'completed' AND amount > 0 AND created_at >= ?
+    GROUP BY day, COALESCE(currency, 'USD')
   `).all(startMs);
 
   const byDay = new Map();
   for (let i = n - 1; i >= 0; i--) {
     const iso = new Date(now - i * DAY_MS_CONST).toISOString().slice(0, 10);
-    byDay.set(iso, { day: iso, signups: 0, logins: 0, revenue: 0 });
+    // `date` and `day` carry the same ISO string. The admin table keys its
+    // rows off `date` and prints it in the Date column — emitting only `day`
+    // left every row with an undefined React key and a blank Date cell.
+    byDay.set(iso, { date: iso, day: iso, signups: 0, logins: 0, revenue: 0, revenue_by_currency: {} });
   }
   for (const r of signups) if (byDay.has(r.day)) byDay.get(r.day).signups = r.c;
   for (const r of logins)  if (byDay.has(r.day)) byDay.get(r.day).logins  = r.c;
-  for (const r of revenue) if (byDay.has(r.day)) byDay.get(r.day).revenue = r.total;
+  for (const r of revenue) {
+    if (!byDay.has(r.day)) continue;
+    const bucket = byDay.get(r.day);
+    const cur = (r.currency || 'USD').toUpperCase();
+    bucket.revenue_by_currency[cur] = (bucket.revenue_by_currency[cur] || 0) + r.total;
+    bucket.revenue += r.total; // legacy cross-currency sum
+  }
   return Array.from(byDay.values());
 }
 
@@ -2297,6 +2880,13 @@ function getTrends(days) {
 // user's payment history still surfaces (with a null email) — useful
 // when reconciling a refund against a now-deleted account. Excludes
 // admin-comp rows and refunds so the ranking reflects real revenue.
+// Highest-spending customers. One row per (user, currency) — NOT per user.
+// Grouping by user alone summed USD cents with INR paise into a single
+// `lifetime_value`, which is not an amount of money; and the admin table
+// reads `total_amount` + `currency` to format it, so a row without a
+// currency rendered "—" in the Total Paid column for every customer on the
+// leaderboard. A customer who has paid in two currencies legitimately appears
+// twice, each row exact in its own currency.
 function getTopCustomers(limit) {
   const n = Math.min(Math.max(Number(limit) || 10, 1), 100);
   return getDB().prepare(`
@@ -2304,14 +2894,16 @@ function getTopCustomers(limit) {
            u.email, u.name, u.tier, u.country_code,
            u.created_at as user_created_at,
            u.last_login_at,
+           COALESCE(p.currency, 'USD') as currency,
            COUNT(p.id) as payment_count,
+           COALESCE(SUM(p.amount), 0) as total_amount,
            COALESCE(SUM(p.amount), 0) as lifetime_value,
            MAX(p.created_at) as last_payment_at
     FROM payments p
     LEFT JOIN users u ON u.id = p.user_id
     WHERE p.status = 'completed' AND p.amount > 0 AND p.provider != 'admin-comp'
-    GROUP BY p.user_id
-    ORDER BY lifetime_value DESC
+    GROUP BY p.user_id, COALESCE(p.currency, 'USD')
+    ORDER BY total_amount DESC
     LIMIT ?
   `).all(n);
 }
@@ -2426,8 +3018,15 @@ function getSuspiciousActivity() {
   const weekAgo = now - 7 * DAY_MS_CONST;
   const dayAgo = now - 1 * DAY_MS_CONST;
 
+  // `country_count` / `fail_count` are the names the admin Risk & Trust panel
+  // renders. They used to be emitted only as `n` / `attempts`, so the panel
+  // printed the literal string "undefined countries" and "undefined fails"
+  // next to each flagged user and IP. Both spellings ship now: the aliases
+  // for the UI, the originals because the HAVING clauses reference them.
   const multiCountry = d.prepare(`
-    SELECT user_id, email, GROUP_CONCAT(DISTINCT country_code) as countries, COUNT(DISTINCT country_code) as n
+    SELECT user_id, email, GROUP_CONCAT(DISTINCT country_code) as countries,
+           COUNT(DISTINCT country_code) as n,
+           COUNT(DISTINCT country_code) as country_count
     FROM login_logs
     WHERE user_id IS NOT NULL AND country_code IS NOT NULL AND created_at >= ? AND success = 1
     GROUP BY user_id HAVING n >= 2
@@ -2435,7 +3034,7 @@ function getSuspiciousActivity() {
   `).all(weekAgo);
 
   const highFailIps = d.prepare(`
-    SELECT ip_address, COUNT(*) as attempts,
+    SELECT ip_address, COUNT(*) as attempts, COUNT(*) as fail_count,
            MAX(created_at) as last_seen,
            GROUP_CONCAT(DISTINCT email) as emails_tried
     FROM login_logs
@@ -2461,31 +3060,46 @@ function getStats() {
     if (row.tier in tiers) tiers[row.tier] = row.c;
   }
 
-  // Month-to-date revenue split by the tier that each payment granted.
-  // NB: this groups payments by `tier_granted` which is set at checkout time,
-  // so if a user upgraded from Basic→Pro within the month, the Basic payment
-  // still appears in the basic row. That's the right behaviour.
+  // Month-to-date revenue split by the tier that each payment granted, AND by
+  // currency. NB: this groups payments by `tier_granted` which is set at
+  // checkout time, so if a user upgraded from Basic→Pro within the month, the
+  // Basic payment still appears in the basic row. That's the right behaviour.
+  //
+  // `ultra` MUST be in these maps. It's the $159/mo flagship (see
+  // routes/payments.js TIER_PRICES) — omitting the key meant every Ultra
+  // payment was dropped on the floor here, so the admin tier cards reported
+  // zero revenue for the single highest-grossing plan.
   const revenueRows = d.prepare(`
-    SELECT tier_granted, COALESCE(SUM(amount), 0) as total, COUNT(*) as c
+    SELECT tier_granted, COALESCE(currency, 'USD') as currency,
+           COALESCE(SUM(amount), 0) as total, COUNT(*) as c
     FROM payments
     WHERE status = 'completed' AND created_at > ?
-    GROUP BY tier_granted
+    GROUP BY tier_granted, COALESCE(currency, 'USD')
   `).all(monthAgo);
-  const revenueByTier = { basic: 0, pro: 0, max: 0 };
-  const paymentsByTier = { basic: 0, pro: 0, max: 0 };
+  const revenueByTier = { basic: 0, pro: 0, max: 0, ultra: 0 };
+  const paymentsByTier = { basic: 0, pro: 0, max: 0, ultra: 0 };
+  // { pro: { USD: 12900 }, ultra: { USD: 15900, INR: 1299900 } } — minor
+  // units. The flat revenueByTier above adds cents to paise and is kept only
+  // for older clients; anything rendering money reads this map.
+  const revenueByTierCurrency = { basic: {}, pro: {}, max: {}, ultra: {} };
   for (const row of revenueRows) {
-    if (row.tier_granted && row.tier_granted in revenueByTier) {
-      revenueByTier[row.tier_granted] = row.total;
-      paymentsByTier[row.tier_granted] = row.c;
-    }
+    const t = row.tier_granted;
+    if (!t || !(t in revenueByTier)) continue;
+    revenueByTier[t] += row.total;
+    paymentsByTier[t] += row.c;
+    // Same rule as byCurrency above: keys only for currencies carrying money,
+    // so a $0 comp can't put an empty currency line on a tier card.
+    if (!row.total) continue;
+    const cur = (row.currency || 'USD').toUpperCase();
+    revenueByTierCurrency[t][cur] = (revenueByTierCurrency[t][cur] || 0) + row.total;
   }
 
   // Signups broken down by tier — lets admin see whether marketing is
-  // driving Pro/Max or mostly free-tier sign-ups.
+  // driving Pro/Max/Ultra or mostly free-tier sign-ups.
   const signupRows = d.prepare(`
     SELECT tier, COUNT(*) as c FROM users WHERE created_at > ? GROUP BY tier
   `).all(monthAgo);
-  const signupsByTier = { free: 0, basic: 0, pro: 0, max: 0 };
+  const signupsByTier = { free: 0, basic: 0, pro: 0, max: 0, ultra: 0 };
   for (const row of signupRows) {
     if (row.tier in signupsByTier) signupsByTier[row.tier] = row.c;
   }
@@ -2510,11 +3124,15 @@ function getStats() {
     // Legacy flat fields — kept so older client builds keep working.
     pro_users: tiers.pro,
     free_users: tiers.free,
-    // New 4-tier breakdown.
+    // Full tier breakdown (free/basic/pro/max/ultra).
     tiers,
     basic_users: tiers.basic,
     max_users: tiers.max,
+    ultra_users: tiers.ultra,
+    // Cross-currency minor-unit sum — legacy, not renderable as money.
     revenue_by_tier: revenueByTier,
+    // Per-tier, per-currency minor units. This is what the dashboard renders.
+    revenue_by_tier_by_currency: revenueByTierCurrency,
     payments_by_tier: paymentsByTier,
     signups_by_tier: signupsByTier,
     active_today: d.prepare('SELECT COUNT(*) as c FROM users WHERE last_login_at > ?').get(dayAgo).c,
@@ -2897,6 +3515,9 @@ function heartbeatSupportAgent(agentEmail) {
 
 // Online = heartbeat within last 90s. Awareness: agent that closed
 // the app without explicit logout still flips to offline naturally.
+// LIVENESS: who has a socket open right now. Use this for "is an agent
+// actually here" UI — e.g. telling a joining customer someone is present.
+// Do NOT use it to decide who to notify; see listNotifiableSupportAgents.
 function listOnlineSupportAgents() {
   const cutoff = Date.now() - 90_000;
   return getDB().prepare(`
@@ -2904,6 +3525,35 @@ function listOnlineSupportAgents() {
      WHERE last_heartbeat_at > ? AND status != 'offline'
      ORDER BY agent_email
   `).all(cutoff);
+}
+
+// REACHABILITY: who should be paged about a waiting customer.
+//
+// This exists because every push path used listOnlineSupportAgents, which
+// requires a heartbeat in the last 90 seconds — and the heartbeat only
+// refreshes while an agent holds an open support WebSocket. So the ntfy
+// push, whose entire purpose is to buzz a phone when nobody is watching
+// the inbox, was skipped in exactly the case it was built for, and fired
+// only when the agent was already looking at the customer on screen.
+//
+// Measured on the live database: three agents had an ntfy topic
+// configured, all with status 'online', and ZERO qualified — heartbeats
+// were 43 hours, 54 days and 67 days stale. Every `[escalation] ntfy skip
+// reason=no_agents_with_topic` line was that, not a missing topic.
+//
+// The two axes are different questions and now have different queries:
+//   last_heartbeat_at → is a socket open (liveness, changes constantly)
+//   status            → does this agent WANT to be reached (intent, only
+//                       ever changed deliberately via POST /inbox/presence)
+// Notification asks the second. 'offline' is the deliberate mute, and is
+// never set automatically on disconnect — doing that would re-create this
+// bug, because closing the inbox is precisely when the phone should ring.
+function listNotifiableSupportAgents() {
+  return getDB().prepare(`
+    SELECT * FROM support_agent_presence
+     WHERE status != 'offline'
+     ORDER BY agent_email
+  `).all();
 }
 
 // ── Escalation queue ──
@@ -2933,12 +3583,16 @@ function getDueSupportEscalations(now = Date.now()) {
   `).all(now);
 }
 
-function markSupportEscalationFired(threadId, channel) {
+// `outcome` is what actually happened — 'sent', 'skipped:<reason>' or
+// 'failed:<reason>'. fired_at alone only ever meant "the worker looked at
+// this row", which made a silently-skipped alert indistinguishable from a
+// delivered one. Optional so existing callers keep working.
+function markSupportEscalationFired(threadId, channel, outcome = null) {
   getDB().prepare(`
     UPDATE support_escalation_queue
-       SET fired_at = ?
+       SET fired_at = ?, outcome = ?
      WHERE thread_id = ? AND channel = ? AND fired_at IS NULL
-  `).run(Date.now(), threadId, channel);
+  `).run(Date.now(), outcome, threadId, channel);
 }
 
 // Called on claim/resolve — wipes any pending alerts for this thread
@@ -2994,18 +3648,19 @@ module.exports = {
   createPasswordResetToken, getPasswordResetToken, getRawPasswordResetToken, consumePasswordResetToken, cleanupExpiredResetTokens,
   invalidatePendingResetTokensForUser, applyPasswordReset,
   // Licenses
-  createLicense, getLicenseByKey, getLicenseByUserId,
+  createLicense, getLicenseByKey, getLicenseByUserId, ensureLicenseForUser,
   incrementSessionCount, updateLicenseStatus, updateLicenseOnPayment,
   extendLicenseExpiry, grantCreditSessions, grantBasicRenewal, grantTimeExtension,
   getLatestRazorpaySubscriptionId,
   setRazorpaySubscriptionId,
   // Usage sessions — server-authoritative interview clock
-  resolveTimeBucket, startUsageSession, heartbeatUsageSession,
+  resolveTimeBucket, startUsageSession, heartbeatUsageSession, hasLiveUsageSession,
   stopUsageSession, sweepStaleUsageSessions, getUsageTotals,
   // Lifecycle emails (pass-expiry reminders etc.)
   markLifecycleEmailOnce, getExpiringPassLicenses,
   // Cycle-end downgrade (paid → free safety net)
-  transitionLicenseToFree, getExpiredCancelingUserIds,
+  transitionLicenseToFree, normalizeFreeLicenseRow,
+  repairCancelWindow, repairAllCancelWindows, getExpiredCancelingUserIds,
   // Devices
   registerDevice, getUserDevices, deactivateDevice, isDeviceAuthorized, resetUserDevices,
   revokeSingleDevice,
@@ -3019,6 +3674,10 @@ module.exports = {
   // Webhook idempotency
   recordWebhookEventOnce, clearWebhookEvent, isRenewalPaymentProcessed,
   isPaymentAlreadyRecorded, hasRefundBeenRecorded, gateAndRecordEventForUser,
+  // Ledger-based resolution — webhook fallbacks when the customer id moved
+  getUserByProviderPaymentId, getUserByProviderSubscriptionId,
+  getCompletedPaymentByProviderId, isTopUpPayment, hasFailedPaymentRecorded,
+  setPaymentProviderMarker,
   // AI quotas
   incrementAndCheckGeminiQuota,
   // Login logs
@@ -3043,6 +3702,7 @@ module.exports = {
   getSupportAgentPresence, setSupportAgentPresence, heartbeatSupportAgent,
   markNtfyVerified, markNtfyAlertSent,
   listOnlineSupportAgents,
+  listNotifiableSupportAgents,
   enqueueSupportEscalations, getDueSupportEscalations,
   markSupportEscalationFired, cancelSupportEscalations,
   getSupportInboxStats,

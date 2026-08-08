@@ -82,7 +82,7 @@ describe('checkout.session.completed gate (P0-S1)', () => {
       created: 1,
       data: {
         object: {
-          id: 'cs_stale',
+          id: 'cs_stale', payment_status: 'paid',
           customer: 'cus_test1',
           customer_email: TEST_USER.email,
           subscription: 'sub_test',
@@ -102,7 +102,7 @@ describe('checkout.session.completed gate (P0-S1)', () => {
       created: Math.floor(Date.now() / 1000),
       data: {
         object: {
-          id: 'cs_fresh',
+          id: 'cs_fresh', payment_status: 'paid',
           customer: 'cus_test1',
           customer_email: TEST_USER.email,
           subscription: 'sub_test',
@@ -316,7 +316,7 @@ describe('checkout.session.completed renewal mode', () => {
       created: Math.floor(Date.now() / 1000),
       data: {
         object: {
-          id: 'cs_renewal',
+          id: 'cs_renewal', payment_status: 'paid',
           customer: 'cus_test1',
           customer_email: TEST_USER.email,
           metadata: { mode: 'renewal', user_email: TEST_USER.email },
