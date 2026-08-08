@@ -379,7 +379,7 @@ router.post('/chat/gemini', geminiQuotaGate, requireTimeRemaining, async (req, r
     parts.push({ text: prompt });
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.6-flash',
       contents: [{ role: 'user', parts }],
       config: {
         systemInstruction: enrichedSystem || '',
@@ -594,7 +594,7 @@ router.post('/chat/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining, 
     const maxTokens = scaleTokensForInstructions(sysText, 16000, 16384);
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-5.5',
+      model: 'gpt-5.6',
       messages: enrichedMessages,
       max_completion_tokens: maxTokens,
       reasoning_effort: reasoningEffort,
@@ -631,7 +631,7 @@ router.post('/chat/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, asy
     const maxTokens = scaleTokensForInstructions(sysText, 8000, 8000);
 
     const completion = await client.chat.completions.create({
-      model: 'grok-4.3',
+      model: 'grok-4.5',
       messages: enrichedMessages,
       max_tokens: maxTokens,
       temperature: 0.7,
@@ -844,7 +844,7 @@ router.post('/stream/gemini', geminiQuotaGate, requireTimeRemaining, async (req,
     parts.push({ text: prompt });
 
     const stream = await ai.models.generateContentStream({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.6-flash',
       contents: [{ role: 'user', parts }],
       config: {
         systemInstruction: enrichedSystem || '',
@@ -904,7 +904,7 @@ router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining
 
     const stream = await openai.chat.completions.create(
       {
-        model: 'gpt-5.5',
+        model: 'gpt-5.6',
         messages: enrichedMessages,
         max_completion_tokens: maxTokens,
         reasoning_effort: reasoningEffort,
@@ -958,7 +958,7 @@ router.post('/stream/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, a
 
     const stream = await client.chat.completions.create(
       {
-        model: 'grok-4.3',
+        model: 'grok-4.5',
         messages: enrichedMessages,
         max_tokens: maxTokens,
         temperature: 0.7,
