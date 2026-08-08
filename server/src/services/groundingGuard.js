@@ -440,7 +440,35 @@ const YEAR_HI = 2100;
 // a lone letter, and the single-letter form refuses to eat the start of a
 // longer word ("3 minutes" must not become three million).
 // Kept byte-identical to NUMBER_CANDIDATE_RE in services/factLedger.ts.
-const NUMBER_CANDIDATE_RE = /(?:~|≈|(?:over|about|approximately|around|roughly|under)\s+)?\d[\d,]*(?:\.\d+)?(?:\s*%|\s*percent\b|\s*(?:thousand|million|billion)\b|[kKmMbB](?![a-zA-Z]))?\+?/gi;
+// ⚠️ THE GUARD USED TO SEE ONLY PERCENTAGES AND SCALE WORDS.
+//
+// Whether an invented metric was caught depended on TYPOGRAPHY, not on
+// meaning. Measured against this file before the units below existed:
+//
+//     "24 hour"  → caught          "24-hour" → INVISIBLE
+//     "90 ms"    → caught          "820ms"   → INVISIBLE
+//     "500 GB"   → caught          "40x"     → INVISIBLE
+//
+// The hyphen and the glued unit both trip isNumberEmbeddedInToken, which
+// exists to skip version numbers and identifiers and cannot tell those
+// from a duration. That is not academic: the fabrication recorded from a
+// real interview — "causing a **24-hour** data loss" — is precisely the
+// invisible spelling. The number WAS the kind of thing this guard is for;
+// it escaped on punctuation alone.
+//
+// Units are listed here so the SAME regex feeds both sides of the check:
+// collectCanonicalNumbers reads the résumé with it and unverifiedNumbers
+// reads the cover with it. Extending only the cover side would invent
+// false rejections — a true "3 days" from the résumé would look made up.
+// Kept byte-identical to services/factLedger.ts (grounding-parity.test.js).
+const METRIC_UNIT_SRC = '(?:ms|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|[KMGTP]B|QPS|TPS|RPS|x)';
+const NUMBER_CANDIDATE_RE = new RegExp(
+  '(?:~|≈|(?:over|about|approximately|around|roughly|under)\\s+)?'
+  + '\\d[\\d,]*(?:\\.\\d+)?'
+  + '(?:\\s*%|\\s*percent\\b|\\s*(?:thousand|million|billion)\\b|[kKmMbB](?![a-zA-Z])'
+  + '|[\\s-]?' + METRIC_UNIT_SRC + '\\b)?\\+?',
+  'gi',
+);
 
 /** Strip the noise a cover puts around a figure so the core is what we report. */
 function numberCoreOf(match) {
@@ -461,6 +489,15 @@ function numberCoreOf(match) {
 function canonicalizeNumber(raw) {
   let s = numberCoreOf(raw).replace(/\+$/, '').trim();
   if (!s) return null;
+
+  // ⚠️ ORDER: the metric unit comes off FIRST, before the K/M/B scale-letter
+  // branch below. That branch reads a trailing [kKmMbB] as thousand/million/
+  // billion — and the B in "500 GB" is exactly such a letter. Stripping later
+  // meant "500 GB" became 500 × 1e9 with a leftover "G", failed the numeric
+  // parse, returned null, and `value === null` is a `continue` — so adding
+  // units to the regex without fixing this order made "500 GB" INVISIBLE when
+  // it had been caught before. Caught by the round-trip test; keep it first.
+  s = s.replace(new RegExp('[\\s-]?' + METRIC_UNIT_SRC + '\\s*$', 'i'), '').trim();
 
   let mult = 1;
   if (/%\s*$/.test(s) || /\bpercent\s*$/i.test(s)) {
@@ -534,7 +571,11 @@ function isSmallBareInteger(core) {
 /** True when this core carries a unit/magnitude/percent — i.e. is a claim. */
 function hasNumberUnit(core) {
   const s = core.replace(/\+$/, '').trim();
-  return /%|\bpercent\b|\b(?:thousand|million|billion)\b|[kKmMbB]\s*$/i.test(s);
+  // The metric units too, or a SMALL number carrying one ("3 days",
+  // "2 weeks") is written off as a bare integer by isSmallBareInteger and
+  // never checked at all.
+  return /%|\bpercent\b|\b(?:thousand|million|billion)\b|[kKmMbB]\s*$/i.test(s)
+    || new RegExp('[\\s-]?' + METRIC_UNIT_SRC + '\\s*$', 'i').test(s);
 }
 
 function collectCanonicalNumbers(source, into) {

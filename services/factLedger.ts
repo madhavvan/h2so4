@@ -117,6 +117,78 @@ const SECTION_HEAD_SRC = '(?:PROFESSIONAL WORK EXPERIENCE|PROFESSIONAL EXPERIENC
 const DEGREE_RE = /\b(bachelor|master|b\.?s\.?|m\.?s\.?|b\.?tech|m\.?tech|ph\.?d|mba|associate degree|diploma)\b/i;
 const CERT_RE = /\b(certified|certification|certificate)\b/i;
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  LIGATURE REPAIR — the bug that made a CERTIFICATION an EMPLOYER
+//
+//  Some PDF generators emit the fi/fl/ff ligatures as their own glyph
+//  runs, and pdfjs then hands us the word broken apart with spaces:
+//  "Certi fi ed", "Snow fl ake", "e ffi ciency".
+//
+//  That is not cosmetic. CERT_RE is what stops a certification line
+//  being read as employment — and `/\bcertified\b/` cannot match
+//  "Certi fi ed". So on one real résumé the line
+//
+//      AWS Certi fi ed Solutions Architect - Associate | Amazon Web Services | Jun 2023
+//
+//  missed the certification branch, fell through to the employer branch,
+//  and the candidate's spoken opener became:
+//
+//      "AWS Certi fi ed Solutions Architect at Amazon Web Services in 2023.
+//       Before that, Microsoft and Databricks."
+//
+//  Three employers the candidate never had, said out loud, first, in an
+//  interview — while the real ones lost on date order. The ligature
+//  splitting and the certs-as-employment fabrication were logged as two
+//  separate observations; they are one bug, cause and effect.
+//
+//  Repaired at the single point every extractor's text flows through
+//  (buildLedger), so classification, vocabulary and the spoken strings
+//  are all fixed by the same pass.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Real Unicode ligature codepoints — a pure character mapping, no
+// judgement involved. Some extractors emit these instead of splitting.
+const LIGATURE_CHARS: Array<[RegExp, string]> = [
+  [/ﬀ/g, 'ff'], [/ﬁ/g, 'fi'], [/ﬂ/g, 'fl'],
+  [/ﬃ/g, 'ffi'], [/ﬄ/g, 'ffl'], [/ﬅ/g, 'st'], [/ﬆ/g, 'st'],
+];
+
+// The space-split form. Only rejoined when the cluster stands alone
+// BETWEEN two lowercase letter fragments — "Certi fi ed", "Snow fl ake".
+// A capital on either side ("Wi Fi") is left alone, and the handful of
+// real English phrases where a bare "fi"/"fl" legitimately follows a word
+// are excluded outright rather than guessed at.
+// The preceding lowercase run is captured WHOLE so the genuine English
+// phrases where a bare "fi" follows a word can be excluded by name rather
+// than guessed at.
+const SPLIT_LIGATURE = /([a-z]+)\s(ffi|ffl|ff|fi|fl)\s([a-z])/g;
+const LIGATURE_KEEP_APART = /^(sci|hi|wi|lo)$/i;
+
+/**
+ * Undo PDF ligature damage. Length-changing, which is safe here because
+ * every span offset in the ledger indexes the REPAIRED text — buildLedger
+ * normalises once, up front, and nothing outside it re-slices the original
+ * file content by span.
+ */
+export function repairLigatures(input: string): string {
+  if (!input) return input;
+  let s = input;
+  for (const [re, to] of LIGATURE_CHARS) s = s.replace(re, to);
+  if (s.indexOf(' fi ') === -1 && s.indexOf(' fl ') === -1
+      && s.indexOf(' ff ') === -1 && s.indexOf(' ffi ') === -1 && s.indexOf(' ffl ') === -1) {
+    return s;
+  }
+  // NB: an earlier draft protected "sci fi" with a NUMERIC placeholder and
+  // restored it afterwards — that would have corrupted every real number in
+  // the resume on the way back, since " 2023 " reads as an index. Deciding
+  // inside the replace callback needs no placeholder at all.
+  const join = (whole: string, pre: string, lig: string, post: string) =>
+    (lig === 'fi' && LIGATURE_KEEP_APART.test(pre)) ? whole : pre + lig + post;
+  return s.replace(SPLIT_LIGATURE, join).replace(SPLIT_LIGATURE, join);
+}
+
+
+
 // Numbers a candidate can safely speak, with their unit. Deliberately
 // unit-anchored: a bare "45" is not a fact, "45 minutes" is.
 // ⚠️ The terminator is a negative lookahead, NOT `\b`.
@@ -749,7 +821,13 @@ export function buildLedger(files: ContextFile[]): Ledger {
 
   for (const f of files || []) {
     if (f.base64) continue;
-    const text = f.content || '';
+    // Repaired BEFORE anything reads it, so classification, vocabulary,
+    // metrics and the spoken strings all see the same intact words. See
+    // repairLigatures: "AWS Certi fi ed …" missed CERT_RE and was spoken as
+    // employment at Amazon Web Services. Every span offset below indexes
+    // THIS string, and nothing outside buildLedger re-slices f.content by
+    // span, so changing its length here is safe.
+    const text = repairLigatures(f.content || '');
     if (!text.trim()) continue;
     // A JOB DESCRIPTION IS NOT EVIDENCE ABOUT THE CANDIDATE.
     //
@@ -1409,7 +1487,23 @@ const YEAR_HI = 2100;
 // longer word ("3 minutes" must not become three million).
 // Kept byte-identical to NUMBER_CANDIDATE_RE in
 // server/src/services/groundingGuard.js.
-const NUMBER_CANDIDATE_RE = /(?:~|≈|(?:over|about|approximately|around|roughly|under)\s+)?\d[\d,]*(?:\.\d+)?(?:\s*%|\s*percent\b|\s*(?:thousand|million|billion)\b|[kKmMbB](?![a-zA-Z]))?\+?/gi;
+// ⚠️ Units added 2026-08-07 — see the long note on the server twin.
+// Whether an invented metric was caught used to depend on TYPOGRAPHY:
+// "24 hour" was caught, "24-hour" was invisible; "90 ms" caught, "820ms"
+// invisible. The fabrication observed in a real interview — "causing a
+// 24-hour data loss" — was the invisible spelling.
+// The SAME regex reads the résumé (collectCanonicalNumbers) and the cover,
+// so extending it on one side only would manufacture false rejections.
+// Kept byte-identical to server/src/services/groundingGuard.js
+// (grounding-parity.test.js asserts both give the same verdict).
+const METRIC_UNIT_SRC = '(?:ms|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|[KMGTP]B|QPS|TPS|RPS|x)';
+const NUMBER_CANDIDATE_RE = new RegExp(
+  '(?:~|≈|(?:over|about|approximately|around|roughly|under)\\s+)?'
+  + '\\d[\\d,]*(?:\\.\\d+)?'
+  + '(?:\\s*%|\\s*percent\\b|\\s*(?:thousand|million|billion)\\b|[kKmMbB](?![a-zA-Z])'
+  + '|[\\s-]?' + METRIC_UNIT_SRC + '\\b)?\\+?',
+  'gi',
+);
 
 /** Strip the noise a cover puts around a figure so the core is what we report. */
 function numberCoreOf(match: string): string {
@@ -1430,6 +1524,14 @@ function numberCoreOf(match: string): string {
 function canonicalizeNumber(raw: string): number | null {
   let s = numberCoreOf(raw).replace(/\+$/, '').trim();
   if (!s) return null;
+
+  // ⚠️ ORDER: the metric unit comes off FIRST, before the K/M/B scale-letter
+  // branch below — that branch reads a trailing [kKmMbB] as thousand/million/
+  // billion, and the B in "500 GB" is exactly such a letter. Stripping later
+  // turned "500 GB" into 500 × 1e9 with a leftover "G", which fails the
+  // numeric parse and returns null — and `value === null` is a `continue`,
+  // so it went from CAUGHT to INVISIBLE. Keep this first.
+  s = s.replace(new RegExp('[\\s-]?' + METRIC_UNIT_SRC + '\\s*$', 'i'), '').trim();
 
   let mult = 1;
   if (/%\s*$/.test(s) || /\bpercent\s*$/i.test(s)) {
@@ -1503,7 +1605,11 @@ function isSmallBareInteger(core: string): boolean {
 /** True when this core carries a unit/magnitude/percent — i.e. is a claim. */
 function hasNumberUnit(core: string): boolean {
   const s = core.replace(/\+$/, '').trim();
-  return /%|\bpercent\b|\b(?:thousand|million|billion)\b|[kKmMbB]\s*$/i.test(s);
+  // The metric units too, or a SMALL number carrying one ("3 days",
+  // "2 weeks") is written off as a bare integer by isSmallBareInteger and
+  // never checked at all.
+  return /%|\bpercent\b|\b(?:thousand|million|billion)\b|[kKmMbB]\s*$/i.test(s)
+    || new RegExp('[\\s-]?' + METRIC_UNIT_SRC + '\\s*$', 'i').test(s);
 }
 
 function collectCanonicalNumbers(source: string, into: Set<number>): void {

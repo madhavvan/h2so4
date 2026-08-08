@@ -1053,8 +1053,39 @@ export function composeOpener(
   }
 
   // ── 2b. Education ──
+  //
+  // ⚠️ ANSWER THE DEGREE THAT WAS ASKED ABOUT, OR SAY NOTHING.
+  //
+  // The EDUCATION matcher above deliberately recognises "bachelors" and
+  // "masters" as separate questions — and this selection then ignored the
+  // difference. `selectFacts` ranks by lexical overlap, so "what was your
+  // bachelors on?" shares no term with "Master of Science", scores nothing,
+  // and fell through to `|| ledger.education[0]` — the most recent entry.
+  // Measured on a real résumé: the candidate was asked about their
+  // BACHELORS and spoke "Indiana University — Master of Science".
+  //
+  // That is the same shape as the `ledger.skills[0]` fallback removed from
+  // the platforms branch below, and it fails the same way: nothing matched,
+  // so it guessed, and a guess here is spoken instantly and with
+  // confidence. When the question names a level we do not have, deferring
+  // is correct — the main model answers from the full résumé a beat later.
   if (anyMatch(EDUCATION, q)) {
-    const edu = selectFacts(ledger, q, 2, ['education'])[0] || ledger.education[0];
+    const wantsUndergrad = /\b(?:bachelor'?s?|undergrad(?:uate)?|b\.?s\.?|b\.?a\.?|b\.?tech|b\.?e\.?)\b/i.test(q);
+    const wantsPostgrad = /\b(?:master'?s?|m\.?s\.?|m\.?tech|mba|ph\.?d|doctorate|post-?grad(?:uate)?)\b/i.test(q);
+    // Only when the question picks exactly ONE level is there a wrong
+    // answer to give. "where did you study" stays as it was.
+    const level = wantsUndergrad !== wantsPostgrad
+      ? (wantsUndergrad ? /\b(?:bachelor|b\.?s\.?|b\.?a\.?|b\.?tech|b\.?e\.?)\b/i : /\b(?:master|m\.?s\.?|m\.?tech|mba|ph\.?d|doctor)\b/i)
+      : null;
+
+    const matchesLevel = (f: typeof ledger.education[number]) =>
+      !level || level.test(`${roleOf(f) || ''} ${f.detail || ''}`);
+
+    const ranked = selectFacts(ledger, q, 2, ['education']).filter(matchesLevel);
+    const edu = ranked[0]
+      // The blind fallback survives ONLY for an unqualified question, where
+      // any degree is a truthful answer.
+      || (level ? ledger.education.filter(matchesLevel)[0] : ledger.education[0]);
     if (edu) {
       const what = roleOf(edu);
       if (what) return emit(pick(EDUCATION_FORMS, seed)(what, edu.subject, spokenDates(edu.when)), 'background');
