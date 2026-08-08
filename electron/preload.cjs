@@ -76,6 +76,10 @@ const INVOKE_CHANNELS = new Set([
   // Robust external-URL opener with shell.openExternal + child_process
   // fallback. Used by Google sign-in to survive ShellExecute hiccups.
   'open-external-robust',
+  // Drain a buffered `interview-copilot://signin-complete` handoff. Read-
+  // once. Covers the cold start, where the protocol URL reaches main
+  // before any renderer exists to hear the broadcast.
+  'auth:consume-google-handoff',
   // Local SQLite (Electron-side conversation/session/message DB)
   'db:claim-orphan-sessions',
   'db:get-active-session',
@@ -126,6 +130,12 @@ const RECEIVE_CHANNELS = new Set([
   // state is handled separately via the existing db:active-session-changed
   // broadcast that endSessionCleanly also emits.
   'cmd-end-session',
+  // Google OAuth handoff from the browser that completed consent, routed
+  // to us by the OS via the `interview-copilot://` protocol. Payload:
+  // { sessionId, code }. The code is the ONLY proof /google/poll accepts,
+  // and it reaches this machine and no other — that is what stops someone
+  // who picked the session_id from redeeming a stranger's sign-in.
+  'auth:google-handoff',
 ]);
 
 function send(channel, data) {

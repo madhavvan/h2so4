@@ -1956,17 +1956,26 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
     // ReferenceError inside the transaction and the route 500'd AFTER the
     // user had already paid in the Razorpay sheet.
     let fetchedOrder = null;
+    // Who this order/subscription was actually created FOR. Read from the
+    // same `notes` block the tier comes from, and stamped at all four
+    // create sites in this file.
+    let ownerUserId = null;
+    let ownerEmail = null;
     try {
       if (razorpay_subscription_id) {
         const sub = await razorpay.subscriptions.fetch(razorpay_subscription_id);
         const t = sub && sub.notes && sub.notes.tier;
         if (VALID_TIERS.includes(t)) grantedTier = t;
+        ownerUserId = sub?.notes?.user_id || null;
+        ownerEmail = sub?.notes?.user_email || null;
         // Subscriptions are never renewals — skip the notes.mode check.
       } else if (razorpay_order_id) {
         const order = await razorpay.orders.fetch(razorpay_order_id);
         fetchedOrder = order;
         const t = order && order.notes && order.notes.tier;
         if (VALID_TIERS.includes(t)) grantedTier = t;
+        ownerUserId = order?.notes?.user_id || null;
+        ownerEmail = order?.notes?.user_email || null;
         if (typeof order?.amount === 'number') grantedAmount = order.amount;
         // Top-up orders carry notes.mode 'renewal' (legacy) or 'extension'
         // (2026-07 one-click). Flag them so the grant below branches to
@@ -1989,6 +1998,54 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
       console.error('  error:          ', fetchErr.message);
       console.error('  → returning pending; webhook will reconcile authoritatively');
       console.error('━'.repeat(60));
+    }
+
+    // ── The payment has to be THIS caller's ──
+    // A valid signature proves Razorpay issued the payment. It says
+    // nothing about who it was issued to — the HMAC is over
+    // order_id|payment_id with OUR secret, so it verifies identically no
+    // matter which signed-in account presents it. Without this check one
+    // real purchase upgrades every account the triple is handed to:
+    // pay once, share {order_id, payment_id, signature}, and each
+    // recipient's /verify-razorpay grants them the tier (the dedup above
+    // is keyed per user_id, so it does not stop the second account).
+    //
+    // All four create sites in this file stamp notes.user_id +
+    // notes.user_email, which is what makes the binding available here.
+    // An order carrying NEITHER was not created by this server, so the
+    // safe answer is to refuse rather than to grant on a tier we read out
+    // of a stranger's notes.
+    if (!lookupFailed) {
+      const callerId = String(req.user.id);
+      const callerEmail = String(req.user.email || '').toLowerCase();
+      const stampedId = ownerUserId ? String(ownerUserId) : null;
+      const stampedEmail = ownerEmail ? String(ownerEmail).toLowerCase() : null;
+
+      const identified = !!(stampedId || stampedEmail);
+      const mine = (stampedId && stampedId === callerId)
+        || (!stampedId && stampedEmail && stampedEmail === callerEmail);
+
+      if (!identified || !mine) {
+        console.warn('━'.repeat(60));
+        console.warn('[verify-razorpay] REFUSED — payment does not belong to the caller');
+        console.warn('  caller:        ', callerId, callerEmail);
+        console.warn('  stamped owner: ', stampedId || '(none)', stampedEmail || '(none)');
+        console.warn('  payment_id:    ', razorpay_payment_id);
+        console.warn('  order_id:      ', razorpay_order_id || '(none)');
+        console.warn('  subscription:  ', razorpay_subscription_id || '(none)');
+        console.warn('━'.repeat(60));
+        try {
+          db.logAdminAction(callerEmail, 'razorpay-verify-ownership-refused', req.user.id, callerEmail, {
+            payment_id: razorpay_payment_id,
+            order_id: razorpay_order_id || null,
+            subscription_id: razorpay_subscription_id || null,
+            stamped_user_id: stampedId,
+            stamped_email: stampedEmail,
+            ip: req.ip || null,
+          });
+        } catch { /* audit is best-effort; the refusal above is the control */ }
+        return res.status(403).json({ error: 'This payment belongs to a different account.' });
+      }
     }
 
     // If we couldn't determine the tier, the safe move is to NOT touch the

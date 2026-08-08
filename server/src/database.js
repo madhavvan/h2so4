@@ -2593,6 +2593,31 @@ function deleteUser(userId) {
     d.prepare('DELETE FROM users WHERE id = ?').run(userId);
   });
   tx();
+
+  // ── The résumé is not only in SQLite ──
+  // services/contextStore.js holds the uploaded knowledge base — résumé,
+  // job description, notes — in memory for up to 3 hours so the client
+  // can send a hash instead of 400KB per question. Deleting the rows left
+  // that copy sitting there, so an account deleted under a policy that
+  // promises deletion is "immediate and permanent" kept its résumé
+  // readable server-side for the rest of the TTL.
+  //
+  // Done here rather than at the four call sites (routes/auth.js
+  // delete-account, routes/admin.js, and both botTools.js paths) so a
+  // fifth caller added later cannot forget it. After the transaction on
+  // purpose: a rolled-back delete must not drop a live user's cache.
+  //
+  // Failure is logged, never thrown — the account IS deleted at this
+  // point, and turning a cache-eviction problem into an exception would
+  // report a completed deletion as a failure.
+  try {
+    const contextStore = require('./services/contextStore');
+    const dropped = contextStore.forgetUser(userId);
+    if (dropped) console.log(`[deleteUser] purged ${dropped} cached context entr${dropped === 1 ? 'y' : 'ies'} for ${userId}`);
+  } catch (err) {
+    console.error(`[deleteUser] FAILED to purge cached context for ${userId} — it will expire on its own TTL:`, err.message);
+  }
+
   return true;
 }
 

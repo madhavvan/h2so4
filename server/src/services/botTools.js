@@ -2281,7 +2281,18 @@ function serializeUserForBot(u) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 // Build a single lookup table keyed by tool name so executeTool() is O(1).
-const ALL_TOOLS = {};
+// Null-prototype on purpose. This object is indexed by a tool name that
+// ultimately comes from a language model, so `ALL_TOOLS[name]` with a
+// plain `{}` resolves inherited members: ALL_TOOLS['__proto__'] returns
+// Object.prototype and ALL_TOOLS['constructor'] returns Object — both
+// truthy, so the `if (!tool)` unknown-name check in executeTool waved
+// them through to `tool.handler(...)`. That landed in the catch (handler
+// is not a function) rather than doing damage, but it meant a name the
+// registry never registered got past the "unknown tool" branch and into
+// the execution path, and the duplicate-name guard below could be fooled
+// the same way. Object.create(null) makes the lookup mean exactly what
+// it reads as.
+const ALL_TOOLS = Object.create(null);
 function register(category, defs) {
   for (const def of defs) {
     if (ALL_TOOLS[def.name]) {

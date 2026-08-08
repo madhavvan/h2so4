@@ -1520,7 +1520,23 @@ export function ManageSubscription({
                 "nothing to cancel" row in the plans section instead.
                 The unified server endpoint auto-detects provider, so the
                 same UI works for everyone. */}
-            {isPaidProvider && isRecurring && status === 'active' && (
+            {/* `|| cancelConfirm` is load-bearing, not defensive.
+                This block holds the ONLY render site for the cancel
+                confirmation panel (the `: (` branch below) — grep
+                cancelConfirm: it is set in two places and read in exactly
+                one. The other setter is the "Cancel Ultra" button in the
+                plans section above, which has NO status gate. So whenever
+                an Ultra subscriber was in any status other than 'active'
+                — notably **past_due**, where Razorpay is still retrying
+                their card and access continues — pressing Cancel Ultra
+                set this state and rendered nothing at all. No modal, no
+                error, no feedback: a dead button on the one screen that
+                is supposed to let someone stop paying.
+                Now the panel appears whenever a cancellation is pending,
+                whatever the status. Nothing else changes: cancelConfirm
+                is only ever set when isPaidProvider, and with it false
+                the gate is exactly what it was. */}
+            {((isPaidProvider && isRecurring && status === 'active') || cancelConfirm) && (
               <>
                 {!cancelConfirm ? (
                   <button
@@ -1593,7 +1609,15 @@ export function ManageSubscription({
                         so we don't fetch the bot endpoint just for
                         labels. */}
                     <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3 space-y-1.5">
-                      <div className="text-[11px] font-bold uppercase tracking-wider text-white/60">What you'll lose at {formatExpiry(expiresAt)}</div>
+                      {/* accessUntilLabel, not raw formatExpiry — Ultra's
+                          licence carries expires_at = -1 by design while the
+                          sub is nominal, and formatExpiry renders -1 as
+                          "Never", so this header read "What you'll lose at
+                          Never". That is exactly what accessUntilLabel was
+                          introduced to prevent (see its definition); the
+                          sibling line above already uses it and this one was
+                          missed. */}
+                      <div className="text-[11px] font-bold uppercase tracking-wider text-white/60">What you'll lose at {accessUntilLabel}</div>
                       <ul className="text-[12px] text-white/80 space-y-1 ml-2 list-disc list-inside">
                         {/* Gate-accurate under 2026-07 pricing (mirrors FEATURE_GATES).
                             Renders for the subscription tiers — legacy Pro/Max subs

@@ -529,91 +529,13 @@ app.get('/stealth-test', (req, res) => {
 //
 // Download filenames MUST match electron-builder's artifactName entries
 // in package.json → build → {win,mac,linux}.
-// Must name the SAME repo as REPO in routes/downloads.js. It pointed at
-// `interviewcopilot-releases` from 2026-07-18 to 2026-08-06 — a repo that
-// was never created — so this fetch 404'd on every refresh and the endpoint
-// silently served FALLBACK_VERSION to every client for three weeks.
-const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/h2so4/releases/latest';
-const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
-
-// Offline fallback ONLY — the GitHub Releases fetch above is the live
-// source of truth. Used when GitHub is unreachable AND the in-memory cache
-// is cold (server just restarted). Override at deploy with LATEST_APP_VERSION
-// so it can't silently drift behind the shipped release: the previous
-// hardcoded 3.4.9 sat four releases behind shipped 4.0.8, which on a cold
-// start would tell every client "latest is 3.4.9" and show a misleading
-// downgrade prompt. Whatever value is used MUST point at a version that
-// actually has a GitHub release.
-const FALLBACK_VERSION = {
-  // Bumped 4.0.8 → 4.0.16 on 2026-08-06. While GITHUB_RELEASES_URL pointed
-  // at a repo that did not exist, the fetch failed on every refresh and this
-  // fallback WAS the live answer — so production told every client the
-  // latest version was 4.0.8 while 4.0.16 was the shipped build. v4.0.16 is
-  // the newest non-draft release on madhavvan/h2so4.
-  version: process.env.LATEST_APP_VERSION || '4.0.16',
-  minVersion: '2.0.0',
-  releaseDate: '2026-07-18',
-  releaseNotes: 'Latest stable release.',
-  downloadUrl: {
-    // Routed through get.minicaai.com → 302 → GitHub release CDN. Keeps the
-    // codename out of any URL the client receives and surfaces in browser
-    // address bars / notifications. The /dl handler at routes/downloads.js
-    // owns the actual GitHub release URL.
-    windows: 'https://get.minicaai.com/windows',
-    mac: 'https://get.minicaai.com/mac',
-    linux: 'https://get.minicaai.com/linux',
-  },
-};
-
-const versionCache = {
-  value: FALLBACK_VERSION,
-  fetchedAt: 0,
-  refreshing: false,
-};
-
-async function refreshVersionCache() {
-  if (versionCache.refreshing) return;
-  versionCache.refreshing = true;
-  try {
-    const res = await fetch(GITHUB_RELEASES_URL, {
-      headers: {
-        'Accept': 'application/vnd.github+json',
-        'User-Agent': 'minicaai-server',
-      },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) throw new Error(`GitHub API ${res.status}`);
-    const data = await res.json();
-    const tag = (data.tag_name || '').replace(/^v/, '');
-    if (!/^\d+\.\d+\.\d+$/.test(tag)) throw new Error(`Bad tag: ${data.tag_name}`);
-    versionCache.value = {
-      version: tag,
-      minVersion: FALLBACK_VERSION.minVersion,
-      releaseDate: data.published_at || FALLBACK_VERSION.releaseDate,
-      releaseNotes: data.body || FALLBACK_VERSION.releaseNotes,
-      // "/releases/latest/download/<asset>" always resolves to current latest,
-      // so the same URLs work after every release.
-      downloadUrl: FALLBACK_VERSION.downloadUrl,
-    };
-    versionCache.fetchedAt = Date.now();
-  } catch (err) {
-    // Keep the last good cached value. On a cold start where GitHub was
-    // never reachable, this stays at FALLBACK_VERSION — clients still get
-    // a sane (if slightly stale) answer rather than a 500.
-    console.warn('[version-check] GitHub fetch failed:', err.message);
-  } finally {
-    versionCache.refreshing = false;
-  }
-}
-
-function getLatestVersion() {
-  // Sync getter. If the cache is stale, kick off a background refresh for
-  // the next caller — never blocks this request.
-  if (Date.now() - versionCache.fetchedAt > VERSION_CACHE_TTL_MS) {
-    refreshVersionCache();
-  }
-  return versionCache.value;
-}
+// The cache itself lives in services/versionSource.js so that routes
+// mounted from this file (notably /api/v1/license/version) can reach the
+// SAME answer without an import cycle. They could not before, and the
+// result was two public endpoints disagreeing about the latest version —
+// this one saying 4.0.17 while /license/version read a hand-maintained
+// database row that still said 4.0.8.
+const { getLatestVersion, refreshVersionCache } = require('./services/versionSource');
 
 // Warm the cache at boot so the first request after restart isn't served
 // the cold-start fallback.

@@ -163,14 +163,10 @@ if (!app.requestSingleInstanceLock()) {
     } else {
       createMainWindow();
     }
-    // If the second-instance trigger was a protocol URL, log it. The
-    // renderer's existing /google/poll path is what actually consumes
-    // the signed-in session — we just needed to bring the window
-    // forward and let the browser tab close on its own.
     try {
       const protoArg = (argv || []).find(a => typeof a === 'string' && a.startsWith('interview-copilot://'));
-      if (protoArg) electronLog.info('[protocol] handoff:', protoArg);
-    } catch { /* logging is best-effort */ }
+      if (protoArg) receiveProtocolUrl(protoArg);
+    } catch { /* handoff is best-effort; the manual code still works */ }
   });
 
   // macOS routes protocol URLs through `open-url` rather than
@@ -180,8 +176,81 @@ if (!app.requestSingleInstanceLock()) {
     if (mainWindow && !mainWindow.isDestroyed()) {
       smoothShow(mainWindow);
     }
-    try { electronLog.info('[protocol] open-url:', url); } catch {}
+    receiveProtocolUrl(url);
   });
+
+  // Cold start: if the app was NOT already running, the OS launches it
+  // with the protocol URL in our own argv — `second-instance` never
+  // fires. Without this branch the very first Google sign-in after an
+  // app restart would find no handoff and fall back to the typed code.
+  //
+  // Deferred to whenReady deliberately: this block runs during module
+  // evaluation, and receiveProtocolUrl closes over `mainWindow` /
+  // `popoutWindow`, whose `let` bindings are still in the temporal dead
+  // zone this early. Calling it inline would throw at boot on precisely
+  // the launch that carries a sign-in.
+  app.whenReady().then(() => {
+    try {
+      const bootProtoArg = (process.argv || []).find(a => typeof a === 'string' && a.startsWith('interview-copilot://'));
+      if (bootProtoArg) receiveProtocolUrl(bootProtoArg);
+    } catch { /* best-effort */ }
+  });
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  GOOGLE SIGN-IN HANDOFF
+//
+//  The browser that completed Google consent navigates to
+//  `interview-copilot://signin-complete?session_id=…&code=…`. The OS
+//  routes that to the app ON THAT MACHINE, which is the whole security
+//  property: /google/poll will not release the session without `code`,
+//  and the code only ever reaches the machine where a human consented.
+//  Someone who picked the session_id and is polling from elsewhere never
+//  sees it. See server/src/routes/auth.js (mintHandoffCode).
+//
+//  Buffered rather than fire-and-forget because the ordering is not ours
+//  to control: on a cold start the URL arrives before any renderer
+//  exists, and even warm the sign-in screen may not have its listener
+//  attached yet. So we push AND hold, and the renderer drains on demand.
+//  Single-slot — a newer sign-in supersedes an abandoned one.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+let pendingGoogleHandoff = null;
+
+function receiveProtocolUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl));
+  } catch {
+    try { electronLog.warn('[protocol] unparseable URL ignored'); } catch {}
+    return;
+  }
+  // `interview-copilot://signin-complete?…` parses with host
+  // 'signin-complete' and an empty path, so match on either shape rather
+  // than assuming one — Chromium's URL parser has moved on this before.
+  const action = (parsed.hostname || parsed.pathname.replace(/^\/+/, '') || '').toLowerCase();
+  if (action !== 'signin-complete') {
+    try { electronLog.info('[protocol] ignored action:', action); } catch {}
+    return;
+  }
+
+  const sessionId = parsed.searchParams.get('session_id');
+  const code = parsed.searchParams.get('code');
+  if (!sessionId || !code) {
+    // A pre-handoff server (or a truncated URL). Nothing to forward; the
+    // browser page shows the typed-code fallback for exactly this case.
+    try { electronLog.warn('[protocol] signin-complete without a handoff code'); } catch {}
+    return;
+  }
+
+  pendingGoogleHandoff = { sessionId, code, receivedAt: Date.now() };
+  // Never log the code itself — it is a bearer credential for a session.
+  try { electronLog.info('[protocol] google handoff received for session', sessionId.slice(0, 8) + '…'); } catch {}
+
+  for (const win of [mainWindow, popoutWindow]) {
+    if (win && !win.isDestroyed()) {
+      try { win.webContents.send('auth:google-handoff', { sessionId, code }); } catch {}
+    }
+  }
 }
 
 let mainWindow = null;
@@ -1095,6 +1164,24 @@ function createPopoutWindow(options = {}) {
 //  IPC HANDLERS
 // ───────────────────────────────────────────────
 
+// Drain the buffered Google sign-in handoff (see receiveProtocolUrl).
+// The renderer calls this when it opens the sign-in screen and again
+// each poll tick, which covers the cold-start case where the protocol
+// URL arrived before any window existed to receive the broadcast.
+//
+// Read-once: handing the same code out twice serves nothing (the server
+// burns it on first redemption) and holding it lets a stale handoff
+// interfere with the next sign-in attempt.
+ipcMain.handle('auth:consume-google-handoff', () => {
+  const handoff = pendingGoogleHandoff;
+  pendingGoogleHandoff = null;
+  // 5 minutes matches the server's pending-session TTL — anything older
+  // is already dead server-side, so returning it would only produce a
+  // confusing "invalid code" instead of a clean fall-through.
+  if (!handoff || Date.now() - handoff.receivedAt > 5 * 60 * 1000) return null;
+  return { sessionId: handoff.sessionId, code: handoff.code };
+});
+
 // Desktop capturer — renderer can't access this directly in Electron 17+
 ipcMain.handle('get-desktop-sources', async () => {
   const sources = await desktopCapturer.getSources({
@@ -1308,20 +1395,36 @@ ipcMain.on('update-prompt-decision', (_event, payload) => {
 // Resize pop-out — keeps window on-screen and animates
 ipcMain.on('resize-popout', (_event, { width, height }) => {
   if (popoutWindow && !popoutWindow.isDestroyed()) {
-    const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
+    // ── Clamp against the display the popout is ACTUALLY on ──
+    // This read getPrimaryDisplay().workAreaSize, which returns a bare
+    // {width,height} with no origin — then compared the popout's ABSOLUTE
+    // x against it. createPopoutWindow places the popout on the display
+    // nearest the cursor (getDisplayNearestPoint above), so on any
+    // multi-monitor setup — a laptop plus an external monitor, which is
+    // the normal interview desk — those two disagree.
+    //
+    // What the user saw: popout open on the second monitor at x=2000,
+    // press the S/M/L size button, and `2000 + 450 > 1920` fires the
+    // "push back on-screen" branch, teleporting the window onto the
+    // primary display mid-interview. A monitor to the LEFT of primary
+    // (negative x) got yanked the same way by the `newX < 0` branch.
+    //
+    // workArea (not workAreaSize) carries x/y, so the comparisons are
+    // now in the same coordinate space as the window's own bounds.
+    const display = screen.getDisplayMatching(popoutWindow.getBounds());
+    const wa = display.workArea; // { x, y, width, height } — absolute
     const [currentX, currentY] = popoutWindow.getPosition();
-    
-    // Calculate new position so window doesn't go off-screen
-    const newW = Math.min(width, screenW - 20);
-    const newH = Math.min(height, screenH - 20);
+
+    const newW = Math.min(width, wa.width - 20);
+    const newH = Math.min(height, wa.height - 20);
     let newX = currentX;
     let newY = currentY;
 
-    // Push back on-screen if needed
-    if (newX + newW > screenW) newX = screenW - newW - 10;
-    if (newY + newH > screenH) newY = screenH - newH - 10;
-    if (newX < 0) newX = 10;
-    if (newY < 0) newY = 10;
+    // Push back on-screen if needed — within THIS display's work area.
+    if (newX + newW > wa.x + wa.width) newX = wa.x + wa.width - newW - 10;
+    if (newY + newH > wa.y + wa.height) newY = wa.y + wa.height - newH - 10;
+    if (newX < wa.x) newX = wa.x + 10;
+    if (newY < wa.y) newY = wa.y + 10;
 
     popoutWindow.setBounds({ x: newX, y: newY, width: newW, height: newH }, true);
     // Re-enforce after resize

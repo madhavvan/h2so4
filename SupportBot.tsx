@@ -67,8 +67,14 @@ export interface SupportBotProps {
   /** User's live subscription tier. Drives the scripted-vs-AI fork:
    *  null/undefined (anonymous) → scripted topic picker.
    *  'free'                     → scripted topic picker.
-   *  'basic' / 'pro' / 'max'    → full AI chat.
-   *  When undefined, the bot fetches /api/v1/support/tier to decide. */
+   *  every tier in AI_CHAT_TIERS → full AI chat.
+   *  When undefined, the bot fetches /api/v1/support/tier to decide.
+   *
+   *  Deliberately NOT a hand-written tier list any more. This doc used to
+   *  read "'basic' / 'pro' / 'max'", and that is exactly the list that
+   *  went stale when Ultra shipped — the top paid tier fell through to
+   *  the scripted FAQ. AI_CHAT_TIERS (below) is the one place tiers are
+   *  enumerated; keep it that way. */
   tier?: string | null;
   /** Optional JWT for the tier probe + /chat auth. If omitted the bot
    *  works anonymously (and falls back to scripted). */

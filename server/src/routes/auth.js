@@ -10,6 +10,49 @@ const router = express.Router();
 
 const DEVELOPER_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ADMIN ADDRESSES ARE NOT SELF-SERVE
+//
+//  Every admin gate in the codebase — middleware/admin.js adminOnly,
+//  middleware/tier.js, middleware/regionGate.js, the support-WS agent
+//  role — decides by comparing an EMAIL STRING against ADMIN_EMAILS.
+//  Nothing consults a flag on the row. So the account that owns an
+//  ADMIN_EMAILS address is admin, full stop, however it came to exist.
+//
+//  Which means: while an ADMIN_EMAILS address has no account yet,
+//  whoever registers it first becomes a full administrator. All three
+//  creation doors had that property — POST /signup, POST /google, and
+//  the /google/callback redirect flow — and each additionally handed out
+//  tier 'pro' with a never-expiring licence on the way in.
+//
+//  Refusing creation is the fix that matches how authorization actually
+//  works here. Signing IN is untouched: once the account exists, every
+//  path works normally. Provisioning is deliberate and offline —
+//  `node server/scripts/provision-admin.mjs` — so an admin account is
+//  never something a stranger can race us to.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function isReservedAdminEmail(email) {
+  return DEVELOPER_EMAILS.includes(String(email || '').trim().toLowerCase());
+}
+
+// Deliberately does not say "that is an admin address". The owner gets a
+// route forward; a stranger probing addresses learns as little as the
+// refusal allows.
+const RESERVED_EMAIL_MESSAGE =
+  'This email address cannot be registered from the app. If it is yours, contact support@minicaai.com.';
+
+function logReservedEmailAttempt(email, route, req) {
+  const addr = String(email || '').trim().toLowerCase();
+  console.warn(`[auth] REFUSED account creation for a reserved admin address via ${route} — ip=${req?.ip || 'unknown'} email=${addr}`);
+  try {
+    db.logAdminAction(addr, 'reserved-admin-email-signup-attempt', null, addr, {
+      route,
+      ip: req?.ip || null,
+      user_agent: req?.headers?.['user-agent'] || null,
+    });
+  } catch { /* audit is best-effort; the refusal above is the control */ }
+}
+
 // Email format validation
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
@@ -40,6 +83,14 @@ router.post('/signup', async (req, res) => {
     const existing = db.getUserByEmail(email);
     if (existing) {
       return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+
+    // Creation door 1 of 3 — see isReservedAdminEmail. Ordered after the
+    // duplicate check so an already-provisioned admin address reports the
+    // ordinary 409 rather than advertising itself.
+    if (isReservedAdminEmail(email)) {
+      logReservedEmailAttempt(email, 'POST /signup', req);
+      return res.status(403).json({ error: RESERVED_EMAIL_MESSAGE });
     }
 
     const isDev = DEVELOPER_EMAILS.includes(email.toLowerCase());
@@ -260,6 +311,13 @@ router.post('/google', async (req, res) => {
           sendMail({ to: user.email, subject, html, text }).catch(() => { /* mail outage non-fatal */ });
         }
       } else {
+        // Creation door 2 of 3. Holding the Google account for an admin
+        // address is not authorization to become an administrator here —
+        // and closing only /signup would leave this one wide open.
+        if (isReservedAdminEmail(email)) {
+          logReservedEmailAttempt(email, 'POST /google', req);
+          return res.status(403).json({ error: RESERVED_EMAIL_MESSAGE });
+        }
         // Create new user via Google
         isNewUser = true;
         const userId = require('uuid').v4();
@@ -365,6 +423,103 @@ setInterval(() => {
     if (now - session.created_at > 5 * 60 * 1000) pendingGoogleSessions.delete(id);
   }
 }, 60 * 1000);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  HANDOFF CODE — the thing that makes /google/poll safe
+//
+//  The flow above has a hole that entropy alone cannot close. `session_id`
+//  is chosen by whoever calls /google/start, and /google/poll hands the
+//  minted JWT to whoever presents that id. So:
+//
+//    1. Attacker calls /google/start?session_id=THEIRS (never finishes it)
+//    2. Attacker sends the victim that same /google/start link
+//    3. Victim consents with THEIR Google account; the callback files the
+//       victim's token under THEIRS
+//    4. Attacker polls with THEIRS and collects the victim's session
+//
+//  Requiring UUID-class entropy in session_id (below) defends against
+//  GUESSING an id. It does nothing here, because the attacker isn't
+//  guessing — they picked it. Nothing in the old flow ever tied the
+//  redeemer to the human who actually consented.
+//
+//  The fix is a secret that does not exist until AFTER consent, so an
+//  attacker who set the session up beforehand cannot know it:
+//
+//    • /google/callback mints a one-time code and stores only its hash.
+//    • The code is delivered ONLY to the browser that completed consent —
+//      in the `interview-copilot://` deep link (which the OS routes to the
+//      app on THAT machine) and printed on the success page for the human.
+//    • /google/poll refuses to release the token without it.
+//
+//  In the attack the deep link fires on the victim's machine and the code
+//  is printed in the victim's browser. The attacker holds session_id and
+//  nothing else, so the poll returns `awaiting_code` forever.
+//
+//  Kept human-typeable (Crockford base32, ambiguous letters removed) so
+//  the printed code is a real fallback when the OS protocol handler is
+//  unavailable — see the note at setAsDefaultProtocolClient in
+//  electron/main.cjs, which fails open by design on sandboxed installs.
+//  50 bits behind a 10-try cap and a 5-minute TTL is far past brute force.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const crypto = require('crypto');
+
+// Escape hatch for a fleet-transition window. Defaults to ON (secure).
+// Turning it off re-opens the takeover above for clients that present no
+// code, so every legacy redemption is logged loudly and still has to come
+// from the same address that consented. Documented in server/.env.example.
+const REQUIRE_HANDOFF_CODE =
+  String(process.env.GOOGLE_POLL_REQUIRE_CODE || 'true').toLowerCase() !== 'false';
+const MAX_HANDOFF_ATTEMPTS = 10;
+const HANDOFF_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'; // no I, L, O, U
+
+function mintHandoffCode() {
+  // rejection-free: 32 symbols divides 256 evenly, so a byte maps to a
+  // symbol with no modulo bias.
+  const bytes = crypto.randomBytes(10);
+  let out = '';
+  for (const b of bytes) out += HANDOFF_ALPHABET[b % 32];
+  return out;
+}
+
+// Accepts what a human retypes: any case, with or without the display
+// hyphen, and with the shapes Crockford folds (I/L → 1, O → 0).
+function normalizeHandoffCode(raw) {
+  return String(raw || '')
+    .toUpperCase()
+    .replace(/[^0-9A-Z]/g, '')
+    .replace(/[IL]/g, '1')
+    .replace(/O/g, '0');
+}
+
+function hashHandoffCode(raw) {
+  return crypto.createHash('sha256').update(normalizeHandoffCode(raw), 'utf8').digest();
+}
+
+function handoffCodeMatches(session, presented) {
+  if (!session || !session.handoff_hash) return false;
+  const normalized = normalizeHandoffCode(presented);
+  if (normalized.length !== 10) return false;
+  const expected = session.handoff_hash;
+  const actual = hashHandoffCode(normalized);
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+// Display form for the human-readable fallback: XXXXX-XXXXX.
+function formatHandoffCode(code) {
+  return `${code.slice(0, 5)}-${code.slice(5)}`;
+}
+
+// Coarse address identity for the legacy (no-code) path only. Compared at
+// /24 for IPv4 and /64 for IPv6 so a NAT pool or a dual-address host does
+// not fail a legitimate redemption, while an attacker elsewhere on the
+// internet still cannot match. Never used when a code is required.
+function addressPrefix(ip) {
+  const raw = String(ip || '').replace(/^::ffff:/, '');
+  if (!raw) return null;
+  if (raw.includes(':')) return raw.split(':').slice(0, 4).join(':').toLowerCase();
+  const octets = raw.split('.');
+  return octets.length === 4 ? octets.slice(0, 3).join('.') : raw;
+}
 
 // Step 1: Start Google OAuth — redirects browser to Google
 router.get('/google/start', (req, res) => {
@@ -488,6 +643,14 @@ router.get('/google/callback', async (req, res) => {
           sendMail({ to: user.email, subject, html, text }).catch(() => { /* mail outage non-fatal */ });
         }
       } else {
+        // Creation door 3 of 3 — the desktop redirect flow. Reports
+        // through the pending-session channel because this handler
+        // answers to a browser, not to the app.
+        if (isReservedAdminEmail(email)) {
+          logReservedEmailAttempt(email, 'GET /google/callback', req);
+          pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: RESERVED_EMAIL_MESSAGE });
+          return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center;max-width:380px;padding:0 20px"><h2 style="color:#f87171">Can\'t create that account</h2><p style="color:#9ca3af;font-size:13px">This email address cannot be registered from the app. If it is yours, contact support@minicaai.com.</p></div></body></html>');
+        }
         isNewUser = true;
         const userId = uuidv4();
         const now = Date.now();
@@ -549,10 +712,22 @@ router.get('/google/callback', async (req, res) => {
     const license = db.getLicenseByUserId(user.id);
     const token = generateToken({ id: user.id, email: user.email, tier: user.tier });
 
+    // Mint the redemption code. This is the first moment in the flow at
+    // which a secret exists that the initiator of /google/start could not
+    // have known, which is exactly why the binding has to happen here and
+    // not at start time. Only the hash is retained.
+    const handoffCode = mintHandoffCode();
+
     // Store the result for polling
     pendingGoogleSessions.set(session_id, {
       created_at: Date.now(),
       status: 'success',
+      handoff_hash: hashHandoffCode(handoffCode),
+      handoff_attempts: 0,
+      // Consulted only on the legacy no-code path (GOOGLE_POLL_REQUIRE_CODE
+      // =false). The consenting browser and the app that polls run on the
+      // same machine in every legitimate sign-in.
+      consent_ip_prefix: addressPrefix(req.ip || req.connection?.remoteAddress),
       data: {
         user: {
           id: user.id,
@@ -584,24 +759,30 @@ router.get('/google/callback', async (req, res) => {
     // redirect is denied, the renderer's existing /google/poll loop
     // signs the user in.
     const safeSessionId = encodeURIComponent(String(session_id));
-    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signed in</title></head><body style="background:#050507;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center;max-width:420px;padding:0 20px"><div style="width:56px;height:56px;border-radius:14px;background:linear-gradient(135deg,#10b981,#3b82f6);display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:24px;color:#fff">✓</div><h2 style="color:#e5e7eb;margin:0 0 6px;font-weight:600;font-size:18px">Signed in</h2><p style="color:#9ca3af;margin:0;font-size:13px">Returning to Interview Copilot…</p><p id="fallback-msg" style="color:#6b7280;margin:18px 0 0;font-size:11px;opacity:0;transition:opacity 0.3s">You can close this tab now.</p></div><script>
+    const safeHandoff = encodeURIComponent(handoffCode);
+    const displayCode = formatHandoffCode(handoffCode);
+    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signed in</title></head><body style="background:#050507;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center;max-width:420px;padding:32px 20px"><div style="width:56px;height:56px;border-radius:14px;background:linear-gradient(135deg,#10b981,#3b82f6);display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:24px;color:#fff">✓</div><h2 style="color:#e5e7eb;margin:0 0 6px;font-weight:600;font-size:18px">Signed in</h2><p style="color:#9ca3af;margin:0;font-size:13px">Returning to Interview Copilot…</p><div id="fallback-box" style="margin:22px 0 0;opacity:0;transition:opacity 0.3s"><p style="color:#9ca3af;margin:0 0 10px;font-size:12px">Still waiting? Enter this code in the app:</p><div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:22px;letter-spacing:2px;color:#e5e7eb;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px 16px;display:inline-block">${displayCode}</div><p style="color:#6b7280;margin:12px 0 0;font-size:11px">It expires in 5 minutes and works once. You can close this tab after signing in.</p></div></div><script>
 (function(){
   // Hand off to the desktop app via the custom protocol. Browsers will
   // close (or blank) this tab automatically when the OS protocol
   // handler claims the navigation. If the OS doesn't recognize the
   // protocol (older install, sandboxed browser), the redirect is a
-  // no-op and the fallback message after ~1.6s tells the user to close
-  // the tab manually.
-  var url = 'interview-copilot://signin-complete?session_id=${safeSessionId}';
+  // no-op and the code block below becomes the way in.
+  //
+  // The code rides the deep link so the normal path stays invisible:
+  // the OS routes it to the app on THIS machine, which is precisely the
+  // property that makes it safe — an attacker holding session_id is on
+  // some other machine and never receives it.
+  var url = 'interview-copilot://signin-complete?session_id=${safeSessionId}&code=${safeHandoff}';
   try { window.location.href = url; } catch (e) { /* CSP or sandbox */ }
   setTimeout(function(){
     // Try the explicit window.close() as a second attempt (works when
     // the original tab was opened via window.open from our app).
     try { window.close(); } catch (e) {}
-    // Show the manual-close hint if we're still alive after the
-    // protocol attempt failed and window.close() was blocked.
+    // Still alive => the protocol handoff didn't take. Reveal the code
+    // so the user can finish by hand instead of hitting a dead end.
     setTimeout(function(){
-      var m = document.getElementById('fallback-msg');
+      var m = document.getElementById('fallback-box');
       if (m) m.style.opacity = '1';
     }, 400);
   }, 1200);
@@ -626,7 +807,52 @@ router.get('/google/poll', (req, res) => {
   if (!session) return res.json({ status: 'pending' });
 
   if (session.status === 'success') {
-    // Clean up after successful retrieval
+    // ── Redemption gate ──
+    // Holding session_id is not proof of anything: the caller chose it.
+    // Proof is the code minted after consent and delivered only to the
+    // browser that consented. See the block above mintHandoffCode.
+    const presented = req.query.code;
+
+    if (REQUIRE_HANDOFF_CODE) {
+      if (!presented) {
+        // Not an error — the normal state while the deep link is still in
+        // flight, and the signal the client uses to show the manual code
+        // entry. Deliberately does NOT release anything.
+        return res.json({ status: 'awaiting_code' });
+      }
+      if (!handoffCodeMatches(session, presented)) {
+        session.handoff_attempts = (session.handoff_attempts || 0) + 1;
+        if (session.handoff_attempts >= MAX_HANDOFF_ATTEMPTS) {
+          // Burn the session rather than let it be ground down. The user
+          // signs in again; an attacker gets nothing either way.
+          pendingGoogleSessions.delete(session_id);
+          console.warn(`[google/poll] handoff code exhausted after ${MAX_HANDOFF_ATTEMPTS} attempts — session burned, ip=${req.ip || 'unknown'}`);
+          return res.json({ status: 'error', error: 'Too many incorrect codes. Please sign in again.' });
+        }
+        return res.json({ status: 'awaiting_code', invalid_code: true });
+      }
+    } else {
+      // ── Legacy path (GOOGLE_POLL_REQUIRE_CODE=false) ──
+      // Only for a fleet-transition window. A code, if presented, still
+      // has to be right — turning the switch off must not turn a wrong
+      // code into an accepted one. With no code we fall back to the
+      // weaker same-address check, which still stops the remote phish
+      // that motivated all of this.
+      if (presented) {
+        if (!handoffCodeMatches(session, presented)) {
+          return res.json({ status: 'awaiting_code', invalid_code: true });
+        }
+      } else {
+        const pollPrefix = addressPrefix(req.ip || req.connection?.remoteAddress);
+        if (!session.consent_ip_prefix || !pollPrefix || session.consent_ip_prefix !== pollPrefix) {
+          console.warn(`[google/poll] REFUSED legacy code-less redemption from a different address (consent=${session.consent_ip_prefix || 'unknown'} poll=${pollPrefix || 'unknown'}) — this is what an account-takeover attempt looks like`);
+          return res.json({ status: 'awaiting_code' });
+        }
+        console.warn(`[google/poll] LEGACY code-less redemption allowed for ${session.data?.user?.email || 'unknown'} — GOOGLE_POLL_REQUIRE_CODE is off; turn it back on once the fleet has updated`);
+      }
+    }
+
+    // Clean up after successful retrieval. Single-use by construction.
     pendingGoogleSessions.delete(session_id);
     return res.json({ status: 'success', ...session.data });
   }

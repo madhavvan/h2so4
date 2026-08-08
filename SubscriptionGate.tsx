@@ -3226,7 +3226,12 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                     </div>
                     <div className="p-4 rounded-xl border border-red-500/20 bg-red-500/[0.04]">
                       <p className="text-[10px] text-red-400 uppercase tracking-wider mb-1">30d Churn</p>
-                      <p className="text-2xl font-bold text-red-400 tracking-tight">{stats?.churn_rate_30d != null ? `${(stats.churn_rate_30d * 100).toFixed(1)}%` : '—'}</p>
+                      {/* NO ×100 — database.js getChurnRate() already returns a
+                    percent, and says so: `// Percent, 2 decimal places` above
+                    `Math.round((churned / existing) * 10000) / 100`. Scaling
+                    it again rendered 5.26% churn as "526.0%", which is not a
+                    number anyone can act on. */}
+                <p className="text-2xl font-bold text-red-400 tracking-tight">{stats?.churn_rate_30d != null ? `${Number(stats.churn_rate_30d).toFixed(1)}%` : '—'}</p>
                     </div>
                   </div>
                 </div>
@@ -6510,7 +6515,11 @@ const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
               className="shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center"
               style={{ background: tierMeta.bg }}
             >
-              {currentLicense?.tier === 'max'
+              {/* Ultra had no branch here, so the top plan fell to the
+                  final `else` and drew Zap — Basic's glyph. */}
+              {currentLicense?.tier === 'ultra'
+                ? <UltraMark size={20} style={{ color: tierMeta.color }} />
+                : currentLicense?.tier === 'max'
                 ? <WizardHat size={20} style={{ color: tierMeta.color }} />
                 : currentLicense?.tier === 'pro'
                 ? <Crown size={20} style={{ color: tierMeta.color }} />
@@ -6682,6 +6691,16 @@ interface PlanRow {
 
 function tierMetaForPlanSheet(tier: string) {
   switch (tier) {
+    // ── Ultra ──
+    // This case did not exist, so 'ultra' hit `default` and the mobile
+    // plan sheet told a paying Ultra subscriber their plan was **Free**,
+    // in Free's grey. That is the same defect the badge helper above
+    // already carries a comment about fixing ("Previously absent, so an
+    // Ultra badge fell through to colorMap.free and rendered grey FREE")
+    // — the fix landed there and never reached this switch.
+    // Amethyst, matching TIER_THEME.ultra and that badge map, so Ultra
+    // reads as Ultra everywhere rather than as Max's amber.
+    case 'ultra': return { label: 'Ultra', bg: 'rgba(139, 92, 246, 0.12)', color: '#6d28d9', accent: '#7c3aed' };
     case 'max':   return { label: 'Max',   bg: 'rgba(245, 158, 11, 0.12)', color: '#b45309', accent: '#d97706' };
     case 'pro':   return { label: 'Pro',   bg: 'rgba(59, 130, 246, 0.12)', color: '#1d4ed8', accent: '#2563eb' };
     case 'basic': return { label: 'Basic', bg: 'rgba(16, 185, 129, 0.12)', color: '#047857', accent: '#059669' };
@@ -7044,7 +7063,13 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
                 className="shrink-0 w-12 h-12 rounded-2xl flex items-center justify-center"
                 style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)' }}
               >
-                {tier === 'max' ? (
+                {/* Ultra first — without its own branch it fell to the
+                    generic Sparkles, the same glyph a Free account gets.
+                    UltraMark is the mark the landing's pricing table and
+                    TIER_THEME.ultra both use. */}
+                {tier === 'ultra' ? (
+                  <UltraMark size={22} style={{ color: tierMeta.color }} />
+                ) : tier === 'max' ? (
                   <WizardHat size={22} style={{ color: tierMeta.color }} />
                 ) : tier === 'pro' ? (
                   <Crown size={22} style={{ color: tierMeta.color }} />
@@ -7075,7 +7100,24 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
                       border: '1px solid var(--cream-line)',
                     }}
                   >
-                    {status === 'active' ? 'Active' : status === 'trial' ? 'Trial' : status === 'expired' ? 'Expired' : status === 'revoked' ? 'Revoked' : 'Free'}
+                    {/* LicenseData.status has NINE values; this chain named
+                        four and sent the other five to 'Free'. So a paying
+                        subscriber mid-cancellation (status='canceling', still
+                        has full access until cycle end) read their plan as
+                        **Free** on the billing screen — as did past_due (card
+                        retrying, access continues), paused, refunded and
+                        disputed. 'Free' is now reserved for the tier that
+                        actually is free. */}
+                    {status === 'active' ? 'Active'
+                      : status === 'trial' ? 'Trial'
+                      : status === 'canceling' ? 'Cancels at period end'
+                      : status === 'past_due' ? 'Payment retrying'
+                      : status === 'paused' ? 'Paused'
+                      : status === 'refunded' ? 'Refunded'
+                      : status === 'disputed' ? 'Payment disputed'
+                      : status === 'expired' ? 'Expired'
+                      : status === 'revoked' ? 'Revoked'
+                      : 'Free'}
                   </span>
                   {provider && tier !== 'free' && !isAdminUser && (
                     <span
@@ -7708,6 +7750,24 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // also need a remount to recover). Set to true by the Cancel button; the
   // poll loop checks it on every tick.
   const googlePollAbortRef = useRef(false);
+  // ── Google sign-in handoff code ──
+  // /google/poll will not release the session without the code minted at
+  // consent time and delivered to THIS machine (deep link, or typed by
+  // the user from the browser page). Holding session_id proves nothing —
+  // the caller picked it — so without this the token was redeemable by
+  // whoever sent the user the sign-in link. See server/src/routes/auth.js.
+  //
+  // A ref, not state: the poll loop is a plain recursive closure and has
+  // to read the value the deep link delivered mid-flight, not the one
+  // captured when it started.
+  const googleHandoffCodeRef = useRef<string | null>(null);
+  const googleSessionIdRef = useRef<string | null>(null);
+  // Drives the "type the code from your browser" fallback, shown only
+  // once the server has told us consent completed and it is waiting on a
+  // code we never received (protocol handler unavailable/blocked).
+  const [googleCodePrompt, setGoogleCodePrompt] = useState(false);
+  const [googleCodeInput, setGoogleCodeInput] = useState('');
+  const [googleCodeInvalid, setGoogleCodeInvalid] = useState(false);
   const [forgotSent, setForgotSent] = useState(false);
 
   // Authenticated user (for download/dashboard views)
@@ -8809,7 +8869,48 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setGoogleManualUrl(null);
     setGoogleUrlCopied(false);
     setAuthError(null);
+    setGoogleCodePrompt(false);
+    setGoogleCodeInput('');
+    setGoogleCodeInvalid(false);
+    googleHandoffCodeRef.current = null;
+    googleSessionIdRef.current = null;
   };
+
+  // The deep link lands in the main process, which broadcasts it here and
+  // also buffers it. Both are needed: the broadcast covers the warm case,
+  // the buffer covers a cold start where the OS launched the app with the
+  // URL before this component existed. Mounted for the life of the gate
+  // so a handoff that arrives early is never dropped on the floor.
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api?.on) return;
+    const dispose = api.on('auth:google-handoff', (payload: any) => {
+      if (!payload?.code) return;
+      // Ignore a handoff for a sign-in we are not running — a leftover
+      // from an abandoned attempt would otherwise burn itself against the
+      // current session and surface as a spurious "incorrect code".
+      if (googleSessionIdRef.current && payload.sessionId !== googleSessionIdRef.current) return;
+      googleHandoffCodeRef.current = payload.code;
+      // The code arrived on its own; the typed fallback is moot.
+      setGoogleCodePrompt(false);
+      setGoogleCodeInvalid(false);
+    });
+    return () => { try { dispose?.(); } catch { /* already disposed */ } };
+  }, []);
+
+  // The code prompt and the code itself only mean anything while a sign-in
+  // is actually running. Hanging them off googleSubmitting means every
+  // teardown path — success, server error, poll timeout, Cancel, logout —
+  // clears them without having to remember to, which is precisely what
+  // eleven separate teardown sites get wrong over time.
+  useEffect(() => {
+    if (googleSubmitting) return;
+    setGoogleCodePrompt(false);
+    setGoogleCodeInput('');
+    setGoogleCodeInvalid(false);
+    googleHandoffCodeRef.current = null;
+    googleSessionIdRef.current = null;
+  }, [googleSubmitting]);
 
   const handleGoogleElectron = async () => {
     setGoogleSubmitting(true);
@@ -8817,8 +8918,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setGoogleManualUrl(null);
     setGoogleUrlCopied(false);
     googlePollAbortRef.current = false;
+    setGoogleCodePrompt(false);
+    setGoogleCodeInput('');
+    setGoogleCodeInvalid(false);
+    googleHandoffCodeRef.current = null;
 
     const sessionId = crypto.randomUUID();
+    googleSessionIdRef.current = sessionId;
     // Env-aware: in dev (vite serves on :3005) we point at VITE_SERVER_URL
     // so Google OAuth lands on the local server's /auth/google/callback,
     // not on prod. PROD short-circuit guards against a stray env var
@@ -8921,6 +9027,13 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     let attempts = 0;
     const maxAttempts = 60; // 60 * 2s = 2 minutes
     const pollInterval = 2000;
+    // Once we're waiting on a typed code the user has to switch to the
+    // browser, read it and come back, and two minutes is not enough for
+    // that. Extend to the server's own 5-minute pending-session TTL —
+    // past that the session is gone anyway, so waiting longer would only
+    // trade a clear timeout for a confusing "incorrect code".
+    const startedAt = Date.now();
+    const withinCodeEntryWindow = () => Date.now() < startedAt + 5 * 60 * 1000;
 
     const poll = async (): Promise<void> => {
       // Three abort conditions:
@@ -8931,10 +9044,53 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       if (!mountedRef.current) return;
       attempts++;
       try {
-        const res = await fetch(`${serverUrl}/api/v1/auth/google/poll?session_id=${sessionId}`);
+        // Drain any handoff the main process buffered before our listener
+        // existed (cold start). Cheap, read-once, and a no-op once we
+        // already hold a code.
+        if (!googleHandoffCodeRef.current && (window as any).electronAPI?.invoke) {
+          try {
+            const buffered = await (window as any).electronAPI.invoke('auth:consume-google-handoff');
+            if (buffered?.code && (!buffered.sessionId || buffered.sessionId === sessionId)) {
+              googleHandoffCodeRef.current = buffered.code;
+            }
+          } catch { /* older preload without the channel — typed code still works */ }
+        }
+        if (googlePollAbortRef.current) return;
+        if (!mountedRef.current) return;
+
+        const handoffCode = googleHandoffCodeRef.current;
+        const codeParam = handoffCode ? `&code=${encodeURIComponent(handoffCode)}` : '';
+        const res = await fetch(`${serverUrl}/api/v1/auth/google/poll?session_id=${sessionId}${codeParam}`);
         const data = await res.json();
         if (googlePollAbortRef.current) return;
         if (!mountedRef.current) return;
+
+        if (data.status === 'awaiting_code') {
+          // Consent succeeded but the code never reached this machine, so
+          // the protocol handoff didn't take (OS registration denied,
+          // sandboxed browser, portable install). The browser page is
+          // showing the code — ask for it rather than spinning to timeout.
+          if (data.invalid_code) {
+            // The code we sent was wrong. Drop it so a stale deep link
+            // can't keep re-submitting itself into the attempt cap.
+            googleHandoffCodeRef.current = null;
+            setGoogleCodeInvalid(true);
+          }
+          setGoogleCodePrompt(true);
+          setGoogleManualUrl(null);
+          if (!withinCodeEntryWindow()) {
+            setAuthError('Sign-in timed out. Please try again.');
+            setGoogleSubmitting(false);
+            return;
+          }
+          // Same await-and-recurse shape as the pending branch below, so
+          // the whole loop stays one promise chain under the caller's
+          // try/catch rather than a detached timer.
+          await new Promise(r => setTimeout(r, pollInterval));
+          if (googlePollAbortRef.current) return;
+          if (!mountedRef.current) return;
+          return poll();
+        }
 
         if (data.status === 'success') {
           // Defensive: server should always return a license on success,
@@ -9036,9 +9192,74 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // here so it captures the latest state via closure and renders identically
   // in both the login and signup views.
   const renderGoogleFallback = () => {
-    if (!googleSubmitting && !googleManualUrl) return null;
+    if (!googleSubmitting && !googleManualUrl && !googleCodePrompt) return null;
     return (
       <div className="mt-3 space-y-2">
+        {/* Consent finished, but the code never reached this machine — the
+            OS protocol handoff is unavailable (registration denied,
+            sandboxed browser, portable install; see the catch around
+            setAsDefaultProtocolClient in electron/main.cjs). The browser
+            tab is displaying the code, so take it by hand. Without this
+            the user would sit on a spinner until the 2-minute timeout. */}
+        {googleCodePrompt && (
+          <div
+            className="rounded-xl px-3 py-2.5"
+            style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink-muted)' }}
+          >
+            <div className="text-[12px] mb-2" style={{ color: 'var(--ink)' }}>
+              Almost there — enter the code shown in your browser.
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                inputMode="text"
+                autoComplete="one-time-code"
+                spellCheck={false}
+                value={googleCodeInput}
+                onChange={(e) => {
+                  setGoogleCodeInput(e.target.value.toUpperCase().slice(0, 12));
+                  setGoogleCodeInvalid(false);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter') return;
+                  e.preventDefault();
+                  // Hand it to the running poll loop rather than fetching
+                  // here — one redemption path means one place that can
+                  // consume the single-use code.
+                  const cleaned = googleCodeInput.replace(/[^0-9A-Za-z]/g, '');
+                  if (cleaned.length !== 10) { setGoogleCodeInvalid(true); return; }
+                  googleHandoffCodeRef.current = cleaned;
+                  setGoogleCodeInvalid(false);
+                }}
+                placeholder="XXXXX-XXXXX"
+                className="flex-1 px-3 py-1.5 rounded-lg font-mono text-[13px] tracking-widest outline-none"
+                style={{
+                  background: 'var(--cream-soft)',
+                  border: `1px solid ${googleCodeInvalid ? 'var(--danger, #ef4444)' : 'var(--cream-line)'}`,
+                  color: 'var(--ink)',
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const cleaned = googleCodeInput.replace(/[^0-9A-Za-z]/g, '');
+                  if (cleaned.length !== 10) { setGoogleCodeInvalid(true); return; }
+                  googleHandoffCodeRef.current = cleaned;
+                  setGoogleCodeInvalid(false);
+                }}
+                className="px-3 py-1.5 rounded-full text-[11.5px] font-medium transition-all hover:opacity-90"
+                style={{ background: 'var(--ink)', color: 'var(--cream)' }}
+              >
+                Continue
+              </button>
+            </div>
+            <div className="text-[11px] mt-2">
+              {googleCodeInvalid
+                ? "That code didn't match. Check the browser tab and try again."
+                : 'It expires in 5 minutes and works once.'}
+            </div>
+          </div>
+        )}
         {googleManualUrl && (
           <div
             className="rounded-xl px-3 py-2.5 text-[12px] break-all"
@@ -9394,7 +9615,9 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                   )}
                   {currentUser.email}
                 </button>
-                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${currentLicense?.tier === 'max' ? 'bg-amber-500/20 text-amber-400' : currentLicense?.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : currentLicense?.tier === 'basic' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-500/20 text-gray-400'}`}>
+                {/* ultra was absent, so the top tier rendered in the same
+                    grey as free — violet matches TIER_THEME.ultra. */}
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${currentLicense?.tier === 'ultra' ? 'bg-violet-500/20 text-violet-300' : currentLicense?.tier === 'max' ? 'bg-amber-500/20 text-amber-400' : currentLicense?.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : currentLicense?.tier === 'basic' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-500/20 text-gray-400'}`}>
                   {currentLicense?.tier || 'free'}
                 </span>
                 {/* Explicit "Subscription" link in the nav — labeled, not

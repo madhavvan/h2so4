@@ -556,10 +556,38 @@ router.post('/set-min-version', authMiddleware, adminNetworkGuard, adminOnly, st
 });
 
 // ── Check minimum version (public) ──
+//
+// `latest_version` used to come from a hand-maintained `latest_app_version`
+// config row. Nobody had touched it in months, so this public endpoint was
+// answering **4.0.8** while 4.0.17 was the shipped release and
+// /api/v1/app-version — reading the live GitHub-backed cache — correctly
+// answered 4.0.17. Two endpoints, two answers, and the wrong one was the
+// one that needed a human to remember it.
+//
+// It now reads the same live source, and takes whichever of the two is
+// NEWER. That last part matters: the stale 4.0.8 row is still sitting in
+// the production database, so an override that simply won whenever it was
+// set would keep serving it. An operator pin that is BEHIND what has
+// actually shipped is never a decision — it is rot — while a pin AHEAD of
+// the live feed is a real use (staging a version before it is cut). Taking
+// the max honours the second and makes the first impossible.
+//
+// min_version stays purely config-driven, because it IS a deliberate
+// operator decision — the force-update floor, not an observation about
+// what exists.
+const { getLatestVersion } = require('../services/versionSource');
+const { compareVersions } = require('../utils/version');
+
 router.get('/version', (req, res) => {
+  const live = getLatestVersion();
+  const pinned = db.getConfig('latest_app_version', null);
+  let latest = live.version;
+  if (pinned && /^\d+\.\d+\.\d+$/.test(String(pinned)) && compareVersions(pinned, live.version) > 0) {
+    latest = String(pinned);
+  }
   res.json({
-    min_version: db.getConfig('min_app_version', '2.0.0'),
-    latest_version: db.getConfig('latest_app_version', '2.0.0'),
+    min_version: db.getConfig('min_app_version', live.minVersion),
+    latest_version: latest,
     download_url: 'https://get.minicaai.com',
   });
 });
