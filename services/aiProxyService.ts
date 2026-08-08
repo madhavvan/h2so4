@@ -112,6 +112,50 @@ function sessionRequiredError(): Error {
   return e;
 }
 
+/**
+ * Is this a quota/rate-limit refusal rather than a transient fault?
+ *
+ * Kept deliberately in step with `isQuotaFailure` in
+ * server/src/services/coverAnswer.js — the two exist for the same reason
+ * (a benched provider should be skipped, not hammered) and drifting them
+ * apart would mean the client retries what the server has already given
+ * up on. Matches only quota signatures; a 5xx or a timeout is NOT one.
+ */
+/**
+ * Build the Error for a non-OK response WITHOUT throwing away what the
+ * server said.
+ *
+ * routes/ai.js goes to real trouble to normalise every provider SDK's
+ * rate-limit shape (its `is429`) into ONE response: HTTP 429 plus
+ * `code: 'rate_limit'` and the provider name. All of that used to be
+ * flattened into an English string here and then re-detected downstream
+ * by substring match — which silently stops working the moment a message
+ * is reworded. Carry the structured verdict instead; the string stays for
+ * display and as a fallback for paths that never had a code.
+ */
+function httpError(status: number, body: any, statusInfo: string): Error {
+  const e: any = new Error((body?.error || 'AI request failed') + statusInfo);
+  e.status = status;
+  if (body?.code) e.code = body.code;
+  if (body?.provider) e.provider = body.provider;
+  return e;
+}
+
+export function isRateLimited(err: any): boolean {
+  if (!err) return false;
+  // Structural first — this is the server's own verdict, normalised in
+  // routes/ai.js across five different provider SDKs.
+  if (err.status === 429 || err.statusCode === 429) return true;
+  if (err.code === 'rate_limit') return true;
+  const m = String(err.message || err).toLowerCase();
+  return m.includes('429')
+    || m.includes('rate limit') || m.includes('rate-limit') || m.includes('rate limited')
+    || m.includes('too many requests')
+    || m.includes('quota')
+    || m.includes('resource_exhausted') || m.includes('resource exhausted')
+    || m.includes('insufficient_quota');
+}
+
 async function withRetry<T>(
   fn: () => Promise<T>,
   maxRetries: number = MAX_RETRIES,
@@ -137,6 +181,26 @@ async function withRetry<T>(
       // has to start their session; waiting 1s + 2s + 4s to tell them so
       // just makes the app feel broken before it makes it feel clear.
       if (err?.name === 'SessionRequiredError') throw err;
+
+      // ── A RATE LIMIT DOES NOT CLEAR IN SEVEN SECONDS ──
+      //
+      // Reported by a live user as "taking time to give the answer". A 429
+      // was retried like a flaky socket: 1s + 2s + 4s of backoff and four
+      // round-trips, all before App.tsx's provider fallback was even
+      // reached — and that fallback then re-ran the whole ladder on the
+      // next provider. Worst case ~14s of pure waiting and ~8 provider
+      // calls before the candidate saw a single token, mid-interview.
+      //
+      // Backoff is the right answer for a transient network fault. It is
+      // the wrong answer for a quota: the window is measured in minutes,
+      // this app has four other providers, and switching is instant. So a
+      // rate limit fails FAST and lets the fallback do its job.
+      //
+      // Deliberately narrow — matches the same signatures the server's
+      // cover-provider cooldown treats as quota failures (isQuotaFailure
+      // in coverAnswer.js). A merely SLOW or 5xx provider still gets its
+      // retries, because for those the next attempt genuinely may work.
+      if (isRateLimited(err)) throw err;
 
       // Retry ALL other errors including auth errors. A bounced 401 may
       // coincide with a server-side token rotation that the revalidation
@@ -194,7 +258,7 @@ export async function proxyRequest(endpoint: string, body: any): Promise<string>
     // and any "please log in" prompt would force them to abandon the session.
     const statusInfo = response.status === 429 ? ' (Rate limited - please wait)' :
                        response.status >= 500 ? ' (Server error - retrying...)' : '';
-    throw new Error((err.error || 'AI request failed') + statusInfo);
+    throw httpError(response.status, err, statusInfo);
   }
 
   const data = await response.json();
@@ -306,7 +370,7 @@ export async function proxyStream(
       // the session.
       const statusInfo = res.status === 429 ? ' (Rate limited - please wait)' :
                          res.status >= 500 ? ' (Server error)' : '';
-      throw new Error((err.error || 'AI request failed') + statusInfo);
+      throw httpError(res.status, err, statusInfo);
     }
     return res;
   }, MAX_RETRIES, signal);

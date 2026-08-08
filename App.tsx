@@ -8,6 +8,10 @@ import { Settings, Mic, MicOff, FileText, Upload, Trash2, Cpu, FileCheck, Refres
 // to fill the modal body and inherit the user's light/dark theme.
 import SupportBot from './SupportBot';
 import { WizardHat } from './WizardHat';
+// The Ultra tier mark — the same glyph the landing's pricing table uses, so
+// the badge in the app reads as the same product. Ultra was the one tier the
+// pop-out header never drew (see the chips below).
+import { UltraMark } from './UltraMark';
 import { PaperAirplane } from './GitHubIcons';
 import { GeminiIcon, OpenAIIcon, ClaudeIcon, GrokIcon, GroqIcon } from './ProviderIcons';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -640,7 +644,11 @@ const CodeBlock: React.FC<{
                                 ? <Loader2 size={12} className="animate-spin" />
                                 : <Zap size={12} className={atPhase !== 'idle' ? 'animate-pulse' : ''} />}
                             <span>{autoTypeLabel}</span>
-                            {!canAutoType && atPhase === 'idle' && <WizardHat size={10} className="text-amber-400" />}
+                            {/* UltraMark, not WizardHat. Auto-Type is Ultra-only
+                            (ULTRA_ONLY in server/src/routes/ai.js), but the
+                            lock badge drew Max's wizard hat — telling a user
+                            that buying Max would unlock it. It would not. */}
+                        {!canAutoType && atPhase === 'idle' && <UltraMark size={10} className="text-violet-300" />}
                         </button>
                     ) : (
                         // Web: never invoke auto-type:* IPC — upsell desktop instead.
@@ -1212,6 +1220,23 @@ const ChatInterface = ({
                         {/* Tier & credit chips — only at M/L sizes so the S preset
                             (340px) doesn't wrap the controls onto two rows.
                             Web PiP always shows tier (no size cycle). */}
+                        {/* ── Ultra ──
+                            This chip did not exist. The pop-out drew a badge
+                            for max, pro and basic and nothing at all for
+                            ultra, so the ONE subscription tier — the most
+                            expensive plan, and the only one that unlocks
+                            Auto-Type — was the single tier that rendered
+                            unbadged, while a $30 Basic pass got a green pill.
+                            `effectiveTier` genuinely carries 'ultra'
+                            (LicenseData.tier's union includes it), so this
+                            was a missing branch, not an impossible state.
+                            Same family as the audit's H54; that fix landed in
+                            SubscriptionGate and stopped here. */}
+                        {(sizeIndex >= 1 || !inElectron) && effectiveTier === 'ultra' && (
+                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-gradient-to-r from-violet-500/20 to-amber-500/10 text-violet-300">
+                            <UltraMark size={9} /> ULTRA
+                          </div>
+                        )}
                         {(sizeIndex >= 1 || !inElectron) && effectiveTier === 'max' && (
                           <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-gradient-to-r from-amber-500/15 to-purple-500/10 text-amber-400">
                             <WizardHat size={9} /> MAX
@@ -1646,7 +1671,19 @@ const ChatInterface = ({
                         now removed. The badge itself is always visible
                         regardless of breakpoint so users on narrow widths
                         still see and can click it. */}
-                    {userLicense && userLicense.tier === 'max' ? (
+                    {/* ── Ultra ──
+                        Without this branch an Ultra subscriber fell past
+                        max/pro/basic into the `userLicense ?` else, which
+                        renders an **"Upgrade"** button — the top plan, in
+                        the main window header, being sold an upgrade. This
+                        is the H54 symptom ("Ultra renders as Free and is
+                        offered Upgrade to Pro") surviving in the one place
+                        the user looks at most. */}
+                    {userLicense && userLicense.tier === 'ultra' ? (
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-gradient-to-r from-violet-500/20 to-amber-500/10 text-violet-300 hover:from-violet-500/30 hover:to-amber-500/20 transition-all cursor-pointer">
+                        <UltraMark size={10} /> ULTRA
+                      </button>
+                    ) : userLicense && userLicense.tier === 'max' ? (
                       <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-gradient-to-r from-amber-500/15 to-purple-500/10 text-amber-400 hover:from-amber-500/25 hover:to-purple-500/20 transition-all cursor-pointer">
                         <WizardHat size={10} /> MAX
                       </button>
@@ -2246,6 +2283,11 @@ function useFeatureGate(license: LicenseData | null) {
     actualTier,
     planLapsed: planState === 'lapsed',
     timeExhausted: planState === 'time_exhausted',
+    // isUltra was missing from this set even though 'ultra' is a real tier,
+    // so every consumer that branched on isMax/isPro/isBasic fell through to
+    // its Free-shaped `else` for the TOP plan — see the model-picker hint,
+    // which told an Ultra subscriber "Basic: 4 models · Pro adds Claude".
+    isUltra: tier === 'ultra',
     isMax: tier === 'max',
     isPro: tier === 'pro',
     isBasic: tier === 'basic',
@@ -2406,13 +2448,40 @@ function looksLikeProviderOutage(rawMessage: string | undefined): boolean {
 // non-Claude models; Pro+ can also land on Claude). Returns null if there's no
 // other usable model (caller then shows the plain error).
 const FALLBACK_PREFERENCE: ModelKey[] = ['openai', 'xai', 'gemini', 'groq', 'claude'];
-function pickFallbackModel(failed: string, allowedModels: string[]): ModelKey | null {
+function pickFallbackModel(failed: string, allowedModels: string[], cooling?: (m: ModelKey) => boolean): ModelKey | null {
   for (const cand of FALLBACK_PREFERENCE) {
     if (cand === failed) continue;
-    if (allowedModels.includes(cand)) return cand;
+    if (!allowedModels.includes(cand)) continue;
+    // Skip a provider we already know is refusing. Without this the
+    // fallback happily hands the question to the model that failed two
+    // questions ago and the user pays that round-trip again.
+    if (cooling && cooling(cand)) continue;
+    return cand;
   }
   return null;
 }
+
+// ── THE MODEL THE USER CHOSE IS THEIRS ──
+//
+// Reported by a live user as "changing from gpt to grok and grok to gpt".
+// The outage fallback used to WRITE its choice back into settings and
+// localStorage, so a transient 429 permanently rewrote the user's model.
+// The bounce follows mechanically from FALLBACK_PREFERENCE:
+//
+//   user picks GPT -> GPT 429s -> fallback picks xai, SAVES it
+//   later Grok 429s -> first preference that isn't xai is openai
+//                   -> back to GPT, SAVED again -> repeat
+//
+// So the app oscillated between two providers and the user's real choice
+// was gone after the first hiccup. The fallback is now per-REQUEST: the
+// retry is told which model to use, nothing is persisted, and the picker
+// keeps showing what the user actually selected.
+//
+// A short cooldown stops the obvious cost of that — reverting to a
+// genuinely-down provider on every question. Same shape and same 60s as
+// the server's cover-provider cooldown in coverAnswer.js, and keyed the
+// same way: only a provider that REFUSED gets benched, never a slow one.
+const PROVIDER_COOLDOWN_MS = 60_000;
 
 // Lock-badge text shown on a model the current user cannot access. We
 // collapse Basic/Pro into a single "PRO" prompt because Pro is the
@@ -3900,6 +3969,31 @@ async function openRenewalCheckoutUrl(checkoutUrl: string, onSuccess?: () => voi
 //   · no saved card / bank demands 3DS → browser checkout (which saves
 //     the card via setup_future_usage, so NEXT time is one-click)
 //   · /extend-now unreachable (older server) → legacy /create-renewal
+// ── Stable top-up attempt ids, one per pack ──
+// The server turns attempt_id into the Stripe idempotency key
+// (`extend_<user>_<attempt>`), so a RETRY has to send the SAME id. Minting
+// a fresh uuid inside the function body defeated that: a lost response
+// (dropped socket, timeout, 5xx) made the retry a SECOND PaymentIntent —
+// a real double charge.
+//
+// ManageSubscription fixed its copy of this with a component ref. This
+// path could not use one — openProRenewal is a module-level function
+// reached from LowWarningToast's onExtend, ExhaustedModal's onRenew and
+// the popout relay's 'cmd-credit-renew', none of which share a component
+// instance. Hence a module-level store, which is also what makes the id
+// survive the surface the user retries from.
+//
+// This is the WORSE of the two paths to get wrong: it fires mid-interview,
+// when the user has just run out of time and will retry immediately.
+// Keyed by pack because Stripe rejects a replayed key whose parameters
+// changed. Cleared once the outcome is definitively known.
+const extendAttemptIds: Record<string, string> = {};
+
+function newAttemptId(): string {
+  return (globalThis.crypto as any)?.randomUUID?.()
+    || `a_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+
 async function openProRenewal(onSuccess?: () => void, packId?: string) {
   const { licenseService } = await import('./services/licenseService');
   const token = licenseService.getToken();
@@ -3922,17 +4016,28 @@ async function openProRenewal(onSuccess?: () => void, packId?: string) {
     const countryCode = saved.user?.country_code || 'US';
 
     // ── One-click path ──
+    const packKey = packId || 'm30';
     try {
-      const attemptId = (globalThis.crypto as any)?.randomUUID?.()
-        || `a_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      // Reuse the id from a previous attempt at this pack if one is still
+      // outstanding — that reuse IS the double-charge protection.
+      const attemptId = extendAttemptIds[packKey] || newAttemptId();
+      extendAttemptIds[packKey] = attemptId;
       const ext = await fetch(`${licenseService.getApiBase()}/api/v1/payments/extend-now`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ attempt_id: attemptId, pack: packId || 'm30' }),
+        body: JSON.stringify({ attempt_id: attemptId, pack: packKey }),
       });
       const extendData: any = await ext.json().catch(() => null);
 
+      // Outcome is known — a 4xx means this attempt will never become a
+      // charge, so holding its id would only make the NEXT deliberate
+      // purchase collide with a key Stripe has already seen. A 5xx or a
+      // network error deliberately does NOT clear: that is the case where
+      // the charge may have happened without us hearing about it.
+      if (ext.status >= 400 && ext.status < 500) delete extendAttemptIds[packKey];
+
       if (ext.ok && extendData?.success && extendData?.flow === 'off_session') {
+        delete extendAttemptIds[packKey];
         // Charged the card on file; time already landed server-side. Pull
         // the authoritative balance into local state and refresh the UI.
         // Server message carries the tier-correct amount; the fallback
@@ -3943,17 +4048,24 @@ async function openProRenewal(onSuccess?: () => void, packId?: string) {
         return;
       }
       if (extendData?.already_unlimited) {
+        delete extendAttemptIds[packKey];
         onSuccess?.();
         return;
       }
       if (extendData?.provider === 'razorpay' && extendData?.flow === 'in_app_sheet') {
+        // Razorpay mints its own order per call and never sees attempt_id,
+        // so the Stripe key is spent either way once we hand off.
+        delete extendAttemptIds[packKey];
         const openedSheet = await openRazorpaySheetInApp(extendData, token, onSuccess);
         if (openedSheet) return; // the sheet's handler completes the flow
         // checkout.js unavailable — fall through to the browser path below.
       }
       if (ext.ok && extendData?.checkout_url) {
         // extend-now degraded itself to a checkout session (first purchase
-        // pre-dates card saving, or the bank wants 3DS).
+        // pre-dates card saving, or the bank wants 3DS). No off-session
+        // charge was made against this key, and the checkout session
+        // carries its own idempotency — release it.
+        delete extendAttemptIds[packKey];
         return await openRenewalCheckoutUrl(extendData.checkout_url, onSuccess, extendData.session_id);
       }
       if (ext.status === 402 && extendData?.error === 'charge_failed') {
@@ -6029,7 +6141,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   }, []);
 
   // --- Core Logic ---
-  const executeSend = useCallback(async (textToSend: string, imageBase64?: string, isAutoSolve?: boolean, _fallbackAttempt?: number) => {
+  const executeSend = useCallback(async (textToSend: string, imageBase64?: string, isAutoSolve?: boolean, _fallbackAttempt?: number, _modelOverride?: ModelKey) => {
       if (!textToSend.trim()) return;
 
       // ── Auto-Solve consistency assert ──
@@ -6087,7 +6199,15 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       }
 
       // ── Feature Gate: Block disallowed models ──
-      const currentModel = settingsRef.current.selectedModel;
+      // The fallback retry passes the model explicitly rather than writing it
+      // into settings — see the DO NOT PERSIST note in the catch below. When
+      // the user's own choice is benched by a recent refusal we also route
+      // around it for THIS send, silently, without touching their preference.
+      const chosenModel = settingsRef.current.selectedModel as ModelKey;
+      const currentModel: ModelKey = _modelOverride
+        || (isModelCooling(chosenModel)
+              ? (pickFallbackModel(chosenModel, gateRef.current?.allowedModels || [], isModelCooling) || chosenModel)
+              : chosenModel);
       // Read the LIVE gate, not the render-time closure. executeSend is
       // memoised on [cancelActiveStream], so the `gate` captured here is
       // whatever the FIRST render computed — a user who upgrades or renews
@@ -6387,35 +6507,37 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         // error into a live interview. Switch to another model the user can
         // use and silently retry the SAME question. Only once (guarded by
         // _fallbackAttempt) so we never loop across a full provider outage.
-        const failedModel = settingsRef.current.selectedModel;
+        const failedModel = _modelOverride || settingsRef.current.selectedModel;
         if (!_fallbackAttempt && looksLikeProviderOutage(actualError)) {
-          const next = pickFallbackModel(failedModel, liveGate.allowedModels);
+          // Bench the provider that just refused so the NEXT question routes
+          // around it instead of paying the same dead round-trip again.
+          providerCooldownRef.current.set(failedModel as ModelKey, Date.now() + PROVIDER_COOLDOWN_MS);
+          const next = pickFallbackModel(failedModel, liveGate.allowedModels, isModelCooling);
           if (next) {
             const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
             const failedLabel = MODEL_REGISTRY[failedModel as ModelKey]?.short ?? cap(failedModel);
             const nextLabel = MODEL_REGISTRY[next]?.short ?? cap(next);
-            // Persist + reflect the switch so the picker + subsequent sends
-            // use the working model too (not just this one retry). The
-            // existing state-sync effect (keyed on settings.selectedModel)
-            // relays the change to the Electron popout automatically.
-            setSettings(prev => ({ ...prev, selectedModel: next }));
-            try { localStorage.setItem('SELECTED_MODEL', next); } catch { /* quota */ }
+            // ── DO NOT PERSIST THE SWITCH ──
+            // This used to setSettings + write SELECTED_MODEL to localStorage,
+            // permanently replacing the model the user picked. Because
+            // FALLBACK_PREFERENCE starts at 'openai', the NEXT failure then chose
+            // GPT back again — so the app oscillated gpt -> grok -> gpt, exactly as
+            // reported from a live interview, and the user's own choice was gone
+            // after the first hiccup. The retry is now TOLD which model to use and
+            // nothing is written down: the picker keeps showing what the user
+            // selected, and the cooldown above is what stops us walking back into
+            // a provider that is genuinely down.
             const noticeMsg: Message = {
               id: Date.now().toString(),
               role: 'model',
-              content: `⚠️ **${failedLabel}** is having a temporary service problem. Switched to **${nextLabel}** and retried your question.`,
+              content: `⚠️ **${failedLabel}** is having a temporary service problem. Using **${nextLabel}** for this answer — your model choice is unchanged.`,
               timestamp: Date.now(),
             };
             if (db.isElectron) { db.addMessage(noticeMsg); } else { setMessages(prev => [...prev, noticeMsg]); }
-            // settingsRef updates on the next render; pass the model explicitly
-            // is unnecessary because we re-read settingsRef inside the retry,
-            // but React may not have flushed setSettings yet — so mutate the
-            // ref directly for this immediate retry.
-            settingsRef.current = { ...settingsRef.current, selectedModel: next };
             // Clear processing for THIS attempt's controller before recursing;
             // the retry seeds its own controller + isProcessing.
             if (streamAbortRef.current === abort) { streamAbortRef.current = null; }
-            void executeSend(textToSend, imageBase64, isAutoSolve, (_fallbackAttempt || 0) + 1);
+            void executeSend(textToSend, imageBase64, isAutoSolve, (_fallbackAttempt || 0) + 1, next);
             return;
           }
         }
@@ -6624,6 +6746,18 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const isProcessingRef = useRef(isProcessing);
   const interimTextRef = useRef(interimText);
   const rawSpeechErrorRef = useRef(_rawSpeechError);
+  // ── Provider cooldown (see PROVIDER_COOLDOWN_MS) ──
+  // model -> epoch ms until which that provider is benched. A ref, not
+  // state: nothing renders off it, and a re-render per 429 during a live
+  // interview is exactly the wrong time to churn the tree.
+  const providerCooldownRef = useRef<Map<ModelKey, number>>(new Map());
+  const isModelCooling = useCallback((m: ModelKey): boolean => {
+    const until = providerCooldownRef.current.get(m);
+    if (!until) return false;
+    if (Date.now() >= until) { providerCooldownRef.current.delete(m); return false; }
+    return true;
+  }, []);
+
   const gateRef = useRef(gate);
   useEffect(() => { rawIsListeningRef.current = _rawIsListening; }, [_rawIsListening]);
   useEffect(() => { isProcessingRef.current = isProcessing; }, [isProcessing]);
@@ -8492,7 +8626,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
                         the old single-pill "Upgrade to Max for all models"
                         which was misleading because Pro also has 4 models —
                         the only model going from Pro→Max unlocks is Claude. */}
-                    {gate.isMax ? (
+                    {gate.isUltra ? (
+                      <span className="mp-hint"><UltraMark size={9} /> Full access</span>
+                    ) : gate.isMax ? (
                       <span className="mp-hint"><WizardHat size={9} /> Full access</span>
                     ) : gate.isPro ? (
                       <span className="mp-hint"><Crown size={9} /> Max adds Train Model + reasoning</span>
