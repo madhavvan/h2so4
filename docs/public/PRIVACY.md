@@ -37,7 +37,7 @@ We split data into two categories: what you give us directly, and what the app g
 | Account identity | Your email address, display name, country, and (if you sign in with Google) a Google account ID |
 | Authentication | Your password (stored as a bcrypt hash; we never see the plain text) |
 | Payment information | Handled entirely by **Stripe** or **Razorpay**. We see your subscription state and the transaction amount; we never see your card number |
-| Résumé and job description | The files you drop into the **Files** panel inside the app. These stay on your machine. They're sent to the AI model as part of the prompt for active answer calls; the model provider receives them transiently for that call and doesn't retain them under their API terms |
+| Résumé and job description | The files you drop into the **Files** panel inside the app. The copy of record lives on your machine. Two other things happen with the text: it's sent to the AI model as part of the prompt for answer calls (the model provider receives it transiently for that call and doesn't retain it under their API terms), and we hold a copy **in memory on our server for up to 3 hours** so the app can send a short reference instead of re-uploading your whole knowledge base with every question. That copy is never written to our disks, is readable only by your own account, and is deleted immediately if you delete your account. See [§5 Where your data is stored](#5-where-your-data-is-stored) |
 | Custom instructions | Any persistent instructions you've written for the model. Stored on your machine |
 
 ### What the app generates
@@ -52,7 +52,18 @@ We split data into two categories: what you give us directly, and what the app g
 | Login logs | Each sign-in attempt: timestamp, IP address, country (derived from IP), success or failure reason. Used for fraud and account-security investigations |
 | Crash reports | Written locally on your machine only (a memory dump plus app version and OS — no chat content). Uploading crash reports to our server is currently disabled. |
 
-We do **not** collect: keystrokes outside the app, content from other windows, your contact list, your browser history, or anything else that isn't explicitly listed above.
+### Screen captures (Auto-Solve and Auto-Type)
+
+Two features read your screen, and both are worth stating plainly because they are the only place the app looks outside its own window.
+
+| Feature | Plans | What is captured | Where it goes |
+|---|---|---|---|
+| **Auto-Solve** | every paid plan | A single still frame of your **whole display**, taken when you press the button — not a recording, and never without that press. Whatever else is on that display is in the frame | Sent with your prompt to the AI model for that one call. Not stored on our server |
+| **Auto-Type** | Ultra | A single still frame of the display your cursor is on, taken only when the app cannot read the code editor through the accessibility APIs it tries first | Uploaded to our server, which passes it straight to the AI model so it can read the editor, and does not keep it. A copy **is written to your own machine** under the app's data folder (`autotype-screenshots`), where the 50 most recent are kept so you can see what the assistant saw. Deleting the app's data folder removes them |
+
+Neither feature records continuously, and neither runs on the free trial.
+
+We do **not** collect: keystrokes outside the app, your contact list, your browser history, the contents of other windows *except* in the single-frame captures described immediately above, or anything else that isn't explicitly listed here.
 
 ## 3. How we use your data
 
@@ -83,8 +94,9 @@ These are the only third parties that ever see any part of your data, and only t
 
 ## 5. Where your data is stored
 
-- **On your machine**: a local SQLite database in your user-data directory. Holds your conversation history, your résumé and job description, your custom instructions, and your settings.
+- **On your machine**: a local SQLite database in your user-data directory. Holds your conversation history, your résumé and job description, your custom instructions, and your settings. Auto-Type also keeps its 50 most recent screen captures here.
 - **On our server (US-East)**: subscription state, conversation mirror, login logs, and the audit log. The database is hosted on Railway with daily backups.
+- **In our server's memory, briefly**: the text of your knowledge-base files, for up to 3 hours from last use, so the app can reference it rather than re-upload it on every question. Held in memory only — never written to our disks, never in a backup, and gone on restart, on expiry, or the moment you delete your account.
 - **With third-party processors**: only the data listed in the table above, only for the duration each processor needs to do its job.
 
 We do not transfer data outside our US-East server other than to the named processors. Stripe and Razorpay may store payment information in their own jurisdictions per their respective policies.
@@ -94,6 +106,8 @@ We do not transfer data outside our US-East server other than to the named proce
 | Data | Retention |
 |---|---|
 | Conversation history (server mirror) | While your account is active. Deleted within 30 days of account deletion |
+| Knowledge-base text (in-memory server cache) | Up to 3 hours from last use. Deleted immediately on account deletion — it is not part of the 30-day window below because it never reaches disk |
+| Auto-Type screen captures | On your machine only; the 50 most recent are kept, older ones are deleted automatically |
 | Login logs | 12 months |
 | Audit log (admin actions affecting your account) | 24 months; entries that document a payment, refund, or dispute are kept with the payment records below |
 | Crash reports | Stored locally on your machine only — server upload is currently disabled |

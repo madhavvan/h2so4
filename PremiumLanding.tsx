@@ -140,6 +140,18 @@ const CSS = `
   transition:background .4s ease, border-color .4s ease, backdrop-filter .4s ease;}
 .pl-navbar.pl-scrolled{background:rgba(9,8,7,.74);border-bottom-color:var(--line);
   backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);}
+/* ── Every nav destination has to clear the sticky bar ──
+   scrollTo() uses scrollIntoView({block:'start'}), which parks a section's
+   TOP at the scrollport's top — which is exactly where the sticky navbar
+   is sitting. Nothing else corrects for that, so each destination was
+   losing however much of itself the bar covers: measured against their own
+   top padding, Features and Pop-out lost 38px, FAQ 16px, Privacy 6px, and
+   the wordmark's scroll-to-top buried 18px of the hero. Only Pricing
+   survived, by 2px of luck (80px padding vs a 78px bar).
+   Set once, on the ids themselves, so a new section cannot be added
+   without it. 92px = 78px bar + 14px of air; 74px = 60px bar + 14px. */
+.pl-root [id]{scroll-margin-top:92px;}
+@media (max-width:767px){ .pl-root [id]{scroll-margin-top:74px;} }
 .pl-eyebrow{font-size:11.5px;font-weight:600;letter-spacing:.34em;text-transform:uppercase;color:var(--gold);}
 .pl-gold{background:linear-gradient(100deg,var(--gold-1),var(--gold-2) 52%,var(--gold-3));
   -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent;}
@@ -2311,8 +2323,28 @@ const LEDGER: { t: string; b: string; chip?: string }[] = [
 const TRUST = [
   { icon: PhHeadphones, t: 'Audio is transcribed, then discarded', b: 'Your call audio streams only to the transcription engine — a paid tier whose terms exclude it from training — and never touches our servers.' },
   { icon: PhShield, t: 'No model trains on you', b: 'Every AI provider in the app runs on paid API terms that exclude your traffic from training datasets.' },
-  { icon: PhMonitor, t: 'Screenshots vanish after the call', b: 'Auto-Solve captures live in memory for a single model call. Nothing is written to disk — yours or ours.' },
-  { icon: PhLock, t: 'Scoped hearing only', b: 'It hears the one source you pick — a tab, a window, a screen. No keylogger, no reading other windows.' },
+  // ── These two were making claims the app does not keep. ──
+  //
+  // "Nothing is written to disk — yours or ours" was false on the user's
+  // own machine: when Auto-Type cannot read an editor through the
+  // accessibility APIs it falls back to a vision planner, and that path
+  // writes the captured frame to <userData>/autotype-screenshots
+  // (electron/autoTypePlanLog.cjs saveScreenshot), keeping the 50 most
+  // recent. True for Auto-Solve, false for Auto-Type — and the heading
+  // generalised to "Screenshots".
+  //
+  // "No ... reading other windows" was contradicted by both features:
+  // Auto-Solve asks desktopCapturer for 'Entire Screen' (App.tsx) and the
+  // Auto-Type planner captures the whole display the cursor is on
+  // (main.cjs captureScreenForVision, types:['screen']). Whatever else is
+  // on that display is in the frame.
+  //
+  // The accurate version is still the strong one — nothing reaches our
+  // servers, the local copy is the user's own, and capture only ever
+  // happens on a deliberate press. Claims here must stay checkable
+  // against the code; docs/public/PRIVACY.md carries the same wording.
+  { icon: PhMonitor, t: 'Screenshots never reach our servers', b: 'Auto-Solve holds the frame in memory for one model call and drops it. Auto-Type keeps its last 50 frames on YOUR machine, so you can see what it saw — never on ours, never in a backup.' },
+  { icon: PhLock, t: 'It only looks when you ask', b: 'Audio comes from the one source you pick. Screen capture is a single still frame, taken when you press Auto-Solve or Auto-Type and never between — no recording, no keylogger, nothing running in the background.' },
   { icon: PhCheck, t: 'Signed and verifiable', b: 'The Windows installer is code-signed via Azure Trusted Signing; updates ship over HTTPS and verify their signature before installing.' },
 ];
 
@@ -4002,7 +4034,10 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           been engineered away. That belongs here, one scroll below the
           card, while they still care. The hero and its globe are untouched;
           this is a separate section that begins where the header ends. */}
-      <section id="seam" className="pl-wrap pl-reveal" style={{ paddingTop: 34, paddingBottom: 46, position: 'relative', scrollMarginTop: 84 }}>
+      {/* scroll-margin-top now comes from the one `.pl-root [id]` rule, so
+          every destination clears the sticky bar by the same amount — this
+          section used to be the only one that had it, inline and alone. */}
+      <section id="seam" className="pl-wrap pl-reveal" style={{ paddingTop: 34, paddingBottom: 46, position: 'relative' }}>
         <div className="pl-seam-halo" aria-hidden />
         <div style={{ position: 'relative', zIndex: 1, maxWidth: 760, margin: '0 auto 30px', textAlign: 'center' }}>
           <p className="pl-eyebrow" style={{ marginBottom: 16 }}>The silence problem</p>
@@ -4497,8 +4532,14 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.025em', marginBottom: 20 }}>
               What we <span className="pl-gold pl-foil">never keep.</span>
             </h2>
+            {/* "built to forget — audio, screenshots, keystrokes" implied we
+                capture keystrokes at all (we emit them for Auto-Type, we do
+                not read them) and that screenshots are forgotten everywhere
+                (Auto-Type keeps its last 50 on the user's own disk). Say the
+                thing that is actually true and still strong: none of it
+                reaches us. */}
             <p style={{ fontSize: 16.5, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 440, marginBottom: 28 }}>
-              A tool this private has to be private all the way down. The whole pipeline is built to forget — audio, screenshots, keystrokes.
+              A tool this private has to be private all the way down. Your audio goes straight to the transcription engine, your screen never leaves your machine, and we keep no recording of either.
             </p>
             <button className="pl-textlink" style={{ fontSize: 15 }} onClick={() => setView('docs')}>
               Read the security overview <PhArrowRight size={14} weight="bold" />
