@@ -182,3 +182,51 @@ describe('the client actually sends the version', () => {
     }
   });
 });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE THRESHOLD MUST BE REACHABLE BY A BUILD THAT ACTUALLY SHIPS.
+//
+//  Every test above proves the gate behaves correctly ON EITHER SIDE of
+//  MIN_PROTOCOL_CLIENT. None of them notice if NOTHING can ever be on the
+//  modern side of it.
+//
+//  That is not hypothetical. Between 2026-08-08 06:42 and 14:05 the server
+//  ran MIN_PROTOCOL_CLIENT='4.0.19' while the newest release, and
+//  package.json, were 4.0.18. Every install in the world was therefore
+//  classified "old", `requireActiveSession` called next() for everyone, and
+//  runCover returned '' on every request — so the session gate AND the
+//  entire cover engine were dormant fleet-wide while every test here passed
+//  and the deploy looked healthy. clientVersion.js warns about exactly this
+//  in its own comments ("Ship 4.0.18 with this set to 4.0.19 and every gate
+//  stays dormant forever — silently, because 'not enforcing' looks exactly
+//  like 'working'"), and the warning was not enough, because a comment
+//  cannot fail a build.
+//
+//  So: the threshold is a promise that some shippable build can keep.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('the protocol threshold is reachable', () => {
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+  const { MIN_PROTOCOL_CLIENT, versionRank } = require('../src/middleware/clientVersion');
+
+  it('this repo builds a client new enough to participate', () => {
+    const shipped = versionRank(pkg.version);
+    const required = versionRank(MIN_PROTOCOL_CLIENT);
+    expect(shipped, `package.json version ${pkg.version} is unparseable`).not.toBeNull();
+    expect(required, `MIN_PROTOCOL_CLIENT ${MIN_PROTOCOL_CLIENT} is unparseable`).not.toBeNull();
+    expect(
+      shipped,
+      `package.json is ${pkg.version} but MIN_PROTOCOL_CLIENT is ${MIN_PROTOCOL_CLIENT}. ` +
+        'A build cut from this tree would be classified "old" by the server, so the session ' +
+        'gate and the LLM cover would BOTH stay dormant for every user — silently. Either ' +
+        'bump the version before releasing, or lower MIN_PROTOCOL_CLIENT to the release that ' +
+        'first sends x-app-version.'
+    ).toBeGreaterThanOrEqual(required);
+  });
+
+  it('a client built from this tree is on the modern side of the gate', () => {
+    // The end the gate actually reads: participatesInProtocol against the
+    // version this repo would stamp into the header.
+    const { participatesInProtocol } = require('../src/middleware/clientVersion');
+    expect(participatesInProtocol({ headers: { 'x-app-version': pkg.version } })).toBe(true);
+  });
+});

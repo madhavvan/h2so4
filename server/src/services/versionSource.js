@@ -41,14 +41,20 @@ const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 // misleading downgrade prompt. Whatever value is used MUST point at a
 // version that actually has a GitHub release.
 const FALLBACK_VERSION = {
-  // Bumped 4.0.8 → 4.0.16 on 2026-08-06, → 4.0.17 on 2026-08-07. While
+  // Bumped 4.0.8 → 4.0.16 on 2026-08-06, → 4.0.17 on 2026-08-07,
+  // → 4.0.18 on 2026-08-08, → 4.0.19 on 2026-08-08. While
   // GITHUB_RELEASES_URL pointed at a repo that did not exist, the fetch
   // failed on every refresh and this fallback WAS the live answer — so
   // production told every client the latest version was 4.0.8 while
   // 4.0.16 was the shipped build.
-  version: process.env.LATEST_APP_VERSION || '4.0.18',
+  //
+  // ⚠️ LATEST_APP_VERSION is NOT set in Railway production (checked
+  // 2026-08-08: 42 vars, not among them), so this literal IS what a cold
+  // start serves. It is not a belt-and-braces default here — it is the
+  // value. It must move with every release.
+  version: process.env.LATEST_APP_VERSION || '4.0.19',
   minVersion: '2.0.0',
-  releaseDate: '2026-08-07',
+  releaseDate: '2026-08-08',
   releaseNotes: 'Latest stable release.',
   downloadUrl: {
     // Routed through get.minicaai.com → 302 → the release CDN. Keeps the
