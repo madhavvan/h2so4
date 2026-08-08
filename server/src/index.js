@@ -453,9 +453,11 @@ const FALLBACK_VERSION = {
   // this endpoint is the ONLY update channel that still reaches the
   // v4.0.11-v4.0.16 installs whose baked update feed 404s. Bump it in the
   // same commit as every version bump.
-  version: process.env.LATEST_APP_VERSION || '4.0.17',
+  //
+  // Bumped 4.0.17 → 4.0.18 on 2026-08-08 with that release.
+  version: process.env.LATEST_APP_VERSION || '4.0.18',
   minVersion: '2.0.0',
-  releaseDate: '2026-08-07',
+  releaseDate: '2026-08-08',
   releaseNotes: 'Latest stable release.',
   downloadUrl: {
     // Routed through get.minicaai.com → 302 → GitHub release CDN. Keeps the

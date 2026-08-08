@@ -94,6 +94,54 @@ describe('the three copies of "which repo" agree', () => {
   });
 });
 
+describe('the two copies of "which version is latest" agree', () => {
+  // The repo-name drift above had a twin that cost just as much, and this
+  // file did not cover it.
+  //
+  // There are TWO independent answers to "what is the latest version":
+  //
+  //   1. package.json `version` — what electron-builder stamps into the
+  //      build and writes into latest.yml on the release.
+  //   2. index.js FALLBACK_VERSION.version — what /app-version serves to
+  //      every client when the GitHub fetch fails AND the in-memory cache
+  //      is cold, i.e. on every fresh server boot.
+  //
+  // While GITHUB_RELEASES_URL pointed at a repo that did not exist, the
+  // fetch failed on EVERY refresh, so (2) was not a fallback at all — it
+  // was the live answer. It said 4.0.8 while 4.0.16 was shipped, so for
+  // three weeks production told the fleet it was up to date when it was
+  // four releases behind. Nothing failed. Nothing logged. The endpoint
+  // returned 200 with a confident, wrong number.
+  //
+  // index.js's own comment already states the policy — "Bump it in the
+  // same commit as every version bump" — but a comment is not a guard,
+  // and the drift it warns about is exactly what happened. This is the
+  // guard.
+  const declared = /version: process\.env\.LATEST_APP_VERSION \|\| '([^']+)'/.exec(indexSrc);
+
+  it('finds FALLBACK_VERSION.version in index.js', () => {
+    expect(declared, 'could not find the LATEST_APP_VERSION fallback literal in index.js').toBeTruthy();
+  });
+
+  it('the offline fallback is exactly the version being shipped', () => {
+    // Equality, not "<=". Behind stranded the fleet silently for three
+    // weeks. Ahead is louder but still broken — the client is told to
+    // fetch a release that does not exist yet and 404s. Only equal is
+    // correct, and it is trivially satisfiable: bump both together.
+    expect(
+      declared[1],
+      `package.json is ${pkg.version} but index.js FALLBACK_VERSION.version is ${declared[1]}. ` +
+        'A cold-started server serves the fallback, so this number IS what the fleet is told. ' +
+        'Bump both in the same commit.'
+    ).toBe(pkg.version);
+  });
+
+  it('the shipped version is a plain three-part release version', () => {
+    // latest.yml / the tag / the updater comparison all assume x.y.z.
+    expect(pkg.version).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+});
+
 describe('download filenames match what electron-builder actually produces', () => {
   // v4.0.9 retired the Universal Mac build for per-arch DMGs but left the old
   // `InterviewCopilot-Mac.dmg` in this map. Every Mac download 302'd to a
