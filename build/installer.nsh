@@ -92,4 +92,25 @@
   !else
     Delete "$LOCALAPPDATA\interview-copilot-ai-updater\installer.exe"
   !endif
+
+  ; ── TELL THE SHELL THE ICON CHANGED ──
+  ;
+  ; Reported after every update: "showing the older icons ... only when the
+  ; update is released". Windows does not re-read an executable's icon just
+  ; because the file was replaced. Explorer, the Start menu and the taskbar
+  ; all render from the shell icon cache, and the cache is keyed in a way
+  ; that happily survives an in-place binary swap — so a release that
+  ; changes the app icon (v4.0.15 and v4.0.16 both did) keeps showing the
+  ; PREVIOUS one until something else invalidates the cache, which can be
+  ; days, or a reboot.
+  ;
+  ; SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL) is the
+  ; documented way to say "icons and associations changed, re-read them".
+  ; It is a notification, not a mutation: nothing is written, no file is
+  ; touched, and it cannot fail in a way that affects the install. This is
+  ; the same call the Windows shell makes to itself when a file type is
+  ; registered.
+  ;
+  ; 0x08000000 = SHCNE_ASSOCCHANGED, 0 = SHCNF_IDLIST.
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
 !macroend
