@@ -2358,13 +2358,25 @@ function looksLikeProviderOutage(rawMessage: string | undefined): boolean {
 // non-Claude models; Pro+ can also land on Claude). Returns null if there's no
 // other usable model (caller then shows the plain error).
 const FALLBACK_PREFERENCE: ModelKey[] = ['openai', 'xai', 'gemini', 'groq', 'claude'];
-function pickFallbackModel(failed: string, allowedModels: string[]): ModelKey | null {
+function pickFallbackModel(failed: string, allowedModels: string[], cooling?: (m: ModelKey) => boolean): ModelKey | null {
   for (const cand of FALLBACK_PREFERENCE) {
     if (cand === failed) continue;
-    if (allowedModels.includes(cand)) return cand;
+    if (!allowedModels.includes(cand)) continue;
+    // Skip a provider we already know is refusing, or the fallback hands the
+    // question straight back to the model that failed a moment ago.
+    if (cooling && cooling(cand)) continue;
+    return cand;
   }
   return null;
 }
+
+// ── THE MODEL THE USER CHOSE IS THEIRS ──
+// The outage fallback used to WRITE its pick into settings and localStorage,
+// permanently replacing the user's model. The oscillation follows from
+// FALLBACK_PREFERENCE: GPT 429s -> first pref != openai = xai (SAVED); later
+// Grok 429s -> first pref != xai = openai (SAVED). Two providers, forever.
+// Reported verbatim as "changing from gpt to grok and grok to gpt".
+const PROVIDER_COOLDOWN_MS = 60_000;
 
 // Lock-badge text shown on a model the current user cannot access. We
 // collapse Basic/Pro into a single "PRO" prompt because Pro is the
@@ -4887,7 +4899,17 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const cancelActiveStream = useCallback(() => {
     const ctrl = streamAbortRef.current;
     if (ctrl) {
-      streamAbortRef.current = null;
+      // Do NOT null the ref here. Every stream owner (executeSend,
+      // handleRegenerate) resets isProcessing in a `finally` guarded by
+      // `streamAbortRef.current === abort`. Clearing the ref BEFORE the abort
+      // lands makes that guard fail, so the aborted run never flips
+      // isProcessing back off and the app wedges on "thinking" — reported from
+      // a live interview as "in between the interview it's getting stuck".
+      // Reachable from New Chat, a conversation switch, or Stop on the phone
+      // mid-answer, after which Send, Auto-Solve and Regenerate are dead in
+      // BOTH windows until the app is restarted. The owning run nulls the ref
+      // itself in its finally; callers that immediately start a replacement
+      // stream overwrite it on the very next line.
       try { ctrl.abort(); } catch {}
     }
   }, []);
@@ -5660,7 +5682,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   }, []);
 
   // --- Core Logic ---
-  const executeSend = useCallback(async (textToSend: string, imageBase64?: string, isAutoSolve?: boolean, _fallbackAttempt?: number) => {
+  const executeSend = useCallback(async (textToSend: string, imageBase64?: string, isAutoSolve?: boolean, _fallbackAttempt?: number, _modelOverride?: ModelKey) => {
       if (!textToSend.trim()) return;
 
       // ── Live-time preflight (2026-07 plan-handling fix) ──
@@ -5696,7 +5718,15 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
       }
 
       // ── Feature Gate: Block disallowed models ──
-      const currentModel = settingsRef.current.selectedModel;
+      // The retry is TOLD which model to use rather than us writing it into
+      // settings. And when the user's own choice is benched by a recent
+      // refusal we route around it for THIS send only, silently, without
+      // touching their saved preference.
+      const chosenModel = settingsRef.current.selectedModel as ModelKey;
+      const currentModel: ModelKey = _modelOverride
+        || (isModelCooling(chosenModel)
+              ? (pickFallbackModel(chosenModel, gateRef.current?.allowedModels || [], isModelCooling) || chosenModel)
+              : chosenModel);
       if (!gate.canUseModel(currentModel)) {
         // Post-trial free users have NO usable models —
         // FEATURE_GATES.free.models is empty under the 2026-07 policy and
@@ -5939,35 +5969,31 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         // error into a live interview. Switch to another model the user can
         // use and silently retry the SAME question. Only once (guarded by
         // _fallbackAttempt) so we never loop across a full provider outage.
-        const failedModel = settingsRef.current.selectedModel;
+        const failedModel = _modelOverride || settingsRef.current.selectedModel;
         if (!_fallbackAttempt && looksLikeProviderOutage(actualError)) {
-          const next = pickFallbackModel(failedModel, gate.allowedModels);
+          // Bench the provider that just refused so the NEXT question routes
+          // around it instead of paying the same dead round-trip again.
+          providerCooldownRef.current.set(failedModel as ModelKey, Date.now() + PROVIDER_COOLDOWN_MS);
+          const next = pickFallbackModel(failedModel, gate.allowedModels, isModelCooling);
           if (next) {
             const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
             const failedLabel = MODEL_REGISTRY[failedModel as ModelKey]?.short ?? cap(failedModel);
             const nextLabel = MODEL_REGISTRY[next]?.short ?? cap(next);
-            // Persist + reflect the switch so the picker + subsequent sends
-            // use the working model too (not just this one retry). The
-            // existing state-sync effect (keyed on settings.selectedModel)
-            // relays the change to the Electron popout automatically.
-            setSettings(prev => ({ ...prev, selectedModel: next }));
-            try { localStorage.setItem('SELECTED_MODEL', next); } catch { /* quota */ }
+            // ── DO NOT PERSIST THE SWITCH ── (see PROVIDER_COOLDOWN_MS above)
+            // This used to setSettings + write SELECTED_MODEL to localStorage,
+            // which is what produced the reported gpt -> grok -> gpt loop and
+            // silently replaced the user's own choice after one hiccup.
             const noticeMsg: Message = {
               id: Date.now().toString(),
               role: 'model',
-              content: `⚠️ **${failedLabel}** is having a temporary service problem. Switched to **${nextLabel}** and retried your question.`,
+              content: `⚠️ **${failedLabel}** is having a temporary service problem. Using **${nextLabel}** for this answer — your model choice is unchanged.`,
               timestamp: Date.now(),
             };
             if (db.isElectron) { db.addMessage(noticeMsg); } else { setMessages(prev => [...prev, noticeMsg]); }
-            // settingsRef updates on the next render; pass the model explicitly
-            // is unnecessary because we re-read settingsRef inside the retry,
-            // but React may not have flushed setSettings yet — so mutate the
-            // ref directly for this immediate retry.
-            settingsRef.current = { ...settingsRef.current, selectedModel: next };
             // Clear processing for THIS attempt's controller before recursing;
             // the retry seeds its own controller + isProcessing.
             if (streamAbortRef.current === abort) { streamAbortRef.current = null; }
-            void executeSend(textToSend, imageBase64, isAutoSolve, (_fallbackAttempt || 0) + 1);
+            void executeSend(textToSend, imageBase64, isAutoSolve, (_fallbackAttempt || 0) + 1, next);
             return;
           }
         }
@@ -6116,6 +6142,17 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const isProcessingRef = useRef(isProcessing);
   const interimTextRef = useRef(interimText);
   const rawSpeechErrorRef = useRef(_rawSpeechError);
+  // model -> epoch ms until which that provider is benched. A ref, not state:
+  // nothing renders off it, and re-rendering the tree on every 429 during a
+  // live interview is exactly the wrong moment to churn.
+  const providerCooldownRef = useRef<Map<ModelKey, number>>(new Map());
+  const isModelCooling = useCallback((m: ModelKey): boolean => {
+    const until = providerCooldownRef.current.get(m);
+    if (!until) return false;
+    if (Date.now() >= until) { providerCooldownRef.current.delete(m); return false; }
+    return true;
+  }, []);
+
   const gateRef = useRef(gate);
   useEffect(() => { rawIsListeningRef.current = _rawIsListening; }, [_rawIsListening]);
   useEffect(() => { isProcessingRef.current = isProcessing; }, [isProcessing]);

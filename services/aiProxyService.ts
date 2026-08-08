@@ -86,6 +86,42 @@ ${raw}
 `;
 }
 
+/**
+ * Is this a quota/rate-limit refusal rather than a transient fault?
+ *
+ * Kept in step with is429 in server/src/routes/ai.js, which already
+ * normalises every provider SDK shape into one response (status 429 +
+ * code rate_limit + provider). Matches quota signatures only — a 5xx or
+ * a timeout is NOT one of these and must still be retried.
+ */
+export function isRateLimited(err: any): boolean {
+  if (!err) return false;
+  // Structural first: this is the server own verdict, already normalised.
+  if (err.status === 429 || err.statusCode === 429) return true;
+  if (err.code === 'rate_limit') return true;
+  const m = String(err.message || err).toLowerCase();
+  return m.includes('429')
+    || m.includes('rate limit') || m.includes('rate-limit') || m.includes('rate limited')
+    || m.includes('too many requests')
+    || m.includes('quota')
+    || m.includes('resource_exhausted') || m.includes('resource exhausted')
+    || m.includes('insufficient_quota');
+}
+
+/**
+ * Build the Error for a non-OK response WITHOUT discarding what the server
+ * said. routes/ai.js returns code rate_limit + provider alongside the 429;
+ * flattening that to English and re-matching by substring downstream breaks
+ * the moment a message is reworded. Keep the structured signal attached.
+ */
+function httpError(status: number, body: any, statusInfo: string): Error {
+  const e: any = new Error((body?.error || 'AI request failed') + statusInfo);
+  e.status = status;
+  if (body?.code) e.code = body.code;
+  if (body?.provider) e.provider = body.provider;
+  return e;
+}
+
 async function withRetry<T>(
   fn: () => Promise<T>,
   maxRetries: number = MAX_RETRIES,
@@ -106,6 +142,20 @@ async function withRetry<T>(
 
       // Don't retry on abort
       if (err?.name === 'AbortError') throw err;
+      // ── A RATE LIMIT DOES NOT CLEAR IN SEVEN SECONDS ──
+      //
+      // Reported from a live interview as "taking time to give the answer".
+      // A 429 was retried like a flaky socket: 1s + 2s + 4s of backoff and
+      // four round-trips, all BEFORE the provider fallback in App.tsx was
+      // even reached — and that fallback then re-ran the whole ladder on the
+      // next provider. Worst case ~14s of dead air and ~8 provider calls
+      // before the candidate saw a single token.
+      //
+      // Backoff is right for a transient network fault and wrong for a
+      // quota: the window is minutes, and four other providers are sitting
+      // idle. Fail fast and let the fallback do its job. A 5xx or a timeout
+      // still gets its retries, because those genuinely may succeed.
+      if (isRateLimited(err)) throw err;
 
       // Retry ALL other errors including auth errors. A bounced 401 may
       // coincide with a server-side token rotation that the revalidation
