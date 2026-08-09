@@ -19,6 +19,7 @@
     "electron:start": "concurrently -k \"npm run dev\" \"wait-on tcp:3005 && electron .\"",
     "electron:build": "npm run build && electron-builder",
     "electron:publish": "npm run build && electron-builder --publish=always",
+    "release:draft": "node scripts/cut-draft-release.mjs",
     "release:verify": "node scripts/verify-release-feed.mjs",
     "release:verify-mac": "node scripts/verify-mac-signing.mjs",
     "release:mirror": "node scripts/mirror-release.mjs"

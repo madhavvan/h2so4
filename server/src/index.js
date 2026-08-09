@@ -604,7 +604,12 @@ app.get('/api/v1/app-version', (req, res) => {
     current: clientVersion,
     isOutdated,
     mustUpdate,
+    // One line, for the banner that renders this as PLAIN TEXT. The full
+    // markdown rides alongside so a surface that can actually render it
+    // does not have to go and fetch the release itself — a field that
+    // exists only server-side is a field the next client cannot use.
     releaseNotes: latest.releaseNotes,
+    releaseNotesFull: latest.releaseNotesFull || latest.releaseNotes,
     downloadUrl: latest.downloadUrl,
   });
 });

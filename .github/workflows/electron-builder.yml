@@ -14,6 +14,29 @@ name: Build and Release Desktop App
 #                         `--publish never`, dispatch runs upload nothing
 #                         (the upload step is gated to release events) —
 #                         backfill by re-publishing the release instead.
+#
+# ── THE ORDER MATTERS, AND IT IS NOT ENFORCED BY GITHUB ──
+#
+#   1. npm run release:draft -- v4.0.23     (invisible; not "latest")
+#   2. npm run electron:publish             (builds + SIGNS Windows locally,
+#                                            uploads it into that draft)
+#   3. publish the draft                    (this fires the workflow below)
+#   4. CI builds mac + linux, mirrors, verifies
+#
+# Step 1 exists because a published release is "latest" the instant it is
+# created, assets or not — that is how v4.0.22 spent two hours serving
+# Windows an error page. A DRAFT is invisible, so the window between
+# "release exists" and "release is installable" is not a window users can
+# fall into.
+#
+# ⚠️ Do NOT try to get this by setting publish[].releaseType to "draft".
+# That value is also written into app-update.yml INSIDE the shipped app,
+# and an installed client configured for drafts cannot see any release
+# anonymously — it would break auto-update for every user. scripts/
+# verify-release-feed.mjs fails the build on exactly that.
+#
+# gate-release-is-installable below is the backstop for when this order is
+# not followed, because a comment has never stopped anybody.
 on:
   release:
     types: [published]
@@ -23,6 +46,79 @@ permissions:
   contents: write
 
 jobs:
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  #  A RELEASE WITHOUT WINDOWS MUST NOT STAY "LATEST".
+  #
+  #  2026-08-09, v4.0.22: the release was created with `gh release create`
+  #  before the Windows installer existed. GitHub makes a release `latest`
+  #  the instant it is published, assets or not, so for two hours every
+  #  Windows visitor got the unavailable page while a good 4.0.21 installer
+  #  sat one release back.
+  #
+  #  Why Windows specifically: macOS and Linux are built by THIS workflow
+  #  and legitimately arrive ~10 minutes after publish. Windows is built
+  #  and signed locally (see the matrix note below — CI has no Azure
+  #  Trusted Signing secrets), so if it is not in the release at the moment
+  #  of publish, nothing downstream is going to put it there.
+  #
+  #  Every prior release passed this by accident: electron-builder CREATED
+  #  the release as part of the Windows publish, so the file and the
+  #  release arrived in the same operation — v4.0.18 through v4.0.21 all
+  #  show Setup.exe landing within one second of published_at. Publishing
+  #  by hand decouples them, and nothing noticed.
+  #
+  #  This runs before the builds and demotes the release to prerelease on
+  #  both repos, which puts GitHub's `latest` pointer back on the previous
+  #  good version within about a minute. It fails the run on purpose: an
+  #  incomplete release should look broken in the Actions tab.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  gate-release-is-installable:
+    name: Refuse to ship a release with no Windows installer
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Windows installer must already be attached
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FEED_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          RELEASE_ID: ${{ github.event.release.id }}
+        run: |
+          set -uo pipefail
+          have=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+            | grep -c '"name": *"InterviewCopilot-Setup.exe"' || true)
+          if [ "$have" != "0" ]; then
+            echo "::notice::Windows installer present on ${TAG} — release is installable."
+            exit 0
+          fi
+
+          echo "::error title=Release has no Windows installer::${TAG} is published and is now GitHub's 'latest', but InterviewCopilot-Setup.exe is not attached. Demoting it to prerelease so downloads fall back to the previous release."
+
+          # Source repo — GITHUB_TOKEN can write here.
+          curl -sS -X PATCH -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -d '{"prerelease":true}' -o /dev/null
+
+          # Feed repo — needs the PAT; without it, say so loudly rather than
+          # leaving a half-demoted pair of feeds.
+          if [ -n "${FEED_TOKEN}" ]; then
+            fid=$(curl -sS -H "Authorization: Bearer ${FEED_TOKEN}" \
+              "https://api.github.com/repos/madhavvan/interviewcopilot-releases/releases/tags/${TAG}" \
+              | sed -n 's/.*"id": *\([0-9]*\).*/\1/p' | head -1)
+            if [ -n "${fid}" ]; then
+              curl -sS -X PATCH -H "Authorization: Bearer ${FEED_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/madhavvan/interviewcopilot-releases/releases/${fid}" \
+                -d '{"prerelease":true}' -o /dev/null
+              echo "::notice::Demoted ${TAG} on the feed repo too."
+            fi
+          else
+            echo "::warning title=Feed repo NOT demoted::RELEASES_REPO_TOKEN is unset, so ${TAG} is still 'latest' on the update feed. Demote it by hand."
+          fi
+          exit 1
+
   release:
     # Hard cap so a slow Apple notarization can't hang the build for hours.
     # A healthy notarized 2-arch build runs ~40-55 min; past this the job
@@ -376,3 +472,45 @@ jobs:
           echo "     never reached the feed repo"
           echo ""
           echo "Re-run this job after fixing; it is safe to run any number of times."
+
+      # ── A RED X IS NOT A FIX ──
+      #
+      # This gate has failed on real releases and the release stayed
+      # "latest" regardless, because a failing check does not change
+      # anything GitHub serves. v4.0.22 sat broken for two hours with this
+      # job already red.
+      #
+      # So failure now DEMOTES: prerelease on both repos puts GitHub's
+      # `latest` pointer back on the previous good release, which is what
+      # routes/downloads.js and electron-updater both follow. Re-running
+      # this job after fixing the feed is safe; promoting back is a
+      # deliberate `gh release edit --prerelease=false --latest`.
+      #
+      # Deliberately NOT `always()` — this must fire on failure only.
+      - name: Demote the release when the feed cannot serve it
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FEED_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          RELEASE_ID: ${{ github.event.release.id }}
+        run: |
+          set -uo pipefail
+          echo "::error title=Feed cannot serve ${TAG}::Demoting to prerelease so downloads and auto-update fall back to the previous release."
+          curl -sS -X PATCH -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -d '{"prerelease":true}' -o /dev/null || true
+          if [ -n "${FEED_TOKEN}" ]; then
+            fid=$(curl -sS -H "Authorization: Bearer ${FEED_TOKEN}" \
+              "https://api.github.com/repos/madhavvan/interviewcopilot-releases/releases/tags/${TAG}" \
+              | sed -n 's/.*"id": *\([0-9]*\).*/\1/p' | head -1)
+            if [ -n "${fid}" ]; then
+              curl -sS -X PATCH -H "Authorization: Bearer ${FEED_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/madhavvan/interviewcopilot-releases/releases/${fid}" \
+                -d '{"prerelease":true}' -o /dev/null || true
+            fi
+          else
+            echo "::warning title=Feed repo NOT demoted::RELEASES_REPO_TOKEN is unset — ${TAG} is still 'latest' on the update feed. Demote it by hand."
+          fi
