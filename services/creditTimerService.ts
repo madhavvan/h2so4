@@ -162,12 +162,36 @@ class CreditTimerService {
       this.displaySeconds = localBal.seconds;
     }
 
-    if (this.source === 'unlimited') {
-      // Session open for supersede/analytics, but no countdown to run.
-      this.emit('started', { remainingSeconds: Infinity, source: 'unlimited', synced: this.synced });
-      return;
-    }
-
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //  UNLIMITED STILL RUNS THE INTERVAL. IT IS NOT ONLY A COUNTDOWN.
+    //
+    //  This used to `return` here — "session open for supersede/analytics,
+    //  but no countdown to run" — which was true about the countdown and
+    //  catastrophic about everything else, because the SAME interval is
+    //  what sends the heartbeat. An Ultra account therefore never beat
+    //  once, its usage_sessions row went stale 90 seconds in, and
+    //  hasLiveUsageSession stopped recognising an interview that was very
+    //  much happening. Invisible only because requireActiveSession is
+    //  dormant; arming it would have refused every Ultra user at 90
+    //  seconds, every interview — the tier that pays most, precisely
+    //  BECAUSE it is the tier with nothing to bill.
+    //
+    //  tick() is already safe on this path and needs no branch: with
+    //  displaySeconds at Infinity the countdown subtracts to Infinity, the
+    //  low-warning comparison is false, and the exhausted test is false.
+    //  The heartbeat it drives is the entire point, and the server charges
+    //  an unlimited session 0 for it (heartbeatUsageSession short-circuits
+    //  on source === 'unlimited').
+    //
+    //  Setting intervalId also makes start() idempotent for Ultra, which it
+    //  never was: the `if (this.intervalId) return` guard above could not
+    //  fire, so every mic reconnect opened a NEW session that superseded
+    //  the last.
+    //
+    //  A non-synced unlimited license never reaches here — the legacy
+    //  fallback above returns on `localBal.source === 'unlimited'` — so
+    //  this is always a real server session with a real session_id to beat.
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     this.lastTickAt = Date.now();
     this.lastBeatAt = Date.now();
     this.intervalId = setInterval(() => this.tick(), 1000);

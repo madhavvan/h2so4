@@ -15,11 +15,80 @@ const require = createRequire(import.meta.url);
 const { classifyQuestion, CATEGORIES } = require('../src/services/questionClassifier.js');
 
 describe('CATEGORIES — canonical set', () => {
-  it('exports the 9 documented categories', () => {
+  it('exports the 10 documented categories', () => {
     expect(Object.values(CATEGORIES).sort()).toEqual([
-      'behavioral', 'clarifier', 'coding', 'concept',
-      'ml_data', 'other', 'quantitative', 'strategy_case', 'system_design',
+      'behavioral', 'clarifier', 'coding', 'concept', 'ml_data', 'other',
+      'practice', 'quantitative', 'strategy_case', 'system_design',
     ]);
+  });
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE QUESTIONS A NON-SOFTWARE SPECIALIST ACTUALLY GETS ASKED.
+//
+//  Every pattern list in the classifier was software, ML, PM or consulting,
+//  and CLARIFIER — "under 80 chars and contains a wh-word" — sat underneath
+//  them catching the remainder. So a CQV lead with twelve years of
+//  validation experience had his entire domain routed to the one bucket
+//  whose prompt shape is "1-2 sentences max", and the app answered the
+//  question his career is about in two lines.
+//
+//  These are real questions from a real session (Kneat Gx / lab-instrument
+//  qualification). They are fixtures, not illustrations: five of the eight
+//  landed in clarifier/other before this.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('classifyQuestion — practice / process ownership', () => {
+  const practice = [
+    'How have you managed qualification documentation in kneat?',
+    'How do you decide IQ versus OQ scope?',
+    'Can you walk me through a turnover package?',
+    'What is your approach to risk-based qualification?',
+    'How do you handle vendor FAT evidence?',
+    'How would you manage reviewer capacity during a startup?',
+    "What's your process for deviation disposition?",
+    'How did you govern electronic approvals across the lab assets?',
+  ];
+  for (const q of practice) {
+    it(`practice: ${q}`, () => {
+      const { category } = classifyQuestion(q);
+      expect(
+        category,
+        `"${q}" must not fall to clarifier/other — that is the 1-2-sentence bucket`,
+      ).toBe(CATEGORIES.PRACTICE);
+    });
+  }
+});
+
+describe('isClarifier — short is not the same as contentless', () => {
+  // A real clarifier leans on the previous turn and carries no subject.
+  // Every one of these leans on the previous turn and names nothing of its
+  // own. ("the second one?" / "so you'd use Postgres?" are follow-ups too,
+  // but carry no wh-word and have always resolved to OTHER — same 'none'
+  // effort, so they are left alone rather than fixture-fitted to here.)
+  const real = [
+    'what do you mean?',
+    'why?',
+    'like what?',
+    'can you repeat that?',
+    'how would you handle nulls?',   // a coding follow-up, not process ownership
+  ];
+  for (const q of real) {
+    it(`still a clarifier: ${q}`, () => {
+      expect(classifyQuestion(q).category).toBe(CATEGORIES.CLARIFIER);
+    });
+  }
+
+  it('never routes a question naming a system or document to clarifier', () => {
+    // The exact regression, stated as the property rather than the instance:
+    // a question with a subject of its own is never a follow-up.
+    const withSubject = [
+      'How have you managed qualification documentation in kneat?',
+      'Which deviations require a technical impact assessment?',
+      'How do you decide IQ versus OQ scope?',
+    ];
+    for (const q of withSubject) {
+      expect(classifyQuestion(q).category, q).not.toBe(CATEGORIES.CLARIFIER);
+    }
   });
 });
 
@@ -253,5 +322,55 @@ describe('classifyQuestion — the deep questions that used to fall through', ()
     // shape is overwhelmingly interpersonal.
     expect(deep('How would you approach a difficult conversation with a teammate?'))
       .not.toBe(CATEGORIES.SYSTEM_DESIGN);
+  });
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE CLASSIFIER IS ONLY HALF OF IT.
+//
+//  The server's category never reaches the model — it selects reasoning
+//  effort and sizes the cover, nothing else. The model picks its answer
+//  SHAPE from the taxonomy in the response-rules prompt, and that taxonomy
+//  is where "1-2 sentences max" actually lives. Fixing the classifier while
+//  leaving the prompt alone would change the effort dial and not one word
+//  of the answer.
+//
+//  Measured on the shipped prompt with the real resume, real gpt-5.6,
+//  reasoning_effort 'none':
+//     before  90 words / 4 sentences   after  128 words / 6 sentences
+//     before  70 words / 2 sentences   after  131 words / 5 sentences
+//  TTFT unchanged (both arms 750-3500ms; +589 tokens on ~13,200).
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('the answer-shape taxonomy has somewhere to put a practice question', () => {
+  const fs = require('node:fs');
+  const rules = fs.readFileSync(
+    new URL('../../services/aiProxyService.ts', import.meta.url), 'utf8',
+  );
+
+  it('defines a practice / process-ownership shape', () => {
+    expect(rules).toContain('PRACTICE / PROCESS OWNERSHIP');
+  });
+
+  it('gives it a real budget, not the short-form one', () => {
+    const block = rules.slice(
+      rules.indexOf('PRACTICE / PROCESS OWNERSHIP'),
+      rules.indexOf('UNIVERSAL SHORT-FORMS:'),
+    );
+    expect(block).toMatch(/Total: 5-7 sentences/);
+    // The five beats that separate someone who ran it from someone who
+    // watched it run. Losing any one of them collapses the shape back
+    // toward a definition.
+    for (const beat of ['THE CONTROL', 'THE MECHANISM', 'THE SIGNAL', 'THE FAILURE MODE', 'THE LIMIT']) {
+      expect(block, `the ${beat} beat is what makes this answer senior`).toContain(beat);
+    }
+  });
+
+  it('tells the model that short does not mean clarifier', () => {
+    const block = rules.slice(rules.indexOf('UNIVERSAL SHORT-FORMS:'));
+    expect(block).toMatch(/CANNOT be understood without the previous turn/);
+    expect(
+      block,
+      'without this, a nine-word question that names a document is answered in two sentences',
+    ).toMatch(/is NOT a clarifier no matter how few words/);
   });
 });

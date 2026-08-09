@@ -229,7 +229,26 @@ const {
 // gate is not armed in the same release that fixes it: 15k interviews start
 // Monday, and "fixed in this build" and "proven in the field" are different
 // claims. Arm it once 4.0.20 has run real traffic.
-const SESSION_GATE_MIN_CLIENT = '4.0.22';
+// ⚠️ MOVED 4.0.22 → 4.0.23 when 4.0.22 was cut. THE HOLD MOVES AHEAD OF THE
+// RELEASE, EVERY TIME — a threshold parked ON the version being shipped arms
+// itself the moment that version ships.
+//
+// 4.0.22 is the release that makes arming SAFE, and that is exactly why it is
+// not the release that arms it. It carries the two fixes this gate was
+// waiting on:
+//   · Ultra never heartbeated (creditTimerService returned before the
+//     interval that sends it), so every unlimited session went stale at 90s.
+//     Reproduced live against a real Ultra account with the mic on: 428 at
+//     t+96s, and 'stale' from t+127s. Fixed, and re-verified green.
+//   · a dropped session never reopened, because the only start() caller
+//     fires on an isListening EDGE and a live mic has none.
+// Both are now covered server-side as well (hasLiveUsageSession exempts
+// unlimited) and the stale window is 15 minutes rather than 90 seconds.
+//
+// What is still missing is field time. Arm this in 4.0.23 once 4.0.22 has run
+// real traffic — "fixed and proven in a harness" and "proven in the field"
+// are different claims, and 15k interviews are downstream of the difference.
+const SESSION_GATE_MIN_CLIENT = '4.0.23';
 
 // ⚠️ THE LLM COVER IS HELD BACK TOO — DORMANT (2026-08-08).
 //
@@ -265,7 +284,10 @@ const SESSION_GATE_MIN_CLIENT = '4.0.22';
 // 4.0.20 → 4.0.21 → 4.0.22, moved on each cut. THIS IS THE ROUTINE, not an
 // oversight: a hold parked on the next version arms itself the moment that
 // version ships. It moves ahead every release until it is deliberately armed.
-const LLM_COVER_MIN_CLIENT = '4.0.22';
+// 4.0.20 → 4.0.21 → 4.0.22 → 4.0.23, moved on each cut. Unchanged in
+// substance: the LLM cover's own TTFT and guard-rejection rate under real
+// traffic still have not been measured, and 4.0.22 changed nothing about it.
+const LLM_COVER_MIN_CLIENT = '4.0.23';
 
 /** Is this caller new enough for the LLM COVER specifically? */
 function clientAtLeastLlmCover(req) {
@@ -879,6 +901,19 @@ const AUTO_EFFORT_BY_CATEGORY = {
   strategy_case:  'low',
   behavioral:     'none',
   concept:        'none',
+  // ⚠️ 'none' IS DELIBERATE, AND IT IS NOT A JUDGEMENT ABOUT DEPTH.
+  //
+  // A practice question ("how have you managed qualification documentation
+  // in Kneat?") wants a five-to-seven sentence answer from someone who has
+  // actually run the thing. That depth is bought in the PROMPT — the answer
+  // shape in aiProxyService — which costs zero extra milliseconds, because
+  // the system prompt is sent either way.
+  //
+  // Buying it here instead would cost real latency twice over: reasoning
+  // tokens before the first word, and membership of DEEP_CATEGORIES, which
+  // is derived from this map and sizes the cover. These questions arrive
+  // mid-interview with a person waiting, so the depth goes where it is free.
+  practice:       'none',
   clarifier:      'none',
   other:          'none',
 };

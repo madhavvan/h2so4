@@ -2078,17 +2078,43 @@ function grantTimeExtension(userId, seconds) {
 // doesn't buy free time — the session just goes stale and gets settled at
 // the LAST heartbeat, and the interview UI dies with it (self-defeating).
 
-const USAGE_STALE_AFTER_MS = 90 * 1000;  // silent this long → sweeper settles the session
-// The ceiling on ONE settle is the STALE WINDOW, not the beat cadence.
-// It used to be 45s while a session stayed live through 90s of silence,
-// and the gap between those two numbers was half-price interview time: a
-// client beating every ~85s stayed live, kept getting answers, and paid
-// for 45 seconds out of every 85 it used — no lying required, just a
-// slower timer. The window is the honest ceiling because past it the
-// session stops authorising answers (hasLiveUsageSession) and the sweeper
-// settles it AT its last beat, so no single gap can represent more.
-// routes/usage.js settles with the same ceiling before these helpers run.
-const USAGE_HEARTBEAT_CAP_S = Math.floor(USAGE_STALE_AFTER_MS / 1000); // max chargeable seconds per settle
+// ── LIVENESS ──
+// How long a silent session still authorises answers, and the sweeper's
+// cutoff. Was 90s; raised to 15 minutes on 2026-08-09.
+//
+// 90 seconds is three missed heartbeats. That is a lift-and-carry to
+// another room, a WiFi handover, a VPN reconnect, an API cold start — and
+// once requireActiveSession is armed, every one of those became a 428
+// mid-interview reading "Turn the mic on to start your session" while the
+// mic was plainly on. The window has to be longer than the disruptions a
+// real interview contains, and 15 minutes is longer than all of them.
+const USAGE_STALE_AFTER_MS = 15 * 60 * 1000;
+
+// ── CHARGING — deliberately NOT the liveness window ──
+// This used to be `USAGE_STALE_AFTER_MS / 1000`, and the comment argued the
+// two must be equal: a cap SMALLER than the window is half-price interview
+// time, because a client that beats slowly stays live and pays the cap for
+// a longer gap. That argument is still true, and it is no longer the one
+// that decides this number.
+//
+// With the window at 15 minutes, an equal cap means a laptop that sleeps
+// for fourteen minutes and wakes drains fourteen minutes from a Pro user's
+// one-hour pass — in ONE beat, for time they spent asleep. tick() makes
+// that certain rather than likely: on wake its displaySeconds goes
+// straight to 0, which fires a confirming heartbeat immediately.
+//
+// So the two numbers now answer their own questions. The window says how
+// long we keep believing someone is in an interview; this says the most a
+// single settle may bill. What is left open is the slow-beat discount, and
+// it is left open ON PURPOSE — it needs a hand-modified client, while the
+// overcharge it would prevent lands on honest users with flaky WiFi. That
+// is the trade this codebase already makes out loud in routes/ai.js:
+// "a temporary billing leak is strictly cheaper than a silent outage
+// during someone's interview."
+//
+// Keep at/above the client's HEARTBEAT_EVERY_MS (20s) with room for a few
+// missed beats, or ordinary jitter starts under-billing real sessions.
+const USAGE_HEARTBEAT_CAP_S = 90; // max chargeable seconds per settle
 
 // Which bucket does this license draw live-interview time from?
 // Mirrors the client's getLiveTimeBalance so both sides agree on semantics:
@@ -2181,11 +2207,34 @@ function chargeLicenseSeconds(userId, source, seconds) {
 // keep authorising answers would just move the free ride somewhere else.
 // The sweeper settles those sessions anyway; this makes them stop
 // working the moment they go quiet, not whenever the sweeper next runs.
+// ⚠️ AN UNLIMITED SESSION IS LIVE WHETHER OR NOT IT EVER BEAT.
+//
+// The heartbeat and the billing clock are the same mechanism: the client's
+// tick() interval charges time AND refreshes last_heartbeat_at. Ultra has
+// no time to charge, so creditTimerService.start() returned before creating
+// that interval — "no countdown to run" — and an Ultra account therefore
+// NEVER heartbeated. Not once, all interview.
+//
+// Nothing surfaced it, because the only reader of last_heartbeat_at that
+// can refuse a user is this function, and requireActiveSession is still
+// dormant. Arm it and every non-admin Ultra user is refused 90 seconds into
+// every interview — the top-paying tier, deterministically, BECAUSE it is
+// the one tier that is never billed. That is the whole bug.
+//
+// The client no longer skips the interval (see creditTimerService), so real
+// beats now arrive. This clause is the belt to that pair of braces: liveness
+// exists to protect metered time, and there is no metered time on an
+// unlimited session, so there is nothing here for staleness to protect. A
+// client that cannot beat — an old build, a throttled renderer, a bug we
+// have not found — must still never be told to start a session it is
+// already in. sweepStaleUsageSessions leaves these rows open for the same
+// reason; /start supersedes them, so at most one lingers per account.
 function hasLiveUsageSession(userId, now = Date.now()) {
   const d = getDB();
   const row = d.prepare(`
     SELECT id FROM usage_sessions
-    WHERE user_id = ? AND ended_at IS NULL AND last_heartbeat_at > ?
+    WHERE user_id = ? AND ended_at IS NULL
+      AND (source = 'unlimited' OR last_heartbeat_at > ?)
     LIMIT 1
   `).get(userId, now - USAGE_STALE_AFTER_MS);
   return !!row;
@@ -2327,11 +2376,16 @@ function getExpiringPassLicenses(windowMs) {
 // Sweeper: sessions silent past USAGE_STALE_AFTER_MS get settled AT their
 // last heartbeat — the user is never charged for time after their client
 // died. Runs from index.js on an interval.
+// Unlimited sessions are exempt for the same reason hasLiveUsageSession
+// exempts them: closing one would re-open the exact hole that function
+// closes, because a closed row fails its `ended_at IS NULL` test too. They
+// carry no charge, and /start supersedes any that linger.
 function sweepStaleUsageSessions() {
   const d = getDB();
   const cutoff = Date.now() - USAGE_STALE_AFTER_MS;
   const stale = d.prepare(
-    'SELECT id, last_heartbeat_at FROM usage_sessions WHERE ended_at IS NULL AND last_heartbeat_at < ?'
+    `SELECT id, last_heartbeat_at FROM usage_sessions
+     WHERE ended_at IS NULL AND source != 'unlimited' AND last_heartbeat_at < ?`
   ).all(cutoff);
   for (const s of stale) {
     d.prepare(`
@@ -3656,6 +3710,11 @@ module.exports = {
   // Usage sessions — server-authoritative interview clock
   resolveTimeBucket, startUsageSession, heartbeatUsageSession, hasLiveUsageSession,
   stopUsageSession, sweepStaleUsageSessions, getUsageTotals,
+  // Exported so routes/usage.js settles against the SAME two numbers rather
+  // than its own copies. They were duplicated there under a "keep in sync"
+  // comment, which is the arrangement that lets a window and a charge
+  // ceiling drift apart silently.
+  USAGE_STALE_AFTER_MS, USAGE_HEARTBEAT_CAP_S,
   // Lifecycle emails (pass-expiry reminders etc.)
   markLifecycleEmailOnce, getExpiringPassLicenses,
   // Cycle-end downgrade (paid → free safety net)

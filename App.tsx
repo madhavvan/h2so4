@@ -3157,6 +3157,18 @@ function useCreditTimer(params: {
   //  — it simply no longer opens, supersedes or settles the row.
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   const stopDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Set immediately before every stop WE ask for, so the recovery listener
+  // below can tell our own stop from one the server imposed.
+  const selfStoppedRef = useRef(false);
+  // Cleared on the way out, not by the listener: stop() only emits when it
+  // had something to stop (`hadInterval || sid`), so a no-op stop would
+  // otherwise leave this armed and silently swallow the NEXT drop — the one
+  // the server imposed. The emit is synchronous, so by the time stop()
+  // returns the listener has already run.
+  const stopOwnSession = () => {
+    selfStoppedRef.current = true;
+    try { creditTimerService.stop(); } finally { selfStoppedRef.current = false; }
+  };
   useEffect(() => {
     if (isPopoutMode) return; // the main window owns the session — see above
     if (isListening) {
@@ -3166,10 +3178,49 @@ function useCreditTimer(params: {
       if (stopDebounceRef.current) clearTimeout(stopDebounceRef.current);
       stopDebounceRef.current = setTimeout(() => {
         stopDebounceRef.current = null;
-        creditTimerService.stop();
+        stopOwnSession();
       }, 8000);
     }
   }, [isListening]);
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  //  A SESSION THE SERVER TOOK AWAY HAS TO COME BACK BY ITSELF.
+  //
+  //  On 410 session_gone — swept after the stale window, or superseded by
+  //  a sign-in elsewhere — the timer clears its clock and emits 'stopped'.
+  //  Every listener for that event only re-read the balance. NOTHING
+  //  re-opened the session, and the sole caller of start() is the effect
+  //  above, which fires on an isListening EDGE. A mic that stays on has no
+  //  edge, so there was no session for the rest of the interview.
+  //
+  //  Today that is a frozen clock. With requireActiveSession armed it is
+  //  "Turn the mic on to start your session" while the mic is on — the same
+  //  sentence as the popout bug, arriving through a different door, and the
+  //  reason a longer stale window alone would not have been enough.
+  //
+  //  Guards: our own stop is ignored (the flag above), a mic that is off
+  //  stays off, an exhausted or lapsed plan is not restarted into a 402
+  //  toast loop, and a 5s floor keeps any unforeseen emit from spinning.
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  const isListeningRef = useRef(isListening);
+  useEffect(() => { isListeningRef.current = isListening; }, [isListening]);
+  const lastResumeAtRef = useRef(0);
+  useEffect(() => {
+    if (isPopoutMode) return;
+    return creditTimerService.on('stopped', () => {
+      if (selfStoppedRef.current) return; // our own teardown, not a drop
+      if (!isListeningRef.current) return;
+      // heartbeat() mirrors the authoritative balance into the cached
+      // license BEFORE it emits, so this reads the just-updated truth.
+      const { license } = licenseService.loadAuth();
+      if (licenseService.getPlanState(license) !== 'ok') return;
+      const now = Date.now();
+      if (now - lastResumeAtRef.current < 5000) return;
+      lastResumeAtRef.current = now;
+      console.warn('[usage] session dropped while the mic was live — reopening');
+      void creditTimerService.start();
+    });
+  }, []);
   // Settle the timer on FINAL unmount only (empty deps → cleanup runs once).
   // Kept separate from the effect above so a reconnect's dep-change cleanup
   // can't fire an immediate stop and defeat the debounce.
@@ -3180,7 +3231,11 @@ function useCreditTimer(params: {
   useEffect(() => () => {
     if (isPopoutMode) return;
     if (stopDebounceRef.current) { clearTimeout(stopDebounceRef.current); stopDebounceRef.current = null; }
-    creditTimerService.stop();
+    // stopOwnSession, not stop(): unmount happens with the mic still live
+    // (quit, logout, tier change), and the recovery listener above must not
+    // read our own teardown as the server dropping us and reopen a session
+    // on the way out.
+    stopOwnSession();
   }, []);
 
   const acknowledgeHourBoundary = useCallback((decision: 'continue' | 'stop') => {
@@ -6408,7 +6463,23 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         // AND relayed to the popout so BOTH windows render character-by-
         // character instead of the popout seeing one final pop.
         const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini, claude: streamClaude };
-        const gen = streamers[currentSettings.selectedModel] || streamGemini;
+        // ⚠️ currentModel, NOT currentSettings.selectedModel.
+        //
+        // currentModel is the model this SEND resolved to: the explicit
+        // _modelOverride on an outage retry, or a routed-around choice when
+        // the user's pick is benched. selectedModel is what the picker
+        // shows, and the outage fallback deliberately never writes to it
+        // (that write was the gpt<->grok ping-pong).
+        //
+        // So routing on selectedModel made the whole fallback ceremonial:
+        // the retry was handed `next`, the gate checked `next` — and then
+        // the request went back to the provider that had just refused. The
+        // user read "Using GPT for this answer" and got a Gemini error a
+        // moment later, with no answer and no working suggestion, because
+        // the message had talked them out of the one fix (switch by hand).
+        // The 60s cooldown was ceremonial for the same reason: it chose a
+        // different model and then called the benched one anyway.
+        const gen = streamers[currentModel] || streamGemini;
         streamingIdRef.current = pendingId;
         streamingTextRef.current = '';
         streamStartAtRef.current = Date.now();
@@ -7886,6 +7957,28 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           electronIPC.send('relay-to-popout', { type: 'stream-end', id: pendingId });
           remoteHostRef.current?.finishAnswer(pendingId);
         }
+        // ── Say something. This used to render NOTHING. ──
+        // The pending bubble was cleared and no message took its place, so
+        // a failed regenerate looked exactly like a button that does not
+        // work: screen goes blank, mid-interview, no reason given. It is
+        // also the path a user is most likely to be on when a provider is
+        // down, because "press regenerate" is the obvious thing to try.
+        //
+        // Regenerate keeps the model the user picked on purpose — it is an
+        // explicit "answer that again", not a routing decision — so unlike
+        // executeSend there is no fallback to announce here. Naming the
+        // provider and the manual fix is the useful thing left to do.
+        const actualError = err?.message || 'Unknown error';
+        const failedModel = settingsRef.current.selectedModel as ModelKey;
+        const errorMsg: Message = {
+          id: Date.now().toString(),
+          role: 'system',
+          content: looksLikeProviderOutage(actualError)
+            ? `⚠️ ${MODEL_REGISTRY[failedModel]?.short ?? failedModel} is having a temporary service problem. Try again in a moment, or pick another model.`
+            : `Error: ${actualError}`,
+          timestamp: Date.now(),
+        };
+        if (db.isElectron) { db.addMessage(errorMsg); } else { setMessages(prev => [...prev, errorMsg]); }
     } finally {
         if (streamAbortRef.current === abort) {
           streamAbortRef.current = null;

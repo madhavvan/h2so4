@@ -8,7 +8,7 @@
 //
 //  Priority order is the key design decision:
 //    BEHAVIORAL (framing) → ML_DATA → CODING → SYSTEM_DESIGN
-//    → STRATEGY_CASE → QUANTITATIVE → CONCEPT → CLARIFIER → OTHER.
+//    → STRATEGY_CASE → QUANTITATIVE → PRACTICE → CONCEPT → CLARIFIER → OTHER.
 //
 //  Why this order:
 //    - BEHAVIORAL framing wins always ("tell me about a time you used
@@ -169,12 +169,116 @@ const CONCEPT_PATTERNS = [
   /\bwhy (is|are|does|do) (a |an |the )?[a-z]/i,
 ];
 
+// ── Practice / process ownership ──
+//
+// "How have you managed qualification documentation in Kneat?" — a question
+// asking whether you have actually RUN the thing. It is the daily bread of
+// every regulated, operational and delivery-side interview (validation,
+// quality, manufacturing, clinical, security compliance, finance controls,
+// SRE, program delivery), and until this category existed the classifier had
+// nowhere to put it: every other list above is software, ML, PM or
+// consulting, so it fell past all of them into CLARIFIER — the bucket whose
+// prompt shape is "1-2 sentences max".
+//
+// That is how a twelve-year specialist got a two-line answer to the question
+// his whole career is about. Measured on eight real CQV questions: five
+// landed in clarifier/other.
+// EXPLICIT — the phrasing itself names the shape ("what's your process for…",
+// "walk me through the…"). Nobody says these as a two-word follow-up, so they
+// need no length test and must not get one: "What's your process for deviation
+// disposition?" carries only three content words and is unmistakably a
+// question about how this person works.
+const PRACTICE_EXPLICIT_PATTERNS = [
+  /\bwhat(?:'s| is| are)? your (approach|process|method|methodology|strategy|workflow|framework|standard|practice|philosophy)\b/i,
+  // "walk me through a turnover package" — BEHAVIORAL claims project/time/
+  // situation above, so what is left here is an artifact or a procedure.
+  /\bwalk me through (a|an|the|your)\b/i,
+  /\bhow (do|would) you (go about|typically|usually|normally)\b/i,
+  /\bwhat does your\b[\s\S]{0,30}?\b(process|workflow|approach) look like\b/i,
+];
+
+// AMBIGUOUS — a verb that a process question and a coding follow-up share.
+// "How would you handle nulls?" matches this word for word and is a
+// follow-up; "How do you decide IQ versus OQ scope?" is not. Only the
+// subject count separates them, so these are gated below.
+const PRACTICE_VERB_PATTERNS = [
+  /\bhow (do|did|have|would) you\b[\s\S]{0,40}?\b(manage[d]?|handl(e|ed)|run|ran|govern(ed)?|own(ed)?|approach(ed)?|track(ed)?|control(led)?|ensur(e|ed)|maintain(ed)?|coordinat(e|ed)|overs(ee|aw)|structur(e|ed)|organi[sz](e|ed)|prioriti[sz](e|ed)|document(ed)?|validat(e|ed)|qualif(y|ied)|review(ed)?|audit(ed)?|escalat(e|ed)|disposition(ed)?|decid(e|ed)|determin(e|ed)|defin(e|ed)|scope[d]?|set|choos(e|ing)|chose|select(ed)?|assess(ed)?|evaluat(e|ed)|justif(y|ied)|enforc(e|ed)|verif(y|ied))\b/i,
+  /\bwhich\b[\s\S]{0,50}?\b(require|need|trigger|warrant)[sd]?\b/i,
+];
+
+// ⚠️ A PRACTICE QUESTION NEEDS A SUBJECT TOO — same test, other direction.
+//
+// "How would you handle nulls?" matches the verb pattern above word for
+// word, and it is a coding follow-up, not a question about how someone runs
+// a programme. What separates them is not the verb, it is how much the
+// question is ABOUT: handle/nulls is two content words, while "decide IQ
+// versus OQ scope" is five.
+//
+// Using the same counter as isClarifier keeps one line between the two
+// buckets instead of two that can drift apart — a question is either
+// carrying its own subject or leaning on the previous turn, never both.
+function isPractice(text) {
+  if (anyMatch(PRACTICE_EXPLICIT_PATTERNS, text)) return true;
+  return anyMatch(PRACTICE_VERB_PATTERNS, text)
+    && contentWordCount(text) > CLARIFIER_MAX_CONTENT_WORDS;
+}
+
 // ── Clarifier ──
 // Short follow-up. Only fires if NOTHING else matched (last resort).
+//
+// ⚠️ "SHORT AND INTERROGATIVE" IS NOT A CLARIFIER.
+//
+// The old rule was exactly that — under 80 characters and containing any of
+// why/how/what/when/where/which/can/could/would. It is the widest net in this
+// file and it sat at the bottom, so it caught everything the domain lists
+// above did not recognise. "Walk me through your background" (77 chars) had
+// already been rescued from it with a bespoke pattern above; that was the
+// same bug, patched one question at a time.
+//
+// A real clarifier CANNOT stand on its own — it only means anything next to
+// the previous turn: "what do you mean?", "the second one?", "so you'd use
+// Postgres?". What separates it from a real question is not length, it is
+// SUBJECT. Strip the function words and a clarifier has almost nothing left,
+// while "how have you managed qualification documentation in kneat" still has
+// managed / qualification / documentation / kneat.
+//
+// So: still short, still interrogative, and now also carrying no subject of
+// its own. Being wrong here is asymmetric — a real question misread as a
+// clarifier is answered in two sentences and the candidate looks thin, while
+// a clarifier misread as a real question costs a few extra seconds of speech.
+const FUNCTION_WORDS = new Set([
+  'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+  'do', 'does', 'did', 'doing', 'done',
+  'you', 'your', 'yours', 'i', 'me', 'my', 'we', 'our', 'us', 'they', 'them',
+  'their', 'it', 'its', 'he', 'she', 'his', 'her',
+  'that', 'this', 'these', 'those', 'and', 'or', 'but', 'so', 'if', 'then',
+  'than', 'as', 'at', 'by', 'for', 'from', 'in', 'into', 'of', 'on', 'to',
+  'with', 'about', 'have', 'has', 'had',
+  'can', 'could', 'would', 'should', 'will', 'shall', 'may', 'might', 'must',
+  'how', 'what', 'why', 'when', 'where', 'which', 'who', 'whom',
+  'ok', 'okay', 'just', 'also', 'any', 'some', 'more', 'much', 'many',
+  'one', 'two', 'there', 'here', 'again', 'sorry', 'please', 'mean', 'means',
+  'say', 'said', 'tell', 'know', 'think', 'like', 'get', 'got',
+]);
+
+/** Words left once the grammar is removed — what the question is ABOUT. */
+function contentWordCount(text) {
+  return String(text)
+    .toLowerCase()
+    .split(/[^a-z0-9+#.]+/)
+    .filter(w => w.length > 1 && !FUNCTION_WORDS.has(w))
+    .length;
+}
+
+// Three is the line. "the second one" and "so you'd use Postgres" sit at or
+// below it; "walk me through a turnover package" (walk/through/turnover/
+// package) and the Kneat question (4) sit above it.
+const CLARIFIER_MAX_CONTENT_WORDS = 3;
+
 function isClarifier(text) {
   if (text.length > 80) return false;
-  if (/\b(why|how|what|when|where|which|can|could|would)\b/i.test(text)) return true;
-  return false;
+  if (!/\b(why|how|what|when|where|which|can|could|would)\b/i.test(text)) return false;
+  return contentWordCount(text) <= CLARIFIER_MAX_CONTENT_WORDS;
 }
 
 const CATEGORIES = Object.freeze({
@@ -185,6 +289,7 @@ const CATEGORIES = Object.freeze({
   CONCEPT:        'concept',
   QUANTITATIVE:   'quantitative',
   STRATEGY_CASE:  'strategy_case',
+  PRACTICE:       'practice',
   CLARIFIER:      'clarifier',
   OTHER:          'other',
 });
@@ -204,6 +309,11 @@ function classifyQuestion(transcript) {
   if (anyMatch(SYSTEM_DESIGN_PATTERNS, text))   return { category: CATEGORIES.SYSTEM_DESIGN, confidence: 'high' };
   if (anyMatch(STRATEGY_CASE_PATTERNS, text))   return { category: CATEGORIES.STRATEGY_CASE, confidence: 'high' };
   if (anyMatch(QUANTITATIVE_PATTERNS, text))    return { category: CATEGORIES.QUANTITATIVE,  confidence: 'high' };
+  // PRACTICE before CONCEPT: "what is your approach to risk-based
+  // qualification" is a question about how this person WORKS, and the
+  // definition pattern (/what (is|are) …/) would otherwise claim it and
+  // answer it like a textbook entry.
+  if (isPractice(text))                         return { category: CATEGORIES.PRACTICE,      confidence: 'high' };
   if (anyMatch(CONCEPT_PATTERNS, text))         return { category: CATEGORIES.CONCEPT,       confidence: 'medium' };
   if (isClarifier(text))                        return { category: CATEGORIES.CLARIFIER,     confidence: 'medium' };
   return { category: CATEGORIES.OTHER, confidence: 'low' };

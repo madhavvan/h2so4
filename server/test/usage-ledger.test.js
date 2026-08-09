@@ -106,7 +106,7 @@ describe('heartbeatUsageSession', () => {
     expect(db.getLicenseByUserId(uid).credits_remaining_seconds).toBe(1775);
   });
 
-  it('clamps a silent gap to the stale window (90s) — no burst overcharge', () => {
+  it('clamps a silent gap to the charge cap (90s) — no burst overcharge', () => {
     const uid = makeUser('pro', { credits_remaining_seconds: 3600, credits_expire_at: Date.now() + 86400000 });
     const { session_id } = db.startUsageSession(uid, 'dev1');
     backdateHeartbeat(session_id, 300); // 5 minutes of silence
@@ -115,18 +115,43 @@ describe('heartbeatUsageSession', () => {
     expect(r.remaining).toBe(3600 - 90);
   });
 
-  // The cap is the STALE WINDOW, not the beat cadence. When it was 45s a
-  // client could beat every ~85s — still inside the 90s live window, so it
-  // kept getting answers — and pay 45s for every 85s it used. The ceiling
-  // has to reach the whole window or that gap is half-price interview time.
-  it('charges the full gap for a slow-beating client just inside the live window', () => {
+  // ⚠️ THE CAP AND THE WINDOW ARE DIFFERENT NUMBERS NOW, ON PURPOSE.
+  //
+  // They used to be equal, and the argument for equality was this test's
+  // original subject: a cap SMALLER than the window is a discount, because
+  // a client that beats slowly stays live and pays the cap for a longer
+  // gap. That is still true and is now an accepted, bounded cost.
+  //
+  // What flipped the decision is the other direction. The window is 15
+  // minutes so an interview survives a WiFi handover or an API cold start
+  // without being refused; an equal cap would then bill a fourteen-minute
+  // laptop sleep as fourteen minutes of a Pro user's one-hour pass, in a
+  // single beat — and tick() makes that certain, because on wake its
+  // displaySeconds hits 0 and fires a confirming heartbeat immediately.
+  // Overcharging honest users beat a discount that needs a patched client.
+  //
+  // So this pins what still holds: a gap inside the CAP is charged in full,
+  // with no rounding-down anywhere in the path.
+  it('charges the full gap for a slow-beating client, up to the cap', () => {
     const uid = makeUser('pro', { credits_remaining_seconds: 3600, credits_expire_at: Date.now() + 86400000 });
     const { session_id } = db.startUsageSession(uid, 'dev1');
-    backdateHeartbeat(session_id, 85); // still live (< 90s), but a slow beat
+    backdateHeartbeat(session_id, 85); // inside the 90s cap, and far inside the window
     expect(db.hasLiveUsageSession(uid)).toBe(true);
     const r = db.heartbeatUsageSession(uid, session_id);
     expect(r.charged).toBe(85);          // was 45 — a 47% discount on used time
     expect(r.remaining).toBe(3600 - 85);
+  });
+
+  // The two constants must never be silently re-coupled: setting the cap
+  // back to the window would restore the sleep overcharge, and shrinking
+  // the window back toward the cap would restore the 428 mid-interview.
+  it('keeps the liveness window well clear of the charge cap', () => {
+    expect(db.USAGE_STALE_AFTER_MS).toBe(15 * 60 * 1000);
+    expect(db.USAGE_HEARTBEAT_CAP_S).toBe(90);
+    expect(
+      db.USAGE_STALE_AFTER_MS,
+      'the window must outlast the blips an interview contains, not just a few beats',
+    ).toBeGreaterThan(db.USAGE_HEARTBEAT_CAP_S * 1000);
   });
 
   it('drains the bucket exactly once and closes the session', () => {
@@ -170,7 +195,9 @@ describe('sweepStaleUsageSessions', () => {
   it('settles a crashed session AT its last heartbeat — no post-crash charge', () => {
     const uid = makeUser('basic', { credits_remaining_seconds: 1800, credits_expire_at: Date.now() + 86400000 });
     const { session_id } = db.startUsageSession(uid, 'dev1');
-    backdateHeartbeat(session_id, 120); // silent past the 90s threshold
+    // Derived, not a literal: this said 120 for a 90s window and silently
+    // stopped exercising the sweeper the moment the window moved.
+    backdateHeartbeat(session_id, Math.ceil(db.USAGE_STALE_AFTER_MS / 1000) + 30);
     const before = db.getLicenseByUserId(uid).credits_remaining_seconds;
     const closed = db.sweepStaleUsageSessions();
     expect(closed).toBeGreaterThanOrEqual(1);
@@ -234,5 +261,94 @@ describe('resolveTimeBucket', () => {
     const b = db.resolveTimeBucket(db.getLicenseByUserId(uid));
     expect(b.source).toBe('credits');
     expect(b.remaining).toBe(0);
+  });
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ULTRA — THE TIER THAT NEVER BEAT.
+//
+//  The heartbeat and the billing clock are one mechanism: the client's
+//  interval charges time AND refreshes last_heartbeat_at. Ultra has no time
+//  to charge, so creditTimerService.start() returned before creating that
+//  interval — "no countdown to run" — and an Ultra account never beat once.
+//  Its row went stale 90 seconds in while the interview was still running.
+//
+//  Nothing surfaced it, because the only reader that can refuse a user is
+//  hasLiveUsageSession and requireActiveSession is still dormant. Arming it
+//  would have refused every non-admin Ultra user 90 seconds into every
+//  interview — the top-paying tier, deterministically, BECAUSE it is the
+//  one tier with nothing to bill.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('an unlimited session is live whether or not it ever beat', () => {
+  it('stays live past the window with a heartbeat that never came', () => {
+    const uid = makeUser('ultra');
+    const { session_id, source } = db.startUsageSession(uid, 'dev1');
+    expect(source).toBe('unlimited');
+    // Older than the window by an hour — an interview well past the point
+    // the client "should" have beaten, if it were ever going to.
+    backdateHeartbeat(session_id, Math.ceil(db.USAGE_STALE_AFTER_MS / 1000) + 3600);
+    expect(
+      db.hasLiveUsageSession(uid),
+      'requireActiveSession would 428 here — "Turn the mic on to start your ' +
+        'session", to an Ultra user whose mic is on',
+    ).toBe(true);
+  });
+
+  it('is not swept away underneath itself', () => {
+    // hasLiveUsageSession also tests `ended_at IS NULL`, so a sweeper that
+    // closed the row would re-open the hole from the other side.
+    const uid = makeUser('ultra');
+    const { session_id } = db.startUsageSession(uid, 'dev1');
+    backdateHeartbeat(session_id, Math.ceil(db.USAGE_STALE_AFTER_MS / 1000) + 3600);
+    db.sweepStaleUsageSessions();
+    expect(getSession(session_id).ended_at).toBeNull();
+    expect(db.hasLiveUsageSession(uid)).toBe(true);
+  });
+
+  it('does NOT hand the same exemption to a metered session', () => {
+    // The control. If this ever goes green, staleness has stopped meaning
+    // anything and the mic-off free ride is back for everyone.
+    const uid = makeUser('pro', { credits_remaining_seconds: 3600, credits_expire_at: Date.now() + 86400000 });
+    const { session_id, source } = db.startUsageSession(uid, 'dev1');
+    expect(source).toBe('credits');
+    backdateHeartbeat(session_id, Math.ceil(db.USAGE_STALE_AFTER_MS / 1000) + 60);
+    expect(db.hasLiveUsageSession(uid)).toBe(false);
+  });
+
+  it('charges nothing when an unlimited session does beat', () => {
+    const uid = makeUser('ultra');
+    const { session_id } = db.startUsageSession(uid, 'dev1');
+    backdateHeartbeat(session_id, 300);
+    const r = db.heartbeatUsageSession(uid, session_id);
+    expect(r.charged).toBe(0);
+    expect(r.remaining).toBe(-1);
+    expect(getSession(session_id).seconds_charged).toBe(0);
+  });
+});
+
+// The server-side exemption above is the belt. This is the braces: the
+// client must actually beat, or Ultra sessions would only ever be "live"
+// by exemption and nothing would notice the next time the interval moved.
+describe('the client no longer skips the interval for unlimited', () => {
+  const fs = require('node:fs');
+  // ESM: no __dirname here. Resolve against this module's own URL.
+  const svc = fs.readFileSync(
+    new URL('../../services/creditTimerService.ts', import.meta.url), 'utf8',
+  );
+
+  it('does not return before setInterval on an unlimited session', () => {
+    const start = svc.indexOf('async start()');
+    const end = svc.indexOf('stop(): void', start);
+    const body = svc.slice(start, end);
+    const interval = body.indexOf('this.intervalId = setInterval');
+    expect(interval).toBeGreaterThan(-1);
+    const before = body.slice(0, interval);
+    // The exact shape of the bug: a bare `return` under an unlimited test,
+    // sitting between the server session and the interval that beats for it.
+    expect(
+      /if \(this\.source === 'unlimited'\)[\s\S]{0,400}?\n\s*return;/.test(before),
+      'unlimited must reach setInterval — that interval is what heartbeats, ' +
+        'not just what counts down',
+    ).toBe(false);
   });
 });

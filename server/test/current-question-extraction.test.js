@@ -106,11 +106,22 @@ describe('auto reasoning depth — policy pins', () => {
       strategy_case: 'low',
       behavioral: 'none',
       concept: 'none',
+      practice: 'none',
       clarifier: 'none',
       other: 'none',
     });
     expect([...DEEP_CATEGORIES].sort()).toEqual(
       ['coding', 'ml_data', 'quantitative', 'strategy_case', 'system_design']);
+  });
+
+  // A practice question wants a 5-7 sentence answer from someone who has run
+  // the thing — but that depth is bought in the PROMPT, which is sent either
+  // way and therefore costs nothing. Buying it here would cost reasoning
+  // tokens before the first word AND pull the category into DEEP_CATEGORIES,
+  // which sizes the cover. Both land on a person waiting mid-interview.
+  it('practice buys depth from the prompt, never from latency', () => {
+    expect(AUTO_EFFORT_BY_CATEGORY.practice).toBe('none');
+    expect(DEEP_CATEGORIES.has('practice')).toBe(false);
   });
 
   it('max tier + auto + deep question → low', () => {

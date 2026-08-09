@@ -54,12 +54,13 @@ function isAdminEmail(email) {
 // exhaustion / session-gone / supersede logic is untouched, and the
 // legitimate 20-second beat still charges exactly what it did before.
 //
-// The ceiling on ONE settle is the stale window, not the per-beat cap: a
-// session stops authorising answers (hasLiveUsageSession) once it has
-// been silent that long, and the sweeper settles it there — so that
-// window is the most time a single gap can honestly represent. Keep in
-// sync with USAGE_STALE_AFTER_MS in database.js (not exported).
-const USAGE_STALE_AFTER_MS = 90 * 1000;
+// Both numbers come from database.js now — they used to be re-declared here
+// under a "keep in sync" comment, and a hand-maintained copy of a billing
+// ceiling is exactly the thing that drifts. The ceiling on ONE settle is
+// USAGE_HEARTBEAT_CAP_S, which is deliberately NOT the liveness window any
+// more: see the long note on both constants in database.js. Using the
+// window here would bill a fifteen-minute laptop sleep as interview time.
+const { USAGE_STALE_AFTER_MS, USAGE_HEARTBEAT_CAP_S } = db;
 // A /start this soon after the running one is the same client asking
 // twice (a re-mounted window, a retried request — or a loop trying to
 // rewind the clock): it RESUMES the live session instead of minting a
@@ -77,7 +78,7 @@ const USAGE_START_RESUME_MS = 10 * 1000;
 function settleUsageSession(userId, sess, now) {
   if (!sess || sess.source === 'unlimited') return 0;
   const owed = Math.max(0, Math.floor(
-    Math.min(now - sess.last_heartbeat_at, USAGE_STALE_AFTER_MS) / 1000,
+    Math.min(now - sess.last_heartbeat_at, USAGE_HEARTBEAT_CAP_S * 1000) / 1000,
   ));
   if (owed <= 0) return 0;
   const col = sess.source === 'credits' ? 'credits_remaining_seconds' : 'trial_remaining_seconds';

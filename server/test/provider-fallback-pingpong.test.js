@@ -131,3 +131,87 @@ describe('the fallback picker, replayed', () => {
     expect(pick('openai', allowed, (m) => cooling.has(m))).toBeNull();
   });
 });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  …AND THE CHOSEN MODEL IS THE ONE ACTUALLY CALLED.
+//
+//  Everything above this line passed while the fallback did nothing at all.
+//  `_modelOverride` was threaded through executeSend and read by the tier
+//  gate, and then the request was issued with
+//  `streamers[currentSettings.selectedModel]` — the provider that had just
+//  refused. The retry re-hit the outage, the 60s cooldown picked a model it
+//  never called, and the user read "Using GPT for this answer" immediately
+//  before a Gemini error.
+//
+//  The tests that missed it asserted the override was PASSED
+//  (`expect(app).toMatch(/_modelOverride/)`). Passing an argument nothing
+//  routes on is exactly the failure they were meant to catch, so these
+//  assert the argument is CONSUMED at the call site.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('the model the send resolved to is the model that gets called', () => {
+  const app = fs.readFileSync(path.join(ROOT, 'App.tsx'), 'utf8');
+
+  /** executeSend's body, from its declaration to its dependency array. */
+  function executeSendBody() {
+    const start = app.indexOf('const executeSend = useCallback(');
+    expect(start, 'executeSend not found — did it get renamed?').toBeGreaterThan(-1);
+    const end = app.indexOf('}, [cancelActiveStream]);', start);
+    expect(end, "executeSend's dependency array not found").toBeGreaterThan(start);
+    return app.slice(start, end);
+  }
+
+  it('routes on currentModel, not on the picker value', () => {
+    const body = executeSendBody();
+    expect(
+      body,
+      'the streamer must be chosen by the model THIS send resolved to — the ' +
+        'outage override, or a routed-around choice when the pick is benched',
+    ).toMatch(/streamers\[currentModel\]/);
+  });
+
+  it('never re-reads selectedModel to choose the streamer', () => {
+    const body = executeSendBody();
+    expect(
+      body,
+      'selectedModel is what the picker SHOWS. The fallback deliberately never ' +
+        'writes to it (that write was the gpt<->grok ping-pong), so routing on ' +
+        'it sends the retry straight back into the provider that just failed.',
+    ).not.toMatch(/streamers\[currentSettings\.selectedModel\]/);
+  });
+
+  it('dispatches on the very variable the override resolves into', () => {
+    // The bug in one sentence: currentModel existed, and every reader of it
+    // was a permission check or a string in a message. Nothing dispatched.
+    //
+    // Counting occurrences cannot catch that — the broken version mentions
+    // currentModel five times. So follow the chain instead: find the name
+    // _modelOverride resolves into, then require THAT name to index the
+    // streamer map. Renaming the variable stays fine; routing around it
+    // does not.
+    const body = executeSendBody();
+    const decl = body.match(/const (\w+): ModelKey = _modelOverride/);
+    expect(decl, 'the outage override no longer resolves into a named model').not.toBeNull();
+    const resolved = decl[1];
+    expect(
+      body,
+      `_modelOverride resolves into \`${resolved}\`, so \`${resolved}\` is what the ` +
+        'request must be issued with — anything else makes the retry, the ' +
+        'cooldown and the notice message all decorative',
+    ).toMatch(new RegExp(`streamers\\[${resolved}\\]`));
+  });
+
+  it('a failed regenerate says something instead of blanking the screen', () => {
+    // handleRegenerate cleared the pending bubble and added no message, so a
+    // regenerate against a down provider looked like a dead button —
+    // mid-interview, on the path a user reaches for when answers stop.
+    const start = app.indexOf('const handleRegenerate = async');
+    expect(start).toBeGreaterThan(-1);
+    const body = app.slice(start, start + 6000);
+    const katch = body.slice(body.indexOf('} catch (err: any) {'));
+    expect(katch).toMatch(/looksLikeProviderOutage\(actualError\)/);
+    expect(
+      katch,
+      'the catch must commit a message, not just clear the streaming bubble',
+    ).toMatch(/db\.addMessage\(errorMsg\)|setMessages\(prev => \[\.\.\.prev, errorMsg\]\)/);
+  });
+});
