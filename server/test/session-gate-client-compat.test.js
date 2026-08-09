@@ -89,9 +89,37 @@ describe('the gate lets through clients that could not understand it', () => {
   });
 });
 
-describe('the gate still does its job for clients that can read it', () => {
-  it(`a ${MIN_PROTOCOL_CLIENT} client with no session IS refused, with 428`, () => {
-    const r = runGate({ version: MIN_PROTOCOL_CLIENT, hasSession: false });
+// ── The gate is HELD BEHIND the cover on purpose (2026-08-08) ──
+// Shipping 4.0.19 armed both at once and a user hit the consequence within
+// the hour: the popout showed "Turn the mic on to start your session" while
+// the mic WAS on, because the popout and the main window are two renderers
+// fighting over one server-side session row. So SESSION_GATE_MIN_CLIENT is a
+// release AHEAD of what ships, and these tests assert against IT, not against
+// MIN_PROTOCOL_CLIENT — otherwise they would go green describing a gate that
+// is not the one running.
+const GATE_MIN = _test.SESSION_GATE_MIN_CLIENT;
+
+describe('the gate is dormant for every client that currently exists', () => {
+  it('is held at a version no shipped build reports', () => {
+    const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+    expect(
+      versionRank(GATE_MIN),
+      `the session gate (${GATE_MIN}) must stay ahead of the shipped release ` +
+        `(${pkg.version}) until the popout can no longer settle the main window's session`
+    ).toBeGreaterThan(versionRank(pkg.version));
+  });
+
+  it('the current release is NOT refused, even with no live session', () => {
+    const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+    const r = runGate({ version: pkg.version, hasSession: false });
+    expect(r.passed, 'this is the regression a user reported mid-interview').toBe(true);
+    expect(r.refusal).toBeNull();
+  });
+});
+
+describe('the gate still does its job once a client reaches its threshold', () => {
+  it(`a ${GATE_MIN} client with no session IS refused, with 428`, () => {
+    const r = runGate({ version: GATE_MIN, hasSession: false });
     expect(r.passed).toBe(false);
     expect(r.refusal?.status).toBe(428);
     expect(r.refusal?.body?.error).toBe('session_required');
@@ -103,13 +131,13 @@ describe('the gate still does its job for clients that can read it', () => {
   });
 
   it('the same client WITH a live session passes', () => {
-    const r = runGate({ version: MIN_PROTOCOL_CLIENT, hasSession: true });
+    const r = runGate({ version: GATE_MIN, hasSession: true });
     expect(r.passed).toBe(true);
     expect(r.refusal).toBeNull();
   });
 
   it('an admin is never gated, whatever they are running', () => {
-    const r = runGate({ version: MIN_PROTOCOL_CLIENT, hasSession: false, email: 'admin@example.invalid' });
+    const r = runGate({ version: GATE_MIN, hasSession: false, email: 'admin@example.invalid' });
     expect(r.passed).toBe(true);
   });
 });

@@ -192,12 +192,57 @@ const { hasAccess, isPlanLapsed } = require('../services/subscriptionStates');
 // it reads, and the reasoning for why it is safe to gate on a spoofable
 // value all live in one place now — two copies of a comparison is exactly
 // how the two ends of a gate drift apart.
-const { participatesInProtocol, MIN_PROTOCOL_CLIENT } = require('../middleware/clientVersion');
+const {
+  participatesInProtocol, MIN_PROTOCOL_CLIENT, versionRank, CLIENT_VERSION_HEADER,
+} = require('../middleware/clientVersion');
 
 // Kept as a named constant because the tests and the app release both refer
 // to it: the shipped app version must be >= this or every gate here stays
 // dormant forever.
-const SESSION_GATE_MIN_CLIENT = MIN_PROTOCOL_CLIENT;
+//
+// ⚠️ HELD ONE RELEASE AHEAD OF THE COVER — DELIBERATELY DORMANT (2026-08-08).
+//
+// This was `= MIN_PROTOCOL_CLIENT`, so shipping 4.0.19 armed the session gate
+// and the LLM cover together. Within the hour a user reported the popout
+// saying "Turn the mic on to start your session" WHILE THE MIC WAS ON, with
+// answers still arriving in between — the gate refusing intermittently
+// mid-interview.
+//
+// Cause is NOT the gate's logic; it is that "is a session live" is a
+// SERVER-side row while the app has TWO renderers. The popout is a separate
+// BrowserWindow with its own creditTimerService, mirroring the main window's
+// mic through remoteIsListening. /usage/start RESUMES only inside
+// USAGE_START_RESUME_MS (10s) and SUPERSEDES after that — and a user pops out
+// minutes into an interview, so the popout's start supersedes the main
+// window's session. When the popout's mirrored isListening then dips, its 8s
+// debounce fires stop(), which settles the session it owns. The main window
+// still holds intervalId, so its start() no-ops and it heartbeats a row that
+// is already ended: no live session anywhere, mic still on, 428.
+//
+// The gate is correct and the cover is unrelated, so they are decoupled here
+// rather than switching both off: the cover keeps running for 4.0.19, and the
+// gate stays dormant until the two renderers can no longer fight over one
+// session row. Re-arm by setting this back to MIN_PROTOCOL_CLIENT in the same
+// release that ships the single-owner fix.
+const SESSION_GATE_MIN_CLIENT = '4.0.20';
+
+/**
+ * Is this caller new enough for the SESSION GATE specifically?
+ *
+ * Mirrors participatesInProtocol but reads SESSION_GATE_MIN_CLIENT, so the
+ * gate and the cover can sit on different releases. Works whether or not the
+ * clientVersion middleware ran, for the same reason that one does: a gate
+ * must not be defeatable by a missing mount. Unparseable / absent → null,
+ * and `null >= n` is false, so such a caller is treated as old and NOT gated.
+ */
+function clientAtLeastSessionGate(req) {
+  const want = versionRank(SESSION_GATE_MIN_CLIENT);
+  if (want === null) return false; // a bad threshold must never enforce
+  const rank = typeof req.clientRank === 'number'
+    ? req.clientRank
+    : versionRank(req.headers && req.headers[CLIENT_VERSION_HEADER]);
+  return rank !== null && rank >= want;
+}
 
 function requireActiveSession(req, res, next) {
   try {
@@ -224,7 +269,13 @@ function requireActiveSession(req, res, next) {
     // someone's interview.
     //
     // Absent header = an old client (nothing before 4.0.19 sends one).
-    if (!participatesInProtocol(req)) {
+    //
+    // Compared against SESSION_GATE_MIN_CLIENT, NOT participatesInProtocol:
+    // this gate is held one release behind the cover on purpose (see the
+    // constant). Using the shared helper here is what coupled them.
+    // versionRank(null) is null and null >= anything is false, so a missing
+    // or junk header still resolves to "old" — the safe direction.
+    if (!clientAtLeastSessionGate(req)) {
       console.warn(
         `[requireActiveSession] not enforcing for client ${req.clientVersion || '(no version header)'} ` +
           `user=${req.user?.id} — pre-${SESSION_GATE_MIN_CLIENT} clients cannot render a 428`
@@ -2637,6 +2688,11 @@ module.exports._test = {
   // that fails on a refactor it should not notice trains people to edit the
   // test, which is how a real regression eventually gets waved through.
   requireActiveSession,
+  // Exported so the compat test asserts against the gate's OWN threshold
+  // rather than MIN_PROTOCOL_CLIENT. The two are deliberately on different
+  // releases while the popout/main-window session ownership is fixed; a test
+  // that hardcoded either one would go green for the wrong reason.
+  SESSION_GATE_MIN_CLIENT,
   geminiQuotaGate,
   resolveReasoningEffort,
   extractCurrentQuestion,
