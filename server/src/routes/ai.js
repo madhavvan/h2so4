@@ -229,7 +229,7 @@ const {
 // gate is not armed in the same release that fixes it: 15k interviews start
 // Monday, and "fixed in this build" and "proven in the field" are different
 // claims. Arm it once 4.0.20 has run real traffic.
-const SESSION_GATE_MIN_CLIENT = '4.0.21';
+const SESSION_GATE_MIN_CLIENT = '4.0.22';
 
 // ⚠️ THE LLM COVER IS HELD BACK TOO — DORMANT (2026-08-08).
 //
@@ -262,7 +262,10 @@ const SESSION_GATE_MIN_CLIENT = '4.0.21';
 // stay ahead of the release, not sit on it. The reachability test below is
 // what catches this; it is the same shape as the bug that left the whole
 // cover engine dormant, pointed the other way.
-const LLM_COVER_MIN_CLIENT = '4.0.21';
+// 4.0.20 → 4.0.21 → 4.0.22, moved on each cut. THIS IS THE ROUTINE, not an
+// oversight: a hold parked on the next version arms itself the moment that
+// version ships. It moves ahead every release until it is deliberately armed.
+const LLM_COVER_MIN_CLIENT = '4.0.22';
 
 /** Is this caller new enough for the LLM COVER specifically? */
 function clientAtLeastLlmCover(req) {
