@@ -226,6 +226,44 @@ const {
 // release that ships the single-owner fix.
 const SESSION_GATE_MIN_CLIENT = '4.0.20';
 
+// ⚠️ THE LLM COVER IS HELD BACK TOO — DORMANT (2026-08-08).
+//
+// runCover is AWAITED before the main provider call on every streaming
+// route, so when the client sends NO local opener the model round-trip is
+// added to the answer. Measured from the deployed code via planCoverFor,
+// 13 of 20 provider × question-shape combinations fire a cover:
+//
+//     gemini deep          +2000ms      openai deep          +2000-2800ms
+//     openai shallow/high  +2800ms      xai shallow          +2800ms
+//     xai deep             +4500ms      groq (any)           +4500ms
+//     claude                  never (fast enough that no plan is made)
+//
+// Before 4.0.19 every one of those was 0ms, because runCover returned ''
+// at the version gate. So 4.0.19 added up to 4.5s in front of an answer —
+// and if the grounding guard then rejects the cover, that time buys the
+// user NOTHING: the cover is dropped and the main answer starts late.
+// That is the "sometimes getting late responses" report, hours after
+// shipping, with 15k interviews on Monday.
+//
+// The feature is sound and the local opener (step 1 of runCover) is the
+// part users actually feel — it costs 0ms and is NOT gated by this. What
+// is unproven is the LLM fallback under real traffic. So it is held at a
+// version nothing reports yet, exactly like the session gate, rather than
+// disabled: re-arm by setting this to MIN_PROTOCOL_CLIENT once the cover
+// has been measured end-to-end against live traffic (its own TTFT, its
+// guard-rejection rate, and the main answer's TTFT behind it).
+const LLM_COVER_MIN_CLIENT = '4.0.20';
+
+/** Is this caller new enough for the LLM COVER specifically? */
+function clientAtLeastLlmCover(req) {
+  const want = versionRank(LLM_COVER_MIN_CLIENT);
+  if (want === null) return false;
+  const rank = typeof req.clientRank === 'number'
+    ? req.clientRank
+    : versionRank(req.headers && req.headers[CLIENT_VERSION_HEADER]);
+  return rank !== null && rank >= want;
+}
+
 /**
  * Is this caller new enough for the SESSION GATE specifically?
  *
@@ -998,9 +1036,12 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
   // see the `!plan` note below, which is the same rule applied to timing.
   // For a client that cannot use it, adding speed means doing nothing.
   //
-  // Same threshold as the session gate: a client that identifies itself as
-  // current is participating; anything older, or unidentified, is not.
-  if (!participatesInProtocol(req)) return '';
+  // ⚠️ HELD AT 4.0.20 — DORMANT ON PURPOSE (2026-08-08). See LLM_COVER_MIN_CLIENT.
+  //
+  // Everything ABOVE this line still runs, which is the point: the client's
+  // locally-composed opener (step 1) is unaffected, so the fast path users
+  // actually feel is untouched. Only the model round-trip below is held.
+  if (!clientAtLeastLlmCover(req)) return '';
 
   const {
     streamCoverAnswer, planCoverFor, SPOKEN_WORDS_PER_SEC,
@@ -2693,6 +2734,8 @@ module.exports._test = {
   // releases while the popout/main-window session ownership is fixed; a test
   // that hardcoded either one would go green for the wrong reason.
   SESSION_GATE_MIN_CLIENT,
+  LLM_COVER_MIN_CLIENT,
+  runCover,
   geminiQuotaGate,
   resolveReasoningEffort,
   extractCurrentQuestion,

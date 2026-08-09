@@ -258,3 +258,57 @@ describe('the protocol threshold is reachable', () => {
     expect(participatesInProtocol({ headers: { 'x-app-version': pkg.version } })).toBe(true);
   });
 });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE LLM COVER IS HELD BACK TOO — AND THE LOCAL OPENER IS NOT.
+//
+//  runCover is AWAITED before the main provider call, so when the client
+//  sends no local opener the model round-trip lands in front of the answer:
+//  measured from planCoverFor, 13 of 20 provider × shape combinations fire,
+//  costing +2000ms (gemini deep) to +4500ms (groq, xai deep). Before 4.0.19
+//  all of them were 0ms. If the grounding guard then rejects the cover, that
+//  time buys nothing at all — the cover is dropped and the answer starts
+//  late. That is the "sometimes getting late responses" report.
+//
+//  What is NOT held is step 1 of runCover: the opener the client composed
+//  locally. It costs one string lookup, it is the part users feel, and it
+//  must keep working while the LLM fallback is dormant. Pinned here because
+//  "held back" and "broken" look identical from the outside.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('the LLM cover is dormant, the local opener is not', () => {
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+
+  it('the LLM cover threshold is ahead of the shipped release', () => {
+    expect(
+      versionRank(_test.LLM_COVER_MIN_CLIENT),
+      `the LLM cover (${_test.LLM_COVER_MIN_CLIENT}) must stay ahead of the shipped ` +
+        `release (${pkg.version}) until its latency is measured against live traffic`
+    ).toBeGreaterThan(versionRank(pkg.version));
+  });
+
+  it('the current release gets NO model round-trip when it sends no opener', async () => {
+    const sent = [];
+    const sse = { send: (t) => sent.push(t), signal: undefined };
+    const req = {
+      user: { id: 'u1', email: 'user@example.invalid' },
+      headers: { 'x-app-version': pkg.version },
+      body: {}, // no instantOpener -> this is the path that used to cost seconds
+    };
+    const out = await _test.runCover({ sse, req, question: 'Design a rate limiter.', provider: 'groq' });
+    expect(out, 'a dormant cover must return the empty string, not stall').toBe('');
+    expect(sent, 'nothing may be streamed for a cover that did not run').toEqual([]);
+  });
+
+  it('the locally-composed opener STILL fires for the current release', async () => {
+    const sent = [];
+    const sse = { send: (t) => sent.push(t), signal: undefined };
+    const req = {
+      user: { id: 'u1', email: 'user@example.invalid' },
+      headers: { 'x-app-version': pkg.version },
+      body: { instantOpener: 'At Evonik I ran CQV for instrument qualification.' },
+    };
+    const out = await _test.runCover({ sse, req, question: 'Tell me about Evonik.', provider: 'groq' });
+    expect(out).toBe('At Evonik I ran CQV for instrument qualification.');
+    expect(sent.join('')).toContain('At Evonik');
+  });
+});
