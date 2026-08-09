@@ -20,6 +20,7 @@
     "electron:build": "npm run build && electron-builder",
     "electron:publish": "npm run build && electron-builder --publish=always",
     "release:verify": "node scripts/verify-release-feed.mjs",
+    "release:verify-mac": "node scripts/verify-mac-signing.mjs",
     "release:mirror": "node scripts/mirror-release.mjs"
   },
   "build": {

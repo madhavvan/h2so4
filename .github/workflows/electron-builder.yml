@@ -305,10 +305,53 @@ jobs:
       # costs nothing when the dispatch above worked: the verifier returns
       # on its first success and does not sleep out the remainder.
       - name: Verify every feed serves ${{ github.event.release.tag_name }}
+        id: feed
         run: node scripts/verify-release-feed.mjs --tag "${{ github.event.release.tag_name }}" --retries 20 --retry-wait 60
 
+      # ── IS THE MAC BUILD OPENABLE, NOT JUST DOWNLOADABLE? ──
+      #
+      # The step above proves the feed SERVES the mac files. It cannot tell
+      # whether they will open: an unsigned or un-stapled .app downloads with
+      # a perfect 200 and then dies at Gatekeeper with "Apple could not
+      # verify this app". To the user that is indistinguishable from the app
+      # being broken.
+      #
+      # This check existed once as `mac-verify.yml` — a ONE-OFF for v4.0.8,
+      # deleted the moment it passed (4170789, then 0ca1ecc). Thirteen
+      # releases shipped afterwards with nobody checking. It is permanent now.
+      #
+      # Needs no macOS runner: it reads the ZIP central directory over HTTP
+      # Range (a few hundred KB, not 2 x 176 MB) and asserts the signature
+      # manifests plus the stapled ticket's 's8ch' magic. Dependency-free, so
+      # a broken install cannot disable it.
+      - name: Verify the macOS build is signed and stapled
+        id: macsign
+        run: node scripts/verify-mac-signing.mjs --tag "${{ github.event.release.tag_name }}"
+
+      # Scoped to its OWN step. Both explainers used to be a bare `failure()`,
+      # which fires them BOTH on either failure — two contradictory diagnoses
+      # for one problem is worse than none.
+      - name: Explain a macOS signing failure
+        if: failure() && steps.macsign.outcome == 'failure'
+        run: |
+          echo "::error title=macOS build will not open::The feed serves the mac files, but they are not correctly signed or not stapled."
+          echo ""
+          echo "Stapling is what lets the app launch with NO network. An app that"
+          echo "is notarized but un-stapled works on your machine (which has already"
+          echo "talked to Apple) and fails on a candidate's — mid-interview."
+          echo ""
+          echo "Check, in order:"
+          echo "  1. did the mac matrix job actually notarize? (notarize: true in"
+          echo "     package.json makes electron-builder FAIL the build if not)"
+          echo "  2. APPLE_API_KEY_ID / APPLE_API_ISSUER / APPLE_API_KEY_P8 valid?"
+          echo "  3. did the mirror copy a TRUNCATED asset to the feed repo?"
+          echo "     -> re-run: npm run release:mirror -- ${{ github.event.release.tag_name }}"
+          echo ""
+          echo "Reproduce locally (no Mac needed):"
+          echo "  npm run release:verify-mac -- --tag ${{ github.event.release.tag_name }}"
+
       - name: Explain what a failure here means
-        if: failure()
+        if: failure() && steps.feed.outcome == 'failure'
         run: |
           echo "::error title=Release is not reachable by users::The build succeeded but the update feed does not serve ${{ github.event.release.tag_name }}."
           echo ""
