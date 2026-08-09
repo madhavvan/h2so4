@@ -87,3 +87,52 @@ describe('only the main window owns the server-side usage session', () => {
     ).toBeGreaterThanOrEqual(2);
   });
 });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE GHOST MAY LEAD THE TEXTAREA. IT MAY NOT DUPLICATE IT.
+//
+//  Both composers (pop-out and main) paint a muted layer BEHIND the
+//  textarea so interim words show the instant Deepgram sends them, while
+//  the textarea only updates on a final. That lead is deliberate.
+//
+//  What was not: the layer rendered `{inputText}{interimText}`, so the
+//  FINALISED text was drawn twice — in the pop-out at 12px italic behind
+//  0.9rem upright, two fonts that cannot align. Users reported "another
+//  shadow normal text" racing ahead of the real one (2026-08-08).
+//
+//  The finals must reserve their width without being painted. Asserted on
+//  source because this is a rendering property with no headless surface.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('the interim ghost never double-paints the finalised text', () => {
+  it('no composer renders inputText and interimText both visibly', () => {
+    // The exact shape of the bug: the two adjacent, both painted.
+    const doubled = appTsx.match(/\{inputText\}\{interimText\}/g) || [];
+    expect(
+      doubled.length,
+      'a ghost layer that paints {inputText} on top of the textarea\'s own ' +
+        '{inputText} shows every finalised word twice, in two fonts'
+    ).toBe(0);
+  });
+
+  it('every ghost layer hides the finals while keeping their width', () => {
+    // visibility:hidden / .invisible keep the box (so the interim lands after
+    // the finals); display:none would collapse it and misplace the interim.
+    const ghosts = appTsx.match(/\{interimText && \([\s\S]{0,900}?\)\}/g) || [];
+    expect(ghosts.length, 'expected the pop-out and main composers').toBeGreaterThanOrEqual(2);
+    for (const g of ghosts) {
+      expect(g).toContain('{interimText}');
+      expect(
+        /visibility:\s*'hidden'|className="invisible"/.test(g),
+        'this ghost paints the finals — it must hide them:\n' + g.slice(0, 220)
+      ).toBe(true);
+      expect(g, 'display:none would collapse the reserved width').not.toMatch(/display:\s*'none'/);
+    }
+  });
+
+  it('no ghost is italic while the textarea it sits behind is not', () => {
+    const ghosts = appTsx.match(/\{interimText && \([\s\S]{0,900}?\)\}/g) || [];
+    for (const g of ghosts) {
+      expect(g, 'slanted glyphs cannot line up with upright ones').not.toMatch(/\bitalic\b/);
+    }
+  });
+});

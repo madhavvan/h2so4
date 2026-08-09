@@ -1544,12 +1544,33 @@ const ChatInterface = ({
                          maximum room to type; auto-grows then scrolls (see the
                          styled scrollbar + max-height in pip-styles.css). ── */}
                     <div style={{ position: 'relative', width: '100%' }}>
+                        {/* ── The live-transcription ghost ──
+                            Interim words appear here the moment Deepgram sends
+                            them; the textarea above only updates when a final
+                            lands. That lead is the point.
+
+                            What was NOT the point: this layer used to render the
+                            finals and the interim back to back, so finalised text was
+                            painted twice — once here at 12px italic, once in the
+                            textarea at 0.9rem upright — two different fonts,
+                            stacked and unalignable. Users read it as a second
+                            "shadow" transcript racing ahead of the real one.
+                            Reported 2026-08-08.
+
+                            So: the finals reserve their exact width but are not
+                            drawn (visibility:hidden keeps the box, unlike
+                            display:none), and the metrics below are copied from
+                            .pip-textarea so the interim lands where the caret
+                            actually is. Only ONE thing is ever visible here. */}
                         {interimText && (
                             <div
-                                className="pointer-events-none absolute left-2.5 top-2 right-2.5 text-[12px] italic truncate z-0"
-                                style={{ color: 'var(--text-muted)', opacity: 0.7 }}
+                                className="pointer-events-none absolute left-2.5 top-2 right-2.5 truncate z-0"
+                                style={{
+                                    color: 'var(--text-muted)', opacity: 0.7,
+                                    fontFamily: 'inherit', fontSize: '0.9rem', lineHeight: 1.5,
+                                }}
                             >
-                                {inputText}{interimText}
+                                <span style={{ visibility: 'hidden' }}>{inputText}</span>{interimText}
                             </div>
                         )}
                         <textarea
@@ -2034,9 +2055,15 @@ const ChatInterface = ({
                                 engages the textarea (parent container glows, not the box). */}
                             <div className="relative flex items-end gap-2.5 px-2 pb-2 pt-0.5">
                                 <div className="relative flex-1 min-w-0">
+                                    {/* Same ghost, same rule as the pop-out composer: the
+                                        finalised text reserves its width but is never PAINTED
+                                        here, or it appears twice in two different fonts. This
+                                        copy already matched the textarea's size and padding —
+                                        `italic` was the only thing making the duplicate visibly
+                                        diverge, and `leading-relaxed` matches its line-height. */}
                                     {interimText && (
-                                        <div className="absolute top-2.5 left-3 text-gray-400 pointer-events-none text-sm md:text-base whitespace-pre-wrap truncate w-full opacity-60 italic z-0">
-                                            {inputText}{interimText}
+                                        <div className="absolute top-2.5 left-3 text-gray-400 pointer-events-none text-sm md:text-base leading-relaxed whitespace-pre-wrap truncate w-full opacity-60 z-0">
+                                            <span className="invisible">{inputText}</span>{interimText}
                                         </div>
                                     )}
                                     <textarea
