@@ -3103,8 +3103,35 @@ function useCreditTimer(params: {
   // a quick reconnect cancels it (start() then no-ops since the timer's still
   // running → continuous session). A real user-stop still settles within 8s,
   // and the server's stale-session sweeper backstops anything longer.
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  //  ONE WINDOW OWNS THE SESSION. IT IS THIS ONE.
+  //
+  //  The usage session is a SERVER-side row, but this app has two renderers,
+  //  and the popout mounts this same hook with `isListening` mirrored from
+  //  main via remoteIsListening. Both therefore drove start()/stop() on
+  //  their OWN creditTimerService instance, against one shared row:
+  //
+  //    · /usage/start RESUMES only within USAGE_START_RESUME_MS (10s) and
+  //      SUPERSEDES after that — and a user pops out MINUTES into an
+  //      interview, so the popout's start superseded main's session;
+  //    · when the popout's mirrored isListening then dipped, the 8s debounce
+  //      below fired stop(), settling the session it had taken over;
+  //    · main still held intervalId, so ITS start() no-op'd and it went on
+  //      heartbeating a row that was already ended.
+  //
+  //  Result: no live session anywhere while the mic was plainly on — which
+  //  the server's session gate then answered with 428, and the popout
+  //  rendered as "Turn the mic on to start your session". Reported from a
+  //  live interview on 2026-08-08.
+  //
+  //  The popout is already a thin client for speech (onResult is a no-op
+  //  there); this makes it a thin client for billing too. It still SHOWS the
+  //  clock — `remaining`/`source` arrive over the same state sync as the mic
+  //  — it simply no longer opens, supersedes or settles the row.
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   const stopDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
+    if (isPopoutMode) return; // the main window owns the session — see above
     if (isListening) {
       if (stopDebounceRef.current) { clearTimeout(stopDebounceRef.current); stopDebounceRef.current = null; }
       void creditTimerService.start();
@@ -3119,7 +3146,12 @@ function useCreditTimer(params: {
   // Settle the timer on FINAL unmount only (empty deps → cleanup runs once).
   // Kept separate from the effect above so a reconnect's dep-change cleanup
   // can't fire an immediate stop and defeat the debounce.
+  //
+  // ⚠️ The popout must not reach this either. Closing the popout mid-interview
+  // is the NORMAL way an interview ends its overlay, and settling the shared
+  // row on that unmount is the same bug arriving by a different door.
   useEffect(() => () => {
+    if (isPopoutMode) return;
     if (stopDebounceRef.current) { clearTimeout(stopDebounceRef.current); stopDebounceRef.current = null; }
     creditTimerService.stop();
   }, []);

@@ -224,7 +224,12 @@ const {
 // gate stays dormant until the two renderers can no longer fight over one
 // session row. Re-arm by setting this back to MIN_PROTOCOL_CLIENT in the same
 // release that ships the single-owner fix.
-const SESSION_GATE_MIN_CLIENT = '4.0.20';
+// ⚠️ MOVED 4.0.20 → 4.0.21 when 4.0.20 was cut — see the note on
+// LLM_COVER_MIN_CLIENT. 4.0.20 DOES carry the single-owner fix below, but a
+// gate is not armed in the same release that fixes it: 15k interviews start
+// Monday, and "fixed in this build" and "proven in the field" are different
+// claims. Arm it once 4.0.20 has run real traffic.
+const SESSION_GATE_MIN_CLIENT = '4.0.21';
 
 // ⚠️ THE LLM COVER IS HELD BACK TOO — DORMANT (2026-08-08).
 //
@@ -252,7 +257,12 @@ const SESSION_GATE_MIN_CLIENT = '4.0.20';
 // disabled: re-arm by setting this to MIN_PROTOCOL_CLIENT once the cover
 // has been measured end-to-end against live traffic (its own TTFT, its
 // guard-rejection rate, and the main answer's TTFT behind it).
-const LLM_COVER_MIN_CLIENT = '4.0.20';
+// ⚠️ MOVED 4.0.20 → 4.0.21 when 4.0.20 was cut. A held threshold set to the
+// NEXT version arms itself the moment that version ships — the hold has to
+// stay ahead of the release, not sit on it. The reachability test below is
+// what catches this; it is the same shape as the bug that left the whole
+// cover engine dormant, pointed the other way.
+const LLM_COVER_MIN_CLIENT = '4.0.21';
 
 /** Is this caller new enough for the LLM COVER specifically? */
 function clientAtLeastLlmCover(req) {

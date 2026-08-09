@@ -189,8 +189,35 @@ export const useSpeechRecognition = ({
       try { socketRef.current.close(); } catch (_) {}
     }
 
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //  no_delay=true — THE 3-SECOND WAIT THIS URL USED TO CARRY.
+    //
+    //  `smart_format` does not just format: while an utterance ends on an
+    //  ENTITY it holds the transcript back, and Deepgram's own docs say it
+    //  will "wait until the speaker continues to non-entity speech, OR
+    //  finalize the transcript after 3 seconds of silence."
+    //
+    //  Interview speech is entity-dense in exactly that position — "...from
+    //  2023", "...70 plus systems", "...at Evonik" — so the utterance that
+    //  ENDS a question is the one most likely to be held. And is_final is
+    //  load-bearing here: handleSpeechResult only arms the auto-send timer
+    //  inside `if (final)`, so a held final delays the send by up to 3s,
+    //  and the 1,200ms silence timer starts only after that. The user sees
+    //  it twice — "the voice is getting transcribed late" AND "sometimes
+    //  taking time to give the answer" — from one cause.
+    //
+    //  no_delay=true drops that wait. The documented cost is that entity
+    //  formatting is skipped "in many cases": "2023" may arrive unformatted,
+    //  a phone number unhyphenated. That text is read by a model and shown
+    //  as a live transcript — neither cares — and up to 3 seconds in front
+    //  of every answer is not a formatting trade, it is the product.
+    //
+    //  endpointing is left at its default (10ms) — already the fast end.
+    //  Pinned by hooks/__tests__ / deepgram-params so a future edit cannot
+    //  quietly reintroduce the wait.
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const socket = new WebSocket(
-      'wss://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&interim_results=true&punctuate=true',
+      'wss://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&interim_results=true&punctuate=true&no_delay=true',
       ['token', cleanKey]
     );
 

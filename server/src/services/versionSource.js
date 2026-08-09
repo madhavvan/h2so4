@@ -52,9 +52,9 @@ const FALLBACK_VERSION = {
   // 2026-08-08: 42 vars, not among them), so this literal IS what a cold
   // start serves. It is not a belt-and-braces default here — it is the
   // value. It must move with every release.
-  version: process.env.LATEST_APP_VERSION || '4.0.19',
+  version: process.env.LATEST_APP_VERSION || '4.0.20',
   minVersion: '2.0.0',
-  releaseDate: '2026-08-08',
+  releaseDate: '2026-08-09',
   releaseNotes: 'Latest stable release.',
   downloadUrl: {
     // Routed through get.minicaai.com → 302 → the release CDN. Keeps the
