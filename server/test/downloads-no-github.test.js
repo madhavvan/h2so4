@@ -128,3 +128,74 @@ describe('the picker pages name no vendor either', () => {
     });
   }
 });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  "LATEST" IS NOT A PROMISE THAT THE FILE IS THERE.
+//
+//  2026-08-09: v4.0.22 was published before its Windows installer existed.
+//  GitHub makes a release `latest` the instant it is published, assets or
+//  not — so for two hours every Windows visitor got the unavailable page
+//  while a perfectly good 4.0.21 installer sat one release back.
+//
+//  The ordering mistake is fixed separately. This is the part that makes
+//  the whole CLASS of it invisible to users: a failed CI job, an asset
+//  deleted by hand, an upload still in flight all produce the same shape.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('a release missing an asset falls back to one that has it', () => {
+  const CDN = 'https://release-assets.githubusercontent.com/github-production-release-asset/1135233886/older?sig=abc';
+
+  /** latest/download 404s; the API lists an older release that carries it. */
+  const partialRelease = (releases) => async (url) => {
+    const u = String(url);
+    if (u.includes('/releases/latest/download/')) return new Response('Not Found', { status: 404 });
+    if (u.includes('api.github.com')) {
+      return new Response(JSON.stringify(releases), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (u.includes('/releases/download/')) {
+      return new Response(null, { status: 302, headers: { location: CDN } });
+    }
+    return new Response('', { status: 206 });
+  };
+
+  const withAsset = (tag, extra = {}) => ({
+    tag_name: tag, draft: false, prerelease: false, ...extra,
+    assets: [{ name: 'InterviewCopilot-Setup.exe', browser_download_url: `https://github.com/o/r/releases/download/${tag}/InterviewCopilot-Setup.exe` }],
+  });
+
+  it('serves the older installer instead of an error page', async () => {
+    const res = await hit('/windows', partialRelease([
+      { tag_name: 'v4.0.22', draft: false, prerelease: false, assets: [] },  // the incomplete one
+      withAsset('v4.0.21'),
+    ]));
+    expect(res.status, 'a missing asset in the newest release must not reach the user').toBe(302);
+    expect(new URL(res.location).hostname).not.toMatch(/(^|\.)github\.com$/i);
+  });
+
+  it('still never hands the browser to github', async () => {
+    const res = await hit('/windows', partialRelease([
+      { tag_name: 'v4.0.22', draft: false, prerelease: false, assets: [] },
+      withAsset('v4.0.21'),
+    ]));
+    expect(res.location).toBe(CDN);
+    expect(res.location).not.toMatch(/madhavvan|h2so4/i);
+  });
+
+  it('skips drafts and prereleases — neither is a thing to hand a stranger', async () => {
+    const res = await hit('/windows', partialRelease([
+      { tag_name: 'v4.0.22', draft: false, prerelease: false, assets: [] },
+      withAsset('v4.0.23-rc', { prerelease: true }),
+      withAsset('v4.0.24-draft', { draft: true }),
+      withAsset('v4.0.21'),
+    ]));
+    expect(res.status).toBe(302);
+    expect(res.location).toBe(CDN);
+  });
+
+  it('falls back to OUR page when no release has the file at all', async () => {
+    const res = await hit('/windows', partialRelease([
+      { tag_name: 'v4.0.22', draft: false, prerelease: false, assets: [] },
+    ]));
+    expect(res.status).toBe(503);
+    expect(res.body).not.toMatch(/github/i);
+  });
+});

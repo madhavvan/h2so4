@@ -117,3 +117,72 @@ describe('/license/version can no longer advertise a stale version', () => {
     expect(resolveLatest('4.0.8', live)).toBe(live);
   });
 });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE UPDATE BANNER IS ONE LINE, SO SEND ONE LINE.
+//
+//  `releaseNotes` reaches exactly one surface: the Settings update banner,
+//  which interpolates it as PLAIN TEXT after "v4.0.22 is available!".
+//  GitHub's body is markdown and HTML collapses its newlines, so 4.0.22's
+//  release note arrived as an unbroken ~1,400-character wall inside a 12px
+//  paragraph — headings, bullets and bold all run together.
+//
+//  Fixing the banner is a client change, and it would only reach users who
+//  update: the exact population that cannot see the fix yet. The field is
+//  consumed as a sentence, so the server owes a sentence.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('release notes are summarised for the banner that shows them', () => {
+  const { summarizeReleaseNotes } = require('../src/services/versionSource.js');
+
+  // The exact body that shipped with v4.0.22.
+  const REAL_4022 = `## Answers that sound like your job, not a summary of it
+
+If your field wasn't one the app recognised — validation, quality, manufacturing,
+clinical, compliance, operations, anything outside software — short questions were
+being read as throwaway follow-ups and answered in a line or two.
+
+## Also in this release
+
+- **Switching models when one is struggling now actually switches.** If a provider had
+  a bad minute, the app would say it was moving to another model and then ask the same
+  one again — so the answer never arrived.
+- **Regenerate tells you what happened.**`;
+
+  it('collapses the real 4.0.22 body to its headline', () => {
+    expect(summarizeReleaseNotes(REAL_4022))
+      .toBe('Answers that sound like your job, not a summary of it');
+  });
+
+  it('is short enough to sit on one line of a banner', () => {
+    expect(summarizeReleaseNotes(REAL_4022).length).toBeLessThanOrEqual(140);
+  });
+
+  it('carries no markdown syntax into a plain-text surface', () => {
+    const out = summarizeReleaseNotes(REAL_4022);
+    for (const junk of ['##', '**', '- ']) {
+      expect(out, `"${junk}" reached a field rendered as plain text`).not.toContain(junk);
+    }
+  });
+
+  it('truncates a long headline on a word boundary', () => {
+    const out = summarizeReleaseNotes(`## ${'qualification documentation governance '.repeat(12)}`);
+    expect(out.length).toBeLessThanOrEqual(140);
+    expect(out.endsWith('…')).toBe(true);
+  });
+
+  it('uses the first paragraph when the notes have no heading', () => {
+    expect(summarizeReleaseNotes('Fixed the thing.\n\nAnd another thing.'))
+      .toBe('Fixed the thing.');
+  });
+
+  it('falls back rather than sending an empty string', () => {
+    for (const empty of ['', '   ', null, undefined]) {
+      expect(summarizeReleaseNotes(empty)).toBe('Latest stable release.');
+    }
+  });
+
+  it('strips links and code spans down to their text', () => {
+    expect(summarizeReleaseNotes('## See [the docs](https://x.test) and `--flag`'))
+      .toBe('See the docs and --flag');
+  });
+});

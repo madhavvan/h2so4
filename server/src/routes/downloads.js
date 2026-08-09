@@ -114,37 +114,110 @@ const assetCache = new Map();   // file -> { url, at }
  * timeout. Never throws: the caller's job is to show a human a page, not to
  * handle an exception on a download click.
  */
+/**
+ * Walk GitHub's redirects from `startUrl` until we leave github.com, and
+ * return the signed CDN URL. '' on anything that is not a live asset.
+ */
+async function followToCdn(startUrl) {
+  let url = startUrl;
+  // Four hops is generous — GitHub uses two — and bounds a redirect loop.
+  for (let hop = 0; hop < 4; hop++) {
+    const res = await fetch(url, {
+      method: 'GET',
+      redirect: 'manual',
+      headers: { 'User-Agent': 'minicaai-downloads', Range: 'bytes=0-0' },
+      signal: AbortSignal.timeout(6000),
+    });
+    // Left github.com, or arrived at the bytes: this is the URL to hand out.
+    if (res.status === 200 || res.status === 206) return url;
+    if (res.status < 300 || res.status >= 400) return '';   // 404 and friends
+    const next = res.headers.get('location');
+    if (!next) return '';
+    url = new URL(next, url).toString();
+    // The moment the host is no longer GitHub's own site, we have the
+    // signed asset URL — hand it over without spending another request.
+    if (!/(^|\.)github\.com$/i.test(new URL(url).hostname)) return url;
+  }
+  return '';
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  "LATEST" IS NOT A PROMISE THAT THE FILE IS THERE.
+//
+//  On 2026-08-09 the v4.0.22 release was created before its Windows
+//  installer existed. GitHub makes a release `latest` the moment it is
+//  published, assets or not — so for two hours every Windows visitor got
+//  the unavailable page below while a perfectly good 4.0.21 installer sat
+//  one release back.
+//
+//  The ordering mistake that caused it is worth fixing separately (and is),
+//  but it is not the only way to arrive here: a failed CI job, an asset
+//  deleted by hand, an upload still in flight, or a release published in
+//  pieces all produce the same shape — newest release, missing file.
+//
+//  So this no longer treats the newest release as the only answer. It falls
+//  back to the most recent PUBLISHED release that actually carries the file.
+//  Serving a user last week's installer is a non-event — the in-app updater
+//  brings them current on first launch. Serving them an error page is the
+//  thing they remember.
+//
+//  Bounded on purpose: ten releases back, one extra API call, and only ever
+//  on the path that was already about to fail.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const FALLBACK_SCAN_RELEASES = 10;
+
+async function resolveFromRecentReleases(file) {
+  const res = await fetch(
+    `https://api.github.com/repos/${REPO}/releases?per_page=${FALLBACK_SCAN_RELEASES}`,
+    {
+      headers: { 'User-Agent': 'minicaai-downloads', Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(6000),
+    },
+  );
+  if (!res.ok) return { url: '', tag: '' };
+  const releases = await res.json();
+  if (!Array.isArray(releases)) return { url: '', tag: '' };
+  for (const rel of releases) {
+    // Drafts are invisible to users and prereleases are deliberately not
+    // "latest" — neither is a thing to hand a stranger who clicked Download.
+    if (rel.draft || rel.prerelease) continue;
+    const asset = (rel.assets || []).find(a => a.name === file);
+    if (!asset || !asset.browser_download_url) continue;
+    const url = await followToCdn(asset.browser_download_url);
+    if (url) return { url, tag: rel.tag_name || '' };
+  }
+  return { url: '', tag: '' };
+}
+
 async function resolveAssetUrl(file) {
   const cached = assetCache.get(file);
   if (cached && Date.now() - cached.at < ASSET_TTL_MS) return cached.url;
 
-  let url = `https://github.com/${REPO}/releases/latest/download/${file}`;
   try {
-    // Four hops is generous — GitHub uses two — and bounds a redirect loop.
-    for (let hop = 0; hop < 4; hop++) {
-      const res = await fetch(url, {
-        method: 'GET',
-        redirect: 'manual',
-        headers: { 'User-Agent': 'minicaai-downloads', Range: 'bytes=0-0' },
-        signal: AbortSignal.timeout(6000),
-      });
-      // Left github.com, or arrived at the bytes: this is the URL to hand out.
-      if (res.status === 200 || res.status === 206) {
-        assetCache.set(file, { url, at: Date.now() });
-        return url;
-      }
-      if (res.status < 300 || res.status >= 400) return '';   // 404 and friends
-      const next = res.headers.get('location');
-      if (!next) return '';
-      url = new URL(next, url).toString();
-      // The moment the host is no longer GitHub's own site, we have the
-      // signed asset URL — hand it over without spending another request.
-      if (!/(^|\.)github\.com$/i.test(new URL(url).hostname)) {
-        assetCache.set(file, { url, at: Date.now() });
-        return url;
-      }
+    const url = await followToCdn(`https://github.com/${REPO}/releases/latest/download/${file}`);
+    if (url) {
+      assetCache.set(file, { url, at: Date.now() });
+      return url;
     }
-  } catch { /* timeout, DNS, TLS — all mean "show our page" */ }
+  } catch { /* timeout, DNS, TLS — fall through to the scan */ }
+
+  try {
+    const { url, tag } = await resolveFromRecentReleases(file);
+    if (url) {
+      // LOUD: the newest release is incomplete and users are being served an
+      // older build. Nothing is broken for them, but somebody has to know.
+      console.error(
+        `[downloads] ${file} is MISSING from the latest release — serving ${tag || 'an older release'} instead. ` +
+        'Publish the missing asset, or the next release will inherit this.'
+      );
+      // Deliberately cached for the normal TTL: a five-minute window of an
+      // older installer is better than an API call on every click while the
+      // release is being repaired.
+      assetCache.set(file, { url, at: Date.now() });
+      return url;
+    }
+  } catch { /* fall through to our own page */ }
+
   return '';
 }
 

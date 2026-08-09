@@ -67,6 +67,46 @@ const FALLBACK_VERSION = {
   },
 };
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE UPDATE BANNER IS ONE LINE, SO SEND ONE LINE.
+//
+//  `releaseNotes` goes to exactly one place: the Settings update banner,
+//  which interpolates it as PLAIN TEXT next to "v4.0.22 is available!".
+//  GitHub's `body` is markdown — headings, bullets, bold — and HTML
+//  collapses its newlines, so a well-written release note arrives as an
+//  unbroken 1,400-character wall inside a 12px paragraph. That is what
+//  4.0.22 shipped, and it looked broken because it was.
+//
+//  Fixing the banner is a client change and would only reach users who
+//  update — the exact population that cannot see it yet. The field is
+//  consumed as a sentence, so the server owes a sentence.
+//
+//  The first heading is used because release notes here are written with
+//  the headline first ("## One transcript on screen, not two"). Full
+//  markdown is still available as releaseNotesFull for any surface that
+//  can actually render it.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const RELEASE_NOTE_MAX_CHARS = 140;
+
+function summarizeReleaseNotes(body) {
+  const src = String(body || '').trim();
+  if (!src) return FALLBACK_VERSION.releaseNotes;
+  const heading = (src.match(/^#{1,6}\s+(.+?)\s*$/m) || [])[1];
+  let text = heading || src.split(/\n{2,}/)[0] || '';
+  text = text
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')          // images
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')       // links → their text
+    .replace(/`{1,3}([^`]*)`{1,3}/g, '$1')         // code spans
+    .replace(/\*\*([^*]+)\*\*/g, '$1')             // bold
+    .replace(/(^|\s)\*([^*]+)\*/g, '$1$2')         // italics
+    .replace(/^\s*[-*+]\s+/gm, '')                 // bullet markers
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return FALLBACK_VERSION.releaseNotes;
+  if (text.length <= RELEASE_NOTE_MAX_CHARS) return text;
+  return `${text.slice(0, RELEASE_NOTE_MAX_CHARS - 1).replace(/\s+\S*$/, '')}…`;
+}
+
 const versionCache = {
   value: FALLBACK_VERSION,
   fetchedAt: 0,
@@ -92,7 +132,8 @@ async function refreshVersionCache() {
       version: tag,
       minVersion: FALLBACK_VERSION.minVersion,
       releaseDate: data.published_at || FALLBACK_VERSION.releaseDate,
-      releaseNotes: data.body || FALLBACK_VERSION.releaseNotes,
+      releaseNotes: summarizeReleaseNotes(data.body),
+      releaseNotesFull: data.body || '',
       // "/releases/latest/download/<asset>" always resolves to current
       // latest, so the same URLs work after every release.
       downloadUrl: FALLBACK_VERSION.downloadUrl,
@@ -126,6 +167,7 @@ function _resetForTest() {
 
 module.exports = {
   getLatestVersion,
+  summarizeReleaseNotes,
   refreshVersionCache,
   FALLBACK_VERSION,
   GITHUB_RELEASES_URL,
