@@ -1308,6 +1308,53 @@ const SLOW_ANSWER_LOG_MS = 8000;
 //  Falls back to a constant only when there is no user, which cannot
 //  happen on these routes (authMiddleware runs first) but costs nothing.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SPEAK THE CLIENT'S OWN VOCABULARY FOR "THE PROVIDER IS DOWN".
+//
+//  Every stream route flushes SSE headers before it calls a provider, so an
+//  upstream failure can never be an HTTP status — it can only be an in-stream
+//  error frame, and we were forwarding `err.message` verbatim. The desktop
+//  then decides whether to switch models by SUBSTRING-matching that string
+//  (App.tsx looksLikeProviderOutage). The match list has "server error",
+//  "overloaded", "unavailable", "rate limit" — and the SDKs do not always
+//  produce those words:
+//
+//    OpenAI 500  "The server had an error while processing your request"
+//                 → does NOT contain "server error"
+//    timeouts    "Request timed out."          → no match
+//    socket drop "Connection error."           → no match
+//    Gemini 500  JSON.stringify(errorBody)     → the raw blob is RENDERED
+//                 into the interview as `Error: {"error":{"code":500,…}}`
+//
+//  So on those shapes the fallback never fired, the 60s provider cooldown was
+//  never set, and the next question went straight back to the failing
+//  provider. Meanwhile Anthropic ("Internal server error") and Gemini 503
+//  ("overloaded") DID fall back — which is why it looked intermittent.
+//
+//  Normalising here rather than in the client is deliberate: this arms the
+//  fallback and the cooldown that are ALREADY SHIPPED in every installed
+//  4.0.22 desktop, with no release. "unavailable" is chosen because it is in
+//  the client's positive list and collides with none of its negative guards
+//  (requires / upgrade / trial / expired / used up / paywall).
+//
+//  4xx passes through untouched — those are tier, quota and validation
+//  answers the client already renders correctly.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const PROVIDER_DOWN_MESSAGE = 'The model provider is temporarily unavailable.';
+
+function normalizeProviderError(err) {
+  const raw = String((err && err.message) || 'AI request failed');
+  const status = err && (err.status || err.statusCode);
+  if (typeof status === 'number' && status >= 500) return PROVIDER_DOWN_MESSAGE;
+  // A JSON body as the message is Gemini's ApiError — never render that at a
+  // candidate mid-interview, whatever it says.
+  if (raw.trim().startsWith('{')) return PROVIDER_DOWN_MESSAGE;
+  if (/timed out|connection error|econnreset|etimedout|socket hang up|had an error|internal error/i.test(raw)) {
+    return PROVIDER_DOWN_MESSAGE;
+  }
+  return raw;
+}
+
 function promptCacheKey(req) {
   const id = req && req.user && req.user.id;
   return id ? `u:${id}` : 'u:anon';
@@ -1925,7 +1972,7 @@ router.post('/stream/gemini', geminiQuotaGate, requireTimeRemaining, requireActi
       return;
     }
     console.error('Gemini stream error:', err.message);
-    sse.error(err.message || 'AI request failed');
+    sse.error(normalizeProviderError(err));
     sse.done();
   }
 });
@@ -2060,7 +2107,7 @@ router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining
       return;
     }
     console.error('OpenAI stream error:', err.message);
-    sse.error(err.message || 'AI request failed');
+    sse.error(normalizeProviderError(err));
     sse.done();
   }
 });
@@ -2133,7 +2180,7 @@ router.post('/stream/xai', requireTier(...TRIAL_MODELS), requireTimeRemaining, r
       return;
     }
     console.error('xAI stream error:', err.message);
-    sse.error(err.message || 'AI request failed');
+    sse.error(normalizeProviderError(err));
     sse.done();
   }
 });
@@ -2201,7 +2248,7 @@ router.post('/stream/groq', requireTier(...TRIAL_MODELS), requireTimeRemaining, 
       return;
     }
     console.error('Groq stream error:', err.message);
-    sse.error(err.message || 'AI request failed');
+    sse.error(normalizeProviderError(err));
     sse.done();
   }
 });
@@ -2309,7 +2356,7 @@ router.post('/stream/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining
       return;
     }
     console.error('Claude stream error:', err.message);
-    sse.error(err.message || 'AI request failed');
+    sse.error(normalizeProviderError(err));
     sse.done();
   }
 });

@@ -352,3 +352,43 @@ describe('the client no longer skips the interval for unlimited', () => {
     ).toBe(false);
   });
 });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  -1 MEANS UNLIMITED, NOT EMPTY.
+//
+//  chargeLicenseSeconds returns readBucketRemaining, which yields the -1
+//  sentinel for an unlimited credits bucket. `-1 <= 0` is true, so the next
+//  heartbeat ended the session as 'exhausted' and the client told someone who
+//  had just been granted unlimited time that theirs was used up — stopping
+//  their mic mid-interview.
+//
+//  The session-level unlimited short-circuit does NOT cover this: it reads the
+//  source recorded when the session OPENED, so a session that began on credits
+//  keeps running through the charge path after the licence became unlimited.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('an unlimited grant never reads as exhaustion', () => {
+  it('does not end a credits session whose licence became unlimited', () => {
+    const uid = makeUser('pro', { credits_remaining_seconds: 600, credits_expire_at: Date.now() + 86400000 });
+    const { session_id, source } = db.startUsageSession(uid, 'dev1');
+    expect(source).toBe('credits');           // opened while metered
+
+    // The upgrade lands mid-interview: the bucket becomes the -1 sentinel.
+    db.getDB().prepare('UPDATE licenses SET credits_remaining_seconds = -1 WHERE user_id = ?').run(uid);
+
+    backdateHeartbeat(session_id, 25);
+    const r = db.heartbeatUsageSession(uid, session_id);
+    expect(r.exhausted, 'a person who just paid was told their time was used up').toBeFalsy();
+    expect(r.remaining).toBe(-1);
+    expect(getSession(session_id).ended_at, 'their session was ended under them').toBeNull();
+  });
+
+  it('still ends a session that genuinely ran out', () => {
+    // The control — without it the fix above could disable exhaustion entirely.
+    const uid = makeUser('pro', { credits_remaining_seconds: 10, credits_expire_at: Date.now() + 86400000 });
+    const { session_id } = db.startUsageSession(uid, 'dev1');
+    backdateHeartbeat(session_id, 30);
+    const r = db.heartbeatUsageSession(uid, session_id);
+    expect(r.exhausted).toBe(true);
+    expect(getSession(session_id).end_reason).toBe('exhausted');
+  });
+});

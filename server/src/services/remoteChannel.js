@@ -153,8 +153,26 @@ function attachRemoteChannel(server, app, { path = REMOTE_WS_PATH } = {}) {
 
         // Replay strictly before live, so the handover cannot duplicate
         // or reorder anything.
+        //
+        // ⚠️ REMOTES ONLY. The replay exists so a phone that joins late can
+        // catch up on what the desktop already said. The DESKTOP is the thing
+        // that produced those events — it has them on screen already, it joins
+        // with `cursor: 0` (services/remoteHost.ts:186), and it never reads
+        // `msg.replay` at all. So replaying to a host was always pure waste.
+        //
+        // Waste that concentrates, which is the problem. On any restart or
+        // redeploy every desktop reconnects inside one ~15s backoff window
+        // (remoteHost.ts scheduleReconnect), and each one made this thread do
+        // a synchronous SQLite read of up to MAX_REPLAY_EVENTS (500) rows —
+        // each row carrying a full answer body — and JSON.stringify them into
+        // a frame the receiver discards. One process, one thread, thousands of
+        // desktops: the restart does not finish before the health check fires
+        // and restarts it again.
+        //
+        // A phone still gets its replay, which is the only case that ever
+        // wanted one.
         let replayed = { events: [], truncated: false };
-        if (client.sessionId) {
+        if (client.sessionId && client.role !== ROLE.HOST) {
           replayed = store.replay(client.userId, client.sessionId, Number(msg.cursor) || 0, MAX_REPLAY_EVENTS);
         }
         send(client, {

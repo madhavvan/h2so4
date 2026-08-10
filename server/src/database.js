@@ -2304,7 +2304,20 @@ function heartbeatUsageSession(userId, sessionId) {
       WHERE id = ?
     `).run(now, elapsed, sessionId);
 
-    if (remaining <= 0) {
+    // ⚠️ -1 IS "UNLIMITED", NOT "NOTHING LEFT".
+    //
+    // chargeLicenseSeconds returns readBucketRemaining, which returns the -1
+    // sentinel when the credits bucket is unlimited (a comp grant, or an
+    // upgrade that landed mid-session). `-1 <= 0` is true, so the very next
+    // heartbeat marked the session 'exhausted', ended the row, and the client
+    // told a person who had just been given unlimited time that theirs was
+    // used up — and stopped their mic mid-interview.
+    //
+    // The session-level `source === 'unlimited'` short-circuit above does not
+    // cover this: that reads the source recorded when the session OPENED, so a
+    // session that began on credits keeps charging through this path even
+    // after the licence underneath it became unlimited.
+    if (remaining !== -1 && remaining <= 0) {
       d.prepare(`
         UPDATE usage_sessions SET ended_at = ?, end_reason = 'exhausted' WHERE id = ?
       `).run(now, sessionId);
