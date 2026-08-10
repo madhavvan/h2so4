@@ -152,3 +152,40 @@ describe('auto reasoning depth — policy pins', () => {
     expect(Object.values(AUTO_EFFORT_BY_CATEGORY)).not.toContain('high');
   });
 });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE SAME PERSON MUST KEEP HITTING THE SAME CACHE SHARD.
+//
+//  A candidate's system prompt is their whole knowledge base — ~10K tokens,
+//  byte-identical question to question — so it should always be a cache hit.
+//  Production said otherwise: three real answers, identical prompt, and the
+//  time for OpenAI to open the stream was 1,160 / 1,527 / 3,969 ms. The
+//  4-second one is a cache miss, felt mid-interview as "sometimes it takes
+//  two seconds longer", with nothing on screen.
+//
+//  Measured with the parameter, same prompt, four questions:
+//     without   1550 / 1059 / 3488 / 1239 ms
+//     with      1113 / 1074 / 1021 / 1105 ms
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+describe('prompt cache routing is pinned per user', () => {
+  const { promptCacheKey } = require('../src/routes/ai.js')._test;
+
+  it('is stable for one user across every question they ask', () => {
+    const req = { user: { id: 'u_abc' } };
+    expect(promptCacheKey(req)).toBe(promptCacheKey({ user: { id: 'u_abc' } }));
+    expect(promptCacheKey(req)).toBe('u:u_abc');
+  });
+
+  it('never buckets two people together', () => {
+    // A shared key would pool strangers' prefixes AND blow past the ~15
+    // requests/minute per key the docs ask for, at 15k concurrent interviews.
+    expect(promptCacheKey({ user: { id: 'a' } })).not.toBe(promptCacheKey({ user: { id: 'b' } }));
+  });
+
+  it('never throws when there is no user', () => {
+    for (const req of [undefined, null, {}, { user: null }, { user: {} }]) {
+      expect(() => promptCacheKey(req)).not.toThrow();
+      expect(typeof promptCacheKey(req)).toBe('string');
+    }
+  });
+});
