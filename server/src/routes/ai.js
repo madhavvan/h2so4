@@ -1907,14 +1907,30 @@ router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OpenAI not configured' });
 
+  // ── STAGE TIMING (2026-08-09) ──
+  // A user reported 3-4s from SEND to answer. Every number we had was
+  // inferred: the client's own work profiles at 3-11ms, OpenAI measured
+  // from a laptop is 0.7-1.5s, and nothing measured the rest — Railway's
+  // own middleware, its distance to OpenAI, or the body upload. So we were
+  // arguing about ~2 unexplained seconds.
+  //
+  // SLOW_ANSWER_LOG_MS was 8000, so a 3-4s answer logged NOTHING. This
+  // records each stage unconditionally and prints one line per answer.
+  // Log-only: no behaviour changes, no PII, no prompt text.
+  const T0 = Date.now();
+  const mark = {};
+  const at = (k) => { mark[k] = Date.now() - T0; };
   const sse = openSseStream(req, res);
   try {
     const { messages } = req.body;
+    at('sse_open');
     const question = extractCurrentQuestion(lastUserMessage(messages));
     const fresh = await tryEnrich(question, req.headers['x-request-id']);
+    at('enrich');
     let enrichedMessages = appendFreshToMessages(messages, fresh?.context);
 
     const reasoningEffort = resolveReasoningEffort(req, question);
+    at('classify');
 
     // ── Instant cover answer ──
     // The main answer's first token can be seconds away (reasoning on a
@@ -1946,6 +1962,8 @@ router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining
       const cover = await runCover({
         sse, req, question, provider: 'openai', effort: reasoningEffort,
       });
+      at('cover');
+      mark.cover_fired = cover ? 1 : 0;
       if (cover) enrichedMessages = appendTextToLastUserMessage(enrichedMessages, buildCoverContinuation(cover));
     }
 
@@ -1964,6 +1982,7 @@ router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining
 
     const ttft = mainTtftReporter({ question, provider: 'openai', effort: reasoningEffort });
     ttft.issued();
+    at('pre_openai');
     const stream = await openai.chat.completions.create(
       {
         model: 'gpt-5.6',
@@ -1975,10 +1994,27 @@ router.post('/stream/openai', requireTier(...TRIAL_MODELS), requireTimeRemaining
       { signal: sse.signal }
     );
 
+    at('openai_open');
     for await (const chunk of stream) {
       if (sse.closed) break;
       const piece = chunk?.choices?.[0]?.delta?.content;
-      if (piece) { ttft.firstToken(); sse.send(piece); }
+      if (piece) {
+        if (mark.first_token === undefined) {
+          at('first_token');
+          // ONE line, every answer. Read it as: where did the time go
+          // between the request arriving here and the first word leaving.
+          //   enrich/classify/cover  — our own work
+          //   openai_open            — Railway -> OpenAI connect + request
+          //   first_token            — OpenAI's own think time
+          console.log(
+            `[stage] openai sys=${Math.round((sysTextEarly || '').length / 1024)}KB cover=${mark.cover_fired}` +
+            ` | sse=${mark.sse_open}ms enrich=${mark.enrich}ms classify=${mark.classify}ms cover=${mark.cover}ms` +
+            ` preOAI=${mark.pre_openai}ms oaiOpen=${mark.openai_open}ms FIRSTTOKEN=${mark.first_token}ms`
+          );
+        }
+        ttft.firstToken();
+        sse.send(piece);
+      }
     }
     sse.done();
   } catch (err) {
