@@ -82,7 +82,38 @@ import { retrieveEvidence } from './kbRetrieval';
 // and that selection is ALSO what the grounding guard checks a citation
 // against — so a bigger ceiling here does not loosen the guard by a
 // character.
-export const COVER_SOURCE_MAX_CHARS = 120_000;
+// ── THE POOL RETRIEVAL IS ALLOWED TO SEARCH ────────────────────────────
+// Raised 120,000 -> 600,000 on 2026-08-23, and the reason is a measured
+// failure, not headroom for its own sake.
+//
+// This cap is applied BEFORE selection and is memoised on the file
+// fingerprint, so it is question-independent: it decides, once per upload,
+// which half of a document every future question is allowed to see. It cut
+// positionally — keep the head, drop the tail — and in a prep dossier the
+// tail is where the specialised material lives. On a real 168 KB dossier it
+// dropped 49,359 characters including, by name:
+//
+//   "20.1 Karl Fischer — USP <921> Water Determination"
+//   "20.12 LC-MS — upgraded from the previous stub"
+//   "20.5 Conductivity and pharmaceutical water"
+//   ...and 25 more instrument sections
+//
+// Measured consequence: "Have you qualified a Karl Fischer titrator?" was
+// refused by the grounding guard at EVERY evidence budget from 2,500 to
+// 9,000 chars — not because the slice was too small, but because the
+// section had been discarded before retrieval ran. No amount of tuning the
+// downstream budget can recover a passage that is not in the pool.
+//
+// The cap is not protecting a shared server: services/ is RENDERER code, so
+// this runs on the user's own machine over their own documents, and the
+// BM25 index is memoised per file-set (built once per upload, not per
+// question). The bound is kept only so a pathological upload cannot wedge
+// the tab.
+//
+// Retrieval, not position, is what should decide relevance. Its job is to
+// find the passage that answers the question; this constant's job is only
+// to stop the machine falling over.
+export const COVER_SOURCE_MAX_CHARS = 600_000;
 
 // ── WHAT ONE QUESTION IS ANSWERED FROM ──
 //
@@ -97,6 +128,21 @@ export const COVER_SOURCE_MAX_CHARS = 120_000;
 // the top row, comfortably inside it — where the whole-document version
 // sat on the edge and missed its own window twice in fifteen questions.
 export const COVER_EVIDENCE_CHARS = 7_000;
+
+// ── The budget is measurable, not just declared ─────────────────────────
+// This number trades two things against each other and you cannot see the
+// trade from the code: a bigger slice carries more of the candidate's
+// material (accuracy), and a bigger prompt is slower to answer, which is
+// paid out of the ~1,050ms the cover has before the question is sent
+// (availability). Picking it by reasoning is how it ended up at a value
+// that measured 8/12 covers delivered when 3k measured 12/12.
+//
+// So the benchmark sweeps it. Production always reads the constant —
+// the override is null unless a bench sets it, and nothing in the app
+// ever calls the setter.
+let _budgetOverride: number | null = null;
+export function _setCoverEvidenceBudget(n: number | null): void { _budgetOverride = n; }
+export function coverEvidenceBudget(): number { return _budgetOverride ?? COVER_EVIDENCE_CHARS; }
 
 // Below this there is nothing to select: an ordinary résumé is 5-7K and
 // the model reads all of it. Selection is for knowledge bases big enough
@@ -143,7 +189,7 @@ const LEAD_CHARS = 900;
 // headings at all, so for the common case by a wide margin this changes
 // nothing. It only bites on documents that have chapters — which are
 // exactly the documents written about a target role.
-function identityLead(text: string): string {
+function stripScaffolding(text: string): string {
   const kept = String(text || '')
     .split('\n')
     .filter((ln) => !/^\s{0,3}#{1,6}\s/.test(ln))   // markdown headings
@@ -152,8 +198,12 @@ function identityLead(text: string): string {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
   // If a document is nothing BUT headings, fall back to the raw text rather
-  // than travelling with an empty identity — a wrong lead beats no lead.
-  return (kept || String(text || '')).slice(0, LEAD_CHARS);
+  // than travelling with nothing — imperfect evidence beats none.
+  return kept || String(text || '');
+}
+
+function identityLead(text: string): string {
+  return stripScaffolding(text).slice(0, LEAD_CHARS);
 }
 
 /**
@@ -325,14 +375,14 @@ export function selectCoverEvidence(contextFiles: ContextFile[], question: strin
       built.parts.map((p, i) => (
         { id: 'cover-' + i, name: p.name, type: 'custom', content: p.text } as ContextFile
       )),
-      Math.max(1_000, COVER_EVIDENCE_CHARS - lead.length),
+      Math.max(1_000, coverEvidenceBudget() - lead.length),
     );
   } catch {
     // Retrieval is an optimisation, never a gate. If it throws, the model
     // gets the head of the document rather than nothing.
-    evidence = whole.slice(0, COVER_EVIDENCE_CHARS);
+    evidence = coverEvidenceBudget() >= whole.length ? whole : whole.slice(0, coverEvidenceBudget());
   }
-  if (!evidence) evidence = whole.slice(0, COVER_EVIDENCE_CHARS);
+  if (!evidence) evidence = whole.slice(0, coverEvidenceBudget());
 
   // ── A QUESTION WITH NOTHING TO MATCH ON STILL DESERVES THE BUDGET ──
   //
@@ -345,9 +395,22 @@ export function selectCoverEvidence(contextFiles: ContextFile[], question: strin
   //
   // Ranking said nothing here, so document order decides instead — which
   // is the right default, because a document leads with what matters.
-  if (evidence.length < COVER_EVIDENCE_CHARS * 0.6) {
-    const room = COVER_EVIDENCE_CHARS - evidence.length;
-    const head = whole.slice(0, room);
+  if (evidence.length < coverEvidenceBudget() * 0.6) {
+    const room = coverEvidenceBudget() - evidence.length;
+    // ⚠️ STRIPPED, for the same reason the lead is.
+    //
+    // This fallback fires exactly when ranking said nothing — "tell me about
+    // yourself", every word a stopword — and it takes the HEAD of the
+    // document. In a prep dossier the head is the title, and the title names
+    // the company being interviewed WITH. Measured: at a 9,000-char budget
+    // this path produced "I worked at Eli Lilly as CQV Lead" on the opening
+    // question of the interview, to that company's own panel, while the
+    // candidate's real employers (Evonik, Cook MyoSite, MSN, Sciegen) sat
+    // further down the same document.
+    //
+    // Fixing the lead alone was not enough because this is a SECOND door to
+    // the same bytes. Headings are structure, not evidence, on both paths.
+    const head = stripScaffolding(whole).slice(0, room);
     if (!evidence || head.indexOf(evidence.slice(0, 120)) !== -1) evidence = head;
     else evidence = `${head}\n\n${evidence}`;
   }
