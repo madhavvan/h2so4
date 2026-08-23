@@ -144,10 +144,35 @@ const WHERE_WORKED = [
   /\blist your (?:companies|employers|roles)\b/i,
 ];
 
+// ⚠️ TWO SETS, AND WHICH ONE IS USED DEPENDS ON WHETHER THE LIST IS WHOLE.
+//
+// These first three all assert COMPLETENESS — "those are the ones" and
+// "it's been X" both mean "that is all of them". listOrgs caps the list at
+// four, so on a résumé with five employers the opener spoke four and
+// claimed it was the full set. Measured live 2026-08-17 with gpt-5.6:
+//
+//   spoken : "Siemens, Indiana University, G Technologies and Apollo
+//             Hospitals — those are the ones."
+//   answer : "Chronologically, I started at KIMS Hospitals, then Apollo
+//             Hospitals, Indiana University, G Technologies, and now Siemens."
+//
+// Every name is real and nothing was fabricated — the guard had nothing to
+// catch. The candidate simply contradicted themselves one sentence in,
+// because the opener claimed a closed list it had just truncated. The main
+// model is not wrong to add the fifth; it can see the whole résumé.
+//
+// So a truncated list gets HEDGED phrasing instead. The hedge is not
+// vagueness, it is accuracy: "mostly" and "among others" are true of four
+// out of five, and "those are the ones" is not.
 const WHERE_WORKED_FORMS = [
   (orgs: string) => `${orgs} — those are the ones.`,
   (orgs: string) => `It's been ${orgs}.`,
+];
+
+const WHERE_WORKED_PARTIAL_FORMS = [
   (orgs: string) => `Mostly ${orgs}.`,
+  (orgs: string) => `${orgs}, among others.`,
+  (orgs: string) => `Most recently ${orgs}.`,
 ];
 
 // "do you have experience with Kafka?", "have you used Snowflake?" — a
@@ -592,7 +617,9 @@ function firstTools(f: Fact, n: number): string[] {
     .slice(0, n);
 }
 
-function listOrgs(orgs: string[], max = 4): string {
+const LIST_ORGS_MAX = 4;
+
+function listOrgs(orgs: string[], max = LIST_ORGS_MAX): string {
   const xs = orgs.slice(0, max);
   if (xs.length === 0) return '';
   if (xs.length === 1) return xs[0];
@@ -745,6 +772,130 @@ const YES_FORMS = [
   (org: string, role: string, when: string) => `I was, yeah — ${role} at ${org}${when ? `, ${when}` : ''}.`,
 ];
 
+// ── WHEN THE LEDGER HAS NO ROLE TITLE ──
+//
+// The call site used to pass `roleOf(known) || 'there'` into the forms
+// above, and the first of them already contains the word "there". Measured
+// live 2026-08-20, spoken aloud: "Yeah, Evonik AL · — I was there there,
+// 2023." Two defects in one sentence, and this is the second half of it.
+//
+// A missing role is not a missing sentence — it just means the only true
+// things left are the name and the dates, so these say exactly that and
+// nothing more.
+const YES_FORMS_NO_ROLE = [
+  (org: string, when: string) => `Yeah, ${org}${when ? ` — ${when}` : ''}.`,
+  (org: string, when: string) => `${org}, yes${when ? ` — ${when}` : ''}.`,
+  (org: string, when: string) => `I was, yeah — ${org}${when ? `, ${when}` : ''}.`,
+];
+
+// ── IS THIS QUESTION ACTUALLY ASKING WHETHER THEY WERE THERE? ──
+//
+// namedKnownOrg matches a known employer ANYWHERE in the question, and the
+// entity-yes branch then answered "yes, I worked there" — regardless of
+// what was asked. Measured live, both spoken:
+//
+//   "Who did you report to at Evonik, and how large was your team?"
+//        -> "Evonik AL ·, yes — there from 2023."
+//   "How many OEMs did you coordinate at Evonik?"
+//        -> "Yeah, Evonik AL · — I was there there, 2023."
+//
+// Neither answers the question, and the main model's own answers to both
+// were excellent and honest ("I reported to Vasu Dama"; "I don't have the
+// exact OEM count and I don't want to invent one"). The opener was pure
+// damage — and because the local rail is TRUSTED, no guard sees it.
+//
+// So a mention is not a question. The name has to be what is being asked
+// ABOUT: a yes/no about having worked there, a "what about X", or a
+// question so short it is essentially just the name. Anything else falls
+// through to the other shapes, and if they defer, the LLM cover answers it
+// with the documents in front of it — which is now the better outcome.
+//
+// ⚠️ MUST STAY GENEROUS. The same rule for tools was written too tight
+// first and deferred "tell me about your Kafka work"; the safe direction
+// here is to ANSWER a borderline case, because a truthful "yes, I was
+// there" is never wrong — it is only ever off-topic.
+const ASKS_WHETHER = [
+  /\b(have|did|do|had)\s+(you|u)\b/i,
+  /\b(were|was)\s+you\b/i,
+  /\byou\s+(ever|previously)\b/i,
+  /\bever\s+(work|worked|been)\b/i,
+  /\b(familiar|experience|worked)\s+(with|at|for|in)\b/i,
+  // "okay, and what is work at apollo?" — a real transcript question, and
+  // the first tightening of this list broke it: present tense "work at",
+  // not past tense "worked at". A question naming the org as the PLACE of
+  // the work is asking about the org.
+  /\b(work|working|role|job|position|stint|time)\s+(at|with|for|in)\b/i,
+  /\bwhat about\b/i,
+  /\bhow about\b/i,
+  /\btell me about\b/i,
+  /\b(know|heard of)\b/i,
+];
+
+// Asking for a DETAIL about a place, not whether it happened. These beat
+// the list above when both match — "did you report to anyone at Evonik" is
+// a who-question wearing a "did you" hat.
+const ASKS_FOR_DETAIL = [
+  /\bwho\b/i,
+  /\bhow (many|much|long|large|big)\b/i,
+  /\bwhat (was|were|is|are)\s+(your|the)\b/i,
+  // "What specific calibration challenges did you face … at Baxter?" —
+  // graded on the real corpus, this reached entity-yes and answered "Yeah,
+  // Baxter — I was Metrology Specialist there" to a question about
+  // calibration. The "did you" in it is not a yes/no; it is the verb of a
+  // detail question.
+  /\bwhat\s+(specific|kind|sort|type|challenges?|problems?|issues?|metrics?|tools?|parts?)\b/i,
+  /\bwhich\b/i,
+  /\bwhy\b/i,
+  // A walk-me-through-your-background question belongs to the `background`
+  // shape, which answers it with the actual career. The corpus caught this
+  // one answering it with a CERTIFICATION instead, because the question
+  // happened to name a platform the candidate is certified in.
+  /\bwalk me through\b/i,
+  /\byour (background|experience|career|journey|history)\b/i,
+];
+
+// ── A "YES" ALSO AFFIRMS EVERYTHING ELSE IN THE QUESTION ──
+//
+// asksWhetherKnownOrg only asks whether the question is a yes/no about a
+// place the candidate worked. It does not ask what ELSE the question
+// claims, and a yes/no answer affirms all of it. Measured live in the app
+// on 2026-08-20, on an automation engineer's résumé that says "Merck & Co,
+// VA":
+//
+//   Q "Did you work at Merck's New Jersey site?"
+//   A "I was, yeah — Automation/Validation Engineer at Merck & Co, 2019 to
+//      2021."   ← spoken
+//     "My site was in Virginia, not New Jersey."   ← the main model, after
+//
+// The candidate confirms a site they never worked at, then retracts it a
+// beat later, in the room. The employer half was true; the question was
+// not about the employer half.
+//
+// The rule needs no list and no parsing: if the question names something
+// the candidate's own documents do not contain, a bare "yes" is affirming
+// that unknown thing too, so the local rail must not answer it. The main
+// model reads the whole document and can say "Merck, but Virginia".
+//
+// This is the same principle as the rest of this rail — speak only what
+// can be pointed at — applied to the QUESTION rather than the answer.
+function questionNamesTheUnknown(ledger: Ledger, question: string, subject: string): string[] {
+  const own = String(subject || '').toLowerCase();
+  return unverifiedProperNouns(ledger, question)
+    .filter((n) => {
+      const t = n.toLowerCase();
+      return t !== own && !own.includes(t) && !t.includes(own);
+    });
+}
+
+function asksWhetherKnownOrg(question: string): boolean {
+  const q = String(question || '').trim();
+  if (!q) return false;
+  if (ASKS_FOR_DETAIL.some((re) => re.test(q))) return false;
+  if (ASKS_WHETHER.some((re) => re.test(q))) return true;
+  // "Evonik?" — barely a sentence, and the only thing in it is the name.
+  return q.split(/\s+/).filter(Boolean).length <= 5;
+}
+
 const NO_FORMS = [
   (orgs: string) => `No, I haven't — my roles have been ${orgs}.`,
   (orgs: string) => `No, not there. Where I have worked is ${orgs}.`,
@@ -869,6 +1020,48 @@ export function interviewerLines(recentTurns?: string): string {
  * fabrication survives into the next turn. Which is why only the
  * interviewer's own lines of it reach the guard; see interviewerLines.
  */
+// ── Is the interviewer challenging what was just said? ──────────────────
+// The ONE verdict from this file that still reaches the product. A question
+// about a previous answer must never be opened by anything: the model that
+// holds the transcript is the only thing that can answer it honestly, and an
+// opener written without the transcript invents a reason — the IBM →
+// Accenture cascade. Extracted from composeOpener so the send path can ask
+// this without composing a sentence it is going to throw away.
+export function isChallengeToPreviousAnswer(question: string): boolean {
+  const q = String(question || '').replace(/\s+/g, ' ').trim();
+  return !!q && anyMatch(META, q);
+}
+
+// ⚠️ NO LONGER ON THE PRODUCT PATH (2026-08-22).
+//
+// composeOpener assembles an opening sentence from verified ledger spans —
+// employers, dates, titles, skills — and for a year it took PRECEDENCE over
+// the model-written cover, on the argument that a sentence built from spans
+// of the user's own file cannot fabricate.
+//
+// That argument was wrong, and a live drive against a 166 KB markdown
+// knowledge base showed exactly how:
+//
+//   "— CQV LEAD at Evonik since 2023. Before that, Opened 6 May 2026
+//     and Cook Myosite."
+//   "Mostly Opened 6 May 2026, Evonik, Cook Myosite and MSN."
+//   "Data system — that's where I did my 2. MS-specific OQ."
+//
+// "Opened 6 May 2026" is a DATE the extractor read as an employer. "2." is a
+// markdown list marker spoken aloud as content. Every token really did come
+// from the document; the *relation* between them was invented by the
+// extractor, and provenance checking cannot see relations — that limit is
+// documented in the two-rules rebuild. A ledger is a lossy re-render of a
+// document, and re-rendering someone's résumé into prose is precisely how
+// you produce confident nonsense in their voice.
+//
+// The cover is now always what the owner described it as: the question goes
+// to the model with the document text selected against it, and the model
+// answers from that. Silence when the model declines is the design.
+//
+// Kept, not deleted: the LEDGER is still load-bearing — ledgerVocabulary
+// feeds the grounding guard's allowed-token union, and the corpus tests
+// still grade composition. What is gone is its ability to SPEAK.
 export function composeOpener(
   ledger: Ledger,
   question: string,
@@ -919,10 +1112,29 @@ export function composeOpener(
 
   // ── 1. A named organisation ──
   const known = namedKnownOrg(ledger, q);
-  if (known && known.kind === 'employer') {
-    return emit(pick(YES_FORMS, seed)(known.subject, roleOf(known) || 'there', spokenDates(known.when)), 'entity-yes');
+  const unknownInQ = known ? questionNamesTheUnknown(ledger, q, known.subject) : [];
+  if (known && known.kind === 'employer' && asksWhetherKnownOrg(q) && !unknownInQ.length) {
+    const role = roleOf(known);
+    const when = spokenDates(known.when);
+    return emit(
+      role
+        ? pick(YES_FORMS, seed)(known.subject, role, when)
+        : pick(YES_FORMS_NO_ROLE, seed)(known.subject, when),
+      'entity-yes',
+    );
   }
-  if (known && (known.kind === 'education' || known.kind === 'certification')) {
+  // ── THE SAME GATE, FOR THE SAME REASON ──
+  //
+  // This branch had the mention-is-not-a-question defect too, and the
+  // corpus caught it: three real questions ABOUT DATABRICKS THE PLATFORM
+  // ("Who do you monitor and auto scale in prod? On Azure Databricks?",
+  // "how will the databricks issues be fixed?", and a walk-me-through-your-
+  // background question) were all answered "Databricks Certified Data
+  // Engineer Associate — that's a certification, not a role." The sentence
+  // is true and it is a non-sequitur, which is the worst combination: no
+  // guard can catch it because nothing in it is false.
+  if (known && (known.kind === 'education' || known.kind === 'certification')
+      && asksWhetherKnownOrg(q) && !unknownInQ.length) {
     // Real, but not a job. Say what it actually was rather than let the
     // main model imply employment.
     const what = known.kind === 'education' ? `that's where I did my ${roleOf(known)}` : 'that\'s a certification, not a role';
@@ -933,6 +1145,27 @@ export function composeOpener(
   if (candidate) {
     const inLedger = findOrganisation(ledger, candidate);
     if (!inLedger) {
+      // ── 0. THE QUESTION ALSO NAMED A PLACE THEY DID WORK ──
+      //
+      // "Did you work at Merck's New Jersey site?" reaches here with
+      // candidate = "New Jersey", which is correctly not an employer — and
+      // denying it produced, live in the app:
+      //
+      //   "I haven't, no — it's been Denali Therapeutics, Cook MyoSite and
+      //    Merck & Co for me."
+      //
+      // A flat no that lists the employer it is denying, in the same
+      // sentence. The question was about a SITE of a real employer, and
+      // neither yes nor no is answerable from a ledger that records
+      // companies rather than addresses.
+      //
+      // (This is the mirror of the gate on the yes branch above: a "yes"
+      // affirms the unknown half, and a "no" denies the known half. Both
+      // are wrong for the same reason, so both defer to the main model,
+      // which reads the document and can say "Merck, but Virginia".)
+      if (known) {
+        return { kind: 'defer', shape: 'entity-no', why: 'the question also names a real employer — a bare no would contradict it' };
+      }
       // ── A "NO" IS A CLAIM, AND IT NEEDS THE SAME EVIDENCE AS A "YES" ──
       //
       // Two ways this went wrong, both measured against the real database.
@@ -1244,7 +1477,13 @@ export function composeOpener(
 
   // ── 4c. Where have you worked ──
   if (anyMatch(WHERE_WORKED, q) && ledger.employers.length) {
-    return emit(pick(WHERE_WORKED_FORMS, seed)(listOrgs(ledger.employers.map((e) => e.subject))), 'platforms');
+    // The phrasing has to match what the list actually is. listOrgs caps at
+    // four, so a fifth employer exists that the sentence is not naming —
+    // and the full answer behind it CAN see them all. See the note on
+    // WHERE_WORKED_PARTIAL_FORMS.
+    const subjects = ledger.employers.map((e) => e.subject);
+    const forms = subjects.length > LIST_ORGS_MAX ? WHERE_WORKED_PARTIAL_FORMS : WHERE_WORKED_FORMS;
+    return emit(pick(forms, seed)(listOrgs(subjects)), 'platforms');
   }
 
   // ── 5. A topic the ledger can place ──
@@ -1286,10 +1525,50 @@ export function composeOpener(
     // Category words are still excluded, and the two gates below — the
     // question must ASK about their experience and must not be a "how" —
     // are what make the looser word list safe here.
-    const tool = String(emp.detail || '')
+    // ⚠️ THE BULLETS, NOT THE JOB TITLE. `detail` is "<role> — <body>", and
+    // searching the whole of it let a word from the TITLE be spoken as a
+    // tool. Verified in the running app on 2026-08-20:
+    //
+    //   Q "Have you used Terraform for any of your infrastructure work?"
+    //   A "That's the NTT Global Data Centers Americas side of things —
+    //      Infrastructure."
+    //
+    // "Infrastructure" is in the question and in "Network Infrastructure
+    // Engineer", so the two collided and the app answered a question about
+    // Terraform — which is nowhere in the résumé — by naming an employer.
+    // Confident, grounded in the strict sense, and a non-sequitur, which is
+    // the worst combination: no guard can catch it because nothing in it is
+    // false, and the local rail is trusted so no guard runs anyway.
+    //
+    // A job title says what someone WAS, never what they USED. Dropping it
+    // from the search costs nothing real: a tool that only ever appears in
+    // a title is not a tool.
+    const body = String(emp.detail || '').split(' — ').slice(1).join(' — ');
+    const tool = body
       .split(/[\s,;()]+/)
       .map((t) => t.replace(/[^A-Za-z0-9+#.]/g, ''))
-      .filter((t) => t.length > 2 && qTokens.has(t.toLowerCase())
+      // ⚠️ CAPITALISED IN THE DOCUMENT, or it is prose and not a tool.
+      //
+      // The token only had to be shared between the question and the body,
+      // so an ordinary noun appearing in both was spoken as though it were
+      // a technology. Verified in the running app on 2026-08-20:
+      //
+      //   Q "Have you used Terraform for any of your infrastructure work?"
+      //   A "That's the NTT Global Data Centers Americas side of things
+      //      — infrastructure."
+      //
+      // Terraform is nowhere in that résumé; "infrastructure" is, inside
+      // the phrase "high-availability infrastructure". So the app answered
+      // a question about one tool by naming an employer and a common noun.
+      // True in the strict sense, a non-sequitur in the room — and the
+      // local rail is trusted, so no guard sees it.
+      //
+      // The candidate's own capitalisation is the signal, and it needs no
+      // list: Grafana, Prometheus, Wireshark and Kafka are written as
+      // names; "infrastructure" and "operations" are not. It also keeps
+      // the reason this stopped using the skills list — a tool named only
+      // in a bullet still qualifies, because it is still capitalised there.
+      .filter((t) => t.length > 2 && /^[A-Z]/.test(t) && qTokens.has(t.toLowerCase())
         && isSpeakableTech(ledger, t.toLowerCase()))
       .sort((a, b) => b.length - a.length)[0];
     // Speak only when the question actually asked about their experience,

@@ -3,7 +3,7 @@
 //
 //  docs/public/TIERS.md promises:
 //    · Free                      — scripted FAQ + handoff
-//    · Basic / Pro / Max / Ultra — full AI chat
+//    · Basic / Pro / Max / Ultra / Enterprise — full AI chat
 //    · "Every tier can hand off to a human at any time."
 //
 //  'ultra' was missing from AI_CHAT_TIERS in BOTH server/src/routes/
@@ -30,8 +30,8 @@ function tiersFrom(file) {
 }
 
 // Every tier the billing layer can actually grant (routes/payments.js).
-const GRANTABLE = ['free', 'basic', 'pro', 'max', 'ultra'];
-const PAID = ['basic', 'pro', 'max', 'ultra'];
+const GRANTABLE = ['free', 'basic', 'pro', 'max', 'ultra', 'enterprise'];
+const PAID = ['basic', 'pro', 'max', 'ultra', 'enterprise'];
 
 describe('AI chat entitlement matches the published plans', () => {
   const server = tiersFrom('server/src/routes/support.js');
@@ -51,6 +51,13 @@ describe('AI chat entitlement matches the published plans', () => {
     // Ultra is granted by routes/payments.js with sessions_limit -1 and is
     // listed under "Full AI chat" in docs/public/TIERS.md.
     expect(server.has('ultra')).toBe(true);
+  });
+
+  it('includes enterprise — the top plan must not fall to the scripted FAQ', () => {
+    // Same failure mode the Ultra case above was written for: a tier added
+    // to billing but not to this list sells "priority support" and delivers
+    // the Free scripted FAQ.
+    expect(server.has('enterprise')).toBe(true);
   });
 
   it('server and client lists are identical', () => {

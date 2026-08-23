@@ -4,9 +4,15 @@ const { generateToken, authMiddleware } = require('../middleware/auth');
 // Clears an account's failed-login counter once the password is proven
 // correct, so the brute-force limiter only ever counts failures.
 const { clearLoginAttempts } = require('../middleware/rateLimiters');
+// One greppable line per auth request: endpoint, status, duration, reason.
+// Mounted first so it wraps every route below, including the ones that
+// return early. See middleware/authObservability.js for why this exists.
+const { authAccessLog } = require('../middleware/authObservability');
 const db = require('../database');
 
 const router = express.Router();
+
+router.use(authAccessLog);
 
 const DEVELOPER_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 
@@ -484,6 +490,44 @@ const crypto = require('crypto');
 // the account. When those stop appearing, the fleet has updated and this
 // can be flipped to 'true' (or the default restored) with no user impact.
 // Flipping it before then re-creates the outage.
+// ── WHEN IS THE HANDOFF CODE REQUIRED? AN OPERATOR FLAG. NOT A VERSION. ──
+//
+// This was briefly version-gated: require the code from clients new enough
+// to receive one, fall back to the address check for older ones. That is
+// UNSOUND and middleware/clientVersion.js says so by name:
+//
+//   "It must NEVER gate a security control. Version-gating the OAuth handoff
+//    code, for instance, would let an attacker downgrade themselves to the
+//    weaker path by omitting a header."
+//
+// Exactly right, and worse than it first looks here: /google/start is opened
+// in the user's SYSTEM BROWSER (SubscriptionGate handleGoogleElectron ->
+// shell.openExternal), and a browser never sends x-app-version. So a flag
+// recorded at start time is false for 100% of real sessions, and the whole
+// decision collapses onto the poll request's own header — which the attacker
+// simply omits. It protected nobody while reading as though it did.
+//
+// So: an operator flag, plus the same-address check as the standing floor.
+//
+//   GOOGLE_POLL_REQUIRE_CODE=true    require the code from everyone
+//   GOOGLE_POLL_REQUIRE_CODE=false   never require it (incident escape hatch)
+//   unset                            same as false — today's default
+//
+// ── WHEN IS IT SAFE TO TURN ON? THIS IS NOW ANSWERABLE. ──
+//
+// The old guidance was "flip it once the fleet has updated", and following it
+// would have caused an outage, because the warnings it told you to wait on
+// could never stop: macOS/Linux had no CFBundleURLTypes or x-scheme-handler
+// (build.protocols was missing from package.json entirely) and helmet's CSP
+// blocked the page script that delivers the code on every platform. No amount
+// of updating fixed either. Both are fixed as of 2026-08-14.
+//
+// The real precondition is fleet composition, and every auth request now logs
+// `client=<version>` (middleware/authObservability.js). Turn this on when
+// that field shows the fleet at or above the first release carrying BOTH
+// fixes, and when `outcome=success:legacy_address_match` has gone quiet.
+// Until then the address check is doing the work, and it is doing it for
+// everyone — including the clients a version gate would have exempted.
 const REQUIRE_HANDOFF_CODE =
   String(process.env.GOOGLE_POLL_REQUIRE_CODE || 'false').toLowerCase() === 'true';
 const MAX_HANDOFF_ATTEMPTS = 10;
@@ -530,18 +574,93 @@ function formatHandoffCode(code) {
 // /24 for IPv4 and /64 for IPv6 so a NAT pool or a dual-address host does
 // not fail a legitimate redemption, while an attacker elsewhere on the
 // internet still cannot match. Never used when a code is required.
+//
+// ── Two bugs this replaces, both of which REFUSED REAL USERS ──
+//
+// 1. The old code did `raw.split(':').slice(0,4)` on a raw IPv6 string.
+//    That is not a /64 when the address is compressed. Measured:
+//      2601:249:8000::5          -> "2601:249:8000:"
+//      2601:249:8000:0:1:2:3:4   -> "2601:249:8000:0"
+//    Same /64, two different answers, redemption refused. Addresses are now
+//    fully expanded to eight hextets BEFORE the first four are taken, so
+//    every spelling of one address produces one prefix.
+//
+// 2. An IPv4 prefix and an IPv6 prefix could never be equal, so a dual-stack
+//    user whose browser reached us over IPv6 while the app polled over IPv4
+//    (or the reverse) was refused 100% of the time — and the old code logged
+//    that as "this is what an account-takeover attempt looks like". It is
+//    not: it is one laptop on one network. The family is now part of the
+//    return value so the caller can tell "different network" (suspicious)
+//    apart from "not comparable" (routine), and say so in the log.
+function expandIpv6(addr) {
+  let a = String(addr).toLowerCase().replace(/^\[|\]$/g, '');
+  const pct = a.indexOf('%');            // strip zone id: fe80::1%en0
+  if (pct !== -1) a = a.slice(0, pct);
+
+  // A trailing dotted-quad (::ffff:1.2.3.4, 64:ff9b::203.0.113.7) is two
+  // hextets written in IPv4 notation. Convert before splitting.
+  const dotted = a.match(/(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (dotted) {
+    const [, b1, b2, b3, b4] = dotted.map(Number);
+    if ([b1, b2, b3, b4].some(n => n > 255)) return null;
+    const hi = ((b1 << 8) | b2).toString(16);
+    const lo = ((b3 << 8) | b4).toString(16);
+    a = a.slice(0, dotted.index) + hi + ':' + lo;
+  }
+
+  const halves = a.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 ? (halves[1] ? halves[1].split(':') : []) : [];
+  if (halves.length === 1 && head.length !== 8) return null;
+
+  const fill = 8 - head.length - tail.length;
+  if (fill < 0) return null;
+  const full = [...head, ...Array(halves.length === 2 ? fill : 0).fill('0'), ...tail];
+  if (full.length !== 8) return null;
+  if (!full.every(h => /^[0-9a-f]{1,4}$/.test(h))) return null;
+  return full.map(h => h.replace(/^0+(?=.)/, ''));   // canonical, no leading zeros
+}
+
 function addressPrefix(ip) {
-  const raw = String(ip || '').replace(/^::ffff:/, '');
+  const raw = String(ip || '').trim().toLowerCase();
   if (!raw) return null;
-  if (raw.includes(':')) return raw.split(':').slice(0, 4).join(':').toLowerCase();
-  const octets = raw.split('.');
-  return octets.length === 4 ? octets.slice(0, 3).join('.') : raw;
+
+  // An IPv4-mapped IPv6 address is an IPv4 address wearing a costume —
+  // compare it as IPv4 so ::ffff:73.102.55.10 and 73.102.55.10 agree.
+  const mapped = raw.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  const candidate = mapped ? mapped[1] : raw;
+
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(candidate)) {
+    const octets = candidate.split('.');
+    if (octets.some(o => Number(o) > 255)) return null;
+    return { family: 'v4', prefix: octets.slice(0, 3).join('.') };   // /24
+  }
+
+  if (raw.includes(':')) {
+    const hextets = expandIpv6(raw);
+    return hextets ? { family: 'v6', prefix: hextets.slice(0, 4).join(':') } : null;
+  }
+
+  return null;
+}
+
+// 'match'            — same family, same network. Safe to release.
+// 'different-family' — one side v4, one side v6. NOT evidence of anything;
+//                      a routine dual-stack laptop. Ask for the code.
+// 'different-network'— same family, different network. This is the shape an
+//                      actual remote-phish takeover has.
+// 'unknown'          — an address we could not parse at all.
+function compareAddresses(consent, poll) {
+  if (!consent || !poll) return 'unknown';
+  if (consent.family !== poll.family) return 'different-family';
+  return consent.prefix === poll.prefix ? 'match' : 'different-network';
 }
 
 // Step 1: Start Google OAuth — redirects browser to Google
 router.get('/google/start', (req, res) => {
   const { session_id } = req.query;
-  if (!session_id) return res.status(400).send('Missing session_id');
+  if (!session_id) { res.locals.authOutcome = 'start:missing_session_id'; return res.status(400).send('Missing session_id'); }
 
   // session_id is CLIENT-generated and later redeems the signed-in user's
   // JWT at /google/poll — so it must carry real entropy. The app has always
@@ -551,9 +670,11 @@ router.get('/google/start', (req, res) => {
   // Cap the pending map so a scripted caller can't balloon server memory
   // with junk ids inside the 5-minute TTL window.
   if (typeof session_id !== 'string' || !/^[A-Za-z0-9_-]{21,64}$/.test(session_id)) {
+    res.locals.authOutcome = 'start:invalid_session_id';
     return res.status(400).send('Invalid session_id');
   }
   if (pendingGoogleSessions.size >= 5000 && !pendingGoogleSessions.has(session_id)) {
+    res.locals.authOutcome = 'start:pending_map_full';
     return res.status(503).send('Sign-in is briefly unavailable. Please try again in a minute.');
   }
 
@@ -562,6 +683,7 @@ router.get('/google/start', (req, res) => {
   const googleClientId = process.env.GOOGLE_CLIENT_ID;
   const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
   if (!googleClientId || !googleClientSecret) {
+    res.locals.authOutcome = 'start:not_configured';
     return res.status(503).send('Google Sign-In not configured on server. Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET.');
   }
 
@@ -573,7 +695,11 @@ router.get('/google/start', (req, res) => {
   // else falls back to US at consumption time.
   const rawCountry = String(req.query.country_code || '').toUpperCase();
   const countryCode = /^[A-Z]{2}$/.test(rawCountry) ? rawCountry : null;
-  pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'pending', country_code: countryCode });
+  pendingGoogleSessions.set(session_id, {
+    created_at: Date.now(),
+    status: 'pending',
+    country_code: countryCode,
+  });
 
   // Build the Google OAuth URL
   const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
@@ -586,9 +712,25 @@ router.get('/google/start', (req, res) => {
     scope: 'openid email profile',
     state: session_id,
     access_type: 'offline',
-    prompt: 'select_account',
   });
 
+  // ── Why prompt=select_account is no longer unconditional ──
+  // It forced Google to render an account chooser on EVERY sign-in, which
+  // means a user click, which means the success tab's history length is 2 —
+  // and Chromium refuses window.close() on any tab with history > 1 that it
+  // did not open itself. So the "Signed in" tab could never clean itself up.
+  // Without the param, a returning user who has already consented is a pure
+  // 302 chain: history length 1, and the tab closes on its own the moment
+  // the handoff fires (measured, both ways).
+  //
+  // The chooser is not gone, it is on demand: the client asks for it with
+  // `switch_account=1` behind a "Use a different account" affordance, so a
+  // multi-account user is never stuck on whichever session Google picks.
+  if (String(req.query.switch_account || '') === '1') {
+    params.set('prompt', 'select_account');
+  }
+
+  res.locals.authOutcome = params.has('prompt') ? 'start:redirected_with_picker' : 'start:redirected';
   res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
 });
 
@@ -596,10 +738,43 @@ router.get('/google/start', (req, res) => {
 router.get('/google/callback', async (req, res) => {
   const { code, state: session_id, error } = req.query;
 
+  // ⚠️ `state` is ATTACKER-CONTROLLED. Google echoes back whatever was put
+  // in the authorize URL, and both client_id and redirect_uri are public
+  // (they are visible in the 302 from /google/start), so anyone can build a
+  // link that sends a victim through a real, valid consent and lands here
+  // with a state of their choosing.
+  //
+  // /google/start validates the shape; this route never did. That was
+  // survivable only while the success page's script was dead — helmet's CSP
+  // blocked it. The moment that script was given a nonce so it could run,
+  // an unvalidated `state` interpolated into a JS string literal became a
+  // live XSS on api.minicaai.com, executing under our own nonce: read the
+  // printed handoff code out of the DOM, exfiltrate it, then redeem the
+  // victim's JWT from /google/poll with the session_id the attacker chose.
+  // Full account takeover from one click.
+  //
+  // Same regex as /google/start. The charset excludes the quote that made
+  // the break-out possible, so this alone closes it — and the page below
+  // no longer interpolates into script at all, which closes it again.
+  if (typeof session_id !== 'string' || !/^[A-Za-z0-9_-]{21,64}$/.test(session_id)) {
+    res.locals.authOutcome = 'callback:invalid_state_rejected';
+    console.warn(`[google/callback] REFUSED — malformed state (len=${String(session_id || '').length}). This is what a forged authorize link looks like.`);
+    return res.status(400).send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Sign-in failed</h2><p style="color:#9ca3af">Please close this window and start sign-in from the app again.</p></div></body></html>');
+  }
+
   if (error || !code || !session_id) {
     if (session_id && pendingGoogleSessions.has(session_id)) {
       pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: error || 'No authorization code received' });
     }
+    // `error` comes from the query string, so it is attacker-controlled even
+    // though Google is the only party that should ever set it. Constrain it
+    // to the charset Google actually uses (access_denied, invalid_request,
+    // …) rather than trusting it — anything else becomes 'other'. The access
+    // log sanitises control characters too, but a value that can never carry
+    // them is better than one that has to be cleaned up downstream.
+    const rawErr = String(error || '');
+    const safeErr = /^[a-z_]{1,30}$/.test(rawErr) ? rawErr : (rawErr ? 'other' : '');
+    res.locals.authOutcome = 'callback:no_code_or_google_error' + (safeErr ? ':' + safeErr : '');
     return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Sign-in failed</h2><p style="color:#9ca3af">You can close this window and try again.</p></div></body></html>');
   }
 
@@ -613,6 +788,7 @@ router.get('/google/callback', async (req, res) => {
         status: 'error',
         error: 'Google Sign-In not configured on server (missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET)',
       });
+      res.locals.authOutcome = 'callback:not_configured';
       return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Sign-in not configured</h2><p style="color:#9ca3af">The server is missing Google OAuth credentials. Contact support.</p></div></body></html>');
     }
     const serverUrl = process.env.SERVER_URL || `${req.protocol}://${req.get('host')}`;
@@ -634,6 +810,7 @@ router.get('/google/callback', async (req, res) => {
 
     if (!email) {
       pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: 'Google account has no email' });
+      res.locals.authOutcome = 'callback:google_account_has_no_email';
       return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">No email found</h2><p style="color:#9ca3af">Your Google account needs an email address.</p></div></body></html>');
     }
 
@@ -706,6 +883,7 @@ router.get('/google/callback', async (req, res) => {
 
     if (user.is_banned) {
       pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: 'Account suspended' });
+      res.locals.authOutcome = 'callback:account_banned';
       return res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Account Suspended</h2><p style="color:#9ca3af">Contact support for help.</p></div></body></html>');
     }
 
@@ -743,7 +921,8 @@ router.get('/google/callback', async (req, res) => {
       handoff_attempts: 0,
       // Consulted only on the legacy no-code path (GOOGLE_POLL_REQUIRE_CODE
       // =false). The consenting browser and the app that polls run on the
-      // same machine in every legitimate sign-in.
+      // same machine in every legitimate sign-in. Now {family, prefix}, so
+      // "we cannot compare these" is distinguishable from "these differ".
       consent_ip_prefix: addressPrefix(req.ip || req.connection?.remoteAddress),
       data: {
         user: {
@@ -778,7 +957,28 @@ router.get('/google/callback', async (req, res) => {
     const safeSessionId = encodeURIComponent(String(session_id));
     const safeHandoff = encodeURIComponent(handoffCode);
     const displayCode = formatHandoffCode(handoffCode);
-    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signed in</title></head><body style="background:#050507;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center;max-width:420px;padding:32px 20px"><div style="width:56px;height:56px;border-radius:14px;background:linear-gradient(135deg,#10b981,#3b82f6);display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:24px;color:#fff">✓</div><h2 style="color:#e5e7eb;margin:0 0 6px;font-weight:600;font-size:18px">Signed in</h2><p style="color:#9ca3af;margin:0;font-size:13px">Returning to Interview Copilot…</p><div id="fallback-box" style="margin:22px 0 0;opacity:0;transition:opacity 0.3s"><p style="color:#9ca3af;margin:0 0 10px;font-size:12px">Still waiting? Enter this code in the app:</p><div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:22px;letter-spacing:2px;color:#e5e7eb;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px 16px;display:inline-block">${displayCode}</div><p style="color:#6b7280;margin:12px 0 0;font-size:11px">It expires in 5 minutes and works once. You can close this tab after signing in.</p></div></div><script>
+
+    // ── CSP: this page's inline script was never running ──
+    // helmet() (index.js:71) ships `script-src 'self'` on every response,
+    // which blocks an un-nonced inline <script>. This page's ENTIRE handoff
+    // lives in one — the `interview-copilot://` navigation AND the reveal of
+    // the printed fallback code. Both silently did nothing, on every OS, for
+    // every user: the browser logged "Executing inline script violates the
+    // following Content Security Policy directive 'script-src 'self''" and
+    // moved on. Every sign-in that worked did so through the code-less
+    // same-address branch in /google/poll, which is why nobody noticed.
+    //
+    // Scope a CSP to THIS response with a one-time nonce instead of
+    // loosening the global helmet policy — this page is the only one in the
+    // service that needs to run script, and it needs to run exactly its own.
+    res.locals.authOutcome = 'callback:success:' + (isNewUser ? 'new_user' : 'returning_user');
+    const cspNonce = crypto.randomBytes(16).toString('base64');
+    res.setHeader(
+      'Content-Security-Policy',
+      `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${cspNonce}'; ` +
+      `base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
+    );
+    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signed in</title></head><body style="background:#050507;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center;max-width:420px;padding:32px 20px"><div style="width:56px;height:56px;border-radius:14px;background:linear-gradient(135deg,#10b981,#3b82f6);display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:24px;color:#fff">✓</div><h2 style="color:#e5e7eb;margin:0 0 6px;font-weight:600;font-size:18px">Signed in</h2><p style="color:#9ca3af;margin:0;font-size:13px">Returning to Interview Copilot…</p><p style="margin:16px 0 0"><a id="open-app" href="interview-copilot://signin-complete?session_id=${safeSessionId}&amp;code=${safeHandoff}" style="color:#60a5fa;font-size:13px;text-decoration:none;border:1px solid rgba(96,165,250,0.4);border-radius:999px;padding:7px 16px;display:inline-block">Open Interview Copilot</a></p><div id="fallback-box" style="margin:22px 0 0"><p style="color:#9ca3af;margin:0 0 10px;font-size:12px">Still waiting? Enter this code in the app:</p><div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:22px;letter-spacing:2px;color:#e5e7eb;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px 16px;display:inline-block">${displayCode}</div><p style="color:#6b7280;margin:12px 0 0;font-size:11px">It expires in 5 minutes and works once. You can close this tab after signing in.</p></div></div><script nonce="${cspNonce}">
 (function(){
   // Hand off to the desktop app via the custom protocol. Browsers will
   // close (or blank) this tab automatically when the OS protocol
@@ -790,18 +990,28 @@ router.get('/google/callback', async (req, res) => {
   // the OS routes it to the app on THIS machine, which is precisely the
   // property that makes it safe — an attacker holding session_id is on
   // some other machine and never receives it.
-  var url = 'interview-copilot://signin-complete?session_id=${safeSessionId}&code=${safeHandoff}';
-  try { window.location.href = url; } catch (e) { /* CSP or sandbox */ }
+  // NOTHING SERVER-SIDE IS INTERPOLATED INTO THIS SCRIPT ANY MORE.
+  // It used to build the deep link by substituting safeSessionId into a
+  // single-quoted JS string. encodeURIComponent does NOT escape a single
+  // quote (it is an unreserved character, verified), so an attacker-chosen
+  // OAuth state closed that string literal and ran arbitrary JS under this
+  // page's own nonce. The URL is now read back off the anchor's href at
+  // runtime: encodeURIComponent DOES escape the double quote as %22, so a
+  // double-quoted HTML attribute cannot be broken out of.
+  var a = document.getElementById('open-app');
+  var url = a ? a.getAttribute('href') : '';
+  try { if (url) window.location.href = url; } catch (e) { /* CSP or sandbox */ }
   setTimeout(function(){
-    // Try the explicit window.close() as a second attempt (works when
-    // the original tab was opened via window.open from our app).
+    // Chromium refuses window.close() unless the tab was script-opened OR
+    // its history length is 1. Measured: a pure 302 chain (returning user,
+    // already consented) lands at length 1 and the tab DOES close itself;
+    // one click on Google's account picker makes it 2 and the close is
+    // refused — and nothing this page does afterwards can undo that
+    // (location.replace and history.replaceState were both tested and both
+    // leave it at 2). That is why /google/start no longer forces
+    // prompt=select_account. When it can't close, the code below is
+    // already on screen, so the tab is a dead end for nobody.
     try { window.close(); } catch (e) {}
-    // Still alive => the protocol handoff didn't take. Reveal the code
-    // so the user can finish by hand instead of hitting a dead end.
-    setTimeout(function(){
-      var m = document.getElementById('fallback-box');
-      if (m) m.style.opacity = '1';
-    }, 400);
   }, 1200);
 })();
 </script></body></html>`);
@@ -811,6 +1021,7 @@ router.get('/google/callback', async (req, res) => {
     if (session_id && pendingGoogleSessions.has(session_id)) {
       pendingGoogleSessions.set(session_id, { created_at: Date.now(), status: 'error', error: 'Authentication failed' });
     }
+    res.locals.authOutcome = 'callback:exception:' + String((err && err.message) || 'unknown').slice(0, 60).replace(/\s+/g, '_');
     res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Something went wrong</h2><p style="color:#9ca3af">Please close this window and try again.</p></div></body></html>');
   }
 });
@@ -818,10 +1029,16 @@ router.get('/google/callback', async (req, res) => {
 // Step 3: Client polls this endpoint to get the auth result
 router.get('/google/poll', (req, res) => {
   const { session_id } = req.query;
-  if (!session_id) return res.status(400).json({ error: 'Missing session_id' });
+  if (!session_id) { res.locals.authOutcome = 'poll:missing_session_id'; return res.status(400).json({ error: 'Missing session_id' }); }
 
   const session = pendingGoogleSessions.get(session_id);
-  if (!session) return res.json({ status: 'pending' });
+  if (!session) {
+    // A session that never existed, or one lost to a server restart —
+    // pendingGoogleSessions is in-memory. The client cannot tell these
+    // apart from "not finished yet", so it polls until it times out.
+    res.locals.authOutcome = 'poll:no_such_session';
+    return res.json({ status: 'pending' });
+  }
 
   if (session.status === 'success') {
     // ── Redemption gate ──
@@ -830,23 +1047,38 @@ router.get('/google/poll', (req, res) => {
     // browser that consented. See the block above mintHandoffCode.
     const presented = req.query.code;
 
+    // ── ONE place decides what a wrong code costs ──
+    // The counter used to live inside the require-code branch only, so the
+    // legacy branch accepted UNLIMITED wrong guesses: present any `code=` and
+    // you skipped the address check and got a free oracle against the session
+    // for its whole 5-minute life, while ten wrong guesses on the other
+    // branch burned it. 32^10 keeps that impractical, but the branch an
+    // attacker can steer into must not be the lenient one. Shared closure so
+    // neither path can forget it again.
+    const rejectWrongCode = (tag) => {
+      session.handoff_attempts = (session.handoff_attempts || 0) + 1;
+      if (session.handoff_attempts >= MAX_HANDOFF_ATTEMPTS) {
+        // Burn the session rather than let it be ground down. The user
+        // signs in again; an attacker gets nothing either way.
+        pendingGoogleSessions.delete(session_id);
+        console.warn(`[google/poll] handoff code exhausted after ${MAX_HANDOFF_ATTEMPTS} attempts — session burned, ip=${req.ip || 'unknown'}`);
+        res.locals.authOutcome = 'error:handoff_attempts_exhausted';
+        return res.json({ status: 'error', error: 'Too many incorrect codes. Please sign in again.' });
+      }
+      res.locals.authOutcome = tag;
+      return res.json({ status: 'awaiting_code', invalid_code: true });
+    };
+
     if (REQUIRE_HANDOFF_CODE) {
       if (!presented) {
         // Not an error — the normal state while the deep link is still in
         // flight, and the signal the client uses to show the manual code
         // entry. Deliberately does NOT release anything.
+        res.locals.authOutcome = 'awaiting_code:no_code_presented';
         return res.json({ status: 'awaiting_code' });
       }
       if (!handoffCodeMatches(session, presented)) {
-        session.handoff_attempts = (session.handoff_attempts || 0) + 1;
-        if (session.handoff_attempts >= MAX_HANDOFF_ATTEMPTS) {
-          // Burn the session rather than let it be ground down. The user
-          // signs in again; an attacker gets nothing either way.
-          pendingGoogleSessions.delete(session_id);
-          console.warn(`[google/poll] handoff code exhausted after ${MAX_HANDOFF_ATTEMPTS} attempts — session burned, ip=${req.ip || 'unknown'}`);
-          return res.json({ status: 'error', error: 'Too many incorrect codes. Please sign in again.' });
-        }
-        return res.json({ status: 'awaiting_code', invalid_code: true });
+        return rejectWrongCode('awaiting_code:wrong_code');
       }
     } else {
       // ── Legacy path (GOOGLE_POLL_REQUIRE_CODE=false) ──
@@ -857,28 +1089,49 @@ router.get('/google/poll', (req, res) => {
       // that motivated all of this.
       if (presented) {
         if (!handoffCodeMatches(session, presented)) {
-          return res.json({ status: 'awaiting_code', invalid_code: true });
+          return rejectWrongCode('awaiting_code:wrong_code_legacy_path');
         }
       } else {
         const pollPrefix = addressPrefix(req.ip || req.connection?.remoteAddress);
-        if (!session.consent_ip_prefix || !pollPrefix || session.consent_ip_prefix !== pollPrefix) {
-          console.warn(`[google/poll] REFUSED legacy code-less redemption from a different address (consent=${session.consent_ip_prefix || 'unknown'} poll=${pollPrefix || 'unknown'}) — this is what an account-takeover attempt looks like`);
-          return res.json({ status: 'awaiting_code' });
+        const verdict = compareAddresses(session.consent_ip_prefix, pollPrefix);
+        const shownConsent = session.consent_ip_prefix ? `${session.consent_ip_prefix.family}:${session.consent_ip_prefix.prefix}` : 'unparsed';
+        const shownPoll = pollPrefix ? `${pollPrefix.family}:${pollPrefix.prefix}` : 'unparsed';
+
+        if (verdict !== 'match') {
+          // Three very different situations, logged as three different
+          // things. Only 'different-network' resembles an attack; the other
+          // two are a dual-stack laptop or an address we could not read, and
+          // calling those an attack is what made this undiagnosable before.
+          const why = {
+            'different-family': `dual-stack client — consent arrived over ${shownConsent.split(':')[0]}, poll over ${shownPoll.split(':')[0]}. Not an attack; the code is required because the two cannot be compared.`,
+            'different-network': `consent and poll came from different networks. THIS is the shape of a remote account-takeover attempt.`,
+            'unknown': `could not parse one or both addresses.`,
+          }[verdict];
+          console.warn(
+            `[google/poll] awaiting_code reason=address_${verdict.replace('-', '_')} ` +
+            `consent=${shownConsent} poll=${shownPoll} email=${session.data?.user?.email || 'unknown'} — ${why}`
+          );
+          res.locals.authOutcome = `awaiting_code:address_${verdict.replace('-', '_')}`;
+          return res.json({ status: 'awaiting_code', reason: `address_${verdict.replace('-', '_')}` });
         }
-        console.warn(`[google/poll] LEGACY code-less redemption allowed for ${session.data?.user?.email || 'unknown'} — GOOGLE_POLL_REQUIRE_CODE is off; turn it back on once the fleet has updated`);
+        console.warn(`[google/poll] LEGACY code-less redemption allowed for ${session.data?.user?.email || 'unknown'} at ${shownPoll} — no handoff code was presented, and the address check is what let it through. See REQUIRE_HANDOFF_CODE for when this path can be closed.`);
+        res.locals.authOutcome = 'success:legacy_address_match';
       }
     }
 
     // Clean up after successful retrieval. Single-use by construction.
     pendingGoogleSessions.delete(session_id);
+    if (!res.locals.authOutcome) res.locals.authOutcome = 'success:handoff_code_verified';
     return res.json({ status: 'success', ...session.data });
   }
 
   if (session.status === 'error') {
     pendingGoogleSessions.delete(session_id);
+    res.locals.authOutcome = 'error:' + String(session.error || 'unknown').slice(0, 40).replace(/\s+/g, '_');
     return res.json({ status: 'error', error: session.error });
   }
 
+  res.locals.authOutcome = 'poll:pending_consent';
   res.json({ status: 'pending' });
 });
 
@@ -1328,3 +1581,11 @@ router.delete('/account', authMiddleware, (req, res) => {
 });
 
 module.exports = router;
+
+// Exported so middleware/authObservability.js can log the SAME prefix this
+// file decides with, rather than keeping a second copy that drifts. Attached
+// to the router (which is a function) so the module's default export stays
+// exactly what every `app.use()` call already expects.
+module.exports.addressPrefix = addressPrefix;
+module.exports.compareAddresses = compareAddresses;
+module.exports.expandIpv6 = expandIpv6;

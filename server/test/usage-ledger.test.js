@@ -37,7 +37,7 @@ function makeUser(tier, licensePatch = {}) {
     status: 'active',
     country_code: 'US',
     expires_at: Date.now() + 30 * 86400000,
-    sessions_limit: tier === 'ultra' ? -1 : 3,
+    sessions_limit: (tier === 'ultra' || tier === 'enterprise') ? -1 : 3,
   });
   if (Object.keys(licensePatch).length) {
     const sets = Object.keys(licensePatch).map(k => `${k} = ?`).join(', ');
@@ -77,8 +77,30 @@ describe('startUsageSession', () => {
     expect(r.remaining).toBe(0);
   });
 
-  it('gives ultra an unlimited session', () => {
-    const uid = makeUser('ultra');
+  it('gives enterprise an unlimited session', () => {
+    const uid = makeUser('enterprise');
+    const r = db.startUsageSession(uid, 'dev1');
+    expect(r.source).toBe('unlimited');
+    expect(r.remaining).toBe(-1);
+  });
+
+  // 2026-08: Ultra stopped being the unlimited tier and became a metered
+  // 9-hour monthly allowance. It draws from the SAME credit bucket the
+  // passes do — that is the whole change, and it is worth pinning because
+  // every "unlimited" path in this file used to be spelled 'ultra'.
+  it('meters ultra against its 9-hour credit bucket', () => {
+    const uid = makeUser('ultra', { credits_remaining_seconds: 9 * 3600, credits_expire_at: 0, expires_at: -1 });
+    const r = db.startUsageSession(uid, 'dev1');
+    expect(r.source).toBe('credits');
+    expect(r.remaining).toBe(9 * 3600);
+  });
+
+  // The grandfather clause: a pre-2026-08 Ultra row still carries the -1
+  // credit sentinel, and must keep unlimited access until a renewal
+  // re-seeds it. Cutting an existing subscriber to a meter mid-cycle is
+  // exactly what isUnlimitedLicenseRow exists to prevent.
+  it('keeps a legacy ultra (-1 sentinel) unlimited', () => {
+    const uid = makeUser('ultra', { credits_remaining_seconds: -1, credits_expire_at: -1, expires_at: -1 });
     const r = db.startUsageSession(uid, 'dev1');
     expect(r.source).toBe('unlimited');
     expect(r.remaining).toBe(-1);
@@ -170,7 +192,7 @@ describe('heartbeatUsageSession', () => {
   });
 
   it('never charges an unlimited session', () => {
-    const uid = makeUser('ultra');
+    const uid = makeUser('enterprise');
     const { session_id } = db.startUsageSession(uid, 'dev1');
     backdateHeartbeat(session_id, 40);
     const r = db.heartbeatUsageSession(uid, session_id);
@@ -275,13 +297,18 @@ describe('resolveTimeBucket', () => {
 //
 //  Nothing surfaced it, because the only reader that can refuse a user is
 //  hasLiveUsageSession and requireActiveSession is still dormant. Arming it
-//  would have refused every non-admin Ultra user 90 seconds into every
+//  would have refused every non-admin unlimited user 90 seconds into every
 //  interview — the top-paying tier, deterministically, BECAUSE it is the
-//  one tier with nothing to bill.
+//  one tier with nothing to bill. (That tier was Ultra when this was
+//  written; since 2026-08 it is Enterprise, and Ultra meters like a pass.)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 describe('an unlimited session is live whether or not it ever beat', () => {
+  // 2026-08: the unlimited tier is ENTERPRISE. Ultra used to be it, and the
+  // narrative above still reads correctly with the name swapped — the bug it
+  // describes is about sessions that are never charged, not about which SKU
+  // happens to be uncharged this quarter.
   it('stays live past the window with a heartbeat that never came', () => {
-    const uid = makeUser('ultra');
+    const uid = makeUser('enterprise');
     const { session_id, source } = db.startUsageSession(uid, 'dev1');
     expect(source).toBe('unlimited');
     // Older than the window by an hour — an interview well past the point
@@ -297,7 +324,7 @@ describe('an unlimited session is live whether or not it ever beat', () => {
   it('is not swept away underneath itself', () => {
     // hasLiveUsageSession also tests `ended_at IS NULL`, so a sweeper that
     // closed the row would re-open the hole from the other side.
-    const uid = makeUser('ultra');
+    const uid = makeUser('enterprise');
     const { session_id } = db.startUsageSession(uid, 'dev1');
     backdateHeartbeat(session_id, Math.ceil(db.USAGE_STALE_AFTER_MS / 1000) + 3600);
     db.sweepStaleUsageSessions();
@@ -316,7 +343,7 @@ describe('an unlimited session is live whether or not it ever beat', () => {
   });
 
   it('charges nothing when an unlimited session does beat', () => {
-    const uid = makeUser('ultra');
+    const uid = makeUser('enterprise');
     const { session_id } = db.startUsageSession(uid, 'dev1');
     backdateHeartbeat(session_id, 300);
     const r = db.heartbeatUsageSession(uid, session_id);

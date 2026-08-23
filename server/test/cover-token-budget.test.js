@@ -1,7 +1,13 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  THE COVER'S BUDGET IS A TOKEN BUCKET, AND IT WAS OVERDRAWN
 //
-//  Groq meters llama-3.3-70b-versatile per MINUTE, not per request, and it
+//  ⚠️ HISTORY, not current state — the numbers in this block are from the
+//  FREE tier running llama-3.3-70b. Both have changed (developer plan,
+//  gpt-oss-20b); see GROQ_TPM below for what is true now. It is kept
+//  because it is why the digest exists, and deleting the reason is how the
+//  9,000-char prose block gets reintroduced by someone tidying up.
+//
+//  Groq metered llama-3.3-70b-versatile per MINUTE, not per request, and it
 //  charges input + max_tokens against that bucket before generating
 //  anything. Measured against the live API:
 //
@@ -34,8 +40,29 @@ const { COVER_SYSTEM, userPrompt, COVER_TIERS } = require('../src/services/cover
 const { buildLedger } = await import('../../services/factLedger.ts');
 const { ledgerDigest } = await import('../../services/instantOpener.ts');
 
-// Groq's published limit for this model on this org.
-const GROQ_TPM = 12_000;
+// Groq's per-minute token limit for the COVER model on this org, read from
+// the API's own `x-ratelimit-limit-tokens` header rather than a docs page.
+//
+// ⚠️ THIS WAS 12,000, AND THAT NUMBER SHAPED THE WHOLE FEATURE. On the free
+// tier, llama-3.3-70b gave 12,000 TPM — about 3 covers a minute against an
+// interview that asks one every 20-40 seconds. That is why distillForCover
+// exists, why the digest replaced a 9,000-char prose slice, and why this
+// test was written at all: the bucket, not latency, was the binding
+// constraint.
+//
+// Two things changed on 2026-08-16. The org moved to a developer plan, and
+// the cover model moved to openai/gpt-oss-20b. Measured live:
+//
+//   openai/gpt-oss-20b        250,000 TPM   (the cover)
+//   openai/gpt-oss-120b       250,000 TPM   (the groq ANSWER route)
+//   llama-3.3-70b-versatile   300,000 TPM
+//
+// So the constraint is gone — ~89 covers a minute against a need of 1.5-3.
+// The request is still kept small, because prompt size is paid in latency
+// and money on every question, and because a 20x headroom is a reason to
+// stop worrying rather than a reason to stop measuring. What this test now
+// guards is that the digest never regresses back toward the prose block.
+const GROQ_TPM = 250_000;
 // ~4 chars per token is the standard English approximation and the one the
 // original measurement used, so the comparison stays apples to apples.
 const tok = (s) => Math.ceil(String(s || '').length / 4);
@@ -102,10 +129,12 @@ describe('cover request size against the per-minute bucket', () => {
     console.log(`   request BEFORE     ${before} tok -> ${perMinBefore.toFixed(1)} covers/min`);
     console.log(`   request AFTER      ${after} tok -> ${perMinAfter.toFixed(1)} covers/min`);
     console.log(`   an interview asks a question every 20-40s = 1.5-3 covers/min needed`);
+    // The invariant that still matters: the digest is smaller than the
+    // prose block it replaced, and it CARRIES MORE (every file, not the
+    // first one). The per-minute figure is now a sanity floor rather than
+    // the binding constraint it was on the free tier -- see GROQ_TPM.
     expect(after).toBeLessThan(before);
-    // A question every 20 seconds is 3 per minute. The bucket has to hold
-    // that with headroom, or the primary provider 429s mid-conversation.
-    expect(perMinAfter).toBeGreaterThan(4);
+    expect(perMinAfter).toBeGreaterThan(20);
   });
 
   it('FOUR resumes — where the old block silently dropped three of them', () => {
@@ -122,7 +151,7 @@ describe('cover request size against the per-minute bucket', () => {
     for (const c of ['Siemens', 'Company1', 'Company2', 'Company3']) {
       expect(digest, `digest is missing ${c}`).toContain(c);
     }
-    expect(GROQ_TPM / after).toBeGreaterThan(4);
+    expect(GROQ_TPM / after).toBeGreaterThan(20);
   });
 
   it('the assembled user prompt stays small even with the transcript attached', () => {

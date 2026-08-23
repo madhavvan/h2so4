@@ -130,7 +130,9 @@ async function consentUnder(sessionId, headers) {
   await get(`/google/start?session_id=${sessionId}`, headers);
   const cb = await get(`/google/callback?code=fake-auth-code&state=${sessionId}`, headers);
   expect(cb.status).toBe(200);
-  const deepLink = cb.body.match(/interview-copilot:\/\/signin-complete\?session_id=[^&]+&code=([A-Z0-9]+)/);
+  // The deep link moved from the inline script into an <a href>, so the
+  // ampersand is HTML-escaped. See google-callback-state-injection.test.js.
+  const deepLink = cb.body.match(/interview-copilot:\/\/signin-complete\?session_id=[^&"]+&(?:amp;)?code=([A-Z0-9]+)/);
   return { deepLinkCode: deepLink ? deepLink[1] : null };
 }
 

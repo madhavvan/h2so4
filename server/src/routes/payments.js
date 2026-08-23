@@ -76,11 +76,18 @@ function getPaymentProvider(countryCode) {
 //            cutoff, and sessions_limit=3 is bookkeeping no gate reads. A
 //            Max buyer can run one 3-hour interview; deliberately more
 //            generous than the copy, never less.)
-//   Ultra  = unlimited                     (-1 sentinels; subscription)
+//   Ultra  = NINE HOURS per billing cycle  (32,400s; subscription, re-seeded
+//            on every renewal by webhooks.js creditsForLifecycleGrant.
+//            Metered since 2026-08-22 — it was unlimited before that, and
+//            unlimited moved up to Enterprise.)
+//   Enterprise = unlimited, never expires  (-1 sentinels; subscription)
 // NOTE: this is the CUSTOMER config. Admin grants are unlimited-until-revoked
 // and use grantAdminTier() / recordCompPayment() instead (never this).
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
 const INTERVIEW_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+// Ultra's monthly allowance. Mirrored in webhooks.js grantConfigForTier and
+// in the client's services/licenseService.ts ULTRA_MONTHLY_SECONDS.
+const ULTRA_CYCLE_SECONDS = 9 * 60 * 60;
 function grantConfigForTier(tier) {
   const now = Date.now();
   if (tier === 'free') {
@@ -98,8 +105,19 @@ function grantConfigForTier(tier) {
     const exp = now + INTERVIEW_WINDOW_MS;
     return { tier: 'max', sessions_limit: 3, expires_at: exp, credits_remaining_seconds: 3 * 60 * 60, credits_expire_at: exp };
   }
-  // ultra — monthly subscription, unlimited.
-  return { tier: 'ultra', sessions_limit: -1, expires_at: -1, credits_remaining_seconds: -1, credits_expire_at: -1 };
+  if (tier === 'ultra') {
+    // Monthly subscription, METERED: 9 hours per billing cycle.
+    //   expires_at: -1        — the SUBSCRIPTION has no end date. This is not
+    //                           a time sentinel; db.resolveTimeBucket must not
+    //                           read it as "unlimited" for ultra, or the $1199
+    //                           plan is being handed out for $159.
+    //   credits_expire_at: 0  — no calendar window on the balance; the next
+    //                           renewal REPLACES it (no rollover). Deliberately
+    //                           0 and not -1: -1 is the unlimited sentinel.
+    return { tier: 'ultra', sessions_limit: -1, expires_at: -1, credits_remaining_seconds: ULTRA_CYCLE_SECONDS, credits_expire_at: 0 };
+  }
+  // enterprise — monthly subscription, unlimited and never expiring.
+  return { tier: 'enterprise', sessions_limit: -1, expires_at: -1, credits_remaining_seconds: -1, credits_expire_at: -1 };
 }
 
 // ── Normalize/validate the tier coming in from the client ──
@@ -108,7 +126,7 @@ function grantConfigForTier(tier) {
 // non-admin callers, /upgrade-tier rejects `free` (they should cancel
 // the subscription instead — that triggers the proper webhook + email
 // chain at cycle end).
-const VALID_TIERS = ['free', 'basic', 'pro', 'max', 'ultra'];
+const VALID_TIERS = ['free', 'basic', 'pro', 'max', 'ultra', 'enterprise'];
 function normalizeTier(t) {
   return VALID_TIERS.includes(t) ? t : 'pro';
 }
@@ -155,7 +173,45 @@ function resolveUserProvider(user) {
 
 // Ladder order for upgrade/downgrade direction decisions (in-place plan
 // swaps). Higher rank = more expensive/more access.
-const TIER_RANK = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4 };
+const TIER_RANK = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4, enterprise: 5 };
+
+// The RECURRING tiers — the ones sold as a monthly subscription rather than a
+// one-time pass. Everything that used to be spelled `tier === 'ultra'` around
+// subscriptions (price shape validation, Razorpay plan requirement, in-place
+// swap eligibility, "is this subscription-backed") means THIS now that
+// Enterprise exists. A missed call site is a real bug in both directions: an
+// Enterprise checkout created as a one-time charge bills $1199 exactly once
+// for a plan sold monthly, and a one-time pass validated as recurring is
+// rejected outright.
+const RECURRING_TIERS = ['ultra', 'enterprise'];
+function isRecurringTier(t) { return RECURRING_TIERS.includes(t); }
+
+// Tiers that draw live time from the credit-seconds bucket, i.e. the ones a
+// top-up can meaningfully extend. Ultra joined in 2026-08 with its 9-hour
+// monthly allowance; Enterprise is never here (unlimited by definition), and
+// free draws from the trial bucket instead.
+const METERED_TIERS = ['basic', 'pro', 'max', 'ultra'];
+
+// ── Credit-write policy — mirrors webhooks.js, same two rules ───────────
+// creditsForPlanChange: an UPGRADE is a real plan change with a prorated
+//   charge behind it, so the new plan's allowance is seeded (Ultra 9 h,
+//   Enterprise -1). A legacy Pro/Max subscriber's migration-era unlimited
+//   balance is left alone — the one-time config would shrink it.
+// creditsForReaffirm: reactivation is NOT a purchase. It only un-sets
+//   cancel_at_period_end on a subscription the user is already inside. It
+//   may write a CONSTANT sentinel (Enterprise's -1, idempotent) but must
+//   never re-seed a metered balance, or cancel→reactivate becomes a free
+//   refill of Ultra's 9 hours, repeatable for as long as the cycle lasts.
+function creditsForPlanChange(grant) {
+  return isRecurringTier(grant.tier)
+    ? { credits_remaining_seconds: grant.credits_remaining_seconds, credits_expire_at: grant.credits_expire_at }
+    : {};
+}
+function creditsForReaffirm(grant) {
+  return grant.tier === 'enterprise'
+    ? { credits_remaining_seconds: grant.credits_remaining_seconds, credits_expire_at: grant.credits_expire_at }
+    : {};
+}
 function isTierUpgrade(fromTier, toTier) {
   return (TIER_RANK[toTier] ?? -1) > (TIER_RANK[fromTier] ?? -1);
 }
@@ -205,16 +261,18 @@ function resolveExtensionPack(packId) {
 // EXPECTED_*_AMOUNTS must stay in sync with pricingService.ts on the
 // client. If you change a price, update both sides.
 const EXPECTED_USD_CENTS = {
-  basic: 3000,  // $30 one-time · 30-min interview
-  pro:   5000,  // $50 one-time · 1-hour interview
-  max:   8900,  // $89 one-time · 3× 1-hour interviews
-  ultra: 15900, // $159/month · unlimited + Auto-Type
+  basic:      3000,   // $30 one-time · 30-min interview
+  pro:        5000,   // $50 one-time · 1-hour interview
+  max:        8900,   // $89 one-time · 3× 1-hour interviews
+  ultra:      15900,  // $159/month · 9 hours of interview time + Auto-Type
+  enterprise: 119900, // $1199/month · unlimited, never expires
 };
 const EXPECTED_INR_PAISE = {
-  basic: 249900,  // ₹2499 one-time
-  pro:   419900,  // ₹4199 one-time
-  max:   739900,  // ₹7399 one-time
-  ultra: 1299900, // ₹12999/month
+  basic:      249900,   // ₹2499 one-time
+  pro:        419900,   // ₹4199 one-time
+  max:        739900,   // ₹7399 one-time
+  ultra:      1299900,  // ₹12999/month
+  enterprise: 9999900,  // ₹99999/month
 };
 const PRICE_VALIDATION_TTL_MS = 10 * 60 * 1000;
 const stripePriceCache = new Map(); // priceId → { amount, currency, recurring, interval, validated_at }
@@ -223,11 +281,12 @@ const razorpayPlanCache = new Map(); // planId  → { amount, currency, period, 
 async function assertStripePriceMatches(stripeClient, priceId, tier) {
   const expected = EXPECTED_USD_CENTS[tier];
   if (!expected) return; // unknown tier — let it through (caller already validated)
-  // 2026-07 model: ONLY Ultra is a recurring subscription. Basic/Pro/Max are
-  // one-time interview purchases. (Pre-2026-07 this was `tier !== 'basic'`,
-  // which wrongly expected Pro/Max to be monthly recurring and would reject a
-  // correctly-configured one-time Pro/Max Price ID.)
-  const expectedRecurring = tier === 'ultra';
+  // 2026-07 model, extended 2026-08: Ultra AND Enterprise are recurring
+  // subscriptions. Basic/Pro/Max are one-time interview purchases.
+  // (Pre-2026-07 this was `tier !== 'basic'`, which wrongly expected Pro/Max
+  // to be monthly recurring and would reject a correctly-configured one-time
+  // Pro/Max Price ID.)
+  const expectedRecurring = isRecurringTier(tier);
 
   const now = Date.now();
   let entry = stripePriceCache.get(priceId);
@@ -409,14 +468,21 @@ function checkoutConflictFor(license, hasRecurringPlan, targetTier) {
     return null;
   }
   if (!['active', 'canceling', 'past_due'].includes(license.status)) return null;
-  if (targetTier === 'ultra') {
-    if (license.tier === 'ultra') {
+  // Any RECURRING target (Ultra, Enterprise). Pre-2026-08 this read
+  // `targetTier === 'ultra'` because Ultra was the only subscription; with
+  // Enterprise on the Team tab, a bare 'ultra' test would let an Enterprise
+  // customer click "Go Ultra" and open a SECOND parallel subscription.
+  if (isRecurringTier(targetTier)) {
+    const targetLabel = targetTier === 'enterprise' ? 'Enterprise' : 'Ultra';
+    // Same plan they already hold → never a second subscription.
+    if (license.tier === targetTier) {
+      const heldLabel = targetLabel;
       if (license.status === 'canceling') {
         return {
           code: 'already_subscribed',
           httpStatus: 409,
           suggested_action: 'reactivate-subscription',
-          message: 'You\'re still on Ultra — your cancellation only takes effect at the end of the billing cycle. Reactivate it from Manage subscription (no new charge today) instead of starting a second subscription.',
+          message: `You're still on ${heldLabel} — your cancellation only takes effect at the end of the billing cycle. Reactivate it from Manage subscription (no new charge today) instead of starting a second subscription.`,
         };
       }
       // past_due is a DEAD CARD, not a healthy subscription. Answering it
@@ -431,18 +497,24 @@ function checkoutConflictFor(license, hasRecurringPlan, targetTier) {
           code: 'payment_method_required',
           httpStatus: 409,
           suggested_action: 'update-payment-method',
-          message: 'Your Ultra subscription is still active, but the last payment didn\'t go through — starting a second subscription won\'t fix that. Update your card from Manage subscription and we\'ll retry the outstanding charge automatically.',
+          message: `Your ${heldLabel} subscription is still active, but the last payment didn't go through — starting a second subscription won't fix that. Update your card from Manage subscription and we'll retry the outstanding charge automatically.`,
         };
       }
       return {
         code: 'already_subscribed',
         httpStatus: 409,
         suggested_action: null,
-        message: 'You\'re already on the Ultra subscription — it includes everything, so there\'s nothing more to buy.',
+        message: targetTier === 'enterprise'
+          ? "You're already on the Enterprise subscription — unlimited interview time, every model, Auto-Type. There's nothing above it to buy."
+          : "You're already on the Ultra subscription — switching plans is done from Manage subscription, not by starting a second one.",
       };
     }
-    // Legacy Pro/Max subscriber going Ultra: the right move is the
-    // in-place plan swap (prorated), never a parallel subscription.
+    // A DIFFERENT subscription on file — a legacy Pro/Max subscriber going
+    // Ultra, an Ultra subscriber going Enterprise, or an Enterprise
+    // customer moving down to Ultra. All three are the same operation:
+    // rewire the existing subscription in place (Stripe prorates an
+    // upgrade; a downgrade is scheduled for cycle end). Never a parallel
+    // subscription — that is how a customer ends up paying twice.
     return { code: 'upgrade_in_place' };
   }
   return {
@@ -633,7 +705,7 @@ router.post('/upgrade-tier', authMiddleware, async (req, res) => {
     const isRazorpay = subProvider === 'razorpay';
     const isStripe = subProvider === 'stripe';
 
-    // ── 2026-07 model: ULTRA is the only subscription plan ──
+    // ── Subscription plans only (Ultra, Enterprise) ──
     // An in-place swap rewires an EXISTING subscription, so the target must
     // itself be a recurring plan. Pro/Max are one-time passes now: putting a
     // one-time Price on a Stripe subscription item is rejected by Stripe's
@@ -643,7 +715,7 @@ router.post('/upgrade-tier', authMiddleware, async (req, res) => {
     // pass from the plans screen. Checked only when a provider is on file —
     // the no-provider fall-through below still routes pro/max targets to a
     // fresh checkout, and admins were already granted above.
-    if ((isRazorpay || isStripe) && targetTier !== 'ultra') {
+    if ((isRazorpay || isStripe) && !isRecurringTier(targetTier)) {
       return res.status(400).json({
         error: `${targetTier.toUpperCase()} is a one-time interview pass now, not a subscription plan — so there's nothing to swap in place. Cancel your current subscription first (you keep access until the end of the billing cycle), then buy the ${targetTier.toUpperCase()} pass from the plans screen.`,
         suggested_action: 'cancel-subscription',
@@ -774,10 +846,7 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
     status: 'active',
     expires_at: grant.expires_at,
     sessions_limit: grant.sessions_limit,
-    ...(grant.tier === 'ultra' ? {
-      credits_remaining_seconds: grant.credits_remaining_seconds,
-      credits_expire_at: grant.credits_expire_at,
-    } : {}),
+    ...creditsForPlanChange(grant),
   });
   const license = db.getLicenseByUserId(user.id);
 
@@ -881,9 +950,9 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
   // will reconcile the next billing cycle. For downgrades we keep the
   // current tier in DB — webhook will downgrade when the new cycle starts.
   if (isUpgrade) {
-    // Same ultra-only credits rule as the Stripe upgrade path: seed the -1
-    // unlimited sentinel for Ultra; never clobber a legacy Pro/Max sub's
-    // migration-era unlimited balance with the one-time-tier config.
+    // Same rule as the Stripe upgrade path (creditsForPlanChange): seed the
+    // target plan's allowance for a recurring tier; never clobber a legacy
+    // Pro/Max sub's migration-era unlimited balance with the one-time config.
     const grant = grantConfigForTier(targetTier);
     db.updateUserTier(user.id, grant.tier);
     db.updateLicenseOnPayment(user.id, {
@@ -891,10 +960,7 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
       status: 'active',
       expires_at: grant.expires_at,
       sessions_limit: grant.sessions_limit,
-      ...(grant.tier === 'ultra' ? {
-        credits_remaining_seconds: grant.credits_remaining_seconds,
-        credits_expire_at: grant.credits_expire_at,
-      } : {}),
+      ...creditsForPlanChange(grant),
     });
   }
   const license = db.getLicenseByUserId(user.id);
@@ -1023,17 +1089,31 @@ function recentOffSessionExtension(userId, packId, windowMs = EXTEND_DEDUP_WINDO
 router.post('/create-renewal', authMiddleware, async (req, res) => {
   try {
     // ── Tier gate ──
-    // Top-ups are for the METERED tiers only (Basic/Pro/Max):
+    // Top-ups are for the METERED tiers only (Basic/Pro/Max, and Ultra since
+    // 2026-08 — a 9-hour monthly allowance can run dry mid-interview, and the
+    // whole point of a top-up is that it is the thing you buy when it does):
     //   • Free user → rejected (a top-up would silently bump them to a
     //     partial Basic grant — confusing for someone comparing plans)
-    //   • Ultra → unlimited, nothing to top up (also caught by the
+    //   • Enterprise → unlimited, nothing to top up (also caught by the
     //     unlimited no-op in grantTimeExtension as defense-in-depth)
-    // We allow ANY basic/pro/max license through (active, expired,
-    // exhausted) because the explicit user intent is "I want more time."
+    //   • Anyone carrying the -1 unlimited sentinel (admin comp, legacy sub)
+    //     → same: refuse rather than charge for time they already have.
+    // We allow ANY metered license through (active, expired, exhausted)
+    // because the explicit user intent is "I want more time."
+    // ORDER MATTERS. The unlimited check runs FIRST because an Enterprise
+    // customer is not on a metered tier either, and answering them with
+    // "pick a plan to start" tells the person on the most expensive plan we
+    // sell that they do not have one. Both are refusals; only one of them is
+    // true for them.
     const license = db.getLicenseByUserId(req.user.id);
-    if (!license || !['basic', 'pro', 'max'].includes(license.tier)) {
+    if (license && db.resolveTimeBucket(license).source === 'unlimited') {
       return res.status(400).json({
-        error: 'Top-ups extend the Basic, Pro, and Max interview passes. Buy a pass to start.',
+        error: 'Your plan already includes unlimited interview time — there is nothing to top up.',
+      });
+    }
+    if (!license || !METERED_TIERS.includes(license.tier)) {
+      return res.status(400).json({
+        error: 'Top-ups extend the Basic, Pro, Max, and Ultra interview clocks. Pick a plan to start.',
       });
     }
     // ── Interview-day gate — the SAME rule /extend-now applies ──
@@ -1108,15 +1188,18 @@ router.post('/extend-now', authMiddleware, async (req, res) => {
       return res.json({ success: true, already_unlimited: true, message: 'Admin accounts have unlimited time.' });
     }
 
+    // Same ordering rule as /create-renewal: answer "you already have
+    // unlimited time" before "you have no plan", or Enterprise (and any
+    // admin-comped account) gets told it has no plan.
     const license = db.getLicenseByUserId(req.user.id);
-    if (!license || !['basic', 'pro', 'max'].includes(license.tier)) {
+    if (license && db.resolveTimeBucket(license).source === 'unlimited') {
+      return res.json({ success: true, already_unlimited: true });
+    }
+    if (!license || !METERED_TIERS.includes(license.tier)) {
       return res.status(400).json({
         error: 'no_pass',
-        message: 'Top-ups extend the Basic, Pro, and Max interview passes. Buy a pass to start.',
+        message: 'Top-ups extend the Basic, Pro, Max, and Ultra interview clocks. Pick a plan to start.',
       });
-    }
-    if (db.resolveTimeBucket(license).source === 'unlimited') {
-      return res.json({ success: true, already_unlimited: true });
     }
 
     // ── Interview-day gate — shared with /create-renewal ──
@@ -1329,6 +1412,12 @@ const STRIPE_PRICE_ENV = {
   // Ultra upgrade, which then degrades to a fresh Checkout Session. See
   // resolveStripeSubscriptionPrice.
   ultra: 'STRIPE_PRICE_ULTRA_USD',
+  // Enterprise is recurring too, and carries the same in-place-swap caveat
+  // as Ultra: a subscription item can only point at a REAL Price, so an
+  // Ultra→Enterprise upgrade needs STRIPE_PRICE_ENTERPRISE_USD set to do
+  // the prorated swap. Unset is safe — Checkout falls back to the inline
+  // price_data default below and the upgrade degrades to a fresh Session.
+  enterprise: 'STRIPE_PRICE_ENTERPRISE_USD',
 };
 
 // Inline-Price defaults — used when the per-tier STRIPE_PRICE_*_USD env
@@ -1374,9 +1463,18 @@ const STRIPE_PRICE_DATA = {
     currency: 'usd',
     product_data: {
       name: 'minicaai Ultra',
-      description: 'Unlimited interviews · all models · Auto-Type · Train Model',
+      description: '9 hours of interview time per month · all models · Auto-Type · Train Model',
     },
     unit_amount: 15900,
+    recurring: { interval: 'month' },
+  },
+  enterprise: {
+    currency: 'usd',
+    product_data: {
+      name: 'minicaai Enterprise',
+      description: 'Unlimited interview time · every model · Auto-Type for coding rounds · Train Model',
+    },
+    unit_amount: 119900,
     recurring: { interval: 'month' },
   },
 };
@@ -1486,9 +1584,10 @@ async function createStripeCheckout(req, res, tier) {
   }
 
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3005';
-  // 2026-07 pricing: Basic/Pro/Max are ONE-TIME interview purchases; only Ultra
-  // is a recurring subscription with provider-managed lifecycle.
-  const mode = tier === 'ultra' ? 'subscription' : 'payment';
+  // 2026-07 pricing, extended 2026-08: Basic/Pro/Max are ONE-TIME interview
+  // purchases; Ultra and Enterprise are recurring subscriptions with
+  // provider-managed lifecycle.
+  const mode = isRecurringTier(tier) ? 'subscription' : 'payment';
 
   // Reuse the existing Stripe customer when we have one. Stripe creates a
   // brand-new cus_* if you pass `customer_email` instead of `customer`,
@@ -1612,16 +1711,22 @@ const RAZORPAY_TIER_CONFIG = {
     description: 'Three 1-hour interviews · all 5 models incl. Claude Sonnet 5',
   },
   ultra: {
-    amountPaise: 1299900, // ₹12999/month · unlimited + Auto-Type
+    amountPaise: 1299900, // ₹12999/month · 9 hours of interview time + Auto-Type
     name: 'minicaai Ultra',
-    description: 'Unlimited interviews · all models · Auto-Type · Train Model',
+    description: '9 hours of interview time per month · all models · Auto-Type · Train Model',
+  },
+  enterprise: {
+    amountPaise: 9999900, // ₹99999/month · unlimited, never expires
+    name: 'minicaai Enterprise',
+    description: 'Unlimited interview time · every model · Auto-Type for coding rounds · Train Model',
   },
 };
-// Plan-ID env per tier. Only Ultra recurs in the 2026-07 model. Legacy Pro/Max
-// plan envs are still recognized so any historical subscriptions keep resolving,
-// but new Pro/Max checkouts are one-time orders (no plan needed).
+// Plan-ID env per tier. Ultra and Enterprise recur; legacy Pro/Max plan envs
+// are still recognized so any historical subscriptions keep resolving, but new
+// Pro/Max checkouts are one-time orders (no plan needed).
 const RAZORPAY_PLAN_ENV = {
   ultra: 'RAZORPAY_PLAN_ID_ULTRA',
+  enterprise: 'RAZORPAY_PLAN_ID_ENTERPRISE',
   pro: 'RAZORPAY_PLAN_ID_PRO',
   max: 'RAZORPAY_PLAN_ID_MAX',
 };
@@ -1636,17 +1741,18 @@ async function createRazorpayCheckout(req, res, tier) {
     return res.status(400).json({ error: `Unknown tier: ${tier}` });
   }
 
-  // 2026-07 model: ONLY Ultra is a recurring subscription. Basic/Pro/Max are
+  // Ultra and Enterprise are the recurring subscriptions. Basic/Pro/Max are
   // one-time interview orders (they fall through to razorpay.orders.create below).
-  if (tier === 'ultra') {
-    const planId = process.env[RAZORPAY_PLAN_ENV.ultra];
+  if (isRecurringTier(tier)) {
+    const planId = process.env[RAZORPAY_PLAN_ENV[tier]];
     if (!planId) {
-      // No recurring Ultra plan configured for India yet. Refuse rather than
-      // sell Ultra as a one-time order — the webhook grants Ultra as
-      // unlimited-forever (expires_at:-1), so a single ₹12,999 charge that
-      // never recurs would hand out permanent unlimited access.
+      // No recurring plan configured for India yet. Refuse rather than sell a
+      // subscription tier as a one-time order — the webhook grants these with
+      // expires_at:-1 (no end date), so a single charge that never recurs
+      // would hand out permanent access for one month of money.
+      const planLabel = tier === 'enterprise' ? 'Enterprise' : 'Ultra';
       return res.status(503).json({
-        error: 'Ultra isn\'t available as a subscription in your region yet. Please choose Basic, Pro, or Max, or contact support.',
+        error: `${planLabel} isn't available as a subscription in your region yet. Please choose Basic, Pro, or Max, or contact support.`,
       });
     }
 
@@ -2418,7 +2524,7 @@ router.post('/verify-stripe', authMiddleware, async (req, res) => {
 // rowid is monotonic per insert, so it expresses the "which came second"
 // that the timestamp cannot.
 function isSubscriptionBackedTier(userId, tier) {
-  if (tier === 'ultra') return true;
+  if (isRecurringTier(tier)) return true;
   if (tier !== 'pro' && tier !== 'max') return false;
   const row = db.getDB().prepare(`
     SELECT provider_subscription_id FROM payments
@@ -2458,9 +2564,19 @@ router.get('/subscription', authMiddleware, async (req, res) => {
     // instead of the user clicking a paid CTA into a 403. One source of
     // truth: this reads interviewDayDenial, so the affordance can never
     // disagree with the gate.
-    const isMeteredPass = ['basic', 'pro', 'max'].includes(license.tier);
+    // "Metered" is a property of the LICENSE, not a hardcoded tier list. The
+    // list used to be ['basic','pro','max'] because those were the only tiers
+    // with a clock; since 2026-08 Ultra has one too, and a hardcoded list left
+    // a metered Ultra with can_extend:false — the Billing Hub hiding the very
+    // button whose route now accepts them, which is the same
+    // affordance-disagrees-with-the-gate bug the comment above describes, just
+    // pointing the other way. Unlimited licenses (Enterprise, admin comps,
+    // grandfathered legacy subs) resolve to 'unlimited' and correctly get no
+    // control: there is nothing to add to.
+    const isMetered = METERED_TIERS.includes(license.tier)
+      && db.resolveTimeBucket(license).source === 'credits';
     const isAdmin = isAdminEmail(req.user.email);
-    const extendDenial = (isMeteredPass && !isAdmin) ? interviewDayDenial(user.id) : null;
+    const extendDenial = (isMetered && !isAdmin) ? interviewDayDenial(user.id) : null;
 
     res.json({
       status: license.status,
@@ -2471,13 +2587,14 @@ router.get('/subscription', authMiddleware, async (req, res) => {
       sessions_limit: license.sessions_limit,
       cancel_at_period_end: isCancelPending,
       cancels_at: isCancelPending ? license.expires_at : null,
-      // Whether the current tier is a recurring subscription (Ultra, or a
-      // legacy Pro/Max sub) vs a one-time pass — see isSubscriptionBackedTier.
+      // Whether the current tier is a recurring subscription (Ultra,
+      // Enterprise, or a legacy Pro/Max sub) vs a one-time pass — see
+      // isSubscriptionBackedTier.
       is_recurring: isSubscriptionBackedTier(user.id, license.tier),
-      // Top-up affordance state. can_extend is false only for a metered
-      // pass outside its interview day; Ultra/free simply don't show the
-      // control, and admins are unlimited.
-      can_extend: isMeteredPass ? !extendDenial : false,
+      // Top-up affordance state. can_extend is false for a metered plan
+      // outside its interview day; free and the unlimited plans simply don't
+      // show the control, and admins are unlimited.
+      can_extend: isMetered ? !extendDenial : false,
       extend_blocked_reason: extendDenial ? extendDenial.body.error : null,
       extend_blocked_message: extendDenial ? extendDenial.body.message : null,
     });
@@ -2597,19 +2714,18 @@ router.post('/reactivate-subscription', authMiddleware, async (req, res) => {
       const safeTier = (t) => VALID_TIERS.includes(t) ? t : null;
       const tier = safeTier(candidate.metadata?.tier) || safeTier(db.getLicenseByUserId(user.id)?.tier);
       if (tier) {
-        // Ultra-only credits, same rule as the upgrade paths: re-affirm the
-        // -1 unlimited sentinel for Ultra; leave a legacy Pro/Max sub's
-        // balance untouched (reactivation isn't a fresh purchase).
+        // Re-affirm only (creditsForReaffirm): reactivation isn't a fresh
+        // purchase — it un-sets cancel_at_period_end inside a cycle the user
+        // already paid for. Enterprise's constant -1 is safe to rewrite;
+        // Ultra's metered balance and a legacy Pro/Max sub's migration-era
+        // unlimited balance are both left exactly as they are.
         const grant = grantConfigForTier(tier);
         db.updateLicenseOnPayment(user.id, {
           tier: grant.tier,
           status: 'active',
           expires_at: grant.expires_at,
           sessions_limit: grant.sessions_limit,
-          ...(grant.tier === 'ultra' ? {
-            credits_remaining_seconds: grant.credits_remaining_seconds,
-            credits_expire_at: grant.credits_expire_at,
-          } : {}),
+          ...creditsForReaffirm(grant),
         });
       }
       // Audit trail
@@ -3058,6 +3174,11 @@ module.exports._test = {
   getPaymentProvider,
   isTierUpgrade,
   TIER_RANK,
+  RECURRING_TIERS,
+  isRecurringTier,
+  METERED_TIERS,
+  creditsForPlanChange,
+  creditsForReaffirm,
   grantConfigForTier,
   // Subscription-vs-pass detection (/subscription is_recurring)
   isSubscriptionBackedTier,

@@ -221,7 +221,19 @@ const METRICS_PER_FILE = 60;
 // Capitalised runs — organisations, products, tools. Allows the internal
 // lowercase joiners a real name uses ("Nizam's Institute of Medical
 // Sciences", "Amazon Web Services").
-const PROPER_RUN = /\b[A-Z][A-Za-z0-9&.+#'’-]*(?:\s+(?:of|the|and|&|for)\s+[A-Z][A-Za-z0-9&.+#'’-]*|\s+[A-Z][A-Za-z0-9&.+#'’-]*){0,4}\b/g;
+// ⚠️ Mirror of the server's groundingGuard.js — the parity test pins them.
+// The class must reach past ASCII: measured live, a CORRECT cover naming
+// "Bausch+Ströbel" was rejected as `invented=[Bausch+Str]` because the run
+// stopped at the "ö". Latin-1 Supplement + Latin Extended-A/B covers the
+// European vendor names this domain is full of.
+const NAME_CHAR = "A-Za-z0-9\\u00C0-\\u024F&.+#'’-";
+const NAME_HEAD = 'A-Z\\u00C0-\\u00DE';
+const PROPER_RUN = new RegExp(
+  `\\b[${NAME_HEAD}][${NAME_CHAR}]*`
+  + `(?:\\s+(?:of|the|and|&|for)\\s+[${NAME_HEAD}][${NAME_CHAR}]*`
+  + `|\\s+[${NAME_HEAD}][${NAME_CHAR}]*){0,4}\\b`,
+  'g',
+);
 
 // Words that are capitalised because a sentence started, or because English
 // capitalises them — never because they name an organisation. Kept small on
@@ -330,6 +342,40 @@ const SENTENCE_OPENERS = new Set([
   'complete', 'partial', 'fast', 'slow', 'cheap', 'accurate',
   'atomic', 'idempotent', 'transactional', 'eventual', 'immediate',
   'duplicate', 'duplicates', 'sequential', 'parallel', 'linear',
+  // Siblings of words already on this list, plus the two the live corpus
+  // run actually caught. earlier and lately were here while early and late
+  // were not, so a judgement opening on the plain adjective was reported as
+  // an invented company. human earns its place through the compound rule
+  // below: it is the head of human-in-the-loop, which a real cover about
+  // agent design opens with and which was discarded as an employer.
+  'early', 'late', 'please', 'human',
+  // ── THE CLOSED CLASS, COMPLETED ONCE INSTEAD OF ONE WORD AT A TIME ──
+  //
+  // This list has now failed FIVE separate times on the same grammatical
+  // class: Additionally (2026-08-06) -> Success -> Early/Late/Please ->
+  // Thus (2026-08-17, a correct no-KB cover rejected as an invented
+  // company). Each fix added the one word that bit, which is why it kept
+  // recurring: a denylist-by-omission is only ever as complete as its
+  // last failure.
+  //
+  // The escapees are not random words — they are DISCOURSE CONNECTIVES
+  // and judgement openers, a closed grammatical class. Unlike nouns (the
+  // open class, where the fabrication risk lives: Apple, Oracle, Fidelity)
+  // connectives are finite and enumerable, so the right fix is to finish
+  // the class in one deliberate pass. Morphology already covers the -ly
+  // shapes (accordingly, namely, firstly); these are the suffix-less ones
+  // it cannot reach. None is a company name, which is the admission test —
+  // see the '-ity'/Fidelity note above for the precedent.
+  'thus', 'hence', 'indeed', 'yet', 'only', 'further',
+  'thereby', 'therein', 'thereafter', 'hereby', 'herein', 'henceforth',
+  'whereby', 'wherein', 'albeit', 'whilst', 'nonetheless', 'nevertheless',
+  'elsewhere', 'altogether', 'together', 'aside', 'apart', 'somehow',
+  'somewhat', 'quite', 'twice', 'worse', 'worst',
+  // Judgement adjectives with no suffix for morphology to read, sitting in
+  // the same block as 'strict'/'real'/'wrong' above and added by the same
+  // rule: words a technical verdict genuinely opens with.
+  'critical', 'common', 'likely', 'unlikely', 'possible', 'impossible',
+  'necessary', 'zero', 'single', 'double',
 ]);
 
 function tokenize(s: string): string[] {
@@ -371,8 +417,67 @@ function isHeadingDebris(token: string): boolean {
   return HEAD_WORDS.some((h) => h !== t && h.endsWith(t));
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  "Role:" IS A LABEL, NOT PART OF THE VALUE
+//
+//  Documents label their fields inline: "Role: Jr Telecom Core Engineer |
+//  Client: NTT Global Data Centers Americas". The label rode into the value
+//  and the app SPOKE it, twice in one run — "Role: Jr Telecom Core Engineer
+//  / Network Infrastructure Engineer at NTT".
+//
+//  The previous fix listed the label WORDS (client, role, company, title…)
+//  and so cleaned the org field while leaving the role field broken — a
+//  list that has to be extended for every new document convention. The
+//  shape is the signal instead: a short run of words followed by a colon,
+//  at the very start of a field, is a label in any vocabulary and any
+//  Latin-script language.
+//
+//  Bounded deliberately. 24 characters is about three words, which is
+//  every field label a document actually uses; longer than that and a
+//  colon is punctuation inside a real value ("Snowflake: the migration"),
+//  which must survive.
+function stripFieldLabel(s: string): string {
+  const m = /^([A-Za-z][A-Za-z/ ]{0,20}):\s*/.exec(s);
+  if (!m) return s;
+  // A label is a short noun, one or two words. Anything longer is prose
+  // that happens to contain a colon, and stripping it eats real content:
+  // "Microsoft Certified: Azure Data Engineer Associate | Microsoft" lost
+  // its first half at a 24-character bound, and the ledger then read
+  // Microsoft as an EMPLOYER - the exact fabrication a regression test in
+  // this repo already exists to prevent.
+  const label = m[1].trim();
+  if (label.length > 14 || label.split(/\s+/).length > 2) return s;
+  return s.slice(m[0].length);
+}
+
+// ── THE BODY MUST NOT REPEAT THE ROLE LINE ──
+//
+// When a document puts the company and the role on SEPARATE lines —
+// "Client: NTT Global Data Centers Americas" then "Role: Jr Telecom Core
+// Engineer / Network Infrastructure Engineer" — the header match ends at
+// the company, so the role line falls inside the body and the fact comes
+// out as "<role> — Role: <role> Responsibilities: …".
+//
+// Verified in the running app on 2026-08-20, and not cosmetic:
+// instantOpener searches the body for a tool the question also mentions,
+// so a word duplicated out of the TITLE became speakable as a tool.
+//
+// TWO layers build an employer body and both had it. One helper, so a
+// third cannot drift away from them.
+function bodyWithoutRole(rawBody: string, role: string): string {
+  const r = String(role || '').trim();
+  if (!r) return rawBody;
+  const stripped = stripFieldLabel(rawBody).replace(
+    new RegExp('^' + r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[\\s:.,;\u2013\u2014-]*', 'i'),
+    '',
+  ).trim();
+  // Never return empty: a body that WAS only the role line is better
+  // represented by the role than by nothing.
+  return stripped || rawBody;
+}
+
 function cleanRole(role: string): string {
-  let s = role.replace(/\s+/g, ' ').trim();
+  let s = stripFieldLabel(role.replace(/\s+/g, ' ').trim());
   const head = new RegExp(SECTION_HEAD_SRC + '\\s*', 'g');
   let m: RegExpExecArray | null;
   let cut = 0;
@@ -392,7 +497,22 @@ function cleanRole(role: string): string {
 function orgOf(companyField: string): string {
   const s = companyField.replace(/\s+/g, ' ').trim();
   const comma = s.indexOf(',');
-  return (comma === -1 ? s : s.slice(0, comma)).trim();
+  return normaliseOrg(comma === -1 ? s : s.slice(0, comma));
+}
+
+/**
+ * The name as it should be SPOKEN.
+ *
+ * orgLooking already ran cleanOrgCandidate to decide whether a span was a
+ * name, but the value that reached the ledger was the RAW span — so a
+ * candidate could be validated in one form and stored in another. That gap
+ * is how "Client: NTT Global Data Centers Americas" passed the check as a
+ * name and was still spoken with its field label attached. Every place that
+ * assigns an org goes through this, so the string that is judged and the
+ * string that is said are the same string.
+ */
+function normaliseOrg(s: string): string {
+  return cleanOrgCandidate(String(s || '').replace(/[|•●]/g, ' '));
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -444,6 +564,112 @@ const ROLE_WORDS = /\b(engineer|engineering|developer|dev|manager|analyst|scient
 // Words that make a string an ORGANISATION even when nothing else does.
 const ORG_SUFFIX = /\b(inc|llc|l\.l\.c|ltd|limited|corp|corporation|co|company|technologies|technology|tech|solutions|systems|group|holdings|hospital|hospitals|university|college|institute|academy|school|labs?|laboratories|pharma|pharmaceuticals?|biotech|bank|health|healthcare|services|consulting|consultancy|software|industries|gmbh|pvt|plc|ag|nv|bv|partners|associates|ventures|capital|foundation|clinic|medical|networks?|international|enterprises?|studios?|agency|motors|energy|logistics)\b/i;
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  A RESUME BULLET STARTS WITH A VERB. A COMPANY DOES NOT.
+//
+//  This is the discriminator orgLooking was missing, and the reason the
+//  capitalisation heuristic could never find it: a bullet opens with a
+//  capitalised action verb and is full of capitalised product names, so it
+//  scores BETTER than a real employer.
+//
+//    "Pioneered AWS Lambda automation"     3 of 4 words capitalised = 75%
+//    "Engineered real-time ETL pipelines"  2 of 4                   = 50%
+//
+//  Both cleared the 50% floor. Measured on real resumes in other people's
+//  templates, where a newline-less PDF puts the previous bullet inside the
+//  date-anchor window, the app would have said out loud:
+//
+//    "It's been Pioneered AWS Lambda automation, Engineered Python/SQL
+//     automation and Digitized records with MongoDB."
+//
+//  That is a candidate naming three bullet points as their employers.
+//
+//  ⚠️ THE ESCAPE HATCH IS ORG_SUFFIX, AND IT IS LOAD-BEARING. Real
+//  companies do start with these words — Applied Materials, United
+//  Airlines, Consolidated Edison, Integrated Device Technology. Any
+//  candidate carrying a corporate suffix is let through, which covers most
+//  of them. The rest are rejected, and that is the RIGHT direction to be
+//  wrong in: a missed employer means the opener defers and the candidate
+//  hears silence, while a bullet read as an employer is spoken aloud with
+//  confidence. Losing "Consolidated Edison" costs a moment; saying
+//  "I worked at Digitized records with MongoDB" costs the interview.
+//
+//  Deliberately EXCLUDED from this list even though they are past-tense
+//  verbs, because they head real company names far more often than they
+//  head resume bullets: advanced, allied, associated, general, standard.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const RESUME_ACTION_VERB = new Set([
+  'accelerated', 'achieved', 'administered', 'advised', 'analysed', 'analyzed',
+  'architected', 'assembled', 'audited', 'authored', 'automated', 'boosted',
+  'built', 'championed', 'collaborated', 'conducted', 'configured', 'consolidated',
+  'constructed', 'coordinated', 'crafted', 'created', 'curated', 'cut',
+  'decreased', 'defined', 'delivered', 'deployed', 'designed', 'developed',
+  'devised', 'diagnosed', 'digitised', 'digitized', 'directed', 'drafted',
+  'drove', 'eliminated', 'empowered', 'enabled', 'enforced', 'engineered',
+  'enhanced', 'ensured', 'established', 'evaluated', 'executed', 'expanded',
+  'expedited', 'facilitated', 'formulated', 'fostered', 'generated', 'grew',
+  'guided', 'halved', 'handled', 'hardened', 'headed', 'identified',
+  'implemented', 'improved', 'increased', 'initiated', 'innovated', 'installed',
+  'instituted', 'instrumented', 'integrated', 'introduced', 'launched', 'led',
+  'leveraged', 'maintained', 'managed', 'mapped', 'masterminded', 'mentored',
+  'migrated', 'modelled', 'modeled', 'modernised', 'modernized', 'monitored',
+  'negotiated', 'normalised', 'normalized', 'operationalised', 'operationalized',
+  'optimised', 'optimized', 'orchestrated', 'organised', 'organized',
+  'overhauled', 'oversaw', 'owned', 'partitioned', 'partnered', 'performed',
+  'piloted', 'pioneered', 'planned', 'prepared', 'presented', 'prioritised',
+  'prioritized', 'produced', 'programmed', 'provided', 'provisioned',
+  'published', 'rearchitected', 'rebuilt', 'reduced', 'refactored', 'refined',
+  'researched', 'resolved', 'restructured', 'revamped', 'reviewed',
+  'revolutionised', 'revolutionized', 'rewrote', 'saved', 'scaled', 'scoped',
+  'secured', 'shaped', 'shipped', 'simplified', 'slashed', 'solved', 'sourced',
+  'spearheaded', 'sped', 'standardised', 'standardized', 'streamlined',
+  'strengthened', 'supervised', 'supported', 'surveyed', 'sustained',
+  'synthesised', 'synthesized', 'tested', 'tracked', 'trailblazed', 'trained',
+  'transformed', 'transitioned', 'translated', 'trimmed', 'troubleshot',
+  'tuned', 'unified', 'unleashed', 'upgraded', 'utilised', 'utilized',
+  'validated', 'verified', 'wrote',
+]);
+
+// Only the markers that cannot occur by accident inside a sentence about
+// work. Deliberately NOT ORG_SUFFIX, which includes domain words (health,
+// medical, services, solutions, technologies) that ordinary achievement
+// prose is full of — see the note where this is used.
+const STRONG_ORG_SUFFIX = /\b(inc|llc|l\.l\.c|ltd|limited|corp|corporation|gmbh|pvt|plc|ag|nv|bv|pte|sarl|s\.a)\b\.?/i;
+
+// ⚠️ A SECTION-POSITION RULE WAS TRIED HERE AND REVERTED — 2026-08-17.
+//
+// The idea: a certification line is indistinguishable from an employment
+// line (name, issuer, date), so reject any dated org sitting under a
+// CERTIFICATIONS or EDUCATION heading. It removed the one wrong fact it was
+// aimed at ("Tableau" as an employer) and it also removed THREE REAL
+// EMPLOYERS from another resume — Jasper Therapeutics, Evonik and MSN
+// Pharmaceuticals all vanished.
+//
+// The cause is the thing that makes it unfixable cheaply: SECTION_HEAD_SRC
+// is matched case-SENSITIVELY on purpose (see its own note — lowercasing it
+// matches "experience" inside ordinary prose and invents boundaries
+// everywhere). So the rule SEES an uppercase SKILLS heading and MISSES the
+// Title Case "Professional Experience" that follows it, and every job under
+// that heading is attributed to the wrong section.
+//
+// Net trade: it prevented a wrong fact that is never spoken (the employer
+// list caps at four, and "Tableau" was fifth) at the cost of silently
+// deleting real jobs that ARE spoken. Wrong direction. If this is
+// revisited, the prerequisite is heading detection that survives Title
+// Case without matching prose — not another predicate on top of this one.
+
+// Resume section headings, lowercased, for an exact-match reject. Built
+// from SECTION_HEAD_SRC plus the title-case ones it does not carry —
+// "Soft Skills" was extracted as an employer from a real resume.
+const HEADING_WORDS = new Set([
+  ...SECTION_HEAD_SRC.replace(/^\(\?:/, '').replace(/\)$/, '').split('|')
+    .map((h) => h.replace(/\?/g, '').toLowerCase().trim()),
+  'soft skills', 'hard skills', 'other skills', 'additional skills',
+  'skills summary', 'technical skill', 'tools', 'technologies', 'languages',
+  'interests', 'activities', 'references', 'contact', 'work history',
+  'career history', 'employment', 'volunteer experience', 'extracurricular',
+]);
+
 /** Does this read like a job title? */
 function roleLooking(s: string): boolean {
   const t = s.replace(/\s+/g, ' ').trim();
@@ -471,9 +697,47 @@ const DANGLING = new Set([
 function cleanOrgCandidate(s: string): string {
   let t = s.replace(/\s+/g, ' ').trim();
   t = t.replace(/^(?:\d+[.)]|[-•●*#>]+)\s*/, '');   // "4. " / "- " / "## "
+  // ── THE LABEL IS NOT PART OF THE NAME ──
+  //
+  // Contractor and consultancy resumes label their fields inline:
+  //   "Role: Jr Telecom Core Engineer | Client: NTT Global Data Centers"
+  // The label rode along into the org, and the opener said it out loud:
+  //   "It's been Client: NTT Global Data Centers Americas and Client:
+  //    Sify Technologies Ltd - Hyderabad Data Center."
+  // Measured on a real resume. Stripping the label leaves the real name,
+  // which is what the field was always announcing.
+  // Structural, not a vocabulary — see stripFieldLabel. The word list this
+  // replaced cleaned the ORG field and left the ROLE field leaking "Role:".
+  t = stripFieldLabel(t);
   t = t.replace(/[*_`~]/g, '');                      // markdown emphasis
   t = t.replace(/\s*\(.*$/, '');                     // an opened bracket onward
-  t = t.replace(/[\s(,;:.|–—-]+$/, '');              // trailing punctuation
+  // ── A SPACED DASH IS A SEPARATOR, NOT PART OF THE NAME ──
+  //
+  // Resumes hang extra detail off the employer with a dash: a supervisor,
+  // a site, a department. Measured live, the opener said "It's been Indiana
+  // University - Dr. Gary Schwebach, CodeAcuity Inc and ..." — a candidate
+  // naming their PI as though it were the institution, and "Sify
+  // Technologies Ltd - Hyderabad Data Center" for the same reason.
+  //
+  // ⚠️ THE SPACES ARE THE WHOLE TEST. Hewlett-Packard, Mercedes-Benz and
+  // Rolls-Royce hyphenate WITHOUT surrounding spaces; a separator is
+  // written with them. Cutting on a bare hyphen would truncate real names.
+  t = t.replace(/\s+[-–—]\s+.*$/, '');
+  // ── A MIDDOT IS A SEPARATOR TOO, AND MARKDOWN IS FULL OF THEM ──
+  //
+  // Same rule, different character. A prep document written in Markdown
+  // separates fields with "·": "Evonik AL · Jul 2023–now · CQV Lead".
+  // Measured live 2026-08-20 on a real upload, the ledger produced
+  // "Evonik AL ·", "Cook MyoSite PA ·", "MSN NJ ·" and "ScieGen NY ·" —
+  // and the app SPOKE them: "Mostly Evonik AL ·, Cook MyoSite PA ·, MSN
+  // NJ · and ScieGen NY ·." The dot is read aloud as part of the company's
+  // name.
+  //
+  // Bullet glyphs get the same treatment for the same reason. The trailing
+  // punctuation strip below cannot do this job — it only reaches the END of
+  // the string, and here the separator is followed by the rest of the line.
+  t = t.replace(/\s*[·•‣▪]\s*.*$/, '');
+  t = t.replace(/[\s(,;:.|·•–—-]+$/, '');            // trailing punctuation
   return t.trim();
 }
 
@@ -506,6 +770,34 @@ function orgLooking(s: string): boolean {
   // two-letter state after the comma — which is most of them.
   const last = words[words.length - 1];
   if (last === last.toLowerCase() && DANGLING.has(last)) return false;
+  // A METRIC IS NEVER PART OF A COMPANY NAME. The date-anchor window can
+  // end mid-achievement — "slashing workload by 30%" — and a percentage is
+  // the one token that says "this is a claim about work, not a letterhead".
+  if (/%/.test(t)) return false;
+
+  // ── A SECTION HEADING IS NOT AN EMPLOYER ──
+  // SECTION_HEAD_SRC is matched case-SENSITIVELY elsewhere (deliberately —
+  // see its note), so a title-case heading slips past it. "Soft Skills" was
+  // extracted as a company and would have been spoken: "It's been Soft
+  // Skills and ...". An exact match against a heading is unambiguous;
+  // no company is called "Soft Skills".
+  if (HEADING_WORDS.has(t.toLowerCase().replace(/[^a-z ]/g, '').trim())) return false;
+
+  // ── A BULLET OPENS WITH AN ACTION VERB; A COMPANY DOES NOT ──
+  //
+  // ⚠️ THIS RUNS BEFORE THE SUFFIX ESCAPE, AND THE ESCAPE IS NARROWER THAN
+  // ORG_SUFFIX. ORG_SUFFIX includes domain words — health, medical,
+  // technologies, solutions, services — which appear all over ordinary
+  // achievement prose. "Managed structured and unstructured healthcare
+  // datasets" matched it on "healthcare", returned true before the verb
+  // was ever considered, and would have been spoken as an employer.
+  //
+  // So the escape here is only a STRUCTURAL corporate marker: Inc, Ltd,
+  // LLC, GmbH. Those never occur by accident in a sentence about work, and
+  // they are what "Managed Care Solutions Inc" has and a bullet does not.
+  const head = words[0].replace(/[^A-Za-z]/g, '').toLowerCase();
+  if (RESUME_ACTION_VERB.has(head) && !STRONG_ORG_SUFFIX.test(t)) return false;
+
   if (ORG_SUFFIX.test(t)) return true;
   // Half the words capitalised is the floor: "Apollo Hospitals" and
   // "Piramal, PA" pass; "Supported troubleshooting of filling equipment"
@@ -526,8 +818,8 @@ function splitRoleOrg(field: string): { role: string; org: string } | null {
     const left = t.slice(0, m.index).trim();
     const right = t.slice(m.index + m[0].length).trim();
     if (!left || !right) continue;
-    if (roleLooking(left) && orgLooking(right) && !roleLooking(right)) return { role: left, org: right };
-    if (roleLooking(right) && orgLooking(left) && !roleLooking(left)) return { role: right, org: left };
+    if (roleLooking(left) && orgLooking(right) && !roleLooking(right)) return { role: left, org: normaliseOrg(right) };
+    if (roleLooking(right) && orgLooking(left) && !roleLooking(left)) return { role: right, org: normaliseOrg(left) };
   }
   return null;
 }
@@ -604,13 +896,13 @@ function readDatedRoles(text: string, covered: Array<[number, number]>): DatedRo
       const pair = splitRoleOrg(before[i]);
       if (pair) { role = role || pair.role; org = org || pair.org; continue; }
       if (!role && roleLooking(before[i])) { role = before[i]; continue; }
-      if (!org && orgLooking(before[i])) org = before[i];
+      if (!org && orgLooking(before[i])) org = normaliseOrg(before[i]);
     }
     for (let i = 0; i < after.length && (!org || !role); i++) {
       const pair = splitRoleOrg(after[i]);
       if (pair) { role = role || pair.role; org = org || pair.org; continue; }
       if (!role && roleLooking(after[i])) { role = after[i]; continue; }
-      if (!org && orgLooking(after[i])) org = after[i];
+      if (!org && orgLooking(after[i])) org = normaliseOrg(after[i]);
     }
 
     // 2. The neighbouring lines. A resume that puts "Company / dates" on one
@@ -626,7 +918,7 @@ function readDatedRoles(text: string, covered: Array<[number, number]>): DatedRo
       const cols = columnsOf(cand);
       for (const c of cols) {
         if (!role && roleLooking(c)) { role = c; continue; }
-        if (!org && orgLooking(c) && !roleLooking(c)) org = c;
+        if (!org && orgLooking(c) && !roleLooking(c)) org = normaliseOrg(c);
       }
     }
 
@@ -655,7 +947,15 @@ function readDatedRoles(text: string, covered: Array<[number, number]>): DatedRo
       // opening bracket behind when the date is cut out of the middle, and
       // the role is SPOKEN: "I was Data Engineer ( there" is what that
       // reaches the candidate's mouth as.
-      role: role.replace(/\s+/g, ' ').replace(/[\s([{,;:–—-]+$/, '').trim(),
+      //
+      // ⚠️ AND stripFieldLabel HAS TO BE HERE TOO. It was added to cleanRole,
+      // which is a DIFFERENT extraction path, so this one kept its label and
+      // the app kept SPEAKING it — verified live in the app on 2026-08-20:
+      //   "Role: Jr Telecom Core Engineer / Network Infrastructure Engineer
+      //    at NTT Global Data Centers Americas since 2025."
+      // Two paths produce a role and both reach the same mouth; a fix on one
+      // of them is not a fix.
+      role: stripFieldLabel(role.replace(/\s+/g, ' ')).replace(/[\s([{,;:–—-]+$/, '').trim(),
       when: m[0].replace(/\s+/g, ' ').trim(),
       from: Math.min(line.from, at),
       to: Math.max(line.to, end),
@@ -758,6 +1058,78 @@ function collectVocabulary(text: string, into: Set<string>): void {
  * Single source of truth — services/aiProxyService.ts imports this rather
  * than keeping the second copy it used to have.
  */
+/**
+ * How many "this text is a job posting" markers does `text` contain?
+ *
+ * Split out of isJobDescription so the SAME evidence can be applied at a
+ * different granularity. buildCoverSource needs it per SECTION, not per
+ * file: a candidate's own interview-prep document routinely quotes the
+ * posting it is preparing for under its own heading, and that quoted block
+ * is a job description sitting inside a file that is emphatically not one.
+ * Reading it as the candidate's history is the Halo Pharma failure — the
+ * app spoke the hiring company's own overview back to them as the
+ * candidate's career — so the rule has to reach inside the file.
+ *
+ * Exported as a COUNT rather than a boolean because the two callers need
+ * different thresholds, and because a threshold is easier to justify in the
+ * place that owns the consequence.
+ */
+// Declared BEFORE the function that reads it. A `const` referenced from a
+// function that runs during module initialisation is a TDZ crash, and this
+// module has been bitten by that ordering before.
+const JOB_POSTING_MARKERS = [
+  /company overview/, /about the (company|role|position)/, /job description/,
+  /what you'?ll do/, /responsibilities:/, /qualifications:/, /requirements:/,
+  /we are (seeking|looking for|hiring)/, /is seeking/, /the ideal candidate/,
+  /reports to:/, /employment type/, /equal opportunity employer/,
+  // Seen in the real postings in the app's database, and impossible in a
+  // resume: nobody writes their own requisition number or salary band.
+  /requisition (number|id)/, /salary range/, /work model:/, /role overview/,
+  /\bduties:/, /(minimum|preferred|basic) qualifications/, /what you'?ll bring/,
+];
+
+export function jobPostingMarkerHits(text: string): number {
+  const t = String(text || '').toLowerCase();
+  return JOB_POSTING_MARKERS.reduce((n, re) => n + (re.test(t) ? 1 : 0), 0);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  A POSTING IS SATURATED WITH THESE. A DOCUMENT THAT QUOTES ONE IS NOT.
+//
+//  This test used to read the first 3,000 characters and call two hits a
+//  job description. That is a PRESENCE test, and presence does not scale:
+//  a candidate's own prep document routinely opens by quoting the posting
+//  it is preparing for, so 2% of the file decided the fate of the other
+//  98%. Measured on a real 39,996-char upload the verdict came back TRUE
+//  and the cover model received nothing at all.
+//
+//  Density is the property that actually separates the two, and it is
+//  scale-free: no heading names, no language-specific structure, no list
+//  that grows every time someone uploads from a new industry. Measured
+//  across every real document to hand — distinct markers per 10,000 chars:
+//
+//     0.00  metrology resume         0.50  fill/finish prep doc (40K)
+//     1.79  telecom resume           6.43  real posting (4.7K)
+//    11.84  real posting (2.5K)     20.15  real posting (3.0K)
+//
+//  Every candidate document under 2, every real posting over 6. The
+//  threshold goes at 2.0 with an absolute floor of two distinct markers,
+//  leaving roughly 3x margin on both sides.
+//
+//  The absolute escape hatch covers the one case density cannot: a long
+//  posting padded with legal boilerplate. Eight DIFFERENT posting markers
+//  is a posting whatever its length.
+const JD_MARKERS_PER_10K = 2.0;
+const JD_MARKERS_ABSOLUTE = 8;
+
+export function looksLikeJobPosting(text: string): boolean {
+  const s = String(text || '');
+  const hits = jobPostingMarkerHits(s);
+  if (hits >= JD_MARKERS_ABSOLUTE) return true;
+  if (hits < 2) return false;
+  return (hits / Math.max(1, s.length / 10_000)) >= JD_MARKERS_PER_10K;
+}
+
 export function isJobDescription(f: ContextFile): boolean {
   // An explicit label outranks every heuristic below it. types.ts has
   // carried this field all along and nothing here ever consulted it; App.tsx
@@ -768,18 +1140,12 @@ export function isJobDescription(f: ContextFile): boolean {
   if (f.type === 'jd') return true;
 
   const head = (f.content || '').slice(0, 3000).toLowerCase();
-  const markers = [
-    /company overview/, /about the (company|role|position)/, /job description/,
-    /what you'?ll do/, /responsibilities:/, /qualifications:/, /requirements:/,
-    /we are (seeking|looking for|hiring)/, /is seeking/, /the ideal candidate/,
-    /reports to:/, /employment type/, /equal opportunity employer/,
-    // Seen in the real postings in the app's database, and impossible in a
-    // resume: nobody writes their own requisition number or salary band.
-    /requisition (number|id)/, /salary range/, /work model:/, /role overview/,
-    /\bduties:/, /(minimum|preferred|basic) qualifications/, /what you'?ll bring/,
-  ];
-  const hits = markers.reduce((n, re) => n + (re.test(head) ? 1 : 0), 0);
-  if (hits >= 2) return true;
+  // Density, not presence — see looksLikeJobPosting. This is what stops a
+  // 2,000-character quotation inside a 40,000-character prep document from
+  // condemning the whole file, and it replaces the section-level blocklist
+  // that used to paper over exactly that failure.
+  const hits = jobPostingMarkerHits(f.content || '');
+  if (looksLikeJobPosting(f.content || '')) return true;
 
   // What is left in the pattern is what a resume is never called. Even so it
   // asks the text for a nod: one marker beside a filename this explicit is
@@ -909,8 +1275,9 @@ export function buildLedger(files: ContextFile[]): Ledger {
       const tail = text.slice(to, nextLine);
       const headM = new RegExp(SECTION_HEAD_SRC).exec(tail);
       const bodyEnd = to + (headM ? headM.index : tail.length);
-      const body = text.slice(to, Math.min(bodyEnd, to + EMPLOYER_BODY_CHARS))
+      const rawBody = text.slice(to, Math.min(bodyEnd, to + EMPLOYER_BODY_CHARS))
         .replace(/\s+/g, ' ').trim();
+      const body = bodyWithoutRole(rawBody, role);   // see the helper
 
       facts.push({
         kind: 'employer',
@@ -949,8 +1316,10 @@ export function buildLedger(files: ContextFile[]): Ledger {
       const tail = text.slice(d.to, nextAt);
       const headM = new RegExp(SECTION_HEAD_SRC).exec(tail);
       const bodyEnd = d.to + (headM ? headM.index : tail.length);
-      const body = text.slice(d.to, Math.min(bodyEnd, d.to + EMPLOYER_BODY_CHARS))
-        .replace(/\s+/g, ' ').trim();
+      const body = bodyWithoutRole(
+        text.slice(d.to, Math.min(bodyEnd, d.to + EMPLOYER_BODY_CHARS)).replace(/\s+/g, ' ').trim(),
+        d.role,
+      );
 
       facts.push({
         kind: 'employer',
@@ -1102,7 +1471,7 @@ export function buildLedger(files: ContextFile[]): Ledger {
         let org = pair?.org || '';
         if (!org) {
           for (const n of [eduLines[i + 1]?.text, eduLines[i - 1]?.text]) {
-            if (n && orgLooking(n) && !DEGREE_RE.test(n)) { org = n; break; }
+            if (n && orgLooking(n) && !DEGREE_RE.test(n)) { org = normaliseOrg(n); break; }
           }
         }
         if (!org) continue;
@@ -1273,6 +1642,43 @@ const HYPHEN_PREFIX = new Set([
   'micro', 'macro', 'mini', 'auto', 'meta', 'ultra', 'super', 'hyper',
 ]);
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE CURATED ACRONYM LIST IS GONE. HERE IS WHY, AND WHAT REPLACES IT.
+//
+//  There used to be ~150 hand-written acronyms here (SLA, ETL, CQV, IQ/OQ,
+//  K8s…) whose only job was to stop the proper-noun check rejecting a term
+//  of art as an invented company. It worked on the two industries it was
+//  written for and failed on the third. Measured live on a telecom resume,
+//  both CORRECT and both thrown away:
+//
+//    REJECTED invented=[UE, Request]  "UE initiates attach by sending
+//                                      Attach Request to the MME."
+//    REJECTED invented=[TEID]         "First, verify the tunnel integrity
+//                                      and TEID matching."
+//
+//  Textbook 3GPP, and the list has no UE, no TEID, no PDU, no gNB, no
+//  AMF/SMF/UPF. It never could: every new field is a new pull request and
+//  every new language is a new list. That is a domestic cure for a disease
+//  the app has everywhere.
+//
+//  And it could not be widened either, because the discriminator does not
+//  exist at the level it was working at. "UE" and "IBM" are both two-to-
+//  three capital letters. Nothing about the TOKEN separates a term of art
+//  from a fabricated employer — only what the sentence DOES with it.
+//
+//  So provenance moved off the words and onto the CLAIM. A cover that
+//  states something about the candidate's own history must hand back the
+//  span of the document it read that from (see citationHolds); a cover
+//  that does not make such a claim is talking about the subject, where an
+//  unfamiliar term is a term of art and not a lie waiting to be spoken.
+//  routes/ai.js applies the two rules; this file supplies the tests.
+//
+//  What is lost: an acronym inside a GROUNDED claim now has to appear in
+//  the span that was cited. "I deduplicated by ID" is rejected if the
+//  cited line does not say ID. That is one dropped cover and a moment of
+//  silence, against a list that has to be maintained per industry forever.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 function isInflectedEnglish(word: string): boolean {
   const w = String(word || '');
   // ⚠️ NEVER a hyphenated compound. "Accenture-led" and "IBM-hosted" both
@@ -1289,12 +1695,46 @@ function isInflectedEnglish(word: string): boolean {
   return (w.length - m[0].length) >= 4;
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  A MODEL AND A DOCUMENT SPELL PUNCTUATION DIFFERENTLY
+//
+//  Mirror of the server's groundingGuard.js — grounding-parity.test.js
+//  asserts the two agree. Measured live 2026-08-20, two CORRECT covers
+//  thrown away: `invented=[Vis]` because the model wrote "UV‑Vis" with a
+//  non-breaking hyphen where the file uses an ASCII one, and
+//  `invented=[Bachelor’s, India]` on a sentence that is word-for-word what
+//  the résumé says, because of a curly apostrophe.
+//
+//  Fourth recurrence of one rule failing for want of exact spelling
+//  (trailing periods, plurals, lower-case speech-to-text, now Unicode).
+//  Normalise before comparing; both sides go through it, so it can only
+//  make a match more likely — never let an invention through.
+const PUNCT_NORMALISE: Array<[RegExp, string]> = [
+  [/[‐-―−]/g, '-'],
+  [/[‘’‛ʼ]/g, "'"],
+  [/[“”]/g, '"'],
+  [/ /g, ' '],
+];
+
+export function normalisePunctuation(s: string): string {
+  let out = String(s || '');
+  for (const [re, to] of PUNCT_NORMALISE) out = out.replace(re, to);
+  // Accents come off too — the token scanners are ASCII classes, so a
+  // non-ASCII letter ENDS a token instead of continuing it. Measured live:
+  // `invented=[Bausch+Str]` on a correct cover naming Bausch+Ströbel, a
+  // maker printed in the uploaded document. Both sides fold identically, so
+  // this can only make a match more likely; an invented name has nothing to
+  // fold onto.
+  return out.normalize('NFD').replace(/[̀-ͯ]/g, '');
+}
+
 export function unverifiedProperNouns(
   ledger: Ledger,
   text: string,
   alsoAllowed?: string,
 ): string[] {
-  const s = String(text || '');
+  const s = normalisePunctuation(String(text || ''));
+  if (alsoAllowed) alsoAllowed = normalisePunctuation(alsoAllowed);
   if (!s.trim() || !ledger) return [];
   // NO KNOWLEDGE BASE, NO OPINION.
   //
@@ -1306,6 +1746,32 @@ export function unverifiedProperNouns(
   if (ledger.charCount === 0 || ledger.vocabulary.size === 0) return [];
   const extra = new Set<string>();
   if (alsoAllowed) collectVocabulary(alsoAllowed, extra);
+
+  // ── THE INTERVIEWER DOES NOT SPEAK IN CAPITALS ──
+  //
+  // `alsoAllowed` is what the interviewer said, and the rule it encodes is
+  // "a name they just used is theirs, not an invention". collectVocabulary
+  // implements that by scanning PROPER_RUN — capitalised runs — which is
+  // right for typed text and wrong for this product: the question arrives
+  // from speech-to-text, which writes terms of art in lower case.
+  //
+  // Measured on the real corpus: asked "how can you define rags?", the
+  // cover answered "RAG is retrieval-augmented generation…" and the guard
+  // discarded it over a word the question had just said out loud.
+  //
+  // This widens nothing that was not already intended — a capitalised
+  // mention has always been admitted, and echoing what the interviewer
+  // named was the deliberate point of `alsoAllowed`. It only makes the
+  // rule work on how people talk rather than on how a transcriber rendered
+  // it. Kept behaviour-identical to groundingGuard.js.
+  if (alsoAllowed) {
+    const SPOKEN = /[A-Za-z][A-Za-z0-9+#'’-]*/g;
+    let am: RegExpExecArray | null;
+    while ((am = SPOKEN.exec(String(alsoAllowed))) !== null) {
+      const t = am[0].replace(/[^A-Za-z0-9+#'’-]/g, '').toLowerCase();
+      if (t.length >= 2) extra.add(t);
+    }
+  }
   const offenders: string[] = [];
   const seen = new Set<string>();
 
@@ -1394,6 +1860,10 @@ export function unverifiedProperNouns(
     if (known(DISCOURSE)) continue;
     if (known(ledger.vocabulary)) continue;
     if (known(extra)) continue;
+    // (The curated acronym waiver that stood here is gone — see the banner
+    // above. A term of art now survives by being in the candidate's own
+    // documents, in the question, or in a sentence that makes no claim
+    // about the candidate at all, which is where terms of art live.)
     // A HYPHENATED COMPOUND IS ITS STEM PLUS ENGLISH. "Python-based" is not
     // a company: it is `python`, which the résumé lists, with a suffix the
     // model added because it was writing a sentence. Requiring the whole
@@ -1612,13 +2082,67 @@ function hasNumberUnit(core: string): boolean {
     || new RegExp('[\\s-]?' + METRIC_UNIT_SRC + '\\s*$', 'i').test(s);
 }
 
-function collectCanonicalNumbers(source: string, into: Set<number>): void {
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  A NUMBER IS A VALUE **AND** A DIMENSION
+//
+//  Mirror of the server's groundingGuard.js — grounding-parity.test.js
+//  asserts the two agree, and this pair has drifted before.
+//
+//  canonicalizeNumber strips the metric unit on purpose: "94%" then "94" is
+//  a model repeating itself, and stripping is what lets the bare form
+//  match. What it also did was let a figure vouch for a DIFFERENT quantity
+//  with the same digits. Measured on a real upload — the document said "12
+//  months" (the contract length) and the cover invented "delayed release by
+//  12 weeks"; the guard compared 12 to 12 and passed it, while correctly
+//  catching the controls "11 weeks" and "3.7 %".
+//
+//  Keyed by value AND unit family now: a bare candidate matches any
+//  recorded value, a united one needs its own family or a bare record.
+//  K/M/B stay a SCALE, already multiplied into the value, family ''.
+const UNIT_FAMILIES: Array<[string, string]> = [
+  ['ms', 'ms'],
+  ['seconds?|secs?', 'sec'],
+  ['minutes?|mins?', 'min'],
+  ['hours?|hrs?', 'hour'],
+  ['days?', 'day'],
+  ['weeks?', 'week'],
+  ['months?', 'month'],
+  ['years?', 'year'],
+  ['[KMGTP]B', 'bytes'],
+  ['QPS|TPS|RPS', 'rate'],
+  ['x', 'x'],
+];
+
+function unitFamilyOf(core: string): string {
+  const s = String(core || '').replace(/\+$/, '').trim();
+  if (/%\s*$/.test(s) || /\bpercent\s*$/i.test(s)) return '%';
+  for (const [alt, fam] of UNIT_FAMILIES) {
+    if (new RegExp('[\\s-]?(?:' + alt + ')\\s*$', 'i').test(s)) return fam;
+  }
+  return '';
+}
+
+interface KnownNumbers { values: Set<number>; keys: Set<string>; }
+
+function newKnownNumbers(): KnownNumbers {
+  return { values: new Set<number>(), keys: new Set<string>() };
+}
+
+function numberIsKnown(known: KnownNumbers, value: number, family: string): boolean {
+  if (!family) return known.values.has(value);
+  return known.keys.has(`${value}|${family}`) || known.keys.has(`${value}|`);
+}
+
+function collectCanonicalNumbers(source: string, into: KnownNumbers): void {
   const str = String(source || '');
   const re = new RegExp(NUMBER_CANDIDATE_RE.source, 'gi');
   let m: RegExpExecArray | null;
   while ((m = re.exec(str)) !== null) {
+    const core = numberCoreOf(m[0]);
     const v = canonicalizeNumber(m[0]);
-    if (v !== null) into.add(v);
+    if (v === null) continue;
+    into.values.add(v);
+    into.keys.add(`${v}|${unitFamilyOf(core)}`);
   }
 }
 
@@ -1658,7 +2182,7 @@ export function unverifiedNumbers(
   const s = String(text || '');
   if (!s.trim()) return [];
 
-  const known = new Set<number>();
+  const known = newKnownNumbers();
   collectCanonicalNumbers(ctx, known);
   if (allowed) collectCanonicalNumbers(allowed, known);
 
@@ -1689,7 +2213,7 @@ export function unverifiedNumbers(
     // cover; a missed fabrication is the cheaper mistake here only when we
     // truly cannot read the match.
     if (value === null) continue;
-    if (known.has(value)) continue;
+    if (numberIsKnown(known, value, unitFamilyOf(core))) continue;
     if (seen.has(core)) continue;
     seen.add(core);
     offenders.push(core);

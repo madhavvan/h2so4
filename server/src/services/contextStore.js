@@ -368,8 +368,39 @@ function resolveMessages(userId, messages, budget) {
   return changed ? out : messages;
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  A MISSING BLOB MUST NOT 409 A FIELD NOBODY IS WAITING ON.
+//
+//  resolveText throws CONTEXT_MISSING so the route can answer 409 and the
+//  client can re-upload and retry — correct for systemInstruction/prompt/
+//  messages, where the model cannot answer without them.
+//
+//  It is the wrong answer for the COVER fields. Those are speculative: the
+//  cover is a sentence spoken in front of an answer that is already on its
+//  way, and /cover/prewarm runs during a silence timer for a question that
+//  has not been asked yet. Refusing the whole request because a spoken
+//  opener lost its grounding would turn a degraded cover into a failed
+//  ANSWER — the exact inversion this feature exists to avoid.
+//
+//  So a miss here degrades to '': the cover falls back to whatever the
+//  no-knowledge-base path already does (which the grounding guard treats
+//  as its STRICTEST mode, not its loosest), and the answer is untouched.
+//
+//  CONTEXT_TOO_LARGE still throws. That one is not a cache miss, it is a
+//  request asking the server to allocate more than it has agreed to, and
+//  swallowing it would remove the only backstop against the amplification
+//  attack the pricing pass above exists to stop.
+function resolveTextLenient(userId, str, budget) {
+  try {
+    return resolveText(userId, str, budget);
+  } catch (err) {
+    if (err && err.code === 'CONTEXT_MISSING') return '';
+    throw err;
+  }
+}
+
 module.exports = {
-  put, get, stats, resolveText, resolveMessages, hasPlaceholder, sha256, forgetUser,
+  put, get, stats, resolveText, resolveTextLenient, resolveMessages, hasPlaceholder, sha256, forgetUser,
   // Exported so a route resolving several fields of ONE body (systemInstruction,
   // prompt, messages) can hold them to a single shared ceiling instead of one
   // ceiling each. Omitting it is safe — every entry point makes its own.

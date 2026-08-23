@@ -38,19 +38,44 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
 }
 
 // ── Tier definitions ──
-// Admin-granted licenses are UNLIMITED-until-revoked. Customer purchases are
-// time-limited interviews (see payments.js/webhooks.js grantConfigForTier),
-// but an admin bumping someone to a paid tier is a comp: never-expires,
-// unlimited sessions, and -1 credit sentinel (seeded in handleChangeTier).
+// ADMIN GRANTS ARE ENTERPRISE-EQUIVALENT, WHATEVER TIER IS NAMED (2026-08
+// owner policy). Customer purchases are metered — a dated interview window
+// for the passes, a 9-hour monthly allowance for Ultra (see
+// payments.js/webhooks.js grantConfigForTier). An admin activating a plan is
+// something else entirely: it is a comp, and the point of a comp is that the
+// person can use the product. So every paid tier an admin grants lands with
+//   expires_at: -1                  → the plan never lapses on the calendar
+//   sessions_limit: -1              → no session cap
+//   credits_remaining_seconds: -1   → the SAME unlimited sentinel Enterprise
+//                                     carries, so the time gate never fires
+// and it stays that way until an admin changes the plan again. Nothing in
+// the system ages it out: the cycle-end sweeper only scans 'canceling', the
+// tier gate skips a -1 expiry, and resolveTimeBucket reads a -1 credit
+// balance as unlimited for every tier (db.isUnlimitedLicenseRow).
+//
+// Naming a tier still matters — it decides which FEATURES the user sees
+// (Basic has no Claude, Pro/Max have no Auto-Type). What it no longer
+// decides for an admin grant is how much time they get: that is always
+// Enterprise's answer, which is "all of it".
 const DAY_MS = 24 * 60 * 60 * 1000;
 const TIER_LICENSE_DEFAULTS = {
-  free:  { expires_at: () => Date.now() + 30 * DAY_MS, sessions_limit: 5 },
-  basic: { expires_at: () => -1, sessions_limit: -1 },
-  pro:   { expires_at: () => -1, sessions_limit: -1 },
-  max:   { expires_at: () => -1, sessions_limit: -1 },
-  ultra: { expires_at: () => -1, sessions_limit: -1 },
+  free:       { expires_at: () => Date.now() + 30 * DAY_MS, sessions_limit: 5 },
+  basic:      { expires_at: () => -1, sessions_limit: -1 },
+  pro:        { expires_at: () => -1, sessions_limit: -1 },
+  max:        { expires_at: () => -1, sessions_limit: -1 },
+  ultra:      { expires_at: () => -1, sessions_limit: -1 },
+  enterprise: { expires_at: () => -1, sessions_limit: -1 },
 };
 const VALID_TIERS = Object.keys(TIER_LICENSE_DEFAULTS);
+
+// The credit grant an admin activation writes, for every paid tier. Pulled
+// out as a named constant so the policy is one thing you can read and one
+// thing you can change, rather than a pair of ternaries buried in a route.
+const ENTERPRISE_EQUIVALENT_CREDITS = {
+  credits_remaining_seconds: -1, // unlimited — same sentinel Enterprise carries
+  credits_expire_at: -1,         // never voids
+};
+const NO_CREDITS = { credits_remaining_seconds: 0, credits_expire_at: 0 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  STEP-UP REAUTH
@@ -379,22 +404,45 @@ function handleChangeTier(req, res) {
       return res.status(500).json({ error: 'Could not create a license for this user' });
     }
 
-    db.updateUserTier(user.id, tier);
-    // Admin grant of a paid tier = unlimited-until-revoked: seed the -1 credit
-    // sentinel so the client's interview-time gate treats it as unlimited
-    // (not a time-limited customer purchase). Downgrade to free clears it.
+    // adminOverride: this route is the deliberate admin action that IS allowed
+    // to move an admin-granted plan down to free.
+    db.updateUserTier(user.id, tier, { adminOverride: true });
+    // Admin grant of ANY paid tier = Enterprise-equivalent credits, unlimited
+    // until an admin changes the plan (see TIER_LICENSE_DEFAULTS above).
+    // Downgrade to free clears the balance.
     const paidGrant = tier !== 'free';
     db.updateLicenseOnPayment(user.id, {
       tier,
       status: 'active',
       expires_at: defaults.expires_at(),
       sessions_limit: defaults.sessions_limit,
-      credits_remaining_seconds: paidGrant ? -1 : 0,
-      credits_expire_at: paidGrant ? -1 : 0,
+      ...(paidGrant ? ENTERPRISE_EQUIVALENT_CREDITS : NO_CREDITS),
+      // Stamp (or clear) the admin-grant marker. While it is set, NO automatic
+      // path can take this plan away: not a provider webhook for some older
+      // subscription of theirs, not a refund or dispute on an old charge, not
+      // the cycle-end sweeper, not the lapsed-plan repair in /license/validate.
+      // Only an admin coming back through this route can. See
+      // db.updateLicenseOnPayment / db.transitionLicenseToFree.
+      admin_granted_at: paidGrant ? Date.now() : 0,
+      // …which also means THIS route has to be able to move someone down to
+      // free. It is the deliberate admin action the rule carves out for.
+      admin_override: true,
     });
 
-    writeAudit(req, 'change-tier', user, { from: previousTier, to: tier });
-    res.json({ success: true, message: `${email} moved to ${tier}`, tier });
+    writeAudit(req, 'change-tier', user, {
+      from: previousTier,
+      to: tier,
+      credits: paidGrant ? 'enterprise-equivalent (unlimited, never expires)' : 'cleared',
+    });
+    res.json({
+      success: true,
+      message: paidGrant
+        ? `${email} moved to ${tier} with unlimited interview time (never expires until you change the plan)`
+        : `${email} moved to ${tier}`,
+      tier,
+      credits: paidGrant ? 'unlimited' : 'none',
+      never_expires: paidGrant,
+    });
   } catch (err) {
     console.error('Change tier error:', err);
     res.status(500).json({ error: 'Failed to change tier' });

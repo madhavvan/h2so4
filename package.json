@@ -49,6 +49,15 @@
         "releaseType": "release"
       }
     ],
+    "protocols": [
+      {
+        "name": "Interview Copilot Sign-in",
+        "schemes": [
+          "interview-copilot"
+        ],
+        "role": "Viewer"
+      }
+    ],
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "build/icon.icns",

@@ -479,7 +479,7 @@ function detectSession(req) {
 // to the Free scripted FAQ. Any new tier must be added here AND in the
 // matching set in SupportBot.tsx — the client hides the AI composer using
 // its own copy, so a tier missing from either one is silently downgraded.
-const AI_CHAT_TIERS = new Set(['basic', 'pro', 'max', 'ultra']);
+const AI_CHAT_TIERS = new Set(['basic', 'pro', 'max', 'ultra', 'enterprise']);
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  POST /chat — SSE tool-loop

@@ -19,20 +19,34 @@
 //    Sonnet 5. No Auto-Type. Extend anytime (+30 min $25 / +1 h $45 / +3 h $80 packs).
 //  - Max ($89 one-time): THREE 1-hour interviews, all five models, full
 //    reasoning control + Train Model. No Auto-Type. Same extension packs as Pro.
-//  - Ultra ($159/month): UNLIMITED interviews, all five models, Auto-Type +
-//    Train Model — the only recurring subscription.
+//  - Ultra ($159/month): NINE HOURS of interview time per billing cycle
+//    (re-seeded on every renewal), all five models, Auto-Type + Train Model.
+//    Metered since 2026-08-22 — it was "unlimited" from 2026-07 until then,
+//    and unlimited moved up to Enterprise. Ultra can top up like the passes.
+//  - Enterprise ($1199/month): UNLIMITED interview time that never expires,
+//    every model, Auto-Type, Train Model. The Team tab's only plan and the
+//    apex of the ladder.
 //  Admins bypass every gate (see isAdmin / getEffectiveTier) — full access,
 //  unlimited everything, no purchase required.
 //
 //  CREDITS vs TIME:
 //  Credits are a display abstraction — internally we track seconds.
-//  3600s = "1 credit" (1 hour). Basic=1800s, Pro=3600s, Max=3×3600s.
+//  3600s = "1 credit" (1 hour). Basic=1800s, Pro=3600s, Max=3×3600s,
+//  Ultra=9×3600s per cycle. Enterprise carries the -1 unlimited sentinel.
+//
+//  WHAT "UNLIMITED" MEANS (2026-08):
+//  Until 2026-08 the test was literally `tier === 'ultra'`. Now that Ultra
+//  is metered, unlimited is a property of the LICENSE ROW, not the tier
+//  name — see isUnlimitedLicense() below. That indirection is what lets an
+//  existing Ultra subscriber whose row still carries the -1 sentinel keep
+//  unlimited access until their next renewal re-seeds them at 9 hours,
+//  instead of being silently cut to a meter mid-cycle.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 export interface LicenseData {
   key: string;
   email: string;
-  tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+  tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
   // Status values mirror what the server's webhook handlers + license
   // routes write into the licenses table. Keep this union exhaustive — a
   // missing value here would render as 'Unknown' in the billing UI's
@@ -80,7 +94,7 @@ export interface UserProfile {
   name: string;
   avatar?: string;
   avatar_url?: string;
-  tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+  tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
   country_code: string;
   created_at: number;
   is_admin?: boolean;
@@ -160,11 +174,34 @@ export const FEATURE_GATES = {
     trainModel: true,    // the Max differentiator (with the reasoning dial)
   },
   ultra: {
-    // Ultra = unlimited interviews, all five models, + Auto-Type. Monthly sub.
+    // Ultra = 9 hours of interview time per billing cycle, all five models,
+    // + Auto-Type. Monthly sub. The METER is a separate gate (credits) —
+    // every FEATURE below stays on for the whole cycle even at 0 seconds,
+    // exactly like the passes: getEffectiveTier follows the plan window,
+    // never the clock.
     models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
     screenCapture: true,
     autoSolve: true,
     autoType: true,      // Ultra unlocks Auto-Type
+    popout: true,
+    contextFiles: -1,    // unlimited
+    sessionsPerMonth: -1, // time is the gate, not session count
+    exportHistory: true,
+    reasoningEffortControl: true,
+    trainModel: true,
+  },
+  enterprise: {
+    // Enterprise = the Team plan. Unlimited interview time that never
+    // expires, every model, Auto-Type for coding rounds, Train Model, full
+    // reasoning control. Feature-identical to Ultra by design — what you buy
+    // at $1199/mo is the removal of the meter, not extra switches. Keeping
+    // the rows identical is deliberate: a feature that lands here but not on
+    // Ultra would silently become an Enterprise-only feature the pricing
+    // copy never promised.
+    models: ['gemini', 'groq', 'openai', 'xai', 'claude'] as string[],
+    screenCapture: true,
+    autoSolve: true,
+    autoType: true,
     popout: true,
     contextFiles: -1,    // unlimited
     sessionsPerMonth: -1, // unlimited
@@ -173,6 +210,48 @@ export const FEATURE_GATES = {
     trainModel: true,
   },
 } as const;
+
+// ── Unlimited-time predicate (2026-08) ──────────────────────────────────
+// THE definition of "this account never runs out of interview time",
+// shared by every client-side time surface. Mirrors the server's
+// db.resolveTimeBucket exactly — drift between the two shows up as a
+// client that shows a full meter while the server 402s the send, or the
+// reverse.
+//
+// Three ways to be unlimited, and the ORDER matters:
+//   1. tier === 'enterprise'  — the unlimited plan, by definition.
+//   2. credits_remaining_seconds === -1 — the sentinel every ADMIN grant
+//      and comp writes (admin.js handleChangeTier / db.recordCompPayment),
+//      and the balance legacy Ultra + migration-era Pro/Max subscribers
+//      still carry. This is what grandfathers a pre-2026-08 Ultra: their
+//      row says -1, so they stay unlimited until a renewal re-seeds them.
+//   3. The legacy -1 window sentinels (expires_at / credits_expire_at) —
+//      kept ONLY for basic/pro/max, which is where they have always been
+//      written. Ultra is deliberately excluded: an Ultra subscription
+//      legitimately carries expires_at = -1 ("no end date"), so honouring
+//      that sentinel here would make every metered Ultra unlimited again
+//      and hand out the $1199 plan for $159.
+export function isUnlimitedLicense(license: Pick<LicenseData, 'tier' | 'credits_remaining_seconds' | 'credits_expire_at' | 'expires_at'> | null): boolean {
+  if (!license) return false;
+  if (license.tier === 'enterprise') return true;
+  if ((license.credits_remaining_seconds ?? 0) === -1) return true;
+  if (license.tier === 'ultra') return false; // metered since 2026-08
+  if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
+    return license.expires_at === -1 || license.credits_expire_at === -1;
+  }
+  return false;
+}
+
+// Tiers whose live time is drawn from the credit-seconds bucket. Ultra
+// joined in 2026-08 when it became metered; Enterprise never appears here
+// because isUnlimitedLicense short-circuits it first.
+const METERED_TIERS: readonly string[] = ['basic', 'pro', 'max', 'ultra'];
+
+// Ultra's monthly allowance. MUST stay in sync with grantConfigForTier in
+// BOTH server/src/routes/payments.js and server/src/routes/webhooks.js —
+// those two are the authority; this is the optimistic client mirror used
+// when a grant lands before the server echo does.
+export const ULTRA_MONTHLY_SECONDS = 9 * 60 * 60;
 
 const APP_VERSION = __APP_VERSION__;
 const MIN_VERSION = '2.0.0';
@@ -192,15 +271,18 @@ export const TIME_CONSTANTS = {
   LOW_WARNING_SECONDS: 120,         // Fire the "2 min left" pre-expiry warning here (owner: "a min or 2 before")
 } as const;
 
-// ── Extension unit (2026-07) ──
-// A flat +30-minute top-up for every metered tier (Basic/Pro/Max); Ultra
-// is unlimited and exempt. Optimistic client mirror of the server grant —
-// MUST stay in sync with the flat +30-min grantTimeExtension in
-// server/src/database.js and RENEWAL_* in services/pricingService.ts.
-export const EXTENSION_SECONDS_BY_TIER: Record<'basic' | 'pro' | 'max', number> = {
+// ── Extension unit (2026-07, extended 2026-08) ──
+// A flat +30-minute top-up for every metered tier — Basic/Pro/Max, and
+// Ultra since its 9-hour monthly allowance replaced "unlimited".
+// Enterprise is unlimited and exempt. Optimistic client mirror of the
+// server grant — MUST stay in sync with the flat +30-min
+// grantTimeExtension in server/src/database.js and RENEWAL_* in
+// services/pricingService.ts.
+export const EXTENSION_SECONDS_BY_TIER: Record<'basic' | 'pro' | 'max' | 'ultra', number> = {
   basic: 30 * 60,
   pro: 30 * 60,
   max: 30 * 60,
+  ultra: 30 * 60,
 } as const;
 
 // Admin check is done server-side via ADMIN_EMAILS env var.
@@ -375,28 +457,30 @@ class LicenseService {
   }
 
   // ── Effective tier resolution ──
-  // Admins resolve to Ultra (full access) unless they opt into a lower tier via
-  // the 'minicaai_admin_test_tier' localStorage override.
+  // Admins resolve to Enterprise (full access, no meter) unless they opt into
+  // a lower tier via the 'minicaai_admin_test_tier' localStorage override.
   // Free user inside their one-time 10-min trial window gets Basic features.
   // Paid tiers (Basic/Pro/Max/Ultra) keep their tier until the PLAN lapses
   // (calendar expiry / cancel / refund / revoke — see isPlanLapsed). Time
   // exhaustion alone never demotes a paying user.
-  getEffectiveTier(license: LicenseData | null): 'free' | 'basic' | 'pro' | 'max' | 'ultra' {
+  getEffectiveTier(license: LicenseData | null): 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise' {
     // ── Admin full access ──
-    // Admins resolve to the top tier (Ultra) for EVERY feature + model gate,
+    // Admins resolve to the top tier (Enterprise since 2026-08 — Ultra used to
+    // BE the top tier and is now metered, so leaving this on 'ultra' would put
+    // every admin behind a 9-hour meter) for EVERY feature + model gate,
     // matching the server-side ADMIN_EMAILS bypass in middleware/tier.js. This is
     // the owner's explicit policy: an admin account has unlimited everything with
     // no purchase and no license row required. To deliberately test a LOWER tier's
     // gating as an admin, set localStorage 'minicaai_admin_test_tier' to one of
-    // free|basic|pro|max|ultra (clear it to restore full access).
+    // free|basic|pro|max|ultra|enterprise (clear it to restore full access).
     if (this.isAdmin()) {
       try {
         const t = typeof localStorage !== 'undefined'
           ? localStorage.getItem('minicaai_admin_test_tier')
           : null;
-        if (t === 'free' || t === 'basic' || t === 'pro' || t === 'max' || t === 'ultra') return t;
+        if (t === 'free' || t === 'basic' || t === 'pro' || t === 'max' || t === 'ultra' || t === 'enterprise') return t;
       } catch { /* localStorage unavailable — fall through to full access */ }
-      return 'ultra';
+      return 'enterprise';
     }
     if (!license) return 'free';
     // ── Paid tiers: features follow the PLAN, not the clock (2026-07 fix) ──
@@ -409,9 +493,10 @@ class LicenseService {
     // Pro" — the reported bug. Now: a time-exhausted paid user keeps the
     // tier (models selectable, Pop-out opens); executeSend / the usage
     // session gate block live use with a top-up prompt instead.
-    // Ultra is the monthly sub: same rule, minus the (nonexistent) meter.
-    if (license.tier === 'ultra') {
-      return this.isPlanLapsed(license) ? 'free' : 'ultra';
+    // Ultra and Enterprise are the monthly subs: same rule. Ultra now HAS a
+    // meter (9 h/cycle) and it is still not what decides features here.
+    if (license.tier === 'ultra' || license.tier === 'enterprise') {
+      return this.isPlanLapsed(license) ? 'free' : license.tier;
     }
     if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
       return this.isPlanLapsed(license) ? 'free' : license.tier;
@@ -533,8 +618,8 @@ class LicenseService {
 
   needsRevalidation(license: LicenseData | null): boolean {
     if (!license) return true;
-    // All paid tiers MUST revalidate with server (Basic/Pro/Max)
-    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max' || license.tier === 'ultra') {
+    // All paid tiers MUST revalidate with the server.
+    if (license.tier !== 'free') {
       return Date.now() - license.last_validated > REVALIDATION_INTERVAL;
     }
     // Free users can work offline for longer
@@ -542,20 +627,19 @@ class LicenseService {
   }
 
   // ── Credit / trial balance helpers ──
-  // Returns 0 if credits are expired or absent. Basic users only.
+  // Returns 0 if credits are expired or absent; Infinity for unlimited
+  // licenses (Enterprise / admin comp / grandfathered). Metered tiers only.
   getCreditsRemainingSeconds(license: LicenseData | null): number {
     if (!license) return 0;
-    // Basic/Pro/Max all draw from the credit-seconds bucket now (time-limited
-    // interviews). Ultra is unlimited; Free uses the trial bucket instead.
-    if (!['basic', 'pro', 'max'].includes(license.tier)) return 0;
-    // Admin-granted / comp licenses are unlimited-until-revoked: the grant path
-    // seeds -1 credits and a -1 (never-expires) window. Treat that as Infinity
-    // so an admin-comped user never hits the interview time cap.
-    if ((license.credits_remaining_seconds ?? 0) === -1
-        || license.expires_at === -1
-        || license.credits_expire_at === -1) {
-      return Infinity;
-    }
+    // Unlimited first — Enterprise, admin comps, and grandfathered legacy
+    // subs all report Infinity regardless of what the credit columns hold.
+    // (Admin grants seed -1 credits + a -1 never-expires window; treating
+    // that as Infinity is what keeps an admin-comped user off the cap.)
+    if (isUnlimitedLicense(license)) return Infinity;
+    // Basic/Pro/Max/Ultra all draw from the credit-seconds bucket
+    // (time-limited interviews; Ultra = 9 h per billing cycle since
+    // 2026-08). Free uses the trial bucket instead.
+    if (!METERED_TIERS.includes(license.tier)) return 0;
     const expireAt = license.credits_expire_at ?? 0;
     if (expireAt > 0 && Date.now() > expireAt) return 0;
     return Math.max(0, license.credits_remaining_seconds ?? 0);
@@ -581,13 +665,14 @@ class LicenseService {
     // stored tier hasn't been upgraded yet.
     if (this.isAdmin()) return { seconds: Infinity, source: 'unlimited' };
     if (!license) return { seconds: 0, source: 'none' };
-    // Ultra is the only unlimited paid tier now.
-    if (license.tier === 'ultra') {
+    // Enterprise (the unlimited plan), admin comps, and grandfathered
+    // legacy subs — see isUnlimitedLicense.
+    if (isUnlimitedLicense(license)) {
       return { seconds: Infinity, source: 'unlimited' };
     }
-    // Basic (30m) / Pro (1h) / Max (3×1h) all draw from the credit-seconds bucket.
-    // An admin-granted unlimited license reports Infinity here → 'unlimited'.
-    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
+    // Basic (30m) / Pro (1h) / Max (3×1h) / Ultra (9h per cycle) all draw
+    // from the credit-seconds bucket.
+    if (METERED_TIERS.includes(license.tier)) {
       const secs = this.getCreditsRemainingSeconds(license);
       return secs === Infinity
         ? { seconds: Infinity, source: 'unlimited' }
@@ -602,11 +687,12 @@ class LicenseService {
   // Saves to storage. No-op for unlimited tiers.
   consumeTime(license: LicenseData, seconds: number): LicenseData {
     if (seconds <= 0) return license;
-    if (license.tier === 'ultra') return license; // unlimited — nothing to deduct
-    // Admin-granted unlimited (-1 sentinel) — never deduct, never expire.
-    if ((license.credits_remaining_seconds ?? 0) === -1 || license.expires_at === -1) return license;
+    // Enterprise / admin-granted / grandfathered unlimited — never deduct,
+    // never expire. Ultra is NOT here any more: since 2026-08 it meters a
+    // 9-hour monthly allowance like the passes do.
+    if (isUnlimitedLicense(license)) return license;
     let updated = { ...license };
-    if (license.tier === 'basic' || license.tier === 'pro' || license.tier === 'max') {
+    if (METERED_TIERS.includes(license.tier)) {
       const remaining = Math.max(0, (license.credits_remaining_seconds ?? 0) - seconds);
       updated.credits_remaining_seconds = remaining;
     } else if (license.tier === 'free') {
@@ -620,18 +706,22 @@ class LicenseService {
 
   // ── Fresh interview-time seed (2026-07 pricing) ──
   // A new purchase seeds the tier's interview clock — Basic 30 min,
-  // Pro 1 hour, Max 3 hours — valid until the server-set license.expires_at.
+  // Pro 1 hour, Max 3 hours, Ultra 9 hours — valid until the server-set
+  // license.expires_at (Ultra's is the -1 subscription sentinel, so its
+  // clock is bounded by the monthly re-seed rather than a date).
   // Called on first-time purchase, NOT on the +30-min extension.
   // Kept private because only normalizeLicenseCredits should decide when to
   // seed — direct callers would mis-overwrite an in-flight balance.
   private freshBasicCreditSeed(license: LicenseData): { credits_remaining_seconds: number; credits_expire_at: number } {
     const fallback = Date.now() + TIME_CONSTANTS.BASIC_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
-    // Per-tier interview time (2026-07 pricing):
-    //   Basic = one 30-min interview · Pro = one 1-hour · Max = three 1-hour.
+    // Per-tier interview time (2026-07 pricing, + 2026-08 Ultra):
+    //   Basic = one 30-min interview · Pro = one 1-hour · Max = three 1-hour
+    //   Ultra = 9 hours per billing cycle.
     const seconds =
-      license.tier === 'pro' ? 60 * 60 :
-      license.tier === 'max' ? 3 * 60 * 60 :
-      /* basic */              30 * 60;
+      license.tier === 'pro'   ? 60 * 60 :
+      license.tier === 'max'   ? 3 * 60 * 60 :
+      license.tier === 'ultra' ? ULTRA_MONTHLY_SECONDS :
+      /* basic */                30 * 60;
     return {
       credits_remaining_seconds: seconds,
       credits_expire_at: license.expires_at > 0 ? license.expires_at : fallback,
@@ -721,8 +811,11 @@ class LicenseService {
   // follows the plan window — but the BALANCE itself must still be right.)
   private normalizeLicenseCredits(license: LicenseData, priorLicense: LicenseData | null): LicenseData {
     // Only the time-limited tiers carry a credit bucket. Free (trial) and
-    // Ultra (unlimited) strip the fields for cleanliness.
-    if (!['basic', 'pro', 'max'].includes(license.tier)) {
+    // Enterprise (unlimited) strip the fields for cleanliness. Ultra KEEPS
+    // them since 2026-08 — it meters 9 h per cycle, and stripping its
+    // balance here would leave the interview clock reading zero on a plan
+    // the user just paid $159 for.
+    if (!METERED_TIERS.includes(license.tier)) {
       const clean: any = { ...license };
       delete clean.credits_remaining_seconds;
       delete clean.credits_expire_at;
@@ -777,12 +870,43 @@ class LicenseService {
   // just paid for. The next successful revalidation picks up the
   // server-bumped expires_at and reconverges.
   grantRenewalCredit(license: LicenseData, packSeconds?: number): LicenseData {
+    // ── Unlimited: nothing to add to ──
+    // Mirrors the server's grantTimeExtension, which returns the license
+    // untouched for Enterprise / admin comps / grandfathered subs. Without
+    // this the arithmetic below runs on an Infinity balance.
+    if (isUnlimitedLicense(license)) return license;
+
     const effectiveRemaining = this.getCreditsRemainingSeconds(license);
-    const tier: 'basic' | 'pro' | 'max' =
-      license.tier === 'pro' || license.tier === 'max' ? license.tier : 'basic';
+    // Preserve the tier. This used to collapse anything that wasn't pro/max
+    // to 'basic', which was harmless only while the metered tiers WERE
+    // basic/pro/max: a top-up on any of them wrote back the tier it already
+    // had. Ultra became metered on 2026-08-22, and the same line would have
+    // written tier:'basic' into a $159/mo subscriber's cached license after
+    // an optimistic top-up — locking them out of Claude and Auto-Type until
+    // the next /validate round-trip corrected it.
+    const tier = METERED_TIERS.includes(license.tier) ? license.tier : 'basic';
     const extensionSeconds = (typeof packSeconds === 'number' && packSeconds > 0)
       ? packSeconds
-      : EXTENSION_SECONDS_BY_TIER[tier];
+      : EXTENSION_SECONDS_BY_TIER[tier as 'basic' | 'pro' | 'max' | 'ultra'];
+
+    // ── Subscription-backed tiers extend the CLOCK ONLY ──
+    // Same rule as the server (database.js grantTimeExtension). A pass is a
+    // dated window, so topping one up moves its end date. A subscription is
+    // not: Ultra carries expires_at = -1 ("no end date") and
+    // credits_expire_at = 0 ("no window"). Running the pass arithmetic over
+    // those gives credits_expire_at = now + 30 min, and 30 minutes later
+    // getCreditsRemainingSeconds reads the window as passed and reports 0 —
+    // on a subscriber who just paid to have MORE time.
+    if (license.tier === 'ultra' || license.tier === 'enterprise') {
+      const updatedSub: LicenseData = {
+        ...license,
+        credits_remaining_seconds: effectiveRemaining + extensionSeconds,
+      };
+      const u = this.loadAuth().user;
+      if (u) this.saveAuth(u, updatedSub);
+      return updatedSub;
+    }
+
     const extensionMs = extensionSeconds * 1000;
     const anchor = Math.max(Date.now(), license.expires_at > 0 ? license.expires_at : 0);
     const updated: LicenseData = {
@@ -1036,12 +1160,14 @@ class LicenseService {
 
       if (tierChanged) {
         // Cleanliness on tier transitions: paid tiers don't read the trial
-        // bucket; free/ultra don't read the credit bucket. (With server
-        // echo these are cosmetic strips, not ledger re-seeds.)
+        // bucket; free/enterprise don't read the credit bucket. Ultra DOES
+        // read it (metered 9 h/cycle since 2026-08) — stripping it here
+        // would blank the clock of anyone upgrading INTO Ultra. (With
+        // server echo these are cosmetic strips, not ledger re-seeds.)
         if (updatedLicense.tier !== 'free') {
           delete (updatedLicense as any).trial_remaining_seconds;
         }
-        if (!['basic', 'pro', 'max'].includes(updatedLicense.tier)) {
+        if (!METERED_TIERS.includes(updatedLicense.tier)) {
           delete (updatedLicense as any).credits_remaining_seconds;
           delete (updatedLicense as any).credits_expire_at;
         }
@@ -1165,7 +1291,7 @@ export const licenseService = new LicenseService();
 // Read-only mirror of GET /api/v1/usage/summary — the server computes
 // used/granted from the SAME ledger the interview clock charges against
 // (resolveTimeBucket + usage_sessions), so this can never disagree with
-// the in-interview timer. `unlimited: true` (admin/ultra) carries no
+// the in-interview timer. `unlimited: true` (admin/enterprise/comp) carries no
 // fraction fields; metered tiers always satisfy granted >= remaining,
 // so used >= 0 and the bar caps at 100%.
 export interface UsageSummary {

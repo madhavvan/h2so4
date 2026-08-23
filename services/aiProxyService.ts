@@ -8,7 +8,8 @@ import { Message, ContextFile } from '../types';
 import { offloadContext, repairContext } from './contextStore';
 import { retrieveEvidence, kbTextLength, RETRIEVAL_MIN_CHARS, warmIndex } from './kbRetrieval';
 import { getLedgerFor, isJobDescription as isJobDescriptionFile } from './factLedger';
-import { composeOpener, ledgerDigest, ledgerVocabulary } from './instantOpener';
+import { isChallengeToPreviousAnswer, ledgerVocabulary } from './instantOpener';
+import { buildCoverSource, selectCoverEvidence } from './coverSource';
 
 // Prod build (`vite build` / `npm run electron:publish`): always points at
 // api.minicaai.com regardless of .env.local. Mirrors licenseService.ts:185.
@@ -315,6 +316,226 @@ export async function prefetchContext(transcript: string): Promise<void> {
     });
   } catch {
     // Silent. Prefetch failure must NEVER affect the user experience.
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE PREWARMED COVER — written while the silence timer runs
+//
+//  The app already spends 1,200ms doing nothing between "the speaker
+//  stopped" and "the question is sent": the transcript sits in the input
+//  box while the auto-send timer counts down. A whole cover takes 300-700ms
+//  on Groq, so it fits inside that window with room to spare.
+//
+//  Getting it out of the answer path is the entire point. `runCover` used
+//  to be AWAITED in front of the main provider call, so a cover that failed
+//  — or that the grounding guard rejected — bought the candidate nothing
+//  and pushed the answer back by up to 4.5s. That is why the feature sat
+//  switched off for four releases. Written here instead, a failed or
+//  rejected cover costs exactly zero, because the question has not been
+//  sent yet.
+//
+//  The server also returns `effort`: a fast model's judgement of how much
+//  reasoning the ANSWER needs, made while it was reading the question
+//  anyway. It rides back on the request and sets the main model's dial.
+//
+//  Held in a module-level cache rather than React state on purpose —
+//  buildOpenerPayload is called deep inside the stream functions, far from
+//  any component, and threading a ref through five call sites to deliver
+//  one string is how the two hand-wired cover copies happened last time.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+export type CoverEffort = 'none' | 'low' | 'medium';
+
+interface PrewarmedCover {
+  question: string;   // normalised, for the divergence check
+  cover: string;
+  effort: CoverEffort | null;
+  at: number;
+  // WHICH ROUTE THIS LINE WAS SIZED FOR, and it is not bookkeeping.
+  //
+  // A cover's LENGTH is chosen entirely by the answering provider's
+  // predicted gap (planForPrewarm -> predictMainTtftMs -> planCover), so
+  // groq's ~20s gap buys a 60-110 word HOLDING line and openai's ~1.5s buys
+  // a short one. This store matched on the QUESTION alone, so a line written
+  // while groq was selected could be spoken in front of an OpenAI answer.
+  //
+  // Measured in a real session, 2026-08-19 (.server.log): a 72-word groq
+  // holding cover — about 28 SECONDS of speech — was handed to an OpenAI
+  // request whose first token arrived at 1,581ms. The candidate is reading a
+  // half-minute holding statement while the finished answer sits underneath
+  // it, and the answer then re-makes the points the holding line just made.
+  //
+  // Optional because the test seam sets no provider; the check only fires
+  // when both sides are known.
+  provider?: string;
+}
+
+let _prewarmed: PrewarmedCover | null = null;
+let _prewarmInFlight: AbortController | null = null;
+
+// A cover written 45s ago is answering a question two turns old.
+const PREWARM_MAX_AGE_MS = 45_000;
+
+const normaliseQ = (s: string) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+/**
+ * Is this prewarmed line still the right answer to what was actually sent?
+ *
+ * The line is written against the transcript AS IT STOOD, and the speaker
+ * may still be talking — "what's your experience with Kafka" becomes
+ * "...and PySpark?" and the auto-send timer restarts. A prefix is fine: the
+ * opener still opens the question honestly and the main model answers the
+ * whole of it. What is not fine is a line written for a materially
+ * different question, so the tail that arrived after it must be small.
+ */
+function prewarmStillFits(sent: string, provider?: string): PrewarmedCover | null {
+  const p = _prewarmed;
+  if (!p || !p.cover) return null;
+  if (Date.now() - p.at > PREWARM_MAX_AGE_MS) return null;
+  // A line written for another route is the wrong LENGTH for this one — see
+  // the note on PrewarmedCover.provider. Dropping it costs one opener;
+  // keeping it costs half a minute of speech in front of a 1.5s answer.
+  if (provider && p.provider && p.provider !== provider) return null;
+  const now = normaliseQ(sent);
+  if (!now) return null;
+  if (now === p.question) return p;
+  // ── THE COMPARISON HAS TO WORK IN BOTH DIRECTIONS ──
+  //
+  // Speech APPENDS, so the obvious case is the sent question having GROWN
+  // past the one the line was written for: "...with Kafka" became "...with
+  // Kafka and PySpark?". The line still opens it honestly and the main
+  // model answers the whole thing, so a bounded tail is fine.
+  //
+  // But the stored question can also be LONGER than what is sent, and that
+  // one cost a live miss: the prewarm watches the transcript INCLUDING the
+  // interim (unfinalised) words, while `executeSend` sends the input buffer
+  // alone. Any interim tail still in flight when the line was written makes
+  // the stored question a superset, a one-directional prefix test fails,
+  // and a perfectly good cover is thrown away — silently, because throwing
+  // it away looks exactly like never having written one.
+  const [shorter, longer] = now.length <= p.question.length ? [now, p.question] : [p.question, now];
+  if (!longer.startsWith(shorter)) return null;
+  return (longer.length - shorter.length) / longer.length <= 0.4 ? p : null;
+}
+
+/**
+ * What the send path should use, or null. CONSUMED on take — and the
+ * consumption is load-bearing, not hygiene. This function used to return
+ * the hit and leave the store intact, so a consecutive similar question
+ * reused it: "…experience with Kafka" was answered, the interviewer
+ * followed up "…experience with Kafka streams" twenty seconds later
+ * (19% growth — inside the divergence bound, inside the 45s TTL), and the
+ * candidate spoke the IDENTICAL opening sentence twice in a row.
+ *
+ * `peek` exists for the speculative path only: the prewarm hook re-fires
+ * as the transcript grows and consults this store to decide whether a
+ * refetch is needed. If that consultation consumed, the hook's own
+ * re-fire would destroy the cover before the send ever saw it.
+ */
+export function takePrewarmedCover(
+  sentQuestion: string,
+  opts?: { peek?: boolean; provider?: string },
+): { cover: string; effort: CoverEffort | null } | null {
+  const hit = prewarmStillFits(sentQuestion, opts?.provider);
+  if (!hit) return null;
+  if (!opts?.peek) _prewarmed = null;
+  return { cover: hit.cover, effort: hit.effort };
+}
+
+export function _clearPrewarmedCover(): void {
+  _prewarmed = null;
+  try { _prewarmInFlight?.abort(); } catch { /* nothing in flight */ }
+  _prewarmInFlight = null;
+}
+
+/**
+ * Test seam. The precedence rules and the divergence check are the whole
+ * safety argument for putting a model-written sentence on the trusted
+ * `instantOpener` rail, and they must be provable without a network call —
+ * a rule that can only be tested against a live provider is a rule that
+ * stops being tested.
+ */
+export function _setPrewarmedCoverForTest(
+  question: string,
+  cover: string,
+  effort: CoverEffort | null,
+  provider?: string,
+): void {
+  _prewarmed = { question: normaliseQ(question), cover, effort, at: Date.now(), provider };
+}
+
+/**
+ * Ask the server to write the opening line for the transcript as it stands.
+ * Fire-and-forget: never awaited by the send path, never blocks anything.
+ */
+export async function prewarmCover(
+  question: string,
+  provider: string,
+  contextFiles: ContextFile[],
+  history?: Message[],
+): Promise<void> {
+  // Declared outside the try so the finally can prove ownership. Stays
+  // null on the cheap early-returns, which never touched the in-flight
+  // slot and so have nothing to clean up.
+  let ctl: AbortController | null = null;
+  try {
+    const token = licenseService.getToken();
+    if (!token) return;
+    const q = String(question || '').trim();
+    if (q.length < 20) return;
+
+    // A newer transcript supersedes an older one — the in-flight call is
+    // answering a question the user has already moved past.
+    try { _prewarmInFlight?.abort(); } catch { /* none */ }
+    ctl = new AbortController();
+    _prewarmInFlight = ctl;
+
+    // Reuse the SAME payload builder the send path uses, so the digest and
+    // vocabulary the guard checks against are byte-identical to the ones it
+    // will check against at send time. Two builders would be two answers.
+    const payload = buildOpenerPayload(q, contextFiles || [], history, { speculative: true, provider });
+    // A locally-composed opener is grounded in verified résumé facts and
+    // costs 0ms; there is nothing a model could add. And `suppress` means an
+    // opener would actively hurt — don't spend a call to be told that.
+    if (payload.instantOpener || payload.coverPolicy === 'suppress') return;
+
+    const res = await fetch(`${API_BASE}/api/v1/ai/cover/prewarm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({
+        question: q,
+        provider,
+        coverPolicy: payload.coverPolicy,
+        coverContext: payload.coverContext,
+        coverVocabulary: payload.coverVocabulary,
+        recentTurns: payload.recentTurns,
+      }),
+      signal: ctl.signal,
+    });
+    if (!res.ok) return;
+    const out = await res.json();
+    if (ctl.signal.aborted) return;          // superseded while in flight
+    if (!out || typeof out.cover !== 'string' || !out.cover) return;
+    _prewarmed = {
+      question: normaliseQ(q),
+      cover: out.cover,
+      effort: (out.effort === 'none' || out.effort === 'low' || out.effort === 'medium') ? out.effort : null,
+      at: Date.now(),
+      provider,
+    };
+  } catch {
+    // Silent, like prefetchContext. Speculative work that fails is a
+    // non-event: the send path finds no prewarm and behaves exactly as it
+    // does today.
+  } finally {
+    // Ownership check, not a liveness check. The old condition ("clear it
+    // if whatever is there isn't aborted") let a SUPERSEDED call's cleanup
+    // null out its successor's controller: T1 fires, T2 aborts T1 and
+    // installs itself, T1's finally sees a live controller and clears it —
+    // and T3 then has nothing to abort, so T2 and T3 run concurrently and
+    // whichever finishes LAST wins the store, older question included.
+    if (ctl && _prewarmInFlight === ctl) _prewarmInFlight = null;
   }
 }
 
@@ -1307,6 +1528,11 @@ export function prewarmContext(contextFiles: ContextFile[]): void {
   if (kbTextLength(contextFiles) < RETRIEVAL_MIN_CHARS) {
     try { void offloadContext(buildTextContext(contextFiles)); } catch { /* fail open */ }
   }
+  // The cover no longer needs an offload of its own. It used to send the
+  // whole document on every request, which is what the ⟪CTX:hash⟫ upload
+  // existed to shrink; it now sends the passages that bear on the question
+  // (selectCoverEvidence), which are ~7KB and change every question — so a
+  // per-question upload would cost a round trip to save nothing.
   void getExtractedCards(contextFiles);
 }
 
@@ -1326,6 +1552,11 @@ export function prewarmRetrieval(contextFiles: ContextFile[]): void {
   if (!contextFiles || contextFiles.length === 0) return;
   try { warmIndex(contextFiles); } catch { /* fail open */ }
   try { buildCoverContext(contextFiles); } catch { /* fail open */ }
+  // The verbatim cover source. CPU only — section split, filter, join — so
+  // it belongs here beside the BM25 index rather than in prewarmContext.
+  // The UPLOAD of it is network work and lives there; until that lands the
+  // text simply travels inline.
+  try { buildCoverSource(contextFiles); } catch { /* fail open */ }
 }
 
 // ── Stream-prompt selector: NEW path when we have cards, OLD when not ──
@@ -1876,6 +2107,14 @@ export interface OpenerPayload {
    * grok and groq the fallback is still what covers a 9-50 second gap.
    */
   recentTurns: string;
+  /**
+   * How much reasoning the ANSWER needs, judged by the fast model that
+   * wrote the prewarmed opener while it was reading the question anyway.
+   * Absent unless a prewarmed cover is being used. The server prefers it
+   * over its own regex classifier and then CLAMPS IT BY TIER — it is a
+   * recommendation, never an entitlement.
+   */
+  coverEffort?: 'none' | 'low' | 'medium' | null;
 }
 
 // How much transcript the fallback gets. Two turns is the follow-up
@@ -1891,6 +2130,12 @@ export function buildOpenerPayload(
   query: string,
   contextFiles: ContextFile[],
   history?: Message[],
+  // `speculative` marks a caller that is NOT about to send — today that is
+  // only prewarmCover deciding whether a refetch is needed. It peeks the
+  // prewarm store instead of consuming it; the send path (the five stream
+  // functions) omits it and takes for real, which is what makes an opener
+  // single-use. See takePrewarmedCover for the double-speak this prevents.
+  opts?: { speculative?: boolean; provider?: string },
 ): OpenerPayload {
   try {
     const ledger = getLedgerFor(contextFiles || []);
@@ -1916,12 +2161,91 @@ export function buildOpenerPayload(
       .join('\n')
       .slice(-RECENT_TURNS_CHARS)
       .replace(/^(?!Interviewer: |You already said: )[^\n]*\n?/, '');
-    const decision = composeOpener(ledger, query, recent);
+    // ── THE COVER IS THE MODEL READING THE DOCUMENT. FULL STOP. ──
+    //
+    // This used to be a three-way precedence in which a LOCALLY COMPOSED
+    // opener — a sentence assembled from ledger spans — won over anything a
+    // model wrote, on the argument that spans of the user's own file cannot
+    // fabricate. Removed 2026-08-22 after a live drive against a 166 KB
+    // markdown knowledge base spoke, at 0ms and with total confidence:
+    //
+    //   "— CQV LEAD at Evonik since 2023. Before that, Opened 6 May 2026
+    //     and Cook Myosite."
+    //   "Data system — that's where I did my 2. MS-specific OQ."
+    //
+    // A date read as an employer, and a markdown list marker read as a
+    // noun. Every token was genuinely in the document; the extractor
+    // invented the relations between them, and no provenance check can see
+    // a relation. Meanwhile the questions that DID reach the model produced
+    // "I pull the as-found vs. as-left record and run impact assessment on
+    // every result since the last passing calibration" — the thing the
+    // feature is for. The 0ms sentence was not a faster cover; it was a
+    // worse one that also blocked the good one.
+    //
+    // What survives is the one verdict that was never about composing:
+    // a question challenging a previous answer is opened by NOTHING. The
+    // model given the question and no transcript invents a reason — the
+    // IBM -> Accenture cascade.
+    //
+    // Everything else takes the prewarmed model cover, which has ALREADY
+    // passed the full grounding guard server-side before it was handed
+    // over. That is what makes it safe to put on the `instantOpener` rail
+    // that runCover streams without re-checking — and that rail now carries
+    // model-written, guard-passed text ONLY.
+    const suppressed = isChallengeToPreviousAnswer(query);
+    const prewarm = suppressed
+      ? null
+      : takePrewarmedCover(query, { peek: !!opts?.speculative, provider: opts?.provider });
+    // ── coverContext IS THE DOCUMENTS NOW, NOT A DIGEST OF THEM ──
+    //
+    // This was `ledgerDigest(ledger)`: the uploaded files parsed into a fact
+    // ledger and then rebuilt into prose. On a real 39,891-char upload that
+    // rebuild delivered 863 characters, four employers as eight entries, a
+    // line the document told it not to claim, and the interviewer's own
+    // company's capital figures under the heading "NUMBERS THAT ARE TRUE".
+    // Every fabrication in the 2026-08-20 live runs came from the rebuild.
+    //
+    // The ledger is still exactly right for composing the LOCAL opener above
+    // — that is assembled from verified spans and speaks only what it can
+    // point at. It is the wrong input for a model that has to answer an
+    // arbitrary question about the candidate's field.
+    //
+    // `coverVocabulary` stays on the ledger deliberately: it is a normalised
+    // token list, it is small, and the server UNIONS it with coverContext
+    // when deciding what the cover was allowed to say (see runCover). The
+    // union is what stops the guard rejecting a true number that the digest
+    // happened not to carry — measured: the real "70" was reported as
+    // invented while an invented "eighteen" passed.
+    //
+    // ── AND IT IS SELECTED FOR THIS QUESTION, NOT SHIPPED WHOLE ──
+    //
+    // Sending the entire knowledge base was the first version of this and
+    // it measured worse than sending part of it: on a 40K prep document the
+    // model lost a tool the candidate uses daily, 3 times out of 3, and
+    // found it 3 times out of 3 once the irrelevant material was gone. The
+    // budget is attention, not bytes. selectCoverEvidence ranks the
+    // candidate's own passages against THIS question and sends those,
+    // verbatim, with the identity block in front.
+    const coverContext = selectCoverEvidence(contextFiles, query);
+    if (prewarm) {
+      return {
+        instantOpener: prewarm.cover,
+        coverPolicy: 'open',
+        coverShape: 'prewarm',
+        coverContext,
+        coverVocabulary: ledgerVocabulary(ledger),
+        recentTurns: recent,
+        coverEffort: prewarm.effort,
+      };
+    }
+    // No prewarmed cover ready. The rail stays EMPTY — there is no local
+    // sentence to fall back to any more, by design. `defer` lets the server
+    // race a live cover; `suppress` tells it not to.
     return {
-      instantOpener: decision.kind === 'speak' ? decision.text : '',
-      coverPolicy: decision.kind === 'speak' ? 'open' : decision.kind,
-      coverShape: decision.shape,
-      coverContext: ledgerDigest(ledger),
+      instantOpener: '',
+      coverPolicy: suppressed ? 'suppress' : 'defer',
+      coverShape: suppressed ? 'meta' : 'unknown',
+      coverContext,
       coverVocabulary: ledgerVocabulary(ledger),
       recentTurns: recent,
     };
@@ -2166,7 +2490,7 @@ export async function streamGemini(
 
   const full = await proxyStream(
     '/stream/gemini',
-    { prompt, systemInstruction, fileParts, ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history)) },
+    { prompt, systemInstruction, fileParts, ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history, { provider: 'gemini' })) },
     onToken,
     signal,
   );
@@ -2213,7 +2537,7 @@ export async function streamOpenAI(
   // through; server enforces tier gate via JWT.
   const full = await proxyStream(
     '/stream/openai',
-    { messages, reasoning_effort: getReasoningEffort(), ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history)) },
+    { messages, reasoning_effort: getReasoningEffort(), ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history, { provider: 'openai' })) },
     onToken,
     signal,
   );
@@ -2252,7 +2576,7 @@ export async function streamXAI(
 
   const full = await proxyStream(
     '/stream/xai',
-    { messages, ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history)) },
+    { messages, ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history, { provider: 'xai' })) },
     onToken,
     signal,
   );
@@ -2291,7 +2615,7 @@ export async function streamGroq(
 
   const full = await proxyStream(
     '/stream/groq',
-    { messages, ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history)) },
+    { messages, ...(isAutoSolve ? NO_OPENER : buildOpenerPayload(query, contextFiles, history, { provider: 'groq' })) },
     onToken,
     signal,
   );

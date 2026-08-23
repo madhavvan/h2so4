@@ -9,6 +9,7 @@ import { WizardHat } from './WizardHat';
 // Ultra's amethyst-brilliant mark — the admin console's tier theming needs it
 // so Ultra never renders with Max's hat or the free tier's grey fallback.
 import { UltraMark } from './UltraMark';
+import { EnterpriseMark } from './EnterpriseMark';
 // Phosphor duotone — used on the public landing + auth surfaces for the
 // editorial, premium feel that lucide's flat strokes can't quite reach.
 // In-app utility icons stay on lucide so dense toolbars don't get heavy.
@@ -31,7 +32,7 @@ import {
 } from '@phosphor-icons/react';
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import { geoService, GeoData } from './services/geoService';
-import { pricingService, RegionPricing, PricingTier, getExtensionPacks, EXTENSION_PACKS } from './services/pricingService';
+import { pricingService, RegionPricing, PricingTier, getExtensionPacks, EXTENSION_PACKS, PLAN_GROUPS, groupOf } from './services/pricingService';
 import { licenseService, UserProfile, LicenseData } from './services/licenseService';
 // Same component the Electron desktop chat-header uses. On the web post-
 // auth download surface we render it as a modal so paid users have full
@@ -236,13 +237,18 @@ const FeaturePill = ({ icon: Icon, text }: { icon: any; text: string }) => (
 const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelect: (tier: PricingTier) => void; isLoading: boolean }) => {
   const isPopular = !!tier.popular;                        // Pro
   const isUltra = tier.id === 'ultra';                     // flagship — purple corner hint
+  // Enterprise (2026-08) is the Team plan and the top of the ladder. It gets
+  // the DEEPEST GOLD, not a second accent colour: Ultra owns amethyst, and
+  // giving Enterprise its own hue would make the top of the ladder read as
+  // Ultra's sibling rather than its successor. Same material, more of it.
+  const isEnterprise = tier.id === 'enterprise';
   const isPlain = tier.price === 0 || tier.id === 'basic'; // Free/Basic — plainest, darkest
   const periodLabel = tier.period === 'month' ? '/mo' : tier.period === 'year' ? '/yr' : '';
 
   const GOLD_CTA = 'linear-gradient(180deg, #f6e4b0 0%, #d9b874 48%, #b58f45 100%)';
-  const hair = isPopular ? 0.26 : (isPlain ? 0.10 : 0.16); // gold-hairline strength
-  const iconColor = isUltra ? '#c4b5fd' : (isPlain ? '#b89a5a' : '#d3ac63');
-  const goldCta = isPopular || isUltra;                    // filled gold CTA on the two flagships
+  const hair = isEnterprise ? 0.34 : isPopular ? 0.26 : (isPlain ? 0.10 : 0.16); // gold-hairline strength
+  const iconColor = isUltra ? '#c4b5fd' : isEnterprise ? '#e6c680' : (isPlain ? '#b89a5a' : '#d3ac63');
+  const goldCta = isPopular || isUltra || isEnterprise;    // filled gold CTA on the flagships
 
   const frameStyle: React.CSSProperties = {
     backgroundColor: 'var(--cream-soft)',
@@ -255,6 +261,14 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
           backgroundImage: 'radial-gradient(60% 55% at 100% 0%, rgba(139,92,246,0.30) 0%, rgba(124,58,237,0.10) 26%, transparent 52%)',
           boxShadow: `inset 0 0 0 1px rgba(211,172,99,${hair}), inset 0 1px 0 rgba(255,255,255,0.05), inset -1px 1px 0 rgba(167,139,250,0.30), 0 20px 44px -30px rgba(139,92,246,0.45)`,
         }
+      : isEnterprise
+      ? {
+          // Warm gold washing DOWN from the top edge across the whole card —
+          // the widest, deepest treatment in the set. Distinguished from
+          // Pro's by scale and from Ultra's by having no violet in it at all.
+          backgroundImage: 'radial-gradient(120% 80% at 50% -10%, rgba(211,172,99,0.20) 0%, rgba(211,172,99,0.05) 42%, transparent 68%)',
+          boxShadow: `inset 0 0 0 1px rgba(211,172,99,${hair}), inset 0 1px 0 rgba(255,255,255,0.07), 0 26px 56px -30px rgba(211,172,99,0.42)`,
+        }
       : isPopular
       ? {
           backgroundImage: 'radial-gradient(120% 70% at 50% -12%, rgba(211,172,99,0.10), transparent 60%)',
@@ -266,7 +280,7 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
   };
 
   const ctaStyle: React.CSSProperties = goldCta
-    ? { background: GOLD_CTA, color: '#2a1f08', boxShadow: `0 8px 20px -10px ${isUltra ? 'rgba(139,92,246,0.40)' : 'rgba(211,172,99,0.38)'}` }
+    ? { background: GOLD_CTA, color: '#2a1f08', boxShadow: `0 8px 20px -10px ${isUltra ? 'rgba(139,92,246,0.40)' : isEnterprise ? 'rgba(211,172,99,0.52)' : 'rgba(211,172,99,0.38)'}` }
     : { background: 'rgba(211,172,99,0.08)', color: 'var(--ink)', boxShadow: 'inset 0 0 0 1px rgba(211,172,99,0.24)' };
 
   return (
@@ -274,14 +288,19 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
       className="relative rounded-2xl flex flex-col p-7 transition-all duration-300 hover:-translate-y-0.5"
       style={frameStyle}
     >
-      {(isPopular || isUltra) && (
+      {(isPopular || isUltra || isEnterprise) && (
         <div
           className="absolute -top-2.5 left-7 px-2.5 py-1 rounded-full text-[10px] font-semibold uppercase tracking-[0.16em]"
           style={isUltra
             ? { background: '#171326', color: '#c4b5fd', boxShadow: 'inset 0 0 0 1px rgba(167,139,250,0.55)' }
             : { background: GOLD_CTA, color: '#2a1f08' }}
         >
-          {isUltra ? 'Unlimited' : 'Most chosen'}
+          {/* Ultra's badge said "Unlimited" until 2026-08-22. It is 9 hours a
+              month now, and a badge that contradicts the feature list one line
+              below it is the kind of thing a customer discovers at 0 seconds
+              in the middle of an interview. "Unlimited" moved to the plan
+              that actually is. */}
+          {isEnterprise ? 'Unlimited' : isUltra ? 'Flagship' : 'Most chosen'}
         </div>
       )}
 
@@ -345,6 +364,73 @@ const PricingCard = ({ tier, onSelect, isLoading }: { tier: PricingTier; onSelec
           </li>
         ))}
       </ul>
+    </div>
+  );
+};
+
+// ── Plan-group tabs — Individual / Team (2026-08) ──────────────────────
+// The pricing surfaces split in two: INDIVIDUAL (Starter/Basic/Pro/Max/Ultra)
+// and TEAM (Enterprise, alone). There are FOUR pricing grids in this file
+// (mobile pager ×2, desktop grid ×2), so the tab strip and the filtering are
+// one shared hook + one shared component rather than four copies that would
+// each have to be found again the next time a tier is added.
+//
+// Grouping comes off the tier itself (pricingService `group`), never a list
+// hardcoded here, so the app and the landing page can never disagree about
+// which tab a plan is on.
+const usePlanGroups = (pricing: RegionPricing | null) => {
+  const [group, setGroup] = useState<'individual' | 'team'>('individual');
+  const all = pricing?.tiers || [];
+  const teamTiers = all.filter(t => groupOf(t) === 'team');
+  // An older server, or a region table without the Team plan, must not leave
+  // a tab strip offering an empty tab — nor hide the individual plans behind
+  // one. When there is no team plan there are no tabs at all.
+  const showTabs = teamTiers.length > 0;
+  const active: 'individual' | 'team' = showTabs ? group : 'individual';
+  const visible = showTabs ? all.filter(t => groupOf(t) === active) : all;
+  return { group: active, setGroup, showTabs, visible };
+};
+
+const PlanGroupTabs = ({
+  group,
+  setGroup,
+  show,
+}: {
+  group: 'individual' | 'team';
+  setGroup: (g: 'individual' | 'team') => void;
+  show: boolean;
+}) => {
+  if (!show) return null;
+  const GOLD_CTA = 'linear-gradient(180deg, #f6e4b0 0%, #d9b874 48%, #b58f45 100%)';
+  return (
+    <div className="flex justify-center mb-8">
+      {/* role="tablist" because this genuinely IS a tabbed disclosure —
+          read as two loose buttons, nothing tells a screen-reader user that
+          picking one replaces the other's content. */}
+      <div
+        role="tablist"
+        aria-label="Plan type"
+        className="inline-flex gap-1 p-1 rounded-full"
+        style={{ background: 'rgba(10,9,8,0.55)', boxShadow: 'inset 0 0 0 1px rgba(211,172,99,0.18)' }}
+      >
+        {PLAN_GROUPS.map(g => {
+          const on = group === g.id;
+          return (
+            <button
+              key={g.id}
+              role="tab"
+              aria-selected={on}
+              onClick={() => setGroup(g.id)}
+              className="px-5 py-2 rounded-full text-[13px] font-semibold transition-all duration-200"
+              style={on
+                ? { background: GOLD_CTA, color: '#2a1f08', boxShadow: '0 8px 20px -12px rgba(211,172,99,0.7)' }
+                : { background: 'transparent', color: 'var(--ink-muted)' }}
+            >
+              {g.label}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 };
@@ -743,11 +829,11 @@ const API_BASE = (import.meta as any).env?.PROD
 // badge fell through to the grey FREE theme, Ultra revenue never appeared on
 // the tier cards, and the change-tier dropdown could not send `ultra` at all —
 // so the console could not put a customer on the top plan.
-type Tier = 'free' | 'basic' | 'pro' | 'max' | 'ultra';
-const TIERS: Tier[] = ['free', 'basic', 'pro', 'max', 'ultra'];
+type Tier = 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
+const TIERS: Tier[] = ['free', 'basic', 'pro', 'max', 'ultra', 'enterprise'];
 // Tiers an admin can grant as a comp / move a user to. Free is excluded from
 // comps (the server rejects it — use change-tier to downgrade).
-const PAID_TIERS: Tier[] = ['basic', 'pro', 'max', 'ultra'];
+const PAID_TIERS: Tier[] = ['basic', 'pro', 'max', 'ultra', 'enterprise'];
 
 // Single source of truth for tier color-coding. Any place that shows a tier
 // pulls its Tailwind classes from here so Free/Basic/Pro/Max/Ultra always look
@@ -760,6 +846,12 @@ const TIER_THEME: Record<Tier, { bg: string; text: string; border: string; bar: 
   // Violet, distinct from Max's amber — Ultra is the top plan and must not be
   // mistaken for Max at a glance.
   ultra: { bg: 'bg-violet-500/10',  text: 'text-violet-300',  border: 'border-violet-500/30',  bar: 'bg-violet-400',   dot: 'bg-violet-400',   Icon: UltraMark },
+  // Enterprise (2026-08) is the TEAM plan and the new top of the ladder.
+  // Amber-adjacent gold rather than a sixth hue: the admin console is a dense
+  // table surface where a new colour per tier stops being information and
+  // starts being noise. It is separated from Max's amber by the mark, which
+  // is the thing an operator actually reads at a glance.
+  enterprise: { bg: 'bg-yellow-500/12', text: 'text-yellow-200', border: 'border-yellow-500/35', bar: 'bg-yellow-300', dot: 'bg-yellow-300', Icon: EnterpriseMark },
 };
 const tierOf = (t?: string): (typeof TIER_THEME)[Tier] => (TIER_THEME as any)[t || ''] || TIER_THEME.free;
 
@@ -826,6 +918,7 @@ const TierBadge = ({ tier }: { tier?: string }) => {
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase border ${th.bg} ${th.text} ${th.border}`}>
       {label === 'MAX' && <WizardHat size={9} />}
       {label === 'ULTRA' && <UltraMark size={9} />}
+      {label === 'ENTERPRISE' && <EnterpriseMark size={9} />}
       {label}
     </span>
   );
@@ -3896,6 +3989,7 @@ const LandingMobile: React.FC<LandingMobileProps> = ({
   setView, geo, pricing, handleTierSelect, isSubmitting, currentUser, setAuthError,
   paymentError, onDismissPaymentError,
 }) => {
+  const planGroup = usePlanGroups(pricing);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [sheetClosing, setSheetClosing] = useState(false);
   const [showStickyCTA, setShowStickyCTA] = useState(false);
@@ -4309,8 +4403,9 @@ const LandingMobile: React.FC<LandingMobileProps> = ({
         </div>
         {pricing && (
           <>
+            <PlanGroupTabs group={planGroup.group} setGroup={planGroup.setGroup} show={planGroup.showTabs} />
             <div ref={pricingScrollRef} className="ios-pager pb-1">
-              {pricing.tiers.map((tier) => (
+              {planGroup.visible.map((tier) => (
                 <div key={tier.id} className="ios-pager-item">
                   <PricingCard tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
                 </div>
@@ -4601,7 +4696,7 @@ interface AuthMobileProps {
   handleForgotPassword: (e: React.FormEvent) => void | Promise<void>;
   handleGoogleSuccess: (cred: any) => void | Promise<void>;
   handleGoogleError: () => void;
-  handleGoogleElectron: () => void | Promise<void>;
+  handleGoogleElectron: (opts?: { switchAccount?: boolean }) => void | Promise<void>;
   renderGoogleFallback: () => React.ReactNode;
   isSubmitting: boolean;
   googleSubmitting: boolean;
@@ -4887,7 +4982,7 @@ const AuthMobile: React.FC<AuthMobileProps> = ({
           {isElectron ? (
             <button
               type="button"
-              onClick={handleGoogleElectron}
+              onClick={() => handleGoogleElectron()}
               disabled={isSubmitting || googleSubmitting}
               className="ios-press mt-5 w-full py-3.5 px-4 rounded-full text-[14px] font-medium flex items-center justify-center gap-3 disabled:opacity-60"
               style={{ background: 'var(--cream-soft)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
@@ -5158,6 +5253,7 @@ const PRICING_FAQ = [
 const PricingMobile: React.FC<PricingMobileProps> = ({
   setView, geo, pricing, handleTierSelect, isSubmitting, currentUser,
 }) => {
+  const planGroup = usePlanGroups(pricing);
   const [isClosing, setIsClosing] = useState(false);
   const [pricingIdx, setPricingIdx] = useState(0);
   const [openFaqIdx, setOpenFaqIdx] = useState<number | null>(null);
@@ -5276,8 +5372,9 @@ const PricingMobile: React.FC<PricingMobileProps> = ({
       {/* Pricing pager */}
       {pricing && (
         <section className="pb-10">
+          <PlanGroupTabs group={planGroup.group} setGroup={planGroup.setGroup} show={planGroup.showTabs} />
           <div ref={pricingScrollRef} className="ios-pager pb-1">
-            {pricing.tiers.map((tier) => (
+            {planGroup.visible.map((tier) => (
               <div key={tier.id} className="ios-pager-item">
                 <PricingCard tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
               </div>
@@ -5387,7 +5484,7 @@ interface DownloadMobileProps {
   handleManageSubscription: () => Promise<void> | void;
   handleCancelSubscription: () => Promise<void> | void;
   initiateRenewal: () => Promise<void> | void;
-  initiateCheckout: (tier?: 'basic' | 'pro' | 'max' | 'ultra') => Promise<void> | void;
+  initiateCheckout: (tier?: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise') => Promise<void> | void;
   basicExpiryLabel: (expiresAt: number | undefined | null) => string | null;
   // Opens Documentation as a modal layer OVER the mobile profile sheet
   // so closing docs returns to the still-open profile. Lifted to
@@ -5436,28 +5533,28 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
   // webhook hasn't landed and currentLicense.tier is still 'free').
   const isAdminUser = !!currentUser && licenseService.isDeveloper(currentUser.email);
   const licenseTier = currentLicense?.tier;
-  // 'ultra' belongs in both lists — it is the apex PAID tier. Without it an
-  // Ultra licence fell through to null and this surface rendered the Free
-  // state, complete with an "Upgrade to Pro" button aimed at a subscriber
-  // already paying for the top plan.
-  const paidLicense =
-    licenseTier === 'ultra' || licenseTier === 'max' || licenseTier === 'pro' || licenseTier === 'basic'
-      ? licenseTier : null;
+  // Every PAID tier belongs in both lists. A tier missing here falls through
+  // to null and this surface renders the Free state — complete with an
+  // "Upgrade to Pro" button aimed at a subscriber already paying for a
+  // higher plan. That happened to Ultra once; the list is derived now so it
+  // cannot happen again to Enterprise.
+  const PAID_LICENSE_TIERS = ['enterprise', 'ultra', 'max', 'pro', 'basic'];
+  const paidLicense = PAID_LICENSE_TIERS.includes(licenseTier as string) ? licenseTier : null;
   const fallbackTier = paidLicense
     ? paidLicense
-    : (lastSuccessfulTier === 'ultra' || lastSuccessfulTier === 'max' || lastSuccessfulTier === 'pro' || lastSuccessfulTier === 'basic'
-        ? lastSuccessfulTier
-        : null);
-  const effectiveTier = isAdminUser ? 'max' : fallbackTier;
+    : (PAID_LICENSE_TIERS.includes(lastSuccessfulTier as string) ? lastSuccessfulTier : null);
+  const effectiveTier = isAdminUser ? 'enterprise' : fallbackTier;
 
   const tierBadge = (() => {
     if (!currentLicense) return null;
     const t = currentLicense.tier;
-    const labelMap: Record<string, string> = { ultra: 'ULTRA', max: 'MAX', pro: 'PRO', basic: 'BASIC', free: 'FREE' };
+    const labelMap: Record<string, string> = { enterprise: 'ENTERPRISE', ultra: 'ULTRA', max: 'MAX', pro: 'PRO', basic: 'BASIC', free: 'FREE' };
     const colorMap: Record<string, { bg: string; color: string }> = {
       // Amethyst, matching TIER_THEME.ultra. Previously absent, so an Ultra
       // badge fell through to `colorMap.free` and rendered grey FREE.
       ultra: { bg: 'rgba(139, 92, 246, 0.15)', color: '#6d28d9' },
+      // Deep gold — the Enterprise material. See TIER_THEME.enterprise.
+      enterprise: { bg: 'rgba(211, 172, 99, 0.18)', color: '#8a6a1f' },
       max:   { bg: 'rgba(245, 158, 11, 0.15)', color: '#b45309' },
       pro:   { bg: 'rgba(59, 130, 246, 0.15)', color: '#1d4ed8' },
       basic: { bg: 'rgba(16, 185, 129, 0.15)', color: '#047857' },
@@ -5669,8 +5766,11 @@ const DownloadMobile: React.FC<DownloadMobileProps> = (props) => {
       {/* Tier-aware action */}
       <section className="px-5 pb-10">
         {(() => {
-          if (effectiveTier === 'max' || effectiveTier === 'pro' || effectiveTier === 'ultra') {
-            const isUltra = effectiveTier === 'ultra';
+          if (effectiveTier === 'max' || effectiveTier === 'pro' || effectiveTier === 'ultra' || effectiveTier === 'enterprise') {
+            // Enterprise borrows Ultra's "top plan" styling branch — both are
+            // subscriptions, and the alternative is a fourth colour on a
+            // surface that already carries three.
+            const isUltra = effectiveTier === 'ultra' || effectiveTier === 'enterprise';
             const isMax = effectiveTier === 'max';
             return (
               <div className="space-y-3">
@@ -6515,8 +6615,11 @@ const ProfileSheetMobile: React.FC<ProfileSheetMobileProps> = ({
               style={{ background: tierMeta.bg }}
             >
               {/* Ultra had no branch here, so the top plan fell to the
-                  final `else` and drew Zap — Basic's glyph. */}
-              {currentLicense?.tier === 'ultra'
+                  final `else` and drew Zap — Basic's glyph. Enterprise gets
+                  its own branch for the same reason. */}
+              {currentLicense?.tier === 'enterprise'
+                ? <EnterpriseMark size={20} style={{ color: tierMeta.color }} />
+                : currentLicense?.tier === 'ultra'
                 ? <UltraMark size={20} style={{ color: tierMeta.color }} />
                 : currentLicense?.tier === 'max'
                 ? <WizardHat size={20} style={{ color: tierMeta.color }} />
@@ -6668,7 +6771,7 @@ interface PlanSheetMobileProps {
   paymentLoading: boolean;
   paymentError: string | null;
   paymentSuccess: string | null;
-  initiateCheckout: (tier?: 'basic' | 'pro' | 'max' | 'ultra') => Promise<void> | void;
+  initiateCheckout: (tier?: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise') => Promise<void> | void;
   initiateRenewal: () => Promise<void> | void;
   handleManageSubscription: () => Promise<void> | void;
   onRequestCancel: () => void;
@@ -6700,6 +6803,10 @@ function tierMetaForPlanSheet(tier: string) {
     // Amethyst, matching TIER_THEME.ultra and that badge map, so Ultra
     // reads as Ultra everywhere rather than as Max's amber.
     case 'ultra': return { label: 'Ultra', bg: 'rgba(139, 92, 246, 0.12)', color: '#6d28d9', accent: '#7c3aed' };
+    // ── Enterprise ── same reasoning as Ultra above: without a case here the
+    // Team plan falls to `default` and the sheet tells a $1199/mo customer
+    // their plan is Free, in Free's grey.
+    case 'enterprise': return { label: 'Enterprise', bg: 'rgba(211, 172, 99, 0.14)', color: '#8a6a1f', accent: '#c9a253' };
     case 'max':   return { label: 'Max',   bg: 'rgba(245, 158, 11, 0.12)', color: '#b45309', accent: '#d97706' };
     case 'pro':   return { label: 'Pro',   bg: 'rgba(59, 130, 246, 0.12)', color: '#1d4ed8', accent: '#2563eb' };
     case 'basic': return { label: 'Basic', bg: 'rgba(16, 185, 129, 0.12)', color: '#047857', accent: '#059669' };
@@ -6773,7 +6880,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
   // Effective tier resolution — admin always renders as Max so the sheet
   // shows the same buttons / state ManageSubscription does for admins.
   const isAdminUser = !!currentUser && licenseService.isDeveloper(currentUser.email);
-  const tier = (isAdminUser ? 'max' : (currentLicense?.tier || 'free')) as 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+  const tier = (isAdminUser ? 'enterprise' : (currentLicense?.tier || 'free')) as 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
   const status = currentLicense?.status || 'none';
 
   // Provider — server is authoritative; geo is a fallback during the brief
@@ -6788,26 +6895,50 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
 
   // Resolve display price for a given tier from the regional pricing payload.
   // Returns null if pricing hasn't loaded — rows guard against null below.
-  const findTierPrice = (id: 'basic' | 'pro' | 'max' | 'ultra'): string | null => {
+  const findTierPrice = (id: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise'): string | null => {
     const t = pricing?.tiers.find(x => x.id === id);
     if (!t) return null;
     const period = t.period === 'month' ? '/mo' : t.period === 'year' ? '/yr' : '';
     return pricingService.formatPrice(t.price, t.currencySymbol, t.currency) + period;
   };
 
-  // Shared "Go Ultra" row — the monthly unlimited subscription must be
-  // purchasable from every non-Ultra tier. It was missing from this sheet
-  // entirely (only the landing pricing cards sold it), so in-app users had
-  // no path to the flagship plan.
+  // Shared "Go Ultra" row — the monthly subscription must be purchasable
+  // from every lower tier. It was missing from this sheet entirely (only the
+  // landing pricing cards sold it), so in-app users had no path to it.
+  // Subtitle says 9 hours, not "unlimited": Ultra became metered on
+  // 2026-08-22 and unlimited moved to Enterprise.
   const ultraRow = (variant?: 'primary'): PlanRow => ({
     key: 'upgrade-ultra',
     Icon: Star, iconBg: 'rgba(139, 92, 246, 0.12)', iconColor: '#7c3aed',
     title: 'Go Ultra',
-    subtitle: 'Unlimited interviews · Auto-Type · all 5 models · billed monthly',
+    subtitle: '9 hours a month · Auto-Type · all 5 models · billed monthly',
     price: findTierPrice('ultra') || undefined,
     variant,
     onClick: wrapAction('upgrade-ultra', () => initiateCheckout('ultra')),
   });
+
+  // Shared "Get Enterprise" row — the Team plan, and the only way to remove
+  // the meter. Rendered only when the region's price table actually carries
+  // Enterprise, so an older/limited table can't produce a row whose checkout
+  // would then 400 on an unknown tier.
+  const enterpriseRow = (variant?: 'primary'): PlanRow | null => {
+    if (!pricing?.tiers.some(t => t.id === 'enterprise')) return null;
+    return {
+      key: 'upgrade-enterprise',
+      Icon: EnterpriseMark, iconBg: 'rgba(211, 172, 99, 0.14)', iconColor: '#c9a253',
+      title: 'Get Enterprise',
+      subtitle: 'Unlimited interview time · never expires · every model · Auto-Type',
+      price: findTierPrice('enterprise') || undefined,
+      variant,
+      onClick: wrapAction('upgrade-enterprise', () => initiateCheckout('enterprise')),
+    };
+  };
+  // Push helper — enterpriseRow() is nullable, and `actions.push(null)` would
+  // put a hole in the list that the renderer then dereferences.
+  const pushEnterprise = (list: PlanRow[], variant?: 'primary') => {
+    const row = enterpriseRow(variant);
+    if (row) list.push(row);
+  };
 
   const renewalPriceLabel = (() => {
     if (!geo) return null;
@@ -6863,6 +6994,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
       });
     }
     actions.push(ultraRow());
+    pushEnterprise(actions);
   }
 
   if (tier === 'basic') {
@@ -6894,6 +7026,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
       onClick: wrapAction('upgrade-max', () => initiateCheckout('max')),
     });
     actions.push(ultraRow());
+    pushEnterprise(actions);
   }
 
   if (tier === 'pro' && !isAdminUser) {
@@ -6911,6 +7044,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
       onClick: wrapAction('upgrade-max', () => initiateCheckout('max')),
     });
     actions.push(ultraRow());
+    pushEnterprise(actions);
   }
 
   if (tier === 'max' && !isAdminUser) {
@@ -6918,8 +7052,20 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
     // and buying a Pro pass mid-Max would charge $50 today AND replace the
     // remaining Max time with Pro's 1-hour clock (the old row even promised
     // "effective at next renewal", which a fresh checkout never honors).
-    // The only sensible move UP from Max is the Ultra subscription.
+    // The only sensible moves UP from Max are the two subscriptions.
     actions.push(ultraRow('primary'));
+    pushEnterprise(actions);
+  }
+
+  // ── Ultra → Enterprise ────────────────────────────────────────────────
+  // Ultra had NO rows at all here, because before 2026-08 it was the top of
+  // the ladder and there was genuinely nothing to sell it. There is now: an
+  // Ultra subscriber who keeps running out of their 9 hours has exactly one
+  // upgrade, and /upgrade-tier turns this into a prorated in-place swap
+  // rather than a second parallel subscription (checkoutConflictFor →
+  // 'upgrade_in_place').
+  if (tier === 'ultra' && !isAdminUser) {
+    pushEnterprise(actions, 'primary');
   }
 
   // Admin actions — admin users can instant-grant themselves any tier
@@ -6933,7 +7079,7 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
   // initiateCheckout falls through to /create-checkout, which doesn't
   // accept those targets. /upgrade-tier with admin bypass handles all
   // four targets in one round-trip.
-  const adminGrant = async (target: 'ultra' | 'pro' | 'max' | 'basic' | 'free') => {
+  const adminGrant = async (target: 'enterprise' | 'ultra' | 'pro' | 'max' | 'basic' | 'free') => {
     const token = licenseService.getToken();
     if (!token) return;
     try {
@@ -6968,11 +7114,16 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
   };
 
   if (isAdminUser) {
-    const adminTargets: Array<{ key: 'ultra' | 'pro' | 'max' | 'basic' | 'free'; title: string; subtitle: string; Icon: any; iconBg: string; iconColor: string }> = [
-      { key: 'ultra', title: 'Switch to Ultra (admin)', subtitle: 'Unlimited + Auto-Type + all 5 models. Instant grant, no checkout.',                    Icon: Star,      iconBg: 'rgba(139, 92, 246, 0.12)', iconColor: '#7c3aed' },
-      { key: 'max',   title: 'Switch to Max (admin)',   subtitle: 'Three 1-hour interviews · Claude + Train Model. Instant grant, no checkout.',          Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309' },
-      { key: 'pro',   title: 'Switch to Pro (admin)',   subtitle: 'One 1-hour interview · all 5 models incl. Claude. Instant grant, no checkout.',        Icon: Crown,     iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb' },
-      { key: 'basic', title: 'Switch to Basic (admin)', subtitle: 'One 30-min interview · 4 models (no Claude). Instant grant — admin override.',         Icon: Zap,       iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857' },
+    // Every admin grant lands with Enterprise-equivalent credits regardless
+    // of the tier named — unlimited time that never expires until an admin
+    // changes the plan (server: admin.js ENTERPRISE_EQUIVALENT_CREDITS). The
+    // tier here decides which FEATURES are visible, not how much time.
+    const adminTargets: Array<{ key: 'enterprise' | 'ultra' | 'pro' | 'max' | 'basic' | 'free'; title: string; subtitle: string; Icon: any; iconBg: string; iconColor: string }> = [
+      { key: 'enterprise', title: 'Switch to Enterprise (admin)', subtitle: 'Every feature, unlimited time that never expires. Instant grant, no checkout.', Icon: EnterpriseMark, iconBg: 'rgba(211, 172, 99, 0.14)', iconColor: '#c9a253' },
+      { key: 'ultra', title: 'Switch to Ultra (admin)', subtitle: 'Auto-Type + all 5 models, with unlimited admin time. Instant grant, no checkout.',    Icon: Star,      iconBg: 'rgba(139, 92, 246, 0.12)', iconColor: '#7c3aed' },
+      { key: 'max',   title: 'Switch to Max (admin)',   subtitle: 'Claude + Train Model + reasoning dial, unlimited admin time. Instant grant.',          Icon: WizardHat, iconBg: 'rgba(245, 158, 11, 0.12)', iconColor: '#b45309' },
+      { key: 'pro',   title: 'Switch to Pro (admin)',   subtitle: 'All 5 models incl. Claude, unlimited admin time. Instant grant, no checkout.',         Icon: Crown,     iconBg: 'rgba(59, 130, 246, 0.12)', iconColor: '#2563eb' },
+      { key: 'basic', title: 'Switch to Basic (admin)', subtitle: '4 models (no Claude), unlimited admin time. Instant grant — admin override.',          Icon: Zap,       iconBg: 'rgba(16, 185, 129, 0.12)', iconColor: '#047857' },
       { key: 'free',  title: 'Switch to Free (admin)',  subtitle: 'Drop to Free with 5 sessions/month default. Instant grant, no checkout.',              Icon: Sparkles,  iconBg: 'var(--cream-soft)',        iconColor: 'var(--ink-muted)' },
     ];
     for (const a of adminTargets) {
@@ -6989,8 +7140,9 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
   // Manage section — Stripe portal vs Razorpay cancel. ULTRA included: it's
   // the only true subscription in the 2026-07 model, and the old pro/max-only
   // gate left Ultra subscribers with no billing-portal/cancel surface here.
-  const showStripeManage = (tier === 'pro' || tier === 'max' || tier === 'ultra') && !isAdminUser && isStripe;
-  const showRazorpayCancel = (tier === 'pro' || tier === 'max' || tier === 'ultra') && !isAdminUser && isRazorpay;
+  const SUB_MANAGEABLE_TIERS = ['pro', 'max', 'ultra', 'enterprise'];
+  const showStripeManage = SUB_MANAGEABLE_TIERS.includes(tier) && !isAdminUser && isStripe;
+  const showRazorpayCancel = SUB_MANAGEABLE_TIERS.includes(tier) && !isAdminUser && isRazorpay;
 
   return (
     <>
@@ -7066,7 +7218,9 @@ const PlanSheetMobile: React.FC<PlanSheetMobileProps> = ({
                     generic Sparkles, the same glyph a Free account gets.
                     UltraMark is the mark the landing's pricing table and
                     TIER_THEME.ultra both use. */}
-                {tier === 'ultra' ? (
+                {tier === 'enterprise' ? (
+                  <EnterpriseMark size={22} style={{ color: tierMeta.color }} />
+                ) : tier === 'ultra' ? (
                   <UltraMark size={22} style={{ color: tierMeta.color }} />
                 ) : tier === 'max' ? (
                   <WizardHat size={22} style={{ color: tierMeta.color }} />
@@ -7725,6 +7879,8 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   const [webDocsOpen, setWebDocsOpen] = useState(false);
   const [geo, setGeo] = useState<GeoData | null>(null);
   const [pricing, setPricing] = useState<RegionPricing | null>(null);
+  // Individual / Team tab state for the two desktop pricing grids below.
+  const planGroup = usePlanGroups(pricing);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -7781,7 +7937,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // Which tier the user clicked on the pricing card. Persisted across
   // signup → checkout transitions (otherwise a non-authenticated user
   // clicking Max would sign up and then get routed through a Pro checkout).
-  const [pendingCheckoutTier, setPendingCheckoutTier] = useState<'basic' | 'pro' | 'max' | 'ultra'>('pro');
+  const [pendingCheckoutTier, setPendingCheckoutTier] = useState<'basic' | 'pro' | 'max' | 'ultra' | 'enterprise'>('pro');
   // What the user just paid for / was just granted. Survives webhook lag:
   // when the Stripe webhook hasn't landed by the time we render /download,
   // currentLicense.tier may still be 'free' — we'd otherwise drop the user
@@ -7804,7 +7960,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     // an ultra live tier read as a downgrade from a cached 'max' and wiped
     // the just-purchased banner, while a cached 'ultra' could never trip the
     // downgrade clear at all.
-    const rank: Record<string, number> = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4 };
+  const rank: Record<string, number> = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4, enterprise: 5 };
     const liveRank = rank[String(currentLicense.tier).toLowerCase()] ?? 0;
     const cachedRank = rank[String(lastSuccessfulTier).toLowerCase()] ?? 0;
     if (liveRank < cachedRank) {
@@ -7856,7 +8012,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
         // Pro. No Auto-Type (Ultra only) — the value is the extra hours.
         return 'Payment successful — Max activated. Three full-hour interviews with every model, including Claude Sonnet 5.';
       case 'ultra':
-        return 'Payment successful — Ultra activated. Unlimited interviews, Auto-Type, and every model including Claude Sonnet 5 — all live.';
+        // 9 hours, not "unlimited" — the success message is the first thing a
+        // brand-new subscriber reads about what they just bought, so it is
+        // the last place that should overstate it.
+        return 'Payment successful — Ultra activated. 9 hours of interview time this month, Auto-Type, and every model including Claude Sonnet 5 — all live.';
+      case 'enterprise':
+        return 'Payment successful — Enterprise activated. Unlimited interview time that never expires, Auto-Type for coding rounds, and every model including Claude Sonnet 5.';
       default:
         return 'Payment successful — your plan is active.';
     }
@@ -8239,7 +8400,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // a routing mismatch (rare). We surface a clear "still waiting" message
   // instead of spinning forever — relaunching the app picks up the new
   // license on the next validateWithServer tick regardless.
-  const pollForUpgrade = async (targetTier: 'basic' | 'pro' | 'max' | 'ultra'): Promise<void> => {
+  const pollForUpgrade = async (targetTier: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise'): Promise<void> => {
     const POLL_INTERVAL_MS = 4000;
     const POLL_TIMEOUT_MS = 10 * 60 * 1000;
     const startedAt = Date.now();
@@ -8316,7 +8477,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   };
 
   // ── Initiate payment checkout (Stripe or Razorpay based on geo) ──
-  const initiateCheckout = async (tier: 'basic' | 'pro' | 'max' | 'ultra' = pendingCheckoutTier) => {
+  const initiateCheckout = async (tier: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise' = pendingCheckoutTier) => {
     setPaymentLoading(true);
     setPaymentError(null);
 
@@ -8350,12 +8511,14 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
       // falls through to /create-checkout's normal new-subscription flow.
       const liveTier = currentLicense?.tier;
       const isLiveActive = currentLicense?.status === 'active';
-      // 2026-07 model: only Ultra is a recurring subscription that can be
-      // swapped in-place. Basic/Pro/Max are one-time purchases — picking a
-      // different one is a fresh /create-checkout, never an /upgrade-tier swap
-      // (which would 404 hunting for a Stripe sub that one-time buyers never had).
+      // Ultra and Enterprise are the recurring subscriptions, and only those
+      // can be swapped in-place (Ultra ⇄ Enterprise). Basic/Pro/Max are
+      // one-time purchases — picking a different one is a fresh
+      // /create-checkout, never an /upgrade-tier swap (which would 404
+      // hunting for a Stripe sub that one-time buyers never had). Mirrors
+      // RECURRING_TIERS in server/src/routes/payments.js.
       const isRecurringTier = (t: string | undefined | null): boolean =>
-        t === 'ultra';
+        t === 'ultra' || t === 'enterprise';
       const isInPlaceUpgrade =
         isLiveActive &&
         isRecurringTier(liveTier) &&
@@ -8888,7 +9051,11 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     googleSessionIdRef.current = null;
   }, [googleSubmitting]);
 
-  const handleGoogleElectron = async () => {
+  // `opts` is optional because this is also wired straight to onClick, where
+  // React hands it a MouseEvent — hence the explicit `=== true` test rather
+  // than a truthiness check on the argument.
+  const handleGoogleElectron = async (opts?: { switchAccount?: boolean }) => {
+    const wantsAccountPicker = opts?.switchAccount === true;
     setGoogleSubmitting(true);
     setAuthError(null);
     setGoogleManualUrl(null);
@@ -8918,7 +9085,12 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     // of the old hardcoded US. Server validates the shape; omitted when geo
     // hasn't resolved yet (server falls back to US).
     const geoCountry = /^[A-Za-z]{2}$/.test(geo?.country_code || '') ? `&country_code=${geo!.country_code.toUpperCase()}` : '';
-    const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}${geoCountry}`;
+    // /google/start no longer forces Google's account chooser — forcing it
+    // meant a click on every sign-in, and a click makes the success tab's
+    // history length 2, which is what stops the tab closing itself. The
+    // chooser is opt-in instead, and THIS is the only thing that opts in.
+    const switchAccountParam = wantsAccountPicker ? '&switch_account=1' : '';
+    const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}${geoCountry}${switchAccountParam}`;
 
     // Open Google sign-in in system browser. We MUST await + catch here —
     // the original fire-and-forget pattern silently swallowed shell errors
@@ -9168,7 +9340,29 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
   // here so it captures the latest state via closure and renders identically
   // in both the login and signup views.
   const renderGoogleFallback = () => {
-    if (!googleSubmitting && !googleManualUrl && !googleCodePrompt) return null;
+    if (!googleSubmitting && !googleManualUrl && !googleCodePrompt) {
+      // Idle. The one thing worth offering here is the account chooser.
+      // /google/start stopped forcing prompt=select_account (it costs the
+      // tab's ability to close itself), so without this a user whose browser
+      // is already signed into the wrong Google account is silently signed in
+      // as that account — and since an unknown email creates a NEW account,
+      // they end up with a second minicaai account on the wrong address and
+      // no way to reach the picker. This is the compensating control for
+      // removing the forced chooser; the two ship together or not at all.
+      return (
+        <div className="mt-2 text-center">
+          <button
+            type="button"
+            onClick={() => handleGoogleElectron({ switchAccount: true })}
+            disabled={isSubmitting || googleSubmitting}
+            className="text-[11.5px] underline-offset-2 hover:underline disabled:opacity-50"
+            style={{ color: 'var(--ink-muted)', background: 'none', border: 'none', cursor: 'pointer' }}
+          >
+            Use a different Google account
+          </button>
+        </div>
+      );
+    }
     return (
       <div className="mt-3 space-y-2">
         {/* Consent finished, but the code never reached this machine — the
@@ -9593,7 +9787,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 </button>
                 {/* ultra was absent, so the top tier rendered in the same
                     grey as free — violet matches TIER_THEME.ultra. */}
-                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${currentLicense?.tier === 'ultra' ? 'bg-violet-500/20 text-violet-300' : currentLicense?.tier === 'max' ? 'bg-amber-500/20 text-amber-400' : currentLicense?.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : currentLicense?.tier === 'basic' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-500/20 text-gray-400'}`}>
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${currentLicense?.tier === 'enterprise' ? 'bg-yellow-500/20 text-yellow-200' : currentLicense?.tier === 'ultra' ? 'bg-violet-500/20 text-violet-300' : currentLicense?.tier === 'max' ? 'bg-amber-500/20 text-amber-400' : currentLicense?.tier === 'pro' ? 'bg-blue-500/20 text-blue-400' : currentLicense?.tier === 'basic' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-500/20 text-gray-400'}`}>
                   {currentLicense?.tier || 'free'}
                 </span>
                 {/* Explicit "Subscription" link in the nav — labeled, not
@@ -9856,24 +10050,25 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               //    above identify a paid tier.
               const isAdminUser = !!currentUser && licenseService.isDeveloper(currentUser.email);
               const licenseTier = currentLicense?.tier;
-              // 'ultra' is a paid tier and must be recognised here, or the
-              // apex subscriber falls through to the Free CTA below and is
-              // sold "Upgrade to Pro".
-              const paidLicense =
-                licenseTier === 'ultra' || licenseTier === 'max' || licenseTier === 'pro' || licenseTier === 'basic'
-                  ? licenseTier
-                  : null;
+              // Every paid tier must be recognised here, or the subscriber
+              // falls through to the Free CTA below and is sold "Upgrade to
+              // Pro". Derived from one list so a new tier can't be missed —
+              // that is exactly how Ultra broke here once.
+              const PAID_TIERS_HERE = ['enterprise', 'ultra', 'max', 'pro', 'basic'];
+              const paidLicense = PAID_TIERS_HERE.includes(licenseTier as string) ? licenseTier : null;
               const fallbackTier = paidLicense
                 ? paidLicense
-                : (lastSuccessfulTier === 'ultra' || lastSuccessfulTier === 'max' || lastSuccessfulTier === 'pro' || lastSuccessfulTier === 'basic'
-                    ? lastSuccessfulTier
-                    : null);
-              const effectiveTier = isAdminUser ? 'max' : fallbackTier;
+                : (PAID_TIERS_HERE.includes(lastSuccessfulTier as string) ? lastSuccessfulTier : null);
+              const effectiveTier = isAdminUser ? 'enterprise' : fallbackTier;
 
-              if (effectiveTier === 'max' || effectiveTier === 'pro' || effectiveTier === 'ultra') {
+              if (effectiveTier === 'max' || effectiveTier === 'pro' || effectiveTier === 'ultra' || effectiveTier === 'enterprise') {
                 return (
                   <>
-                    {effectiveTier === 'ultra' ? (
+                    {effectiveTier === 'enterprise' ? (
+                      <div className="px-6 py-2.5 rounded-xl bg-yellow-500/10 border border-yellow-500/30 text-yellow-200 text-sm font-semibold flex items-center gap-2">
+                        <EnterpriseMark size={14} /> {isAdminUser ? 'Admin · Enterprise Active' : 'Enterprise Active'}
+                      </div>
+                    ) : effectiveTier === 'ultra' ? (
                       <div className="px-6 py-2.5 rounded-xl bg-violet-500/10 border border-violet-500/30 text-violet-300 text-sm font-semibold flex items-center gap-2">
                         <UltraMark size={14} /> Ultra Active
                       </div>
@@ -9943,7 +10138,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                       )}
                     </div>
                     {/* Pack picker for renewal */}
-                {['basic', 'pro', 'max'].includes(currentLicense?.tier || '') && (() => {
+                {['basic', 'pro', 'max', 'ultra'].includes(currentLicense?.tier || '') && (() => {
                   const packs = getExtensionPacks(geo?.country_code || 'US');
                   return (
                     <div className="flex gap-1 mb-2">
@@ -10421,11 +10616,18 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             )}
           </div>
           {pricing && (
-            <div className="grid sm:grid-cols-2 lg:grid-cols-5 gap-4 max-w-7xl mx-auto">
-              {pricing.tiers.map((tier) => (
-                <PricingCard key={tier.id} tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
-              ))}
-            </div>
+            <>
+              <PlanGroupTabs group={planGroup.group} setGroup={planGroup.setGroup} show={planGroup.showTabs} />
+              {/* Column count follows the tab: five plans on Individual, one
+                  on Team. Leaving it at lg:grid-cols-5 would render the
+                  Enterprise card as a lonely fifth-width sliver with four
+                  empty columns beside it. */}
+              <div className={`grid gap-4 mx-auto ${planGroup.visible.length > 1 ? 'sm:grid-cols-2 lg:grid-cols-5 max-w-7xl' : 'max-w-md'}`}>
+                {planGroup.visible.map((tier) => (
+                  <PricingCard key={tier.id} tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
+                ))}
+              </div>
+            </>
           )}
         </section>
 
@@ -10632,7 +10834,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 </div>
                 {isElectron ? (
                   <button
-                    onClick={handleGoogleElectron}
+                    onClick={() => handleGoogleElectron()}
                     disabled={isSubmitting || googleSubmitting}
                     className="auth-submit mt-3 w-full py-2.5 px-4 rounded-full text-[13.5px] font-medium flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
@@ -10923,7 +11125,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
                 </div>
                 {isElectron ? (
                   <button
-                    onClick={handleGoogleElectron}
+                    onClick={() => handleGoogleElectron()}
                     disabled={isSubmitting || googleSubmitting}
                     className="auth-submit mt-3 w-full py-2.5 px-4 rounded-full text-[13.5px] font-medium flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink)' }}
@@ -11034,11 +11236,18 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           </div>
 
           {pricing && (
-            <div className="grid sm:grid-cols-2 lg:grid-cols-5 gap-4 max-w-7xl mx-auto">
-              {pricing.tiers.map((tier) => (
-                <PricingCard key={tier.id} tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
-              ))}
-            </div>
+            <>
+              <PlanGroupTabs group={planGroup.group} setGroup={planGroup.setGroup} show={planGroup.showTabs} />
+              {/* Column count follows the tab: five plans on Individual, one
+                  on Team. Leaving it at lg:grid-cols-5 would render the
+                  Enterprise card as a lonely fifth-width sliver with four
+                  empty columns beside it. */}
+              <div className={`grid gap-4 mx-auto ${planGroup.visible.length > 1 ? 'sm:grid-cols-2 lg:grid-cols-5 max-w-7xl' : 'max-w-md'}`}>
+                {planGroup.visible.map((tier) => (
+                  <PricingCard key={tier.id} tier={tier} onSelect={handleTierSelect} isLoading={isSubmitting} />
+                ))}
+              </div>
+            </>
           )}
 
           {/* Comparison table — all four tiers. The previous Free-vs-Pro
@@ -11047,36 +11256,59 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
               models" on Pro read like "all models" to a user who hadn't
               seen Max — exactly the source of the long-running "Subscribe
               to Pro for all models" confusion. */}
-          <div className="mt-16 max-w-3xl mx-auto">
+          {/* Feature comparison — SIX tiers, matching FEATURE_GATES in
+              services/licenseService.ts and grantConfigForTier on the server.
+              This table had been stuck on the four-tier ladder from before
+              Ultra existed, and every row of it was wrong in a way that costs
+              money or trust: it sold Auto-Type as a MAX feature (it is
+              Ultra+), gave Pro "4 models" (Pro is where Claude unlocks — the
+              exact confusion the comment above says this table was rewritten
+              to end), and promised "Unlimited" interview sessions on Pro and
+              Max, which are one-time passes with a 1-hour and a 3-hour clock.
+              Rows lead with TIME, because time is what every plan actually
+              sells; the feature switches follow. */}
+          <div className="mt-16 max-w-5xl mx-auto">
             <h3 className="text-lg font-bold text-center mb-8">Feature comparison</h3>
-            <div className="border border-white/[0.06] rounded-xl overflow-hidden">
-              <div className="grid grid-cols-5 text-xs bg-white/[0.03]">
-                <div className="px-3 py-3 text-gray-500 font-medium">Feature</div>
-                <div className="px-3 py-3 text-gray-400 text-center font-bold uppercase tracking-wider">Free</div>
-                <div className="px-3 py-3 text-emerald-400 text-center font-bold uppercase tracking-wider">Basic</div>
-                <div className="px-3 py-3 text-blue-400 text-center font-bold uppercase tracking-wider">Pro</div>
-                <div className="px-3 py-3 text-amber-400 text-center font-bold uppercase tracking-wider">Max</div>
-              </div>
-              {[
-                { feature: 'Interview sessions', free: '5/mo', basic: '3 (14d)', pro: 'Unlimited', max: 'Unlimited' },
-                { feature: 'AI Models',          free: 'Gemini', basic: '4 models', pro: '4 models', max: '5 incl. Claude' },
-                { feature: 'Auto-Type',          free: '—',      basic: '—',         pro: '—',        max: 'Yes' },
-                { feature: 'Train Model',        free: '—',      basic: '—',         pro: '—',        max: 'Yes' },
-                { feature: 'Screen capture',     free: '—',      basic: 'Yes',       pro: 'Yes',      max: 'Yes' },
-                { feature: 'Auto-solve',         free: '—',      basic: 'Yes',       pro: 'Yes',      max: 'Yes' },
-                { feature: 'Pop-out overlay',    free: '—',      basic: 'Yes',       pro: 'Yes',      max: 'Yes' },
-                { feature: 'Context files',      free: '1',      basic: 'Unlimited', pro: 'Unlimited', max: 'Unlimited' },
-                { feature: 'Session history',    free: '—',      basic: 'Yes',       pro: 'Yes',      max: 'Yes' },
-                { feature: 'Support',            free: 'Community', basic: 'Email',  pro: 'Priority', max: 'Priority' },
-              ].map(({ feature, free, basic, pro, max }, i) => (
-                <div key={i} className="grid grid-cols-5 text-xs border-t border-white/[0.04]">
-                  <div className="px-3 py-2.5 text-gray-300 font-medium">{feature}</div>
-                  <div className="px-3 py-2.5 text-gray-500 text-center">{free}</div>
-                  <div className="px-3 py-2.5 text-emerald-300/80 text-center">{basic}</div>
-                  <div className="px-3 py-2.5 text-blue-300/80 text-center">{pro}</div>
-                  <div className="px-3 py-2.5 text-amber-300 text-center font-medium">{max}</div>
+            {/* Seven columns do not fit a phone. The table scrolls inside its
+                own container rather than pushing the page sideways. */}
+            <div className="border border-white/[0.06] rounded-xl overflow-x-auto">
+              <div className="min-w-[720px]">
+                <div className="grid grid-cols-7 text-xs bg-white/[0.03]">
+                  <div className="px-3 py-3 text-gray-500 font-medium">Feature</div>
+                  <div className="px-3 py-3 text-gray-400 text-center font-bold uppercase tracking-wider">Free</div>
+                  <div className="px-3 py-3 text-emerald-400 text-center font-bold uppercase tracking-wider">Basic</div>
+                  <div className="px-3 py-3 text-blue-400 text-center font-bold uppercase tracking-wider">Pro</div>
+                  <div className="px-3 py-3 text-amber-400 text-center font-bold uppercase tracking-wider">Max</div>
+                  <div className="px-3 py-3 text-violet-300 text-center font-bold uppercase tracking-wider">Ultra</div>
+                  <div className="px-3 py-3 text-yellow-200 text-center font-bold uppercase tracking-wider">Enterprise</div>
                 </div>
-              ))}
+                {[
+                  { feature: 'Interview time',    free: '10-min trial', basic: 'One 30-min',    pro: 'One 1-hour', max: 'Three 1-hour', ultra: '9 h / month', ent: 'Unlimited' },
+                  { feature: 'Billing',           free: '—',            basic: 'One-time',      pro: 'One-time',   max: 'One-time',     ultra: 'Monthly',     ent: 'Monthly' },
+                  { feature: 'Top-ups',           free: '—',            basic: 'Yes',           pro: 'Yes',        max: 'Yes',          ultra: 'Yes',         ent: 'Not needed' },
+                  { feature: 'AI models',         free: '4 in trial',   basic: '4 (no Claude)', pro: 'All 5',      max: 'All 5',        ultra: 'All 5',       ent: 'All 5' },
+                  { feature: 'Auto-Type',         free: '—',            basic: '—',             pro: '—',          max: '—',            ultra: 'Yes',         ent: 'Yes' },
+                  { feature: 'Train Model',       free: '—',            basic: '—',             pro: '—',          max: 'Yes',          ultra: 'Yes',         ent: 'Yes' },
+                  { feature: 'Reasoning control', free: '—',            basic: '—',             pro: '—',          max: 'Yes',          ultra: 'Yes',         ent: 'Yes' },
+                  { feature: 'Screen capture',    free: 'In trial',     basic: 'Yes',           pro: 'Yes',        max: 'Yes',          ultra: 'Yes',         ent: 'Yes' },
+                  { feature: 'Auto-solve',        free: 'In trial',     basic: 'Yes',           pro: 'Yes',        max: 'Yes',          ultra: 'Yes',         ent: 'Yes' },
+                  { feature: 'Pop-out overlay',   free: 'In trial',     basic: 'Yes',           pro: 'Yes',        max: 'Yes',          ultra: 'Yes',         ent: 'Yes' },
+                  { feature: 'Context files',     free: '1',            basic: 'Unlimited',     pro: 'Unlimited',  max: 'Unlimited',    ultra: 'Unlimited',   ent: 'Unlimited' },
+                  { feature: 'Session history',   free: '—',            basic: 'Yes',           pro: 'Yes',        max: 'Yes',          ultra: 'Yes',         ent: 'Yes' },
+                  { feature: 'Devices',           free: '2',            basic: '2',             pro: '3',          max: '5',            ultra: '10',          ent: '25' },
+                  { feature: 'Support',           free: 'Community',    basic: 'AI chat',       pro: 'AI chat',    max: 'AI chat',      ultra: 'Priority',    ent: 'Priority' },
+                ].map(({ feature, free, basic, pro, max, ultra, ent }, i) => (
+                  <div key={i} className="grid grid-cols-7 text-xs border-t border-white/[0.04]">
+                    <div className="px-3 py-2.5 text-gray-300 font-medium">{feature}</div>
+                    <div className="px-3 py-2.5 text-gray-500 text-center">{free}</div>
+                    <div className="px-3 py-2.5 text-emerald-300/80 text-center">{basic}</div>
+                    <div className="px-3 py-2.5 text-blue-300/80 text-center">{pro}</div>
+                    <div className="px-3 py-2.5 text-amber-300/90 text-center">{max}</div>
+                    <div className="px-3 py-2.5 text-violet-300/90 text-center">{ultra}</div>
+                    <div className="px-3 py-2.5 text-yellow-200 text-center font-medium">{ent}</div>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
 

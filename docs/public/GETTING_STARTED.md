@@ -46,15 +46,16 @@ The Windows installer is signed by Azure Trusted Signing, so SmartScreen lets it
 
 ## 4. Sign in and pick a plan
 
-The first time you open the app you'll be asked to sign in. Use email + password or Google. Every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra); signing in past the allowance moves the seat off your oldest device.
+The first time you open the app you'll be asked to sign in. Use email + password or Google. Every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra, 25 on Enterprise); signing in past the allowance moves the seat off your oldest device.
 
-After sign-in you'll see the plan picker. Basic, Pro, and Max are **one-time interview passes** (use within 30 days); Ultra is the only monthly subscription:
+After sign-in you'll see the plan picker. Basic, Pro, and Max are **one-time interview passes** (use within 30 days); Ultra and Enterprise are monthly subscriptions:
 
 - **Free** — one-time 10-minute trial (every model except Claude), one context file
 - **Basic** — one 30-minute interview, four models (Gemini, GPT-5.6, Grok, Groq), unlimited context files, pop-out, screen capture, Auto-Solve — extendable on interview day (+30 min / +1 h / +3 h packs)
 - **Pro** — one 1-hour interview, all five models including Claude with web search
 - **Max** — three 1-hour interviews, all five models, plus Train Model and the reasoning-effort knob
-- **Ultra** — unlimited interviews billed monthly, everything in Max plus Auto-Type
+- **Ultra** — 9 hours of interview time a month, billed monthly, everything in Max plus Auto-Type
+- **Enterprise** — unlimited interview time that never expires, billed monthly, everything in Ultra with no cap
 
 Pricing varies by region; the picker shows your local currency.
 

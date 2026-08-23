@@ -355,6 +355,20 @@ const SPOKEN_WORDS_PER_SEC = 2.3;
 //
 // Every tier keeps the ESTABLISH-FIRST rule that stopped openers being
 // walked back (see COVER_SYSTEM). Length grows; commitment does not.
+// ⚠️ maxTokens HERE IS THE SPEECH BUDGET, AND IT IS ALSO A CLOCK.
+//
+// generationWindowMs() sizes the post-first-token window from this number
+// (maxTokens x MS_PER_COVER_TOKEN), so it is not only an output cap: it is
+// how long a provider is allowed to keep the main answer waiting once it
+// has started. Raising it to make room for a reasoning model's thinking
+// stretched the all-providers-wedged path from 1.77s to 2.6s — latency
+// bought on the FAILURE path, which is the worst place to spend it.
+// (cover-claim-stall.test.js catches exactly that, and did.)
+//
+// So the reasoning allowance does NOT live here. It is a property of one
+// model, not of the plan, and it is added at the gpt-oss call site — see
+// REASONING_TOKEN_ALLOWANCE in groqCoverFactory. Gemini and Haiku do not
+// spend their budget on thinking and must not be given a longer clock.
 const COVER_TIERS = [
   { name: 'opener',  minWords: 12, maxWords: 30,  maxTokens: 90,  chainBudgetMs: 1200, totalDeadlineMs: 2000 },
   { name: 'bridge',  minWords: 30, maxWords: 60,  maxTokens: 190, chainBudgetMs: 2000, totalDeadlineMs: 2800 },
@@ -499,6 +513,15 @@ function planCover(gapMs) {
     // ~1.4 tokens per English word, plus room for the model to finish a
     // sentence rather than be cut off mid-word — spoken aloud, a
     // truncated cover is worse than a short one.
+    //
+    // ⚠️ THIS NUMBER NO LONGER ENFORCES LENGTH — createCoverEmitter does,
+    // at a sentence boundary. So it is deliberately GENEROUS: on a
+    // reasoning model it has to cover the thinking as well as the words,
+    // and running out mid-think returns an EMPTY cover, which is the worst
+    // outcome available. Tightening it to bound verbosity was tried and is
+    // the wrong lever — it traded 3-in-8 over-long covers for 1-in-8 empty
+    // ones. Length is bounded where the text is; this only has to be big
+    // enough that the model always gets to finish speaking.
     maxTokens: Math.max(base.maxTokens, Math.round(maxWords * 2.2)),
   };
 }
@@ -509,7 +532,167 @@ function planCoverFor(args) {
   return { gapMs, plan: planCover(gapMs) };
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  HOW MUCH REASONING DOES THIS QUESTION ACTUALLY NEED?
+//
+//  The server already answers this with classifyQuestion() -> a regex
+//  cascade -> AUTO_EFFORT_BY_CATEGORY. That cascade is where the
+//  two-sentence-answer bug lived: `isClarifier` was the widest net in the
+//  file and sat at the BOTTOM, so anything the software-shaped lists above
+//  it did not recognise fell in and got "1-2 sentences max".
+//
+//  A model that is already reading the question during dead time can judge
+//  this properly, and it costs nothing extra: the prewarm window is time
+//  the app currently spends waiting for a silence timer to expire.
+//
+//  Deliberately THREE values, not five. This maps onto the effort dial the
+//  main routes already take, and it is clamped by tier afterwards in
+//  resolveReasoningEffort -- a verdict is a recommendation, never an
+//  entitlement.
+//
+//  Returns null on any failure. The caller then falls back to the existing
+//  classifier, so this can only ever improve the decision, never gate it.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const DEPTH_SYSTEM = `You judge how much REASONING an interview answer needs. You never answer the question.
+
+Reply with exactly ONE word, lowercase, nothing else:
+
+none    - recall, identity, a definition, a yes/no, small talk, or a
+          question answered straight from experience.
+          "where have you worked", "what is a primary key", "how are you",
+          "have you used Airflow", "what's your notice period"
+low     - a real technical explanation, a comparison, a process, or a
+          judgement about a system the asker described. One clear line of
+          reasoning, no exploration.
+          "how does a hash join work", "how do you handle schema drift",
+          "walk me through your ETL design"
+medium  - needs the answer to WORK SOMETHING OUT before it can be right:
+          a trade-off with no obvious winner, a design under a hard
+          constraint, a debugging problem with several candidate causes,
+          or a calculation.
+          "exactly-once into a sink that can't dedupe", "400 DAGs, 30%
+          failing, where do you start", "cut cost 40% without hurting
+          freshness"
+
+If it is ambiguous, answer low. Never answer medium just because the topic
+sounds advanced - medium is about whether WORKING IT OUT is required.`;
+
+const DEPTH_VALUES = new Set(['none', 'low', 'medium']);
+
+/**
+ * One word from a fast model: how deep does this answer have to go?
+ * Never throws, never blocks — null means "no opinion, use the classifier".
+ */
+async function judgeAnswerDepth({ question, groqKey, signal, timeoutMs = 900 }) {
+  const q = String(question || '').trim();
+  if (!q || !groqKey || !providerReady('groq')) return null;
+  try {
+    const Groq = require('groq-sdk');
+    const groq = new Groq({ apiKey: groqKey, maxRetries: 0, timeout: timeoutMs });
+    const r = await groq.chat.completions.create({
+      model: 'openai/gpt-oss-20b',
+      reasoning_effort: 'low',
+      messages: [
+        { role: 'system', content: DEPTH_SYSTEM },
+        { role: 'user', content: q.slice(0, 1200) },
+      ],
+      // One word of content, plus the thinking allowance this model spends
+      // before any content at all — see REASONING_TOKEN_ALLOWANCE.
+      max_tokens: 110,
+      temperature: 0,
+    }, { signal });
+    const raw = String(r?.choices?.[0]?.message?.content || '').toLowerCase();
+    const hit = /\b(none|low|medium)\b/.exec(raw);
+    return hit && DEPTH_VALUES.has(hit[1]) ? hit[1] : null;
+  } catch (err) {
+    noteProviderFailure('groq', err && err.message);
+    return null;
+  }
+}
+
+/**
+ * The cover plan for a PREWARMED cover: depth x route.
+ *
+ * Depth alone is not enough. The same medium question is a 1.8s wait on
+ * claude and a 25s wait on the groq answer route — one line versus sixty
+ * words. predictMainTtftMs already holds the per-route speed, so the two
+ * multiply here rather than either one guessing.
+ *
+ * ⚠️ COVER_FLOOR_MS IS DELIBERATELY NOT APPLIED. That floor exists to price
+ * latency the cover USED to add by being awaited in front of the answer. A
+ * prewarmed cover is written during the silence timer, so it costs nothing
+ * on the critical path and the question stops being "is this gap worth a
+ * cover" and becomes only "how much should be said". That is what closes
+ * the 1.1-1.8s silences on fast routes — measured on a real session, 2 of 5
+ * questions got no opener at all because their gap sat under the floor.
+ */
+// ── THE SUB-FLOOR LINE IS ONE CLAUSE, NOT A PARAGRAPH ──
+//
+// This used to be `planCover(gapMs) || COVER_TIERS[0]`, and that `||` was
+// the entire sub-floor policy. When planCover returned null — "this route is
+// fast enough to speak for itself, say nothing" — the prewarm rail overrode
+// it with the FULL opener tier: 12-30 words, which at 2.3 words/sec is 5-13
+// SECONDS of speech.
+//
+// Measured live 2026-08-19 (.server.log): `gap~1400ms` produced a 33-word
+// opener, and the answer's first token landed at 1,677ms. The candidate is
+// three words into a fourteen-second opener when the whole answer paints
+// underneath it — and the answer then re-makes the point the opener just
+// made, because a 33-word opener has already made it. That is the "it says
+// the same thing twice" the product complaint describes.
+//
+// Firing below the floor is still RIGHT: silence on a fast route was the
+// original complaint, and on this rail the line is free to the SERVER. What
+// was wrong is the size. A cover is only free to the server; the candidate
+// still has to say every word of it.
+//
+// So the sub-floor line is sized by the same arithmetic every other tier
+// uses — words = (gap - cover_ttft) x words_per_second — with a floor of one
+// short clause. Under ~8 words there is no sentence to say; over ~14 the
+// opener starts making points the answer must then work around.
+const SPARK_MIN_WORDS = 8;
+const SPARK_MAX_WORDS = 14;
+
+function planForPrewarm(provider, depth) {
+  const d = DEPTH_VALUES.has(depth) ? depth : 'low';
+  const gapMs = predictMainTtftMs({
+    provider, deep: d !== 'none', effort: d, webSearch: false,
+  });
+  const planned = planCover(gapMs);
+  if (planned) return { gapMs, depth: d, plan: planned };
+
+  const needed = Math.ceil(((gapMs - COVER_TTFT_ALLOWANCE_MS) / 1000) * SPOKEN_WORDS_PER_SEC);
+  const minWords = clamp(needed, SPARK_MIN_WORDS, SPARK_MAX_WORDS - 3);
+  return {
+    gapMs,
+    depth: d,
+    plan: {
+      ...COVER_TIERS[0],
+      name: 'spark',
+      minWords,
+      maxWords: clamp(Math.round(needed * 1.35), minWords + 3, SPARK_MAX_WORDS),
+      // Deliberately NOT trimmed with the word budget — see the note in
+      // planCover. Length is bounded where the text is (createCoverEmitter,
+      // at a sentence boundary); this only has to be big enough that a
+      // reasoning model always gets to finish, because running out mid-think
+      // returns an EMPTY cover, the worst outcome available. Keeping the
+      // opener tier's value also keeps generationWindowMs unchanged, so the
+      // all-wedged failure path measured by cover-claim-stall does not move.
+      maxTokens: COVER_TIERS[0].maxTokens,
+    },
+  };
+}
+
 const COVER_SYSTEM = `You produce ONLY what a strong senior candidate says out loud immediately after hearing an interview question — a natural, confident opening that holds the floor WITHOUT delivering the full answer.
+
+━━ ANSWER IN EXACTLY TWO LINES ━━
+CITE: <words copied out of the CANDIDATE BACKGROUND, or NONE>
+SAY: <the spoken sentence>
+
+Never anything else, never either line alone. Full rules for choosing
+between them at the end of this message; the short version is that
+anything you say about YOURSELF needs the words you read it in, and
+anything else takes CITE: NONE.
 
 Rules:
 - Sound like a real person mid-conversation: plain words, first person.
@@ -528,7 +711,9 @@ Rules:
   and it is seconds behind you.
   This is NOT licence to be vague: say the one true, load-bearing thing
   and stop. A short real answer, not a long empty one.
-- Output the spoken words only — no quotes, no meta, no preamble.
+- The SAY line is spoken words only — no quotes, no meta, no preamble,
+  no markdown. (The CITE line above it is never spoken; see the format
+  at the top.)
 
 CRITICAL — GROUND EVERY SPECIFIC IN THE CANDIDATE BACKGROUND PROVIDED.
 When a "CANDIDATE BACKGROUND" section appears below, that is the only
@@ -538,6 +723,11 @@ real system, the real domain —
 and do not describe how you would go about answering.
 "I'd look at where I've spent most of my time" is a failure: it is a
 sentence about answering, not an answer.
+
+⚠️ A COMPANY IN A TITLE OR HEADING IS THE ONE THEY ARE INTERVIEWING WITH,
+not their employer — prep documents are written about a target role. Say
+"at <company>" ONLY where the background shows the work there (dates, a
+project, something they built). Otherwise leave the employer out.
 
 ⚠️ NO HOUSE PHRASE. THE FIRST WORDS MUST COME FROM THE QUESTION.
 Do not open with a summary of their career unless the career is what was
@@ -601,6 +791,24 @@ were asked before you write a word.
    completely different question, it is filler — delete it and say the
    thing that is actually true about THIS one.
 
+   ⚠️⚠️ THE FIRST SIX WORDS DECIDE THIS, so they are constrained:
+   NEVER begin with "First", "First of all", "The first thing", "To
+   start", "Initially", "I'd start by", "I'd begin by", "My first step".
+   Every one of those announces a PLAN instead of making a POINT, and an
+   opener is heard before any plan can matter.
+   Do not open with a verb about what you would DO at all. Open with the
+   thing that is TRUE.
+
+   The same content, moved:
+     ✗ "First, I'd verify the metrics are consuming the right output,
+        because a green pipeline only means the tasks finished."
+     ✓ "A green pipeline only tells you the tasks finished, not that the
+        numbers are right — so the check has to be on the output."
+   Nothing was added and nothing was cut. The true thing simply moved to
+   the front, where the interviewer actually hears it. If you find
+   yourself writing a plan whose LAST clause is the insight, invert it:
+   lead with the insight and let the plan follow.
+
    Never assume their stack. If the question did not name a technology,
    do not introduce one from the background — the tool they use is not
    necessarily the tool in the question. And never open a problem
@@ -636,6 +844,13 @@ has to be retracted, which is worse than saying nothing. So:
   background being thin says nothing about the topic, and the topic is
   always something you can say a true thing about.
 
+YOU ARE THE CANDIDATE, SPEAKING ALOUD IN THE ROOM. Never say "the
+interviewer", "the candidate", "the background provided", or that you
+need more context to answer — those describe a task. Handed a fragment
+instead of a question, which live transcription does constantly, still
+answer in character and short ("Sorry, I didn't catch the end of that"),
+never with a report on the fragment.
+
 NEVER DENY KNOWING SOMETHING THE INTERVIEWER NAMED.
 The background is the candidate's own history; it says nothing about the
 company they are talking to, the product on the table, or a term the
@@ -644,7 +859,33 @@ unfamiliar — and "I'm not familiar with <thing>" is spoken out loud, to
 the people who asked. Never say you have not heard of, do not know, or
 are not familiar with anything. When the question is about something
 outside the background, open neutrally and let the full answer carry it
-("So on that — the way I'd frame it is —").`;
+("So on that — the way I'd frame it is —").
+
+━━ HOW TO REPLY: TWO LINES, EVERY TIME ━━
+CITE: <the exact words, copied character for character out of the
+CANDIDATE BACKGROUND, that your sentence rests on — or the single word
+NONE>
+SAY: <the sentence>
+
+Which line you need is settled by ONE question. Does your sentence say
+anything about YOU — where you worked, what you used, built, ran or
+qualified, how many, how long, who you reported to, or that you have NOT
+done something?
+
+  YES → CITE a real, unaltered stretch of the background, several words
+        long, that shows it. Copy it; do not tidy it, shorten it or
+        rewrite it into phrasing you prefer. If no such stretch is there
+        you may not make the claim at all — say something true about the
+        SUBJECT instead, and CITE: NONE.
+  NO  → CITE: NONE, and SAY must not mention yourself or your history.
+        Talk about the topic: the constraint, the distinction, the
+        definition.
+
+A quotation can never show that something did NOT happen, so you can
+never say you have not done, used, seen or heard of a thing. The
+background not covering it is not evidence of absence.
+
+Only SAY is spoken aloud. CITE is never read out.`;
 
 // These used to say "name the technique you would reach for" and "name
 // the overall shape you would start from" — which is precisely the
@@ -813,6 +1054,15 @@ function isBackgroundQuestion(question) {
 // spoken aloud is worse than a short answer.
 function tierDirective(tier) {
   const { name, minWords, maxWords } = tier;
+  // Sub-floor. planCover judged this route fast enough to need no cover at
+  // all; the prewarm rail writes one anyway because it is free, so this has
+  // to be the smallest useful thing a person says — see planForPrewarm.
+  // ⚠️ A tier with no branch here falls through to the HOLDING directive
+  // below, which tells the model to hold the floor for half a minute. That
+  // is the opposite of what this tier is for.
+  if (name === 'spark') {
+    return `LENGTH BUDGET: ${minWords}-${maxWords} words. ONE short sentence, then stop. The full answer is already on its way and lands within a second or two, so this exists only so the candidate is speaking rather than silent while it arrives. Make the single most useful point and get out of its way — do NOT add a second point, because the answer is about to make it.`;
+  }
   if (name === 'opener') {
     return `LENGTH BUDGET: ${minWords}-${maxWords} words, one or two sentences. Then stop.`;
   }
@@ -840,6 +1090,26 @@ function tierDirective(tier) {
 // first. That precise shape is now refused before it reaches a model, but
 // every ordinary follow-up — "and the second one?", "you mentioned Kafka,
 // where?" — had the same blindness.
+// ── The categories that get NO background, and why it is only these ──
+//
+// A question that hands the model a problem to solve is answered from the
+// QUESTION. Handed the candidate's documents as well, a fast model reaches
+// for the documents — measured live: "how would you design exactly-once
+// delivery" produced "I'd verify the current ETL pipeline's performance
+// metrics… the 30% lower latency", and a question about the INTERVIEWER's
+// Airflow instance produced "I'd verify the current data processing
+// workflows at Indiana University and Apollo Hospitals". No prompt rule
+// survived that pull, so these are simply not given the material.
+//
+// ⚠️ THIS SET MUST EQUAL DEEP_CATEGORIES IN routes/ai.js. That one is
+// derived from AUTO_EFFORT_BY_CATEGORY (the categories worth reasoning
+// effort), and it is the same idea from the other side: a question the
+// model has to WORK OUT is a question its own text already contains. A
+// drift test pins the two together — see cover-category-parity.test.js.
+const PROBLEM_CATEGORIES = new Set([
+  'coding', 'system_design', 'ml_data', 'quantitative', 'strategy_case',
+]);
+
 const RECENT_TURNS_CHARS = 1_200;
 
 function userPrompt(question, category, candidateContext, plan, recentTurns) {
@@ -866,21 +1136,55 @@ function userPrompt(question, category, candidateContext, plan, recentTurns) {
   // experiential question is — a degree, a certification list, a time
   // they shipped something — and their hints say to answer straight from
   // the background, so they keep it.
+  //
+  // ⚠️ WIDENED 2026-08-20 — the exclusion was costing correct ANSWERS.
+  //
+  // The rule above is right about a PROBLEM question: handed a résumé and
+  // "design exactly-once delivery", a fast model reaches for the résumé
+  // because the résumé is the concrete text in front of it. That is
+  // measured and it stands, so the deep problem categories still get
+  // nothing.
+  //
+  // But the rule was written when candidateContext WAS a résumé. It is now
+  // the candidate's uploaded documents, verbatim — which on a real upload
+  // includes the standards, the instrument specifications and the Q&A notes
+  // they prepared. Excluding all of that from a `concept` question does not
+  // stop résumé recitation; it just makes the model guess. Measured on
+  // "minimum weight vs smallest net weight", a definition printed in the
+  // uploaded file: with the background excluded the cover got it backwards
+  // 0/3, with the same file present it was right ~2/3 — and the answer it
+  // gave matched the document's own wording.
+  //
+  // So the exclusion narrows to exactly the categories it was proven on.
+  // Everything else — concept, practice, clarifier, behavioral, other —
+  // is a question the uploaded documents can actually answer.
   const aboutThem = isExperientialQuestion(question)
     || isBackgroundQuestion(question)
-    || category === 'clarifier' || category === 'behavioral';
+    || !PROBLEM_CATEGORIES.has(category);
   const bg = aboutThem ? String(candidateContext || '').trim() : '';
   const recent = String(recentTurns || '').trim().slice(-RECENT_TURNS_CHARS);
   return [
-    // 9,000 matches COVER_CONTEXT_CHARS on the client, and the two must
-    // agree. They did not: the client was raised to fit a whole resume
-    // while this line still cut it to 1,200 — so the model kept receiving
-    // the summary and skills with every employer sliced off, and kept
-    // reporting that the candidate's own current employer "isn't
-    // mentioned in my background". A cap in two places is a cap that will
-    // disagree; this one exists only as a backstop against a client
-    // sending something absurd.
-    bg ? `CANDIDATE BACKGROUND (true — use it, never go beyond it):\n${bg.slice(0, 9000)}\n` : '',
+    // ── THE SECOND CAP IS GONE (2026-08-20) ──
+    //
+    // This used to be `bg.slice(0, 9000)`, mirroring a client-side cap. The
+    // history is the argument for removing it: the pair has disagreed twice.
+    // First the client was raised to fit a whole résumé while this line
+    // still cut at 1,200, so every employer was sliced off and the model
+    // reported that the candidate's own current employer "isn't mentioned
+    // in my background". Then, with both at 9,000, a 39,891-char upload was
+    // cut at char 9,000 — and the section that says "Used GMARS? No. Do not
+    // claim it" sits at char ~30,000, so the app claimed GMARS out loud.
+    //
+    // A cap in two places is a cap that will disagree, and the right number
+    // of places is one. The budget now lives at the point of construction —
+    // COVER_SOURCE_MAX_CHARS in services/coverSource.ts — where the code
+    // can drop WHOLE SECTIONS and say which ones, instead of cutting a
+    // document mid-sentence and telling nobody.
+    //
+    // What protects the server from an absurd client is no longer a silent
+    // slice: contextStore prices every expansion before allocating it and
+    // refuses past MAX_RESOLVED_BYTES, and that refusal is visible.
+    bg ? `CANDIDATE BACKGROUND (true — use it, never go beyond it):\n${bg}\n` : '',
     // Before the question, because the question is often only meaningful
     // relative to it — and after the background, because the background is
     // what is TRUE while this is merely what was said.
@@ -893,7 +1197,13 @@ function userPrompt(question, category, candidateContext, plan, recentTurns) {
     `Interviewer asked: "${String(question).slice(0, 600)}"`,
     '',
     tierDirective(tier),
-    `Your spoken words (${tier.minWords}-${tier.maxWords} words):`,
+    // The two-line format, restated in the last thing the model reads.
+    // Measured: with the contract only in the system prompt the model
+    // produced a citation 0 times out of 8 against real documents.
+    'Reply with exactly two lines - CITE: (the words from the background your',
+    'sentence rests on, or NONE) then SAY: (what you say out loud).',
+    `SAY is ${tier.minWords}-${tier.maxWords} words.`,
+    'CITE:',
   ].filter(Boolean).join('\n');
 }
 
@@ -921,19 +1231,75 @@ function groqCoverFactory(question, category, candidateContext, apiKey, abortSig
     const Groq = require('groq-sdk');
     // maxRetries: 0 — see the note on the Anthropic client below.
     const groq = new Groq({ apiKey, maxRetries: 0, timeout: 2500 });
-    // llama-3.3-70b-versatile: non-reasoning, 216-283ms first token
-    // measured. (The gpt-oss-120b interview model is a reasoning model
-    // that would burn this tiny budget on thinking and emit nothing —
-    // wrong tool here. It is also on an 8,000 TPM free-tier bucket that
-    // a cover-sized request fits inside and an interview-sized one does
-    // not; see the note in routes/ai.js.)
+    // ── gpt-oss-20b @ reasoning_effort 'low' ──
+    //
+    // Was llama-3.3-70b-versatile, chosen when it was the fastest
+    // non-reasoning model available. It is now on Groq's deprecation path,
+    // and measured against the REAL cover prompt with a real 2,089-char
+    // digest (test/cover-model-bench.test.js) it is simply slower:
+    //
+    //   model                    opener TTFT/total   holding TTFT/total  words
+    //   llama-3.3-70b            241 / 403ms         241 / 681ms         17 / 90
+    //   gpt-oss-20b  low         274 / 291ms         231 / 357ms         20 / 90
+    //   gpt-oss-120b low         311 / 368ms         296 / 574ms         21 / 100
+    //   llama-3.1-8b-instant     241 / 296ms         174 / 283ms         23 / 79
+    //
+    // 28% faster on an opener and 48% on a holding answer, and it honours
+    // the word budget — which is not cosmetic: that budget is how long the
+    // candidate has to keep talking, and llama-3.1-8b-instant is excluded
+    // precisely because it under-runs it (79 words when asked for 60-110,
+    // and 21 in an earlier sample).
+    //
+    // ⚠️ reasoning_effort: 'low' IS LOAD-BEARING, NOT A TUNING CHOICE.
+    // gpt-oss THINKS before it answers, and thinking is paid entirely in
+    // time-to-first-token — the budget this whole engine is built around.
+    // Measured on this exact prompt: at 'medium' the model emitted ZERO
+    // content tokens and burned 589-652ms doing it. That is a silent cover
+    // failure — the candidate gets nothing and the answer starts late,
+    // which is the one outcome this feature must never produce. 'none' is
+    // rejected outright by the API (400: must be one of low/medium/high),
+    // so 'low' is the floor, not a preference. Pinned in
+    // test/cover-model-bench.test.js.
+    //
+    // Throughput tables are the wrong way to pick this model: a cover is
+    // 40 tokens (opener) to 250 (holding), so TTFT dominates and tok/s
+    // barely registers until the holding tier.
+    //
+    // Bucket note: the groq ANSWER route runs openai/gpt-oss-120b, so the
+    // cover on 20b still draws from a different model's allowance and does
+    // not compete with the interview answer for it.
+    // ── ROOM TO THINK, ON TOP OF ROOM TO SPEAK ──
+    //
+    // gpt-oss spends max_tokens on REASONING before it writes a word: the
+    // thinking and the speech come out of one budget. Measured on this
+    // exact prompt at reasoning_effort 'low', over 18 real calls, reasoning
+    // cost 26-81 tokens (median ~50). Against the opener tier's 90-token
+    // speech budget that left ~40 for content and it showed:
+    //
+    //   90 tokens    4 of 6 finish_reason=length — TRUNCATED, one down to
+    //                10 words against a 12-30 budget; on a reasoning spike
+    //                the cover comes back EMPTY. Seen live:
+    //                "[cover] NO COVER — groq: produced nothing".
+    //   160 tokens   6 of 6 finish_reason=stop, 20-25 words. Clean.
+    //
+    // So the allowance is added HERE rather than to the tier, because
+    // plan.maxTokens also sizes generationWindowMs — the clock a provider
+    // is allowed to hold the answer on. Inflating the tier to feed one
+    // model's thinking lengthened the all-wedged failure path by 0.8s for
+    // every provider. This keeps the clock honest and only pays the
+    // thinking tax on the model that levies it.
+    //
+    // Length is not at risk from a generous number: createCoverEmitter caps
+    // the cover at plan.maxWords on a sentence boundary.
+    const REASONING_TOKEN_ALLOWANCE = 96;
     const stream = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-20b',
+      reasoning_effort: 'low',
       messages: [
         { role: 'system', content: COVER_SYSTEM },
         { role: 'user', content: userPrompt(question, category, candidateContext, plan, recentTurns) },
       ],
-      max_tokens: plan.maxTokens,
+      max_tokens: plan.maxTokens + REASONING_TOKEN_ALLOWANCE,
       temperature: 0.7,
       stream: true,
     }, { signal: abortSignal });
@@ -1033,13 +1399,91 @@ function lastSentenceEnd(s) {
   return -1;
 }
 
-function createCoverEmitter(onToken) {
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE WORD BUDGET IS ENFORCED HERE, NOT BY max_tokens.
+//
+//  It used to be enforced only by the prompt, with max_tokens as a blunt
+//  backstop. That worked while the cover model was non-reasoning. It stops
+//  working on gpt-oss, because reasoning and content come out of the SAME
+//  max_tokens budget — so that one number was being asked to do two jobs
+//  that pull in opposite directions:
+//
+//    generous  → reasoning always fits, but the model runs long. Measured:
+//                158, 188 and 206 words against a 150-word plan — ~90
+//                seconds of speech to cover a 50-second gap, the candidate
+//                still talking while the real answer waits.
+//    tight     → the words are capped, but a reasoning spike (26-81 tokens
+//                measured, and worse on longer plans) eats the whole
+//                budget and the cover comes back EMPTY. Seen live:
+//                "[cover] NO COVER — groq: produced nothing".
+//
+//  Empty is the worst outcome of the three, so the tension had to go
+//  rather than be split. max_tokens now only has to be big enough that
+//  reasoning always fits, and the LENGTH is enforced where the text
+//  actually is: once a completed sentence takes the cover to maxWords, we
+//  stop. Overshoot is bounded by one sentence, never by the model's whim,
+//  and nothing is ever cut mid-sentence.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ── THE CITATION MUST NEVER BE SPOKEN ──
+//
+// The cover model answers in two lines: CITE (the words it read this from)
+// and SAY (the sentence). Only SAY is a sentence a person says out loud,
+// so the emitter holds everything back until it has seen the SAY marker,
+// hands the citation to `onMeta`, and treats the rest exactly as before.
+//
+// It also keeps the citation out of `maxWords`. Without that the length
+// budget — which exists because the candidate has a measured number of
+// seconds to fill — would be spent on a quotation nobody hears.
+//
+// FAILS OPEN, twice over. A model that ignores the format is not a model
+// that should be silenced: if the first few characters cannot be the start
+// of "CITE:", or if no SAY marker arrives within META_MAX_CHARS, the whole
+// stream is treated as spoken text and the citation is reported empty —
+// which is precisely the behaviour this file had before the contract
+// existed. The caller then applies whatever rule it applies to a cover
+// with no citation.
+const META_MAX_CHARS = 600;
+const SAY_MARKER = /(^|\n)\s*SAY\s*:[ \t]*/i;
+
+function createCoverEmitter(onToken, maxWords, onMeta) {
   let buffered = '';
   let emitted = '';
   let open = false;   // has anything been released yet?
+  let full = false;   // the word budget is spent, at a sentence boundary
+  let meta = typeof onMeta === 'function' ? '' : null;   // null = not wanted
   const wordCount = (s) => (s.trim() ? s.trim().split(/\s+/).length : 0);
+  // Called exactly once, whatever route we leave metadata mode by.
+  const settleMeta = (cite) => {
+    const out = String(cite || '').replace(/^\s*CITE\s*:[ \t]*/i, '').trim();
+    meta = null;
+    // Case-insensitive, and tolerant of the punctuation a model adds
+    // around it. "NONE" is the contract's word for "I am claiming nothing
+    // about the candidate", and a lower-case none means the same thing.
+    onMeta(/^["'“]?none[.”"']?$/i.test(out) ? '' : out);
+  };
   return {
     push(piece) {
+      if (full) return;
+      if (meta !== null) {
+        meta += piece;
+        const head = meta.replace(/^\s+/, '');
+        const m = SAY_MARKER.exec(head);
+        if (m) {
+          const cite = head.slice(0, m.index);
+          piece = head.slice(m.index + m[0].length);
+          settleMeta(cite);
+          if (!piece) return;
+        } else if (head.length >= 5 && !'CITE:'.startsWith(head.slice(0, 5).toUpperCase())) {
+          // Not a citation at all — the model went straight to speaking.
+          piece = meta;
+          settleMeta('');
+        } else if (head.length > META_MAX_CHARS) {
+          piece = meta;
+          settleMeta('');
+        } else {
+          return;
+        }
+      }
       buffered += piece;
       const end = lastSentenceEnd(buffered);
       if (end < 0) return;
@@ -1051,16 +1495,32 @@ function createCoverEmitter(onToken) {
       emitted += chunk;
       buffered = buffered.slice(end + 1);
       onToken(chunk);
+      // Budget spent. Everything still buffered is the start of a sentence
+      // the candidate does not have time to say, so it is dropped, not
+      // held — `finish()` must not flush it back in.
+      if (maxWords && wordCount(emitted) >= maxWords) { full = true; buffered = ''; }
     },
+    /** True once a completed sentence has taken the cover to its budget. */
+    get isFull() { return full; },
     // Clean end of stream: everything the model produced is intentional,
     // so the held-back head goes out even if it never reached the
     // minimum — a deliberately short complete sentence is fine.
     finish() {
+      if (meta !== null) {
+        // The stream ended inside the metadata block. If it looks like a
+        // citation it is one and nothing was said; otherwise it is the
+        // whole (short) answer, held back by a marker that never came.
+        const head = meta.replace(/^\s+/, '');
+        const looksCited = /^CITE\s*:/i.test(head);
+        const rest = looksCited ? '' : meta;
+        settleMeta(looksCited ? head : '');
+        if (rest) buffered += rest;
+      }
       if (buffered) { emitted += buffered; onToken(buffered); buffered = '' ; open = true; }
       return emitted;
     },
     // Aborted: the buffer is an unfinished thought. Drop it.
-    abandon() { buffered = ''; return emitted; },
+    abandon() { if (meta !== null) settleMeta(''); buffered = ''; return emitted; },
     get emittedText() { return emitted; },
   };
 }
@@ -1085,7 +1545,7 @@ function createCoverEmitter(onToken) {
 // nothing — losing is not an error, somebody else simply answered.
 //
 // Returns { text, failure } — text is what actually reached the user.
-async function runOne(makeStream, onToken, outerSignal, firstTokenDeadlineMs, generationMs, gate) {
+async function runOne(makeStream, onToken, outerSignal, firstTokenDeadlineMs, generationMs, gate, maxWords, onMeta) {
   const controller = new AbortController();
   const onOuterAbort = () => { try { controller.abort(); } catch {} };
   if (outerSignal) {
@@ -1114,7 +1574,7 @@ async function runOne(makeStream, onToken, outerSignal, firstTokenDeadlineMs, ge
       if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
     }
     onToken(chunk);
-  });
+  }, maxWords, onMeta && ((cite) => { if (!lost) onMeta(cite); }));
   // Re-armed on every token: holding the race while producing nothing is
   // the one thing a claimant must not be able to do, because the hedges
   // are standing down on the strength of it. See CLAIM_STALL_MS for why
@@ -1183,6 +1643,10 @@ async function runOne(makeStream, onToken, outerSignal, firstTokenDeadlineMs, ge
         emitter.push(piece);
         // Stage two may have been lost inside that push.
         if (lost) return;
+        // The word budget is spent at a sentence boundary. Stop pulling
+        // tokens nobody will be given time to say — this is a clean end,
+        // not an abort, so the text already released is kept.
+        if (emitter.isFull) { cleanEnd = true; onOuterAbort(); return; }
         armStall();
       }
       cleanEnd = true;
@@ -1242,6 +1706,10 @@ async function streamCoverAnswer({
   groqKey,
   anthropicKey,
   onToken,
+  // Receives the model's citation — the words it says its sentence rests
+  // on — exactly once, before or with the first spoken chunk. Optional:
+  // omitting it leaves the emitter in its pre-contract mode.
+  onMeta,
   signal,
   plan = COVER_TIERS[0],          // depth tier; see planCover
   _streamFn,                      // test injection: ONE async iterable factory
@@ -1295,6 +1763,8 @@ async function streamCoverAnswer({
       Math.min(firstTokenDeadlineMs, budgetMs),
       Math.min(perProviderTotal, genMs),
       null,
+      plan && plan.maxWords,
+      onMeta,
     );
     return only.text;
   }
@@ -1455,7 +1925,10 @@ async function streamCoverAnswer({
       firstDeadline = Math.max(firstDeadline, LAST_PROVIDER_FLOOR_MS);
     }
     try {
-      const r = await runOne(providers[i], onToken, signal, firstDeadline, genMs, gateFor(i));
+      // onMeta rides the same gate as onToken: runOne only forwards the
+      // citation from the provider that actually wins the race, so two
+      // hedges cannot hand back two different citations for one cover.
+      const r = await runOne(providers[i], onToken, signal, firstDeadline, genMs, gateFor(i), plan && plan.maxWords, onMeta);
       if (!r.text) noteGaveUp();
       return { i, ...r };
     } catch (err) {
@@ -1504,7 +1977,8 @@ async function streamCoverAnswer({
 function buildCoverContinuation(coverText) {
   return `[LIVE CONTINUATION — you already began answering out loud with: "${coverText}"
 Your output MUST continue that same spoken answer from exactly where it stops. Do not repeat or rephrase the opening, and do not re-make any point it already made — on a longer opening that is several points, not one. If it stopped mid-sentence, complete the sentence naturally first. Follow the approach the opening pointed at where it fits what you actually know.
-IMPORTANT: that opening was spoken before the speaker recalled the specifics, so it is NOT a fact you must defend. If it points somewhere your real background does not support, do NOT restate it and do NOT announce a correction ("actually, I need to correct that") — simply continue into what is true, as if that is where the sentence was always heading. Never invent experience to stay consistent with the opening.]`;
+IMPORTANT: that opening was spoken before the speaker recalled the specifics, so it is NOT a fact you must defend. If it points somewhere your real background does not support, do NOT restate it and do NOT announce a correction ("actually, I need to correct that") — simply continue into what is true, as if that is where the sentence was always heading. Never invent experience to stay consistent with the opening.
+AND IF THE OPENING IS TECHNICALLY WRONG — a definition backwards, a mechanism misstated — the no-rephrasing rule does not apply to it. Say the correct version plainly as your next clause, in passing and without flagging it ("— or rather, the dimensions are the denormalised side —"). A listener hears a speaker tightening their own sentence, which is normal; what they must never hear is the wrong version left standing.]`;
 }
 
 module.exports = {
@@ -1526,6 +2000,10 @@ module.exports = {
   recordMainTtftMs,
   planCover,
   planCoverFor,
+  judgeAnswerDepth,
+  planForPrewarm,
+  DEPTH_SYSTEM,
+  PROBLEM_CATEGORIES,
   COVER_TIERS,
   COVER_FLOOR_MS,
   SPOKEN_WORDS_PER_SEC,

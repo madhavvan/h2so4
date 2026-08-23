@@ -39,6 +39,7 @@ import {
   resetCoverContext, resetIdentityCache,
 } from './aiProxyService';
 import { resetIndex } from './kbRetrieval';
+import { resetCoverSource } from './coverSource';
 import { forgetAll, forgetExcept } from './contextStore';
 
 /**
@@ -103,6 +104,10 @@ export function forgetKnowledge(): void {
   try { resetLedger(); } catch { /* fail open */ }
   try { resetIndex(); } catch { /* fail open */ }
   try { resetCoverContext(); } catch { /* fail open */ }
+  // The verbatim cover source holds whole documents in memory and an
+  // offload reference to them on the server. "New conversation" has to mean
+  // both are gone, or the next interview's cover reads the last one's file.
+  try { resetCoverSource(); } catch { /* fail open */ }
   try { resetIdentityCache(); } catch { /* fail open */ }
   try { forgetAll(); } catch { /* fail open */ }
   // The Claude-side briefing cache lives in claudeService, which imports

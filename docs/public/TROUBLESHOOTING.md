@@ -7,7 +7,7 @@ Step-by-step fixes for the issues we hear about most. If your problem isn't here
 1. [The interviewer's voice isn't being heard](#1-the-interviewers-voice-isnt-being-heard)
 2. [The pop-out window is missing or off-screen](#2-the-pop-out-window-is-missing-or-off-screen)
 3. [Auto-Solve doesn't capture the screen](#3-auto-solve-doesnt-capture-the-screen)
-4. [Auto-Type doesn't type anything (Ultra)](#4-auto-type-doesnt-type-anything-ultra)
+4. [Auto-Type doesn't type anything (Ultra & Enterprise)](#4-auto-type-doesnt-type-anything-ultra--enterprise)
 5. [Sign-in failures](#5-sign-in-failures)
 6. [My license is stuck on another machine](#6-my-license-is-stuck-on-another-machine)
 7. [My subscription doesn't show up](#7-my-subscription-doesnt-show-up)
@@ -56,7 +56,7 @@ You need to grant screen-capture permission to the app.
 
 After granting, test Auto-Solve once with a non-interview screen first to confirm it works.
 
-## 4. Auto-Type doesn't type anything (Ultra)
+## 4. Auto-Type doesn't type anything (Ultra & Enterprise)
 
 Auto-Type uses OS-level accessibility APIs to type into other applications.
 
@@ -77,7 +77,7 @@ If none of these work, email **support@minicaai.com** with the account email and
 
 ## 6. My license is stuck on another machine
 
-It isn't — just sign in on the new machine. Every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra), and signing in past the allowance automatically deactivates your **oldest** device. There is no binding to release and no support ticket needed, even if the old machine is lost, broken, or sold.
+It isn't — just sign in on the new machine. Every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra, 25 on Enterprise), and signing in past the allowance automatically deactivates your **oldest** device. There is no binding to release and no support ticket needed, even if the old machine is lost, broken, or sold.
 
 If a sign-in on a new machine reports a device-limit error anyway, email **support@minicaai.com** from your account email and we'll look at the device list server-side.
 
@@ -161,7 +161,7 @@ If a specific model is slower than usual for you:
 
 1. Switch to a different model temporarily — the picker is at the top of the chat
 2. Check your internet connection (the app needs ~50 KB/s of bandwidth for streaming)
-3. Try toggling the reasoning-effort knob (Max & Ultra) down to **None** — it slows responses significantly
+3. Try toggling the reasoning-effort knob (Max, Ultra & Enterprise) down to **None** — it slows responses significantly
 
 If everything is slow, our provider is likely having a regional outage. Check our status (we'll post on the marketing site banner if there's a known issue) or write to **support@minicaai.com**.
 
@@ -169,7 +169,7 @@ If everything is slow, our provider is likely having a regional outage. Check ou
 
 Web search comes with **Claude**, which unlocks at **Pro** and above. It won't fire on other models. Check:
 
-- You're on Pro, Max, or Ultra (account menu → **Manage Subscription** shows your tier)
+- You're on Pro, Max, Ultra, or Enterprise (account menu → **Manage Subscription** shows your tier)
 - You've selected **Claude** in the model picker
 - Your question is the kind where web search helps — current-state info, recent changes, specific product features. The model decides whether to search; not every Claude call searches.
 

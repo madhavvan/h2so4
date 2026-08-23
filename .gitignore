@@ -134,3 +134,11 @@ server/scripts/.autotype-test/
 
 # Cross-session coordination scratch file (two Claude Code tabs). Never commit.
 .claude-session-coordination.md
+
+# ── Cover-drive run artifacts ──
+# scripts/cover-live-run.mjs writes the transcript of a live drive (the
+# candidate's own documents come back in the `full` answers), and the
+# ad-hoc .cover-live-*.json files are the same thing from earlier runs.
+# They are measurements, not source, and they carry personal data.
+.cover-live-*.json
+server/cover-live-run.json

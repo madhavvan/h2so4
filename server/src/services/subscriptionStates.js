@@ -128,7 +128,7 @@ function isTerminal(status) {
 // and get 402 "top up" from the time gate, never 403 "renew".
 function isPlanLapsed(license) {
   if (!license) return false;
-  if (!['basic', 'pro', 'max', 'ultra'].includes(license.tier)) return false;
+  if (!['basic', 'pro', 'max', 'ultra', 'enterprise'].includes(license.tier)) return false;
   if (!hasAccess(license.status)) return true;
   if (license.expires_at > 0 && Date.now() > license.expires_at) return true;
   return false;

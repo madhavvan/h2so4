@@ -142,19 +142,65 @@ if (!app.requestSingleInstanceLock()) {
   // installed exe; dev launches register the running electron binary.
   try {
     const protocolName = 'interview-copilot';
+    // ⚠️ setAsDefaultProtocolClient RETURNS A BOOLEAN. It does not throw.
+    // The old code wrapped it in this try/catch and discarded the return
+    // value, so a failed registration produced NO signal of any kind — and
+    // on macOS it always failed, because the app never declared the scheme
+    // in Info.plist (build.protocols was missing from package.json until
+    // 2026-08-14). That silence is why it went unnoticed for 20 releases.
+    // Read the result back with isDefaultProtocolClient and say so out loud.
+    let registered = false;
     if (process.defaultApp) {
       // Dev mode: tell the OS to launch this script via the running
       // electron CLI with the second argument (path of the app dir).
       if (process.argv.length >= 2) {
-        app.setAsDefaultProtocolClient(protocolName, process.execPath, [require('path').resolve(process.argv[1])]);
+        registered = app.setAsDefaultProtocolClient(protocolName, process.execPath, [require('path').resolve(process.argv[1])]);
       }
     } else {
-      app.setAsDefaultProtocolClient(protocolName);
+      registered = app.setAsDefaultProtocolClient(protocolName);
+    }
+
+    let confirmed = false;
+    try { confirmed = app.isDefaultProtocolClient(protocolName); } catch { /* not supported everywhere */ }
+
+    if (registered && confirmed) {
+      try { electronLog.info(`[protocol] OK — ${protocolName}:// is registered to this app (platform=${process.platform})`); } catch {}
+    } else {
+      try {
+        electronLog.warn(
+          `[protocol] NOT REGISTERED — ${protocolName}:// will not reach this app. ` +
+          `setAsDefaultProtocolClient=${registered} isDefaultProtocolClient=${confirmed} platform=${process.platform} ` +
+          `packaged=${!process.defaultApp} path=${app.getPath('exe')}. ` +
+          `Google sign-in still completes via polling, and the browser page shows a typed code, ` +
+          `but the automatic hand-back is unavailable on this install.`
+        );
+      } catch {}
+    }
+
+    // ── macOS App Translocation ──
+    // If the user launched the app straight out of the mounted .dmg (or from
+    // Downloads without moving it), Gatekeeper runs it from a randomised
+    // read-only path under /private/var/folders/.../AppTranslocation/. In
+    // that state LaunchServices will not honour the bundle's URL scheme, so
+    // the deep link cannot be delivered no matter what Info.plist says.
+    // There is no API to undo it — the user has to move the app to
+    // /Applications. Detect it so the logs say so instead of looking like
+    // the scheme registration is broken.
+    if (process.platform === 'darwin' && !process.defaultApp) {
+      const exePath = app.getPath('exe') || '';
+      if (/AppTranslocation|^\/private\/var\/folders\//.test(exePath)) {
+        try {
+          electronLog.warn(
+            `[protocol] macOS APP TRANSLOCATION detected — running from ${exePath}. ` +
+            `The app was launched from the disk image or Downloads rather than /Applications, ` +
+            `so macOS refuses to register interview-copilot://. Move the app to /Applications ` +
+            `and relaunch. Until then Google sign-in requires the typed code from the browser page.`
+          );
+        } catch {}
+      }
     }
   } catch (e) {
-    // OS denied registration (admin-required, sandboxed, etc.). Sign-in
-    // still works via polling; we just don't get the auto-close.
-    try { electronLog.warn('[protocol] setAsDefaultProtocolClient failed:', e && e.message); } catch {}
+    try { electronLog.warn('[protocol] setAsDefaultProtocolClient threw:', e && e.message); } catch {}
   }
 
   app.on('second-instance', (_evt, argv) => {
@@ -257,6 +303,9 @@ let mainWindow = null;
 let popoutWindow = null;
 let tray = null;
 let installerModalWindow = null;
+// Pending always-on-top release from focus-main-window. Module-level so a
+// second sign-in cancels the first one's timer instead of stacking two.
+let _focusReleaseTimer = null;
 
 // Cached userId for main-process operations that need it without a renderer
 // roundtrip — specifically the close/quit "fresh session on next launch"
@@ -926,6 +975,50 @@ function createMainWindow() {
   // shell.openExternal (with allowlisted protocols), refuse navigation
   // away from the dev server / packaged dist URL.
   attachNavigationGuards(mainWindow.webContents, isDev);
+
+  // ── Release the post-sign-in Spaces pin at the RIGHT moment ──
+  // focus-main-window pins the window to all Spaces (visibleOnFullScreen) so
+  // it can surface over a full-screen Safari after Google consent. That pin
+  // must NOT be dropped on a short timer — doing so un-surfaces the window in
+  // exactly the case it was set for. It is dropped here instead, once the
+  // user has actually moved on: the window loses focus or is hidden. Leaving
+  // it pinned indefinitely would make the main window follow the user into
+  // every full-screen app, which is its own bug.
+  if (process.platform === 'darwin') {
+    // Bind to THIS window, not to the module-level `mainWindow`. The window
+    // can be recreated (tray reopen, close-to-tray then restore), and a
+    // handler that reads the module variable would, on the old window's
+    // blur, strip the Spaces pin off the NEW window — potentially the moment
+    // after a sign-in surfaced it.
+    const thisWindow = mainWindow;
+
+    // ⚠️ Release on blur ONLY AFTER the window has actually been focused.
+    //
+    // Releasing on the first blur breaks the very case the pin exists for.
+    // Picture the macOS fallback path: the deep link did not arrive (App
+    // Translocation, say — this file detects that a few lines up), so the
+    // browser is showing the printed code. The window surfaces over
+    // full-screen Safari, and the user clicks Safari to READ that code. That
+    // click is a blur. Drop the pin there and the window falls off the
+    // full-screen Space, so when they switch back to type the code the app
+    // has vanished again — right back to "it never came forward", with the
+    // code still untyped. Waiting for a real focus first means we only let go
+    // once the user has genuinely had the window, then left it.
+    let hasBeenFocused = false;
+    const releaseSpacesPin = () => {
+      if (!hasBeenFocused) return;
+      if (!thisWindow || thisWindow.isDestroyed()) return;
+      try { thisWindow.setVisibleOnAllWorkspaces(false); } catch { /* best effort */ }
+    };
+    thisWindow.on('focus', () => { hasBeenFocused = true; });
+    thisWindow.on('blur', releaseSpacesPin);
+    // 'hide' is unconditional: the window is gone from the screen either way,
+    // so there is nothing left to keep pinned to a Space.
+    thisWindow.on('hide', () => {
+      if (!thisWindow || thisWindow.isDestroyed()) return;
+      try { thisWindow.setVisibleOnAllWorkspaces(false); } catch { /* best effort */ }
+    });
+  }
 
   // Load the full app
   if (isDev) {
@@ -1617,9 +1710,51 @@ ipcMain.on('focus-main-window', () => {
     // Briefly flash always-on-top to beat the OS focus-stealing guard,
     // then release it so the window doesn't stay pinned.
     mainWindow.setAlwaysOnTop(true);
-    setTimeout(() => {
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setAlwaysOnTop(false);
+
+    // ── macOS needs TWO things Windows does not ──
+    // 1. BrowserWindow.show()/focus()/moveTop() cannot activate an
+    //    application that is in the background on macOS. Only
+    //    app.focus({steal:true}) can. Without it the user finished Google
+    //    consent, the poll succeeded, the session was saved — and the app
+    //    stayed behind Safari. They are signed in and cannot tell, which
+    //    is indistinguishable from "Google sign-in is broken on Mac".
+    // 2. Safari opens full-screen by default, and a full-screen app owns
+    //    its own Space. A window without visibleOnFullScreen cannot appear
+    //    over it. This MUST be set AFTER setAlwaysOnTop above — that call
+    //    resets the collection behaviour (same note as the popout at
+    //    main.cjs createPopoutWindow).
+    let spacesOk = null;
+    let focusOk = null;
+    if (process.platform === 'darwin') {
+      try { mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); spacesOk = true; }
+      catch (e) { spacesOk = false; try { electronLog.warn('[focus] setVisibleOnAllWorkspaces failed:', e && e.message); } catch {} }
+      try { app.focus({ steal: true }); focusOk = true; }
+      catch (e) { focusOk = false; try { electronLog.warn('[focus] app.focus({steal:true}) failed:', e && e.message); } catch {} }
+      // Report what actually happened, not that we tried. A line that always
+      // says "applied" is the same kind of non-signal that let the protocol
+      // registration fail silently for twenty releases.
+      try { electronLog.info(`[focus] darwin activation: app.focus(steal)=${focusOk} visibleOnFullScreen=${spacesOk}`); } catch {}
+    }
+
+    // Cancel any release still pending from a previous call — a double
+    // sign-in (or a fast retry) used to stack two timers, and the first one
+    // firing would strip the always-on-top the second had just set.
+    if (_focusReleaseTimer) clearTimeout(_focusReleaseTimer);
+    _focusReleaseTimer = setTimeout(() => {
+      _focusReleaseTimer = null;
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.setAlwaysOnTop(false);
+      // ⚠️ Do NOT drop visibleOnFullScreen here. 500 ms is long enough to
+      // raise the window and far too short for the user to have read
+      // anything; releasing it un-pins the window from the full-screen Space
+      // it was just surfaced into, so the exact case this fix exists for —
+      // consent completed in full-screen Safari — would silently undo itself
+      // half a second later. It is released on the next hide/blur instead
+      // (see the window's own lifecycle handlers), which is when the user
+      // has actually finished with it.
     }, 500);
+  } else {
+    try { electronLog.warn('[focus] focus-main-window ignored — no live main window'); } catch {}
   }
 });
 
@@ -3100,9 +3235,10 @@ function autoTypeSenderIsTrusted(event) {
 // ── Did they pay? ──
 // The renderer is no longer believed about tier. gates.autoType comes from
 // JSON.parse(localStorage['minicaai_license']) and user.is_admin from the
-// same blob flips the effective tier to 'ultra' outright, so the client-side
-// gate is decoration. The ONE real gate in the system is server-side:
-// /api/v1/ai/autotype-plan is mounted behind requireTier('ultra'). We reuse
+// same blob flips the effective tier to the top plan outright, so the
+// client-side gate is decoration. The ONE real gate in the system is
+// server-side: /api/v1/ai/autotype-plan is mounted behind
+// requireTier(...AUTOTYPE_TIERS) — ultra + enterprise. We reuse
 // it as an entitlement probe rather than inventing a new endpoint — and we
 // POST a body with NO `code` field on purpose, so the tier middleware runs
 // (that is the entire thing we want) and the route itself bails at its own
@@ -4163,7 +4299,8 @@ ipcMain.handle('auto-type:send', async (event, payload) => {
   let plannerDetail = '';                     // human-readable "why"
   // ── Mid-run entitlement revocation ──
   // All three planner routes (/autotype-vision, /autotype-agent,
-  // /autotype-plan) sit behind the SAME requireTier('ultra') middleware, so a
+  // /autotype-plan) sit behind the SAME requireTier(...AUTOTYPE_TIERS)
+  // middleware (ultra + enterprise), so a
   // 401/402/403 from any of them is the server saying "not entitled" —
   // exactly the answer Gate 2 asked for at the top, arriving late (token
   // expired mid-run, subscription cancelled between the two calls, or a

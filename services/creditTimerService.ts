@@ -241,7 +241,12 @@ class CreditTimerService {
     const { user, license } = licenseService.loadAuth();
     if (!user || !license) return;
     const updated = { ...license } as any;
-    if (['basic', 'pro', 'max'].includes(license.tier)) {
+    // Every METERED tier draws from the credit bucket — Ultra joined them on
+    // 2026-08-22. A tier missing here keeps ticking on the server while the
+    // cached license holds its opening balance forever, so the Billing Hub
+    // and the usage bar quietly show a number that stopped being true at the
+    // start of the interview.
+    if (['basic', 'pro', 'max', 'ultra'].includes(license.tier)) {
       updated.credits_remaining_seconds = remaining;
     } else if (license.tier === 'free') {
       updated.trial_remaining_seconds = remaining;

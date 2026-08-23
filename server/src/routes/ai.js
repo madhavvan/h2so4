@@ -70,9 +70,10 @@ router.use((req, res, next) => {
     const userId = req.user?.id;
     const body = req.body;
     if (!userId || !body || typeof body !== 'object') return next();
-    // ONE budget for all three fields. Per-call budgets would let a request
-    // spend the whole ceiling three times over (systemInstruction + prompt +
-    // messages), and the expansion is what we're bounding — not the field.
+    // ONE budget for all the fields below. Per-call budgets would let a
+    // request spend the whole ceiling several times over (systemInstruction
+    // + prompt + messages + the cover fields), and the expansion is what
+    // we're bounding — not the field.
     const budget = contextStore.newResolveBudget();
     if (typeof body.systemInstruction === 'string') {
       body.systemInstruction = contextStore.resolveText(userId, body.systemInstruction, budget);
@@ -82,6 +83,40 @@ router.use((req, res, next) => {
     }
     if (Array.isArray(body.messages)) {
       body.messages = contextStore.resolveMessages(userId, body.messages, budget);
+    }
+    // ── THE COVER READS THE DOCUMENTS TOO, AND IT READS THEM WHOLE ──
+    //
+    // coverContext used to be a hand-built SUMMARY of the knowledge base
+    // (ledgerDigest) precisely because it could not use this store — the
+    // middleware resolved three fields and this was not one of them, so a
+    // placeholder would have reached the cover model as the literal text
+    // "⟪CTX:…⟫". Measured consequence: on a 39,891-char upload the cover
+    // model received 863 characters, and they were the wrong 863 — eight
+    // entries for four employers, plus the INTERVIEWER's company financials
+    // under a heading that called them true facts about the candidate.
+    //
+    // Resolving it here is what lets the cover carry the documents verbatim
+    // at ~4KB on the wire, exactly as the main answer already does.
+    //
+    // LENIENT on purpose — see resolveTextLenient. These two fields are
+    // speculative; a cache miss must cost grounding, never the answer.
+    //
+    // ⚠️ AND IT SAYS SO WHEN IT DROPS ONE. A degraded cover and a cover that
+    // never had a knowledge base look identical from the outside, and this
+    // file has lost hours twice to a bound returning '' with nothing in the
+    // log to say it had (OPENER_MAX_CHARS at 400; the 1,200-char slice).
+    // Silent is the one thing this path must not be.
+    for (const field of ['coverContext', 'coverVocabulary']) {
+      const raw = body[field];
+      if (typeof raw !== 'string') continue;
+      body[field] = contextStore.resolveTextLenient(userId, raw, budget);
+      if (raw.indexOf('⟪CTX:') !== -1 && !body[field]) {
+        console.warn(
+          `[cover] ${field} MISS user=${userId} — the offloaded blob is gone (evicted, `
+          + 'restarted, or another instance). The cover runs with no knowledge base '
+          + 'for this request; the answer is unaffected.'
+        );
+      }
     }
     next();
   } catch (err) {
@@ -284,10 +319,49 @@ const SESSION_GATE_MIN_CLIENT = '4.0.23';
 // 4.0.20 → 4.0.21 → 4.0.22, moved on each cut. THIS IS THE ROUTINE, not an
 // oversight: a hold parked on the next version arms itself the moment that
 // version ships. It moves ahead every release until it is deliberately armed.
-// 4.0.20 → 4.0.21 → 4.0.22 → 4.0.23, moved on each cut. Unchanged in
-// substance: the LLM cover's own TTFT and guard-rejection rate under real
-// traffic still have not been measured, and 4.0.22 changed nothing about it.
-const LLM_COVER_MIN_CLIENT = '4.0.23';
+// 4.0.20 → 4.0.21 → 4.0.22 → 4.0.23, moved on each cut.
+//
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ✅ ARMED 2026-08-16. THE RE-ARM CONDITION ABOVE HAS BEEN MET.
+//
+//  The condition was "its own TTFT, its guard-rejection rate, and the main
+//  answer's TTFT behind it". Holding for LIVE traffic was the mistake that
+//  kept this dormant for four releases: none of those three numbers needs
+//  live traffic. The questions are in the app's own SQLite, the resumes are
+//  in the same rows, and the chain and guard are pure server code. Measured
+//  offline against 24 real deferred questions on the real providers
+//  (server/test/cover-live-corpus.test.js, COVERDRILL=1):
+//
+//    cover TTFT        median 1,119ms   max 2,803ms
+//    cover TOTAL       median 1,858ms
+//    guard rejection   29.2% -> 12.5% after the guard fixes below
+//
+//  Every one of those lands inside the smallest gap a cover is allowed to
+//  fire into (COVER_FLOOR_MS = 2,500ms), so the sentence is on screen
+//  before the main model would have spoken in the only cases it runs at all.
+//
+//  What the measurement actually found was that the risk was never the
+//  latency — it was the GUARD, throwing away 29% of correct covers over
+//  ordinary terms of art (RAG, SLA, ETL, CDC, SLO), and over its own
+//  "the interviewer already said it" rule scanning only for CAPITALISED
+//  words while the question arrives from speech-to-text in lower case.
+//  Both are fixed in services/groundingGuard.js, mirrored client-side in
+//  services/factLedger.ts, and pinned in test/cover-guard-terms.test.js.
+//
+//  WHAT USERS GOT WHILE THIS WAS DORMANT, graded on all 1,730 real
+//  questions in copilot.db: the local opener speaks on 143 of them. The
+//  other 1,587 got NOTHING — and on xai and groq 91.7% of those sit past
+//  the cover floor, average predicted gap 10.8s and 24.8s, worst 20s and
+//  50s. That is the silence this feature exists to remove and has never
+//  once removed.
+//
+//  Set to MIN_PROTOCOL_CLIENT exactly as the instruction above says, so
+//  the cover is reachable by every client that sends the header at all —
+//  4.0.19 is the release that added coverContext/coverVocabulary, so it is
+//  the oldest build that can actually use a cover. Older installs still
+//  get '' and are unaffected.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const LLM_COVER_MIN_CLIENT = MIN_PROTOCOL_CLIENT;
 
 /** Is this caller new enough for the LLM COVER specifically? */
 function clientAtLeastLlmCover(req) {
@@ -634,19 +708,23 @@ function rateLimitedJson(provider) {
 //   - PAID        → basic + pro + max + ultra  (kept for non-trial paid gates)
 //   - CLAUDE_TIERS→ pro + max + ultra          (Claude Sonnet 5 — Basic and the
 //                    free trial both exclude Claude)
-//   - ULTRA_ONLY  → ultra only                 (Auto-Type — the Ultra-exclusive feature)
+//   - AUTOTYPE_TIERS → ultra + enterprise      (Auto-Type — the coding-round
+//                    feature, sold on Ultra and Enterprise)
 // Free tier (2026-07): the 10-minute trial covers the four non-Claude
 // models; after it nothing is free — Gemini included (it stays behind
 // geminiQuotaGate + the time gate). Defined here so adding a new model
 // route only requires picking the right gate, not hand-listing tiers.
-const TRIAL_MODELS = ['free', 'basic', 'pro', 'max', 'ultra'];
-const PAID = ['basic', 'pro', 'max', 'ultra'];
-const CLAUDE_TIERS = ['pro', 'max', 'ultra'];
-const ULTRA_ONLY = ['ultra'];
+const TRIAL_MODELS = ['free', 'basic', 'pro', 'max', 'ultra', 'enterprise'];
+const PAID = ['basic', 'pro', 'max', 'ultra', 'enterprise'];
+const CLAUDE_TIERS = ['pro', 'max', 'ultra', 'enterprise'];
+// Auto-Type: Ultra and Enterprise. Kept under the old ULTRA_ONLY name at the
+// call sites would have been a lie, so it is renamed — every mount below and
+// the mirror list in routes/license.js (AUTO_TYPE_TIERS) move together.
+const AUTOTYPE_TIERS = ['ultra', 'enterprise'];
 //   - TRAIN_TIERS → max + ultra                 (Train Model — the Max
 //                    differentiator, sold as "Max+" on every pricing
 //                    surface and mirrored by FEATURE_GATES.trainModel)
-const TRAIN_TIERS = ['max', 'ultra'];
+const TRAIN_TIERS = ['max', 'ultra', 'enterprise'];
 
 // TODO(owner-decision): the 10-minute free trial is currently NOT available
 // in India. requireActiveSubscriptionInRegion (mounted above via router.use)
@@ -681,7 +759,7 @@ router.get('/models', (req, res) => {
     const email = (req.user?.email || '').toLowerCase();
     const isAdmin = ADMIN_EMAILS.includes(email);
     const license = db.getLicenseByUserId(req.user.id);
-    const tier = isAdmin ? 'ultra' : (license?.tier || 'free');
+    const tier = isAdmin ? 'enterprise' : (license?.tier || 'free');
 
     const allow = (tiers) => isAdmin || tiers.includes(tier);
     // Order matters — the phone uses the first as its default and the
@@ -788,6 +866,365 @@ router.post('/prefetch-context', async (req, res) => {
 // Test hook — exposes the dedup helper so test code can reset state
 // between cases. Only used by Vitest.
 function _resetPrefetchDedup() { _prefetchDedup.clear(); }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  /cover/prewarm — WRITE THE OPENING LINE IN TIME NOBODY IS USING
+//
+//  The app already spends 1,200ms doing nothing: the transcript lands in
+//  the input box and an auto-send timer counts down before the question is
+//  sent at all. That window is longer than a whole cover takes (measured
+//  today: gpt-oss-20b first token 274ms, complete one-liner 291-476ms).
+//
+//  So the cover moves OFF the critical path entirely. It used to be
+//  awaited in FRONT of the main provider call — which is the single reason
+//  the feature was frozen for four releases, because a cover that fails or
+//  is rejected bought the user nothing and delayed the answer by up to
+//  4.5s. Written here instead, a cover that fails costs exactly zero, and
+//  a cover that is rejected by the guard costs zero too. The feature can
+//  finally only ever ADD speed, which is what it always claimed to do.
+//
+//  Two jobs, one window, because the model has to read the question either
+//  way:
+//    1. judgeAnswerDepth  — how much reasoning does the ANSWER need? This
+//       recommendation rides back with the question and replaces the regex
+//       cascade in resolveReasoningEffort. It is CLAMPED BY TIER there; a
+//       verdict is a recommendation, never an entitlement.
+//    2. the cover itself, sized by depth x the chosen route's speed.
+//
+//  ⚠️ THE GUARD RUNS HERE, NOT AT SEND TIME. The result comes back to the
+//  client and returns as `instantOpener`, which runCover streams at 0ms
+//  and does NOT re-check — that rail is trusted because the local opener
+//  is assembled from verified résumé facts and cannot fabricate. A model
+//  wrote this one, so it has to clear the same bar BEFORE it is handed
+//  over. Skipping that would put an unguarded LLM sentence on the trusted
+//  rail, which is the exact hole the grounding work exists to close.
+//
+//  No time gate and no session gate, for the same reason /prefetch-context
+//  has neither: this is speculative work that may be thrown away, and it
+//  must never consume interview minutes or refuse a live session.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// The five routes a question can actually be answered on. An unknown value
+// falls back to 'openai' rather than erroring: the provider only sizes the
+// cover, so guessing wrong costs a few words, and refusing costs the opener.
+const STREAM_PROVIDERS = new Set(['openai', 'claude', 'gemini', 'xai', 'groq']);
+
+const PREWARM_TTL_MS = 45_000;
+const PREWARM_MAX_ENTRIES = 500;
+const _prewarmCache = new Map();
+
+function _prewarmKey(userId, provider, question) {
+  return `${userId}|${provider}|${String(question).trim().toLowerCase()}`;
+}
+function _prewarmGet(key) {
+  const hit = _prewarmCache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.at + PREWARM_TTL_MS) { _prewarmCache.delete(key); return null; }
+  return hit;
+}
+function _prewarmPut(key, value) {
+  // Bounded: an interview is tens of questions, but a long-lived process
+  // serving many users must not grow a map forever.
+  if (_prewarmCache.size >= PREWARM_MAX_ENTRIES) {
+    const oldest = _prewarmCache.keys().next().value;
+    if (oldest !== undefined) _prewarmCache.delete(oldest);
+  }
+  _prewarmCache.set(key, { ...value, at: Date.now() });
+}
+function _resetPrewarmCache() { _prewarmCache.clear(); }
+
+// ── ONE PREWARM IN FLIGHT PER USER, AND A DEAD CLIENT STOPS THE WORK ──
+//
+// The client fires a prewarm on every 350ms-stable pause while someone is
+// still talking, aborting its own PREVIOUS fetch each time. The server
+// never saw those aborts: streamCoverAnswer was called with
+// `signal: undefined`, so every superseded prewarm — depth judge, cover,
+// and the parallel second attempt on 'medium' — ran to completion and
+// billed for a question that no longer existed. A single long spoken
+// question could burn five or more full generations to deliver one.
+//
+// Two mechanisms, one intent:
+//   · req/res teardown aborts the controller, so a fetch the client
+//     abandoned stops mid-generation instead of finishing for nobody;
+//   · a newer prewarm from the same user aborts the older one outright,
+//     which covers the case where the client's abort never reached us.
+//
+// Multi-device note: the key is the USER, so two devices prewarming at
+// once would supersede each other. That is the right trade — the usage
+// session is single-owner by design (see requireActiveSession), so two
+// simultaneous interviews on one account is already not a supported state.
+const _prewarmInFlightByUser = new Map();
+
+router.post('/cover/prewarm', async (req, res) => {
+  const t0 = Date.now();
+  const question = typeof req.body?.question === 'string' ? req.body.question.trim() : '';
+  const provider = STREAM_PROVIDERS.has(req.body?.provider) ? req.body.provider : 'openai';
+  // Nothing shorter is a question, and coverWorthy is the same bar the
+  // in-line cover applies. An empty answer here is a normal outcome, not
+  // an error — the client simply sends without an opener.
+  if (!question || question.length < 20 || !coverWorthy(question)) {
+    return res.json({ cover: '', effort: null, reason: 'not-cover-worthy' });
+  }
+  // The client decides when an opener would be actively harmful (the user
+  // is challenging a previous answer). Honour it here too, or the prewarm
+  // would hand back the very sentence the suppress rule exists to prevent.
+  if (req.body?.coverPolicy === 'suppress') {
+    return res.json({ cover: '', effort: null, reason: 'suppressed' });
+  }
+
+  const key = _prewarmKey(req.user?.id || '-', provider, question);
+  const cached = _prewarmGet(key);
+  if (cached) {
+    return res.json({ cover: cached.cover, effort: cached.effort, cached: true, ms: 0 });
+  }
+
+  // Everything past this point spends model calls, so it is all cancellable.
+  // `writableEnded` distinguishes "the response went out" (close always
+  // fires after a normal finish) from "the client hung up mid-generation",
+  // which is the only case that should abort the work.
+  const uid = req.user?.id || '-';
+  const ac = new AbortController();
+  res.on('close', () => { if (!res.writableEnded) ac.abort(); });
+  const prev = _prewarmInFlightByUser.get(uid);
+  if (prev) { try { prev.abort(); } catch { /* already done */ } }
+  _prewarmInFlightByUser.set(uid, ac);
+
+  const {
+    judgeAnswerDepth, planForPrewarm, streamCoverAnswer, MIN_FLUSH_WORDS,
+  } = require('../services/coverAnswer');
+  const {
+    unverifiedProperNouns, hasBannedOpener, unverifiedNumbers, hasMetaLeak,
+    citationHolds, claimsOwnHistory,
+    opensWithProcessNarration,
+  } = require('../services/groundingGuard');
+
+  const coverContext = typeof req.body?.coverContext === 'string' ? req.body.coverContext : '';
+  const coverVocabulary = typeof req.body?.coverVocabulary === 'string' ? req.body.coverVocabulary : '';
+  const recentTurns = typeof req.body?.recentTurns === 'string' ? req.body.recentTurns : '';
+
+  try {
+    // ── 1. THE JUDGE AND THE COVER RUN TOGETHER, NOT ONE BEHIND THE OTHER ──
+    //
+    // These were sequential: await the depth verdict, then size the cover
+    // from it, then write. That is one full round trip in front of another,
+    // and it is where the tail came from. Measured live 2026-08-20, median
+    // ready 709ms but two of fifteen at 1,771ms and 2,069ms — both past the
+    // ~850ms the auto-send timer leaves, so the line was written, paid for,
+    // and thrown away. 900ms is judgeAnswerDepth's own timeout, so a slow
+    // judge cost its entire budget before the cover had started.
+    //
+    // The dependency is real but weak: `depth` only picks a TIER, and for a
+    // given provider 'none' and 'low' usually land on the same one. So the
+    // cover starts immediately on the default plan (planForPrewarm's own
+    // fallback, which is what a timed-out judge produced anyway), and the
+    // verdict is awaited alongside it — where it still does its two real
+    // jobs: the `effort` hint that rides back to the client, and deciding
+    // whether the anti-narration second attempt is worth firing.
+    //
+    // The cost is that a 'none' question may get a line sized for 'low' —
+    // bounded, since both are the opener tier on every route where they
+    // differ. The gain is that the cover no longer waits on a model that
+    // has nothing to do with what it says.
+    const depthPromise = judgeAnswerDepth({
+      question, groqKey: process.env.GROQ_API_KEY, signal: ac.signal,
+    });
+
+    // ── THE PROVISIONAL TIER IS THE SHORTEST ONE, NOT THE DEFAULT ONE ──
+    //
+    // planForPrewarm's own fallback is 'low', and using it here was wrong in
+    // the one direction that costs the candidate something. Measured on the
+    // first run after this change: `started on "opener", verdict "none"
+    // wanted "spark"` on six of eight questions — i.e. the cover was being
+    // written a tier LONGER than the judge would have asked for, on exactly
+    // the fast routes the `spark` tier was added to protect (2026-08-19,
+    // where a 33-word opener landed in front of a 1,677ms answer and the
+    // answer then re-made the point the opener had just made).
+    //
+    // The two errors are not symmetrical. Too long is the measured harm —
+    // the candidate is still speaking when the real answer paints under it.
+    // Too short is a briefer opening sentence and nothing else. So the
+    // provisional is the shortest plan any verdict could produce, and a
+    // verdict asking for MORE simply arrives too late to lengthen it.
+    const provisional = planForPrewarm(provider, 'none');
+    const { category } = classifyQuestion(question);
+    // Each attempt carries its OWN citation. Two concurrent attempts
+    // produce two different sentences resting on two different lines, and
+    // checking one against the other's evidence would be worse than not
+    // checking at all.
+    const write = (extra, planOverride) => {
+      let cite = '';
+      return streamCoverAnswer({
+        question: extra ? `${question}\n\n${extra}` : question,
+        category,
+        candidateContext: coverContext,
+        recentTurns,
+        plan: planOverride || provisional.plan,
+        groqKey: process.env.GROQ_API_KEY,
+        geminiKey: process.env.GEMINI_API_KEY,
+        anthropicKey: process.env.ANTHROPIC_API_KEY,
+        onToken: () => {},
+        onMeta: (c) => { cite = c; },
+        signal: ac.signal,
+      }).then((text) => ({ text, cite }));
+    };
+    // Started BEFORE the verdict is known — that is the whole point.
+    const firstPromise = write('');
+
+    const depth = await depthPromise;
+    if (ac.signal.aborted) {
+      if (!res.writableEnded) res.json({ cover: '', effort: null, reason: 'superseded', ms: Date.now() - t0 });
+      return;
+    }
+    const { gapMs, depth: used, plan } = planForPrewarm(provider, depth);
+    if (plan.name !== provisional.plan.name) {
+      // Observable on purpose: this is the cost of starting early, and if it
+      // turns out to be common the trade should be revisited with numbers
+      // rather than reasoning.
+      console.log(
+        `[prewarm] tier user=${req.user?.id} started on "${provisional.plan.name}", `
+        + `verdict "${depth || 'null'}" wanted "${plan.name}" — kept the running one`
+      );
+    }
+    // ── 2b. TWO ATTEMPTS IN PARALLEL, NOT ONE THEN ANOTHER ──
+    //
+    // Problem questions open by announcing a plan instead of making a
+    // point — "First, I'd inventory every DAG..." — which COVER_SYSTEM
+    // forbids and gpt-oss produced on both scenario questions in a
+    // measured set. The model plainly knows better: one of those had the
+    // correct opener as its own LAST clause.
+    //
+    // ⚠️ THE OBVIOUS FIX — generate, check, retry if narrated — IS WORSE
+    // THAN THE DISEASE, and it was measured being worse. A sequential
+    // retry doubles the prewarm: 1,633ms instead of ~600ms. Add the hook's
+    // 350ms debounce and the line is ready at ~1,983ms, against a 1,200ms
+    // auto-send window. The retry SUCCEEDED and the client had already
+    // sent without it, falling through to the in-line cover — which then
+    // opened with the exact "First, I would audit..." the retry had fixed.
+    // Spending the window to improve a cover that misses the window is a
+    // net loss.
+    //
+    // So the second attempt runs ALONGSIDE the first. Wall-clock is the
+    // slower of two concurrent calls rather than their sum, which keeps
+    // the whole thing inside the window; the cost is one extra ~$0.002
+    // call, and only on the questions where this shape actually occurs.
+    //
+    // Gated on depth: 'medium' is the judge's verdict for "you have to
+    // work something out", which is exactly the scenario/design shape that
+    // narrates. Identity and knowledge questions never did it, so they
+    // pay nothing.
+    const ANTI_NARRATION =
+      'REMINDER FOR THIS ANSWER: do NOT begin by announcing what you would do. '
+      + 'Never open with "First", "To start", "Initially", "I\'d start by", or '
+      + '"The first thing". Lead with the one thing that is already TRUE about '
+      + 'this problem — the constraint that decides it, the distinction being '
+      + 'conflated, or what kind of problem it actually is. If the insight would '
+      + 'have landed in your last clause, put that clause FIRST.';
+
+    const wantsSecond = used === 'medium';
+    const EMPTY = { text: '', cite: '' };
+    const [first, second] = await Promise.all([
+      firstPromise,
+      wantsSecond ? write(ANTI_NARRATION, plan).catch(() => EMPTY) : Promise.resolve(EMPTY),
+    ]);
+
+    let chosen = first;
+    const firstNarrates = opensWithProcessNarration(first.text);
+    if (!first.text && second.text) {
+      chosen = second;
+    } else if (firstNarrates && second.text && !opensWithProcessNarration(second.text)) {
+      chosen = second;
+      console.log(`[prewarm] shape user=${req.user?.id} first opened "${firstNarrates}" — took the parallel attempt`);
+    } else if (firstNarrates) {
+      // Kept, not dropped: this shape is weak, not false, and silence is
+      // worse than filler.
+      console.log(`[prewarm] shape user=${req.user?.id} both attempts narrated ("${firstNarrates}") — keeping it`);
+    }
+    let cover = chosen.text;
+    const citation = chosen.cite;
+
+    // ── A FRAGMENT IS NOT A COVER ──
+    //
+    // Measured live 2026-08-20: the client was handed `instantOpener="An
+    // installation"` and spoke it. The server logged it without complaint —
+    // `[prewarm] words=2` then `[cover] LOCAL shape=prewarm words=2` —
+    // against an opener tier whose minWords is 12. Three of fifteen covers
+    // that run came in under the tier minimum (8, 2 and 10 words).
+    //
+    // Nothing enforced the floor. createCoverEmitter has one, but only for
+    // the FIRST flush (MIN_FLUSH_WORDS); a clean end-of-stream deliberately
+    // releases whatever the model produced, on the reasoning that "a
+    // deliberately short complete sentence is fine". Two words is not a
+    // short sentence, it is the beginning of one, and this is the same
+    // defect class as the "So the" the emitter was built to stop.
+    //
+    // Dropped rather than kept: on the prewarm rail a rejection costs the
+    // user nothing at all, because the question has not been sent yet.
+    const coverWords = String(cover || '').split(/\s+/).filter(Boolean).length;
+    if (cover && coverWords < MIN_FLUSH_WORDS) {
+      console.warn(
+        `[prewarm] TOO SHORT user=${req.user?.id} tier=${plan.name} ${coverWords}w `
+        + `(floor ${MIN_FLUSH_WORDS}, tier wants ${plan.minWords}) — dropped. text="${cover}"`
+      );
+      cover = '';
+    }
+
+    if (!cover) {
+      // An aborted generation also lands here with '' — report it as what
+      // it was, and never write to a connection the client already closed.
+      const reason = ac.signal.aborted ? 'superseded' : 'no-cover';
+      if (!res.writableEnded) res.json({ cover: '', effort: depth, reason, ms: Date.now() - t0 });
+      return;
+    }
+
+    // ── 3. The same bar the in-line cover clears, before it is trusted ──
+    const allowed = `${question}\n${interviewerSaid(recentTurns)}`;
+    const verdict = coverVerdict({
+      cover, citation, shown: coverContext, vocabulary: coverVocabulary, allowed,
+    });
+    if (verdict) {
+      console.warn(
+        `[prewarm] REJECTED user=${req.user?.id} provider=${provider} tier=${plan.name} `
+        + `${verdict} after ${Date.now() - t0}ms — dropped before it could be spoken. `
+        + `text="${cover.slice(0, 120)}"`
+      );
+      // A rejection costs the user NOTHING now: this ran in the silence
+      // timer, and the question has not been sent yet.
+      return res.json({ cover: '', effort: depth, reason: 'guard', ms: Date.now() - t0 });
+    }
+
+    const words = cover.split(/\s+/).filter(Boolean).length;
+    console.log(
+      `[prewarm] ${provider} user=${req.user?.id} depth=${depth || 'null'}->${used} `
+      + `tier=${plan.name} gap~${gapMs}ms words=${words} ready=${Date.now() - t0}ms`
+    );
+    // ⚠️ `depth`, NOT `used`. `used` is planForPrewarm's DEFAULT — 'low'
+    // when the judge timed out or failed — and it exists only to size the
+    // cover, where a guess is fine. Returned as the effort hint it became a
+    // fabricated verdict: the client shipped coverEffort='low', which
+    // OVERRIDES the server's classifier in resolveReasoningEffort, so a
+    // question the classifier would have run at 'none' paid reasoning
+    // latency because a 900ms timeout was converted into an opinion.
+    // Observed live: "[prewarm] ... depth=null->low ready=1538ms". A null
+    // hint falls through to the classifier, which is the designed fallback.
+    _prewarmPut(key, { cover, effort: depth });
+    return res.json({ cover, effort: depth, ms: Date.now() - t0 });
+  } catch (err) {
+    // Speculative work. Failing is a non-event: the client sends without an
+    // opener and the in-line path behaves exactly as it does today. A
+    // superseded/abandoned request is quieter still — it was cancelled on
+    // purpose, so it does not earn a "failed" line.
+    if (ac.signal.aborted) {
+      if (!res.writableEnded) res.json({ cover: '', effort: null, reason: 'superseded', ms: Date.now() - t0 });
+      return;
+    }
+    console.warn(`[prewarm] failed user=${req.user?.id}:`, err && err.message);
+    return res.json({ cover: '', effort: null, reason: 'error', ms: Date.now() - t0 });
+  } finally {
+    // Ownership-checked, same reason as the client's _prewarmInFlight: a
+    // superseded request's cleanup must not evict the SUCCESSOR's entry,
+    // or the next supersede finds nothing to abort and the chain breaks.
+    if (_prewarmInFlightByUser.get(uid) === ac) _prewarmInFlightByUser.delete(uid);
+  }
+});
 
 // ── Gemini ──
 router.post('/chat/gemini', geminiQuotaGate, requireTimeRemaining, requireActiveSession, async (req, res) => {
@@ -1000,7 +1437,24 @@ const { classifyQuestion } = require('../services/questionClassifier');
 //  Length cap and control-character strip only. The text is derived from
 //  the user's own uploaded documents by the user's own client, and can only
 //  ever affect that user's answer — there is nothing here to authorise.
-const OPENER_MAX_CHARS = 400;
+//
+//  ⚠️ THIS WAS 400, AND IT SILENTLY ATE EVERY PREWARMED COVER.
+//
+//  400 chars was right when this rail carried ONE thing: the locally
+//  composed opener, a single ledger sentence of 12-30 words (~150 chars).
+//  It now also carries the PREWARMED cover, and on a slow route that is a
+//  holding-tier answer — up to HOLDING_MAX_WORDS at ~9 chars a word, so
+//  ~1,350. Measured live: a 148-word / 1,003-char prewarmed cover arrived,
+//  `clientOpener` returned '' on the length check, and runCover fell
+//  straight through to the in-line LLM path. The cover was written, passed
+//  the guard, reached the request — and was dropped one line before it
+//  would have been spoken, with no log to say so.
+//
+//  Derived from the word budget rather than picked, so a future change to
+//  HOLDING_MAX_WORDS cannot re-introduce the same silent truncation. The
+//  bound is a sanity check on client input, not a security boundary — see
+//  the paragraph above for why there is nothing here to authorise.
+const OPENER_MAX_CHARS = 1_600;
 
 function clientOpener(req) {
   const raw = req.body && req.body.instantOpener;
@@ -1032,7 +1486,121 @@ function interviewerSaid(recentTurns) {
     .filter((line) => /^Interviewer:/.test(line.trim()))
     .join('\n');
 }
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  WHAT THE COVER WAS ALLOWED TO SAY — THE UNION, NOT ONE OR THE OTHER
+//
+//  This used to be `coverVocabulary.trim() ? coverVocabulary : allowed`, so
+//  the whole knowledge base was represented by the ledger's token list and
+//  nothing else. That list is a PARSE, and a parse can miss.
+//
+//  Measured on a real upload: the candidate's document says "70+ analytical
+//  and lab assets" and the ledger never carried the 70. The cover said "over
+//  70 assets" — true, printed in the file — and the guard rejected it as
+//  `fabricatedNumbers=[70]`, while an invented "eighteen" sailed through
+//  because the digest happened to contain "18 B" (the INTERVIEWER's capital
+//  commitment). The guard was rejecting the true statement and accepting
+//  the false one, and both failures were the same root cause: it was asking
+//  a summary whether something was true.
+//
+//  coverContext is now the documents themselves, so it is the better
+//  witness. The ledger list stays in the union rather than being replaced —
+//  it is normalised (case, plurals, punctuation stripped) and catches forms
+//  the raw text spells differently.
+//
+//  ⚠️ THE EMPTY CASE IS UNCHANGED AND MUST STAY THAT WAY. With no knowledge
+//  base at all, `allowed` — the question plus what the interviewer actually
+//  said — is the whole permitted vocabulary. That is the STRICTEST mode in
+//  this file, not the loosest, and it is what stops a cover inventing an
+//  employer for a user who uploaded nothing.
+function allowedVocabulary(coverVocabulary, coverContext, allowed) {
+  const parts = [coverVocabulary, coverContext]
+    .filter((s) => typeof s === 'string' && s.trim());
+  return parts.length ? parts.join('\n') : allowed;
+}
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE TWO RULES
+//
+//  Everything the cover is checked for now hangs off ONE distinction: is
+//  this sentence about the CANDIDATE, or about the SUBJECT?
+//
+//  That distinction is what three industries of live testing kept pointing
+//  at. Every list this replaced — pharma section headings, ~150 curated
+//  acronyms — was an attempt to answer "is this word safe?", and the word
+//  is the wrong unit. "UE" and "IBM" are the same shape; one is a term of
+//  art and one is a fabricated employer, and only the CLAIM tells them
+//  apart. Measured, all four live:
+//
+//    REJECTED invented=[UE, Request]   correct 3GPP, no claim about anyone
+//    REJECTED invented=[TEID]          correct, no claim about anyone
+//    SPOKEN   "I haven't worked with LLMs"      false, and a claim
+//    SPOKEN   "roughly twenty-five … daily"     invented, and a claim
+//
+//  So:
+//
+//    ABOUT THE CANDIDATE → the model must hand back the words it read the
+//      claim from, and those words must really be in what it was shown.
+//      A citation that does not hold means the model invented its own
+//      evidence, which is worse than an unsupported sentence: the whole
+//      cover goes. Then the existing vocabulary and number checks run, as
+//      the second net.
+//
+//    ABOUT THE SUBJECT → nothing here can be false ABOUT THIS CANDIDATE,
+//      because it says nothing about them. The proper-noun and number
+//      checks are skipped, which is what stops the app rejecting the
+//      vocabulary of whichever field it has never seen before. Style
+//      checks (meta leak, banned opener) still apply — they are about how
+//      it sounds, not about what is true.
+//
+//  ⚠️ WHAT THIS STILL DOES NOT CATCH, stated plainly rather than implied:
+//  a sentence whose words are all real and whose RELATION is wrong. "I
+//  held Cpk 1.33" where 1.33 is an acceptance criterion in the document,
+//  not an achieved result; "AMF handles session management" where the SMF
+//  does. Provenance cannot see relations. Only the main model can, and it
+//  corrected both of those one sentence later in the live runs.
+function coverVerdict({ cover, citation, shown, vocabulary, allowed }) {
+  // Required here rather than at module scope, matching the rest of this
+  // file: groundingGuard is a cold-start cost the health check should not
+  // pay. Node caches the module, so this is one map lookup per cover.
+  const {
+    unverifiedProperNouns, hasBannedOpener, unverifiedNumbers, hasMetaLeak,
+    citationHolds, claimsOwnHistory, deniesOwnHistory,
+  } = require('../services/groundingGuard');
+  const meta = hasMetaLeak(cover);
+  if (meta) return `metaLeak="${meta}"`;
+  const banned = hasBannedOpener(cover);
+  if (banned) return `bannedOpener="${banned}"`;
+
+  // Before the lanes, because it belongs to neither: no citation can carry
+  // it and no framing exempts it. See deniesOwnHistory.
+  if (deniesOwnHistory(cover)) return 'deniedOwnHistory';
+
+  // ── THE FRAMING LANE IGNORES THE CITATION ENTIRELY ──
+  //
+  // The first draft rejected a framing sentence whose surplus citation did
+  // not hold, reasoning that a model inventing quotations should not be
+  // trusted with the sentence either. Measured across three résumés, that
+  // cost correct covers and caught nothing:
+  //
+  //   Q "what is the difference between calibration and qualification?"
+  //     CITE "calibration, qualification, validation"   ← a paraphrase
+  //     SAY  a correct, entirely generic definition     ← thrown away
+  //
+  // Nothing in that sentence rests on the citation, so a bad citation
+  // cannot make it false. The claim rule is the guarantee; this was
+  // superstition on top of it.
+  if (!claimsOwnHistory(cover)) return '';
+  if (!citation) return 'uncitedClaim';
+  if (!citationHolds(shown, citation)) return 'confabulatedCitation';
+
+  const invented = unverifiedProperNouns(allowedVocabulary(vocabulary, shown, allowed), cover, allowed);
+  if (invented.length) return `invented=[${invented.join(', ')}]`;
+  const numbers = unverifiedNumbers(shown, cover, allowed);
+  if (numbers.length) return `fabricatedNumbers=[${numbers.join(', ')}]`;
+  return '';
+}
 
 async function runCover({ sse, req, question, provider, effort = 'none', webSearch = false }) {
   // ── 1. The client already knows what to say ──
@@ -1084,11 +1652,10 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
   // see the `!plan` note below, which is the same rule applied to timing.
   // For a client that cannot use it, adding speed means doing nothing.
   //
-  // ⚠️ HELD AT 4.0.20 — DORMANT ON PURPOSE (2026-08-08). See LLM_COVER_MIN_CLIENT.
-  //
-  // Everything ABOVE this line still runs, which is the point: the client's
-  // locally-composed opener (step 1) is unaffected, so the fast path users
-  // actually feel is untouched. Only the model round-trip below is held.
+  // ✅ ARMED 2026-08-16 at MIN_PROTOCOL_CLIENT. See LLM_COVER_MIN_CLIENT for
+  // the measurement that met the re-arm condition. This check stays — it is
+  // what keeps a pre-4.0.19 install, which sends no coverContext and cannot
+  // render the result, from paying for a round-trip it can only waste.
   if (!clientAtLeastLlmCover(req)) return '';
 
   const {
@@ -1121,6 +1688,7 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
   // get this far.
   const t0 = Date.now();
   let held = '';
+  let citation = '';
   const cover = await streamCoverAnswer({
     question,
     category,
@@ -1138,6 +1706,7 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
     // Paid backstop for the day both free tiers are rate-limited.
     anthropicKey: process.env.ANTHROPIC_API_KEY,
     onToken: (t) => { held += t; },
+    onMeta: (c) => { citation = c; },
     signal: sse.signal,
   });
   if (!cover) return '';
@@ -1147,8 +1716,19 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
   // did not just say, was invented. Dropping the cover degrades to exactly
   // the pre-existing no-cover behaviour: the answer still arrives, a
   // little later, and nothing false was spoken.
-  const { unverifiedProperNouns, hasBannedOpener, unverifiedNumbers } = require('../services/groundingGuard');
+  const {
+    unverifiedProperNouns, hasBannedOpener, unverifiedNumbers, hasMetaLeak,
+    citationHolds, claimsOwnHistory,
+  } = require('../services/groundingGuard');
+
+  // ── WHO IS SPEAKING ──
+  // Checked before anything else because it is the only failure here that
+  // is not about the facts. A cover that says "the interviewer is asking
+  // about specific work" contains no invented name and no invented number,
+  // so every other check below passes it — and it is read aloud, in the
+  // room, to the interviewer it just referred to in the third person.
   const vocab = typeof req.body?.coverVocabulary === 'string' ? req.body.coverVocabulary : '';
+  const shown = typeof req.body?.coverContext === 'string' ? req.body.coverContext : '';
   // The transcript counts as allowed vocabulary too: a name the interviewer
   // used two turns ago is theirs, not an invention. Adding it here is what
   // lets the cover answer a follow-up at all without being rejected for
@@ -1159,84 +1739,32 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
   // into `allowed` with everything else — so a name the model invented last
   // turn became trusted vocabulary this turn, and the sentence that explains
   // the invention sailed through the guard that had rejected the invention
-  // itself. That is the IBM → Accenture cascade with the guard's own help,
-  // and it bites hardest at the `vocab.trim() ? vocab : allowed` line below,
-  // where `allowed` is not merely added to the knowledge base — it IS the
-  // knowledge base. The model still SEES its previous answer: it is passed
-  // to streamCoverAnswer above, in full, as prompt context. It just no
-  // longer gets to vouch for itself.
+  // itself. That is the IBM → Accenture cascade with the guard's own help.
+  // The model still SEES its previous answer: it is passed to
+  // streamCoverAnswer above, in full, as prompt context. It just no longer
+  // gets to vouch for itself.
   const allowed = `${question}\n${interviewerSaid(req.body?.recentTurns)}`;
 
-  // ── NO KNOWLEDGE BASE IS THE STRICTEST CASE, NOT THE LOOSEST ──
+  // ── ONE VERDICT, SHARED WITH THE PREWARM RAIL ──
   //
-  // The guard abstains when the vocabulary is empty, and for the main answer
-  // that is right: with nothing uploaded there is nothing to contradict, and
-  // flagging every name would suppress every cover in the app's most common
-  // state. Applied to the COVER it is exactly backwards, because a
-  // no-documents session is precisely when a fast model has nothing to draw
-  // on and reaches for a name. Measured live, with no files attached:
+  // These two rails used to hold two copies of the same four checks in two
+  // different orders, and they had already drifted once. coverVerdict is
+  // the single implementation; see the banner on it for what the two rules
+  // are and why they replaced the lists.
+  //
+  // NO KNOWLEDGE BASE IS THE STRICTEST CASE, NOT THE LOOSEST, and that
+  // survives here: with `shown` empty a claim about the candidate cannot
+  // produce a citation that holds, so it is dropped. Measured live with no
+  // files attached, both spoken before this existed:
   //
   //   "At my previous role at Google, we experienced a major outage…"
   //   "I've worked at IBM and then spent several years at Accenture…"
-  //
-  // Both passed, because there was no vocabulary to fail against.
-  //
-  // So when there is no knowledge base, the QUESTION becomes the vocabulary:
-  // any name the interviewer did not just say is, by construction, invented —
-  // the candidate's background is unknown, so no name can be supported by it.
-  // A cover in that state should be a stance about approach, which needs no
-  // proper nouns at all (COVER_SYSTEM says exactly this). Losing a cover here
-  // costs a moment of silence; keeping one costs a fabricated employer spoken
-  // out loud.
-  const invented = unverifiedProperNouns(vocab.trim() ? vocab : allowed, cover, allowed);
-
-  // Style, not just facts. Measured over the last 400 answers in the user's
-  // database, 15.3% opened with a phrase COVER_SYSTEM explicitly forbids —
-  // three separate answers began with the identical words "Most of my time's
-  // been on", one of them in front of a question about concurrency. The
-  // prompt asked for variety and did not get it, so the check is here.
-  const banned = hasBannedOpener(cover);
-  if (banned) {
+  const verdict = coverVerdict({ cover, citation, shown, vocabulary: vocab, allowed });
+  if (verdict) {
     console.warn(
       `[cover] REJECTED ${provider} user=${req.user?.id} tier=${plan.name} `
-      + `bannedOpener="${banned}" after ${Date.now() - t0}ms — a canned opening in front of `
-      + `an unrelated question is worse than no opening. text="${cover.slice(0, 100)}"`
-    );
-    return '';
-  }
-  if (invented.length) {
-    console.warn(
-      `[cover] REJECTED ${provider} user=${req.user?.id} tier=${plan.name} `
-      + `invented=[${invented.join(', ')}] after ${Date.now() - t0}ms — dropping the opener `
-      + `rather than speaking it. text="${cover.slice(0, 120)}"`
-    );
-    return '';
-  }
-
-  // ── AND THE NUMBERS ──
-  // The check above polices NAMES. It has nothing to say about a figure, and
-  // a cover that invents one is just as unspeakable: measured live against
-  // the real providers, this was FORWARDED and would have been read aloud —
-  //   "queries on our service metadata were timing out during peak traffic.
-  //    I pulled the slow logs and ran test queries against different index
-  //    sizes..."
-  // — none of it on the résumé, every proper noun in it perfectly valid. A
-  // number the candidate then has to defend is worse than one they never
-  // said, because the REAL answer is still generating and has not seen the
-  // cover's invention; the two can contradict each other out loud.
-  // `candidateContext` is the digest the model was given, so anything it
-  // quotes from there is supported by construction, and anything it did not
-  // is a figure it made up.
-  const madeUpNumbers = unverifiedNumbers(
-    typeof req.body?.coverContext === 'string' ? req.body.coverContext : '',
-    cover,
-    allowed,
-  );
-  if (madeUpNumbers.length) {
-    console.warn(
-      `[cover] REJECTED ${provider} user=${req.user?.id} tier=${plan.name} `
-      + `fabricatedNumbers=[${madeUpNumbers.join(', ')}] after ${Date.now() - t0}ms — a metric `
-      + `the background does not contain. text="${cover.slice(0, 120)}"`
+      + `${verdict} after ${Date.now() - t0}ms — dropped rather than spoken. `
+      + `cite="${String(citation).slice(0, 80)}" text="${cover.slice(0, 120)}"`
     );
     return '';
   }
@@ -1407,10 +1935,33 @@ function resolveReasoningEffort(req, transcript) {
   // own example phrases and mislabel every call as behavioral.
   let validated;
   if (requested === 'auto') {
-    const t = extractCurrentQuestion(transcript || (Array.isArray(req.body?.messages)
-      ? lastUserMessage(req.body.messages) : ''));
-    const { category } = classifyQuestion(t);
-    validated = AUTO_EFFORT_BY_CATEGORY[category] || 'none';
+    // ── A READ OF THE QUESTION BEATS A REGEX CASCADE ──
+    //
+    // `coverEffort` is the verdict from /cover/prewarm: a fast model that
+    // already had to read this question during the silence timer, asked how
+    // much reasoning the ANSWER needs. It is preferred over the classifier
+    // because the classifier is a keyword cascade whose widest net sits at
+    // the bottom — `isClarifier` caught anything the software-shaped lists
+    // above it did not recognise and handed it "1-2 sentences max", which
+    // is how a specialist got two-sentence answers to their own subject.
+    //
+    // Falls through to the classifier whenever the verdict is absent: the
+    // prewarm may have failed, been skipped, or come from a client that
+    // does not send it. This can only sharpen the decision, never gate it.
+    //
+    // ⚠️ It lands ABOVE the tier gate below on purpose. A recommendation
+    // from a free model must not become an entitlement — a free user whose
+    // question is judged 'medium' still resolves to 'none' there, exactly
+    // as the classifier's own 'medium' would.
+    const hinted = typeof req.body?.coverEffort === 'string' ? req.body.coverEffort : '';
+    if (ALLOWED_REASONING_EFFORTS.includes(hinted) && hinted !== 'auto') {
+      validated = hinted;
+    } else {
+      const t = extractCurrentQuestion(transcript || (Array.isArray(req.body?.messages)
+        ? lastUserMessage(req.body.messages) : ''));
+      const { category } = classifyQuestion(t);
+      validated = AUTO_EFFORT_BY_CATEGORY[category] || 'none';
+    }
   } else {
     validated = requested;
   }
@@ -1422,11 +1973,12 @@ function resolveReasoningEffort(req, transcript) {
   // reasoning_effort is ~5x the per-call cost), regardless of what a
   // tampered client sends. Auto-classification for gated users still
   // runs but is silently downgraded here. Note this reads the RAW tier:
-  // a time-exhausted Max/Ultra keeps the dial (their plan is still
+  // a time-exhausted Max/Ultra/Enterprise keeps the dial (their plan is still
   // theirs) — requireTimeRemaining is what blocks out-of-time sends.
   const tier = req.license?.tier || 'free';
   const isAdminCaller = ADMIN_EMAILS.includes((req.user?.email || '').toLowerCase());
-  if (tier !== 'max' && tier !== 'ultra' && !isAdminCaller && validated !== 'none') {
+  const REASONING_DIAL_TIERS = ['max', 'ultra', 'enterprise'];
+  if (!REASONING_DIAL_TIERS.includes(tier) && !isAdminCaller && validated !== 'none') {
     return 'none';
   }
   return validated;
@@ -2393,7 +2945,7 @@ router.post('/stream/claude', requireTier(...CLAUDE_TIERS), requireTimeRemaining
 // vendors so an Anthropic outage doesn't sink Tier 2 entirely. The caller
 // (electron/main.cjs) treats the response as opaque — `planner_used` in
 // the body identifies which vendor served the plan.
-router.post('/autotype-agent', requireTier(...ULTRA_ONLY), async (req, res) => {
+router.post('/autotype-agent', requireTier(...AUTOTYPE_TIERS), async (req, res) => {
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   const groqKey = process.env.GROQ_API_KEY;
 
@@ -2484,7 +3036,7 @@ router.post('/autotype-agent', requireTier(...ULTRA_ONLY), async (req, res) => {
 // `move_relative` / `lines_delta` fields for invisible counted-arrow
 // cursor repositioning). Falls through (caller's responsibility) to the
 // text agent / Haiku / deterministic chain on any non-2xx.
-router.post('/autotype-vision', requireTier(...ULTRA_ONLY), async (req, res) => {
+router.post('/autotype-vision', requireTier(...AUTOTYPE_TIERS), async (req, res) => {
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   if (!anthropicKey) {
     return res.status(503).json({ error: 'Claude not configured (need ANTHROPIC_API_KEY)' });
@@ -2537,7 +3089,7 @@ router.post('/autotype-vision', requireTier(...ULTRA_ONLY), async (req, res) => 
 // validation. Inserting any body-validating middleware AHEAD of requireTier
 // would make an unentitled account 400 too, and that is a paid-feature
 // bypass, not a cosmetic bug. See electron/main.cjs autoTypeVerifyEntitlement.
-router.post('/autotype-plan', requireTier(...ULTRA_ONLY), async (req, res) => {
+router.post('/autotype-plan', requireTier(...AUTOTYPE_TIERS), async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !Anthropic) {
     return res.status(503).json({ error: 'Claude not configured' });
@@ -2900,7 +3452,27 @@ module.exports._test = {
   // that hardcoded either one would go green for the wrong reason.
   SESSION_GATE_MIN_CLIENT,
   LLM_COVER_MIN_CLIENT,
+  // Exported so the compat test can assert reachability by CALLING the
+  // predicate rather than re-deriving the comparison. The hold this replaced
+  // was enforced by a test that only ever compared two version strings, and
+  // that is precisely how a temporary hold became permanent.
+  clientAtLeastLlmCover,
   runCover,
+  // The prewarm rail: its cache reset, so a test can prove the TTL/dedup
+  // behaviour without waiting 45 seconds.
+  _resetPrewarmCache,
+  STREAM_PROVIDERS,
+  // The categories a cover gets NO background for. Exported so the drift
+  // test can compare this against coverAnswer's own copy by VALUE — the
+  // two encode the same judgement from opposite sides (worth reasoning
+  // effort / answered from the question alone) and a silent divergence
+  // would start feeding résumés to design questions again.
+  DEEP_CATEGORIES,
+  allowedVocabulary,
+  // The whole cover policy in one function. Exported so the tests drive
+  // the REAL decision rather than a copy of it that can drift from it -
+  // the two rails already drifted once when they held two copies.
+  coverVerdict,
   // Exported so the cache-routing pins can assert stability per user
   // without booting Express — a shared or unstable key silently reverts
   // the 3.3x latency swing this parameter removed.
@@ -2925,6 +3497,10 @@ module.exports._test = {
   TRIAL_MODELS,
   PAID,
   CLAUDE_TIERS,
-  ULTRA_ONLY,
+  AUTOTYPE_TIERS,
+  // Back-compat alias for the pre-2026-08 name, which the private docs and
+  // App.tsx comments still cite. Same array object as AUTOTYPE_TIERS, so the
+  // two can never drift from each other or from the route mounts.
+  ULTRA_ONLY: AUTOTYPE_TIERS,
   _resetPrefetchDedup,
 };

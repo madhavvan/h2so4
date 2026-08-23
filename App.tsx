@@ -12,6 +12,7 @@ import { WizardHat } from './WizardHat';
 // the badge in the app reads as the same product. Ultra was the one tier the
 // pop-out header never drew (see the chips below).
 import { UltraMark } from './UltraMark';
+import { EnterpriseMark } from './EnterpriseMark';
 import { PaperAirplane } from './GitHubIcons';
 import { GeminiIcon, OpenAIIcon, ClaudeIcon, GrokIcon, GroqIcon } from './ProviderIcons';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -26,6 +27,7 @@ import { remoteHostRef, publishRemote, registerAutoTypeBlock, extractCodeBlocks,
 import { streamClaude, prewarmClaudeIdentity, trainClaudeModel, trainClaudeModelBeast, hasCachedTechState, type TrainingProgress } from './services/claudeService';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import { usePrefetchContext } from './hooks/usePrefetchContext';
+import { useCoverPrewarm } from './hooks/useCoverPrewarm';
 import { extractTextFromPdf } from './services/pdfService';
 import { extractTextFromDocx } from './services/docxService';
 import { useDatabase, SessionSummary } from './hooks/useDatabase';
@@ -1232,6 +1234,16 @@ const ChatInterface = ({
                             was a missing branch, not an impossible state.
                             Same family as the audit's H54; that fix landed in
                             SubscriptionGate and stopped here. */}
+                        {/* Enterprise gets its own branch for exactly the
+                            reason the comment above gives for Ultra: a tier
+                            with no branch here draws NO badge at all, and the
+                            plan that would go unbadged is the most expensive
+                            one on the price list. */}
+                        {(sizeIndex >= 1 || !inElectron) && effectiveTier === 'enterprise' && (
+                          <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-gradient-to-r from-yellow-500/20 to-amber-500/10 text-yellow-200">
+                            <EnterpriseMark size={9} /> ENTERPRISE
+                          </div>
+                        )}
                         {(sizeIndex >= 1 || !inElectron) && effectiveTier === 'ultra' && (
                           <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold bg-gradient-to-r from-violet-500/20 to-amber-500/10 text-violet-300">
                             <UltraMark size={9} /> ULTRA
@@ -1700,7 +1712,11 @@ const ChatInterface = ({
                         is the H54 symptom ("Ultra renders as Free and is
                         offered Upgrade to Pro") surviving in the one place
                         the user looks at most. */}
-                    {userLicense && userLicense.tier === 'ultra' ? (
+                    {userLicense && userLicense.tier === 'enterprise' ? (
+                      <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-gradient-to-r from-yellow-500/20 to-amber-500/10 text-yellow-200 hover:from-yellow-500/30 hover:to-amber-500/20 transition-all cursor-pointer">
+                        <EnterpriseMark size={10} /> ENTERPRISE
+                      </button>
+                    ) : userLicense && userLicense.tier === 'ultra' ? (
                       <button onClick={onOpenManageSub} title="Manage subscription" className="flex px-2.5 py-1 rounded-full text-[10px] font-bold items-center gap-1.5 bg-gradient-to-r from-violet-500/20 to-amber-500/10 text-violet-300 hover:from-violet-500/30 hover:to-amber-500/20 transition-all cursor-pointer">
                         <UltraMark size={10} /> ULTRA
                       </button>
@@ -2293,7 +2309,7 @@ import { FEATURE_GATES } from './services/licenseService';
 // separately for billing/upgrade UI that should ignore the trial boost.
 function useFeatureGate(license: LicenseData | null) {
   const tier = licenseService.getEffectiveTier(license);
-  const actualTier = (license?.tier ?? 'free') as 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+  const actualTier = (license?.tier ?? 'free') as 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
   const gates = FEATURE_GATES[tier];
   const onTrial = licenseService.isTrialActive(license);
   // Plan state for MESSAGING (licenseService.getPlanState):
@@ -2314,7 +2330,13 @@ function useFeatureGate(license: LicenseData | null) {
     // so every consumer that branched on isMax/isPro/isBasic fell through to
     // its Free-shaped `else` for the TOP plan — see the model-picker hint,
     // which told an Ultra subscriber "Basic: 4 models · Pro adds Claude".
-    isUltra: tier === 'ultra',
+    // isEnterprise exists for the same reason, and isUltra is deliberately
+    // TRUE for Enterprise too: every consumer of isUltra is asking "does this
+    // user have the flagship feature set" (Auto-Type, all models, the
+    // reasoning dial), and Enterprise has all of it. Consumers that need to
+    // distinguish the two — anything about TIME — use isEnterprise.
+    isUltra: tier === 'ultra' || tier === 'enterprise',
+    isEnterprise: tier === 'enterprise',
     isMax: tier === 'max',
     isPro: tier === 'pro',
     isBasic: tier === 'basic',
@@ -3038,9 +3060,11 @@ function TimeTubeGauge({ granted, remaining, width = 34 }: {
 }
 
 // ── useCreditTimer ──
-// Drives the ticking session clock for Basic users and Free-tier trial users.
-// Pro/Max = unlimited; creditTimerService.start() silently no-ops for them so
-// this hook is safe to mount for everyone and just stays dormant.
+// Drives the ticking session clock for every METERED tier (Basic/Pro/Max, and
+// Ultra since its 9-hour monthly allowance replaced "unlimited") plus Free-tier
+// trial users. Unlimited licenses — Enterprise, admin comps, grandfathered
+// legacy subs — make creditTimerService.start() silently no-op, so this hook is
+// safe to mount for everyone and just stays dormant for them.
 function useCreditTimer(params: {
   isListening: boolean;
   license: LicenseData | null;
@@ -3296,7 +3320,7 @@ const HourBoundaryModal = ({ remainingSeconds, onDecision }: { remainingSeconds:
 // (see the isPopoutElectron render path + cmd-credit-* handlers).
 const LowWarningToast = ({ remainingSeconds, actualTier, countryCode, onDismiss, onExtend }: {
   remainingSeconds: number;
-  actualTier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+  actualTier: 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
   countryCode: string;
   onDismiss: () => void;
   onExtend?: (packId?: string) => void;
@@ -3363,21 +3387,22 @@ type PlanNotice = {
 
 function computePlanNotice(license: LicenseData | null): PlanNotice | null {
   if (!license) return null;
-  // Admins never get plan/expiry nags. They resolve to full Ultra access via
-  // getEffectiveTier's is_admin short-circuit (before any license check), so a
-  // placeholder admin license row that happens to be an EXPIRED ultra/paid tier
+  // Admins never get plan/expiry nags. They resolve to full Enterprise access
+  // via getEffectiveTier's is_admin short-circuit (before any license check),
+  // so a placeholder admin license row that happens to be an EXPIRED paid tier
   // must not surface a "plan ended / expiring" toast. The tier heuristic below
-  // (effectiveTier==='ultra' && tier!=='ultra') only catches admins whose row
-  // tier isn't 'ultra'; this closes the gap when the row IS an expired ultra.
+  // (effectiveTier==='enterprise' && tier!=='enterprise') only catches admins whose row
+  // tier isn't 'enterprise'; this closes the gap when the row IS an expired
+  // paid tier.
   try { if (licenseService.loadAuth().user?.is_admin) return null; } catch { /* localStorage unavailable */ }
   const now = Date.now();
   const tier = license.tier;
   const effectiveTier = licenseService.getEffectiveTier(license);
-  // Admins resolve to 'ultra' (or their explicit test-tier override) —
+  // Admins resolve to 'enterprise' (or their explicit test-tier override) —
   // never nag an admin about a placeholder license row.
-  if (effectiveTier === 'ultra' && tier !== 'ultra') return null;
+  if (effectiveTier === 'enterprise' && tier !== 'enterprise') return null;
 
-  if (tier === 'basic' || tier === 'pro' || tier === 'max' || tier === 'ultra') {
+  if (tier === 'basic' || tier === 'pro' || tier === 'max' || tier === 'ultra' || tier === 'enterprise') {
     const label = tier.charAt(0).toUpperCase() + tier.slice(1);
     // Ended = plan LAPSE only (calendar expiry, cancel completion, refund,
     // revoke — the same predicate the tier gates use, so this toast can
@@ -3392,14 +3417,16 @@ function computePlanNotice(license: LicenseData | null): PlanNotice | null {
         cta: 'Renew',
       };
     }
-    // Metered tiers (Basic/Pro/Max) with the interview clock at 0 while
-    // the plan window is still VALID: top-up prompt. Features persist —
-    // this is deliberately NOT "plan ended". Fingerprint keys on
-    // credits_expire_at, which every top-up pushes forward, so a
-    // re-exhaustion after a top-up re-arms while the same empty state
-    // never re-nags. (Unlimited/comp licenses report Infinity and never
-    // land here; admins resolve out at the effectiveTier guard above.)
-    if (tier !== 'ultra') {
+    // Metered tiers (Basic/Pro/Max — and Ultra since 2026-08) with the
+    // interview clock at 0 while the plan window is still VALID: top-up
+    // prompt. Features persist — this is deliberately NOT "plan ended".
+    // Fingerprint keys on credits_expire_at, which every top-up pushes
+    // forward, so a re-exhaustion after a top-up re-arms while the same
+    // empty state never re-nags. (Unlimited licenses — Enterprise, admin
+    // comps, grandfathered legacy subs — report Infinity from
+    // getLiveTimeBalance and never reach the inner branch; admins resolve
+    // out at the effectiveTier guard above.)
+    if (tier !== 'enterprise') {
       const bal = licenseService.getLiveTimeBalance(license);
       if (bal.source === 'credits' && bal.seconds <= 0) {
         return {
@@ -3411,12 +3438,14 @@ function computePlanNotice(license: LicenseData | null): PlanNotice | null {
       }
     }
     // Nearing expiry: soonest applicable deadline within the window.
-    // Ultra has no credit window; metered tiers warn on whichever of
-    // expires_at / credits_expire_at comes first. -1 sentinels and 0
-    // (unset) are filtered by the `> now` guard.
+    // The SUBSCRIPTION tiers have no credit window (Ultra's balance is
+    // replaced by the monthly re-seed rather than aging out, and it carries
+    // credits_expire_at = 0); the passes warn on whichever of expires_at /
+    // credits_expire_at comes first. -1 sentinels and 0 (unset) are filtered
+    // by the `> now` guard.
     const candidates = [
       license.expires_at,
-      tier !== 'ultra' ? (license.credits_expire_at ?? 0) : 0,
+      (tier !== 'ultra' && tier !== 'enterprise') ? (license.credits_expire_at ?? 0) : 0,
     ].filter((t): t is number => typeof t === 'number' && t > now);
     const deadline = candidates.length ? Math.min(...candidates) : 0;
     if (deadline > 0 && deadline - now <= EXPIRY_WARNING_DAYS * 86400000) {
@@ -3513,15 +3542,16 @@ const UnreadableFilesNotice = ({ count, onDismiss }: { count: number; onDismiss:
 );
 
 // ── Exhausted modal — blocking; offers the PLAN-SPECIFIC extension for
-// Basic/Pro/Max (Basic +30 min · $25, Pro/Max +1 hour · $45 — see
-// pricingService.getRenewalPrice), plan picker for everyone (2026-07
-// model: Basic/Pro/Max are one-time interviews, Ultra is the unlimited
-// monthly subscription and never reaches this modal).
+// every metered tier (see pricingService.getRenewalPrice), plus the plan
+// picker for everyone. Basic/Pro/Max are one-time interviews; Ultra is a
+// monthly subscription with a 9-hour allowance and DOES reach this modal
+// when that allowance runs out (it could not before 2026-08, when it was
+// unlimited). Enterprise never reaches it — unlimited by definition.
 const ExhaustedModal = ({
   source, actualTier, countryCode, onRenew, onUpgrade, onDismiss,
 }: {
   source: 'trial' | 'credits' | 'unlimited' | 'none';
-  actualTier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+  actualTier: 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
   countryCode: string;
   onRenew: (packId?: string) => void;
   onUpgrade: () => void;
@@ -3544,14 +3574,28 @@ const ExhaustedModal = ({
           </div>
         </div>
         <p className="text-sm text-gray-400 mb-5 leading-relaxed">
+          {/* Ultra is 9 hours a month since 2026-08-22, not unlimited — and
+              this modal is now a place an ULTRA subscriber can actually land
+              (they could not before, when Ultra had no meter). Selling them
+              "go unlimited with Ultra" on the screen that just told them
+              their Ultra time ran out would be the worst possible copy.
+              Metered tiers get the top-up line; Enterprise is the only plan
+              this can honestly call unlimited. */}
           {wasTrial
-            ? 'Buy the interview that\'s ahead of you — a 30-minute Basic, a 1-hour Pro with all five models, or go unlimited with Ultra.'
-            : ['basic', 'pro', 'max'].includes(actualTier)
+            ? 'Buy the interview that\'s ahead of you — a 30-minute Basic, a 1-hour Pro with all five models, or a monthly block of hours with Ultra.'
+            : ['basic', 'pro', 'max', 'ultra'].includes(actualTier)
               ? 'Interview running long? Pick a time pack — your card on file is charged instantly.'
-              : 'Grab another interview pass, or go unlimited with Ultra.'}
+              : 'Grab another interview pass, or remove the cap entirely with Enterprise.'}
         </p>
         <div className="flex flex-col gap-2">
-          {!wasTrial && ['basic', 'pro', 'max'].includes(actualTier) && (
+          {/* Top-up packs for every METERED tier. Ultra joined that list on
+              2026-08-22: its 9-hour monthly allowance can genuinely run out
+              mid-interview, and this modal is the one place the fix has to
+              land — a subscriber whose time just ended, staring at a dialog
+              with no way to buy more, is the whole reason top-ups exist.
+              Enterprise never reaches here (unlimited), and free gets the
+              trial-over copy above. */}
+          {!wasTrial && ['basic', 'pro', 'max', 'ultra'].includes(actualTier) && (
             <>
               <div className="flex gap-2 mb-1">
                 {packs.map(p => (
@@ -3604,7 +3648,7 @@ let externalCheckoutPollActive = false;
 // modals immediately; the tier badge in the chat header flips when the
 // poll detects the upgrade.
 async function pollForExternalUpgrade(
-  targetTier: 'basic' | 'pro' | 'max' | 'ultra',
+  targetTier: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise',
   onSuccess?: (info: { tier: string }) => void,
   sessionId?: string,
 ) {
@@ -3795,7 +3839,7 @@ async function tryOpenCheckoutUrl(url: string): Promise<{
 }
 
 async function openProUpgrade(
-  targetTier: 'basic' | 'pro' | 'max' | 'ultra' = 'pro',
+  targetTier: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise' = 'pro',
   onSuccess?: (info: { tier: string; message?: string }) => void,
 ) {
   const { licenseService } = await import('./services/licenseService');
@@ -3819,7 +3863,9 @@ async function openProUpgrade(
     // swap — picking a different one is always a fresh /create-checkout.
     const liveTier = saved.license?.tier;
     const isLiveActive = saved.license?.status === 'active';
-    const isRecurringTier = (t: string | undefined): boolean => t === 'ultra';
+    // Mirrors RECURRING_TIERS in server/src/routes/payments.js — the tiers
+    // that are monthly subscriptions and can therefore be swapped in place.
+    const isRecurringTier = (t: string | undefined): boolean => t === 'ultra' || t === 'enterprise';
     const isInPlaceUpgrade =
       isLiveActive &&
       isRecurringTier(liveTier) &&
@@ -4995,10 +5041,10 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   // modal closed instantly on click and the user was thrown into a
   // dim app waiting for a toast that hadn't surfaced yet — the exact
   // "thrown to chat interface" symptom.
-  const [upgradePending, setUpgradePending] = useState<'basic' | 'pro' | 'max' | 'ultra' | null>(null);
+  const [upgradePending, setUpgradePending] = useState<'basic' | 'pro' | 'max' | 'ultra' | 'enterprise' | null>(null);
   const [renewPending, setRenewPending] = useState(false);
 
-  const handleSubscriptionUpgrade = useCallback(async (targetTier: 'basic' | 'pro' | 'max' | 'ultra') => {
+  const handleSubscriptionUpgrade = useCallback(async (targetTier: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise') => {
       // Reuse the checkout flow in openProUpgrade. The checkout happens in
       // the browser via openExternal for /create-checkout, or completes
       // server-side and updates local state for /upgrade-tier. The
@@ -6813,6 +6859,50 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   usePrefetchContext({
     transcript: `${inputText} ${interimText}`,
     enabled: !isProcessing,
+  });
+
+  // ── The opening line, written while the silence timer runs ──
+  //
+  // Same moment as the prefetch above, different job: that one warms the
+  // retrieval caches, this one writes the sentence the candidate SAYS.
+  //
+  // It exists because the cover used to be produced inside the answer
+  // request — runCover awaited in front of the main provider call — so a
+  // cover that failed, or that the grounding guard rejected, delayed the
+  // answer and gave the candidate nothing. Written here it is free, and a
+  // rejected line costs zero because the question has not been sent yet.
+  //
+  // Main window only: the popout is a thin client with no speech pipeline
+  // of its own, and both firing would double the provider spend for one
+  // sentence.
+  useCoverPrewarm({
+    // ⚠️ inputText ALONE, not `${inputText} ${interimText}` like the
+    // prefetch above. executeSend sends the input BUFFER; the interim words
+    // are not part of the question. Including them here wrote the line
+    // against a question that was never asked, and the divergence check
+    // then discarded a perfectly good cover — invisibly, because a
+    // discarded cover looks identical to one that was never written.
+    // Finals land in inputText continuously, so the head start is unchanged.
+    transcript: inputText,
+    provider: settings.selectedModel,
+    // ⚠️ db.contextFiles, NOT settings.contextFiles.
+    //
+    // The knowledge base lives in the database hook; `settings.contextFiles`
+    // is initialised to [] and is not the array the send path reads —
+    // executeSend uses contextFilesRef.current, which mirrors db.contextFiles.
+    //
+    // Passing the wrong one gave the prewarm an EMPTY ledger, and an empty
+    // ledger is the single worst input this feature can have: composeOpener
+    // finds no fact so it defers (so the prewarm always fires), and the
+    // model is then asked to open a question about someone's career with
+    // nothing to stand on. Measured live, it did exactly what a model does
+    // in that position — "I spent most of my career at Acme Corp, leading
+    // the data engineering team..." and "I've handled that at Confluent".
+    // The guard caught both, so nothing was spoken, but every one of those
+    // was a paid call thrown away and a cover the candidate never got.
+    contextFiles: db.contextFiles,
+    history: messages,
+    enabled: !isProcessing && !isPopoutThinClient,
   });
 
   // ── Clean-close listener ─────────────────────────────────────────────
@@ -9902,7 +9992,11 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           actualTier={gate.actualTier}
           countryCode={userProfile?.country_code || 'US'}
           onDismiss={creditTimer.dismissLowWarning}
-          onExtend={['basic', 'pro', 'max'].includes(gate.actualTier) ? handleRenewCredit : undefined}
+          // Metered tiers only — Ultra included since its 9-hour monthly
+          // allowance replaced "unlimited" (2026-08-22). Without it, the
+          // two-minute warning an Ultra subscriber now sees carries no
+          // Extend button.
+          onExtend={['basic', 'pro', 'max', 'ultra'].includes(gate.actualTier) ? handleRenewCredit : undefined}
         />
       )}
       {!isPopoutElectron && creditTimer.exhausted && (
@@ -9941,7 +10035,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           actualTier={remoteCreditActualTier}
           countryCode={remoteCreditCountryCode}
           onDismiss={() => electronIPC.send('relay-to-main', { type: 'cmd-credit-low-dismiss' })}
-          onExtend={['basic', 'pro', 'max'].includes(remoteCreditActualTier)
+          onExtend={['basic', 'pro', 'max', 'ultra'].includes(remoteCreditActualTier)
             ? () => electronIPC.send('relay-to-main', { type: 'cmd-credit-renew' })
             : undefined}
         />

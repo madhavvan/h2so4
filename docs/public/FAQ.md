@@ -33,10 +33,10 @@ The desktop app is where you do the actual interview. The website (minicaai.com)
 ## 2. Plans and billing
 
 **What plans are there?**
-Free, Basic, Pro, Max, and Ultra. Free is genuinely free (no card required). Basic, Pro, and Max are **one-time interview purchases** — no recurring charge. Ultra is the only monthly subscription. See **[Tiers & Billing](./TIERS.md)** for the full feature breakdown.
+Free, Basic, Pro, Max, Ultra, and Enterprise. Free is genuinely free (no card required). Basic, Pro, and Max are **one-time interview purchases** — no recurring charge. Ultra and Enterprise are monthly subscriptions: Ultra gives you 9 hours of interview time a month, Enterprise removes the meter entirely. See **[Tiers & Billing](./TIERS.md)** for the full feature breakdown.
 
 **How much do they cost?**
-Pricing varies by region. The website's **Pricing page** shows your local currency once we detect your region. In USD: Basic is $30 (one 30-minute interview), Pro is $50 (one 1-hour interview), Max is $89 (three 1-hour interviews) — all one-time. Ultra is $159/month for unlimited interviews plus Auto-Type.
+Pricing varies by region. The website's **Pricing page** shows your local currency once we detect your region. In USD: Basic is $30 (one 30-minute interview), Pro is $50 (one 1-hour interview), Max is $89 (three 1-hour interviews) — all one-time. Ultra is $159/month for 9 hours of interview time plus Auto-Type. Enterprise is $1199/month for unlimited interview time that never expires.
 
 **Can I try before I buy?**
 Yes. The Free tier gives you a one-time 10 minutes of trial time with every model except Claude, and one knowledge file. No card on file, no auto-conversion to paid — after the trial you pick a plan to keep going.
@@ -54,7 +54,7 @@ Not currently. We may revisit in 2026.
 Not for individual subscriptions. For team or enterprise (5+ seats), email **sales@minicaai.com**.
 
 **Do I need to add a card to use the Free tier?**
-No card required for Free. You only enter payment details when you explicitly pick a paid plan (Basic, Pro, Max, or Ultra).
+No card required for Free. You only enter payment details when you explicitly pick a paid plan (Basic, Pro, Max, Ultra, or Enterprise).
 
 **What payment methods do you accept?**
 - **USD and most countries**: Visa, Mastercard, Amex, Discover, Apple Pay, Google Pay (via Stripe)
@@ -123,7 +123,7 @@ Use the reset-link flow: sign out, click **Forgot password?** on the sign-in scr
 Email **support@minicaai.com** with both the old and new email. We can't change the email field in the app itself (it's also the account identifier).
 
 **How do I sign in on a new machine?**
-Just sign in — every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra). Signing in past your allowance automatically moves the seat off your oldest device, so you never need support to switch machines.
+Just sign in — every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra, 25 on Enterprise). Signing in past your allowance automatically moves the seat off your oldest device, so you never need support to switch machines.
 
 **Can I share my account with a friend?**
 No. The license is for one person. The device allowance exists so *you* can move between your own machines — sharing credentials violates our terms and can get the account revoked.

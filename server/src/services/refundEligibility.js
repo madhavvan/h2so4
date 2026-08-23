@@ -85,7 +85,7 @@ function computeRefundEligibility(payment, license, usageStats) {
   // shares the SAME published terms: 14 days from the payment being
   // refunded (Ultra: the first charge) + under 2 hours of total session
   // time. One rule, straight from the REFUND_POLICY.md table.
-  if (tier === 'basic' || tier === 'pro' || tier === 'max' || tier === 'ultra') {
+  if (tier === 'basic' || tier === 'pro' || tier === 'max' || tier === 'ultra' || tier === 'enterprise') {
     if (ageMs > REFUND_WINDOW_DAYS * ONE_DAY_MS) {
       return { eligible: false, code: 'window_expired', reason: `The ${tier} refund window is ${REFUND_WINDOW_DAYS} days (published policy §1); this payment is ${Math.round(ageMs / ONE_DAY_MS)} days old.` };
     }

@@ -241,10 +241,18 @@ describe('computeRefundEligibility — guardrails', () => {
     expect(r.code).toBe('comp_payment');
   });
 
+  // 'enterprise' used to stand in for "a tier the billing layer can't grant".
+  // It became a real, purchasable tier on 2026-08-22, so the fixture has to
+  // be something genuinely unknown or the test passes for the wrong reason.
   it('ineligible: unknown tier without override', () => {
-    const r = computeRefundEligibility(makePayment({ tier_granted: 'enterprise' }), makeLicense({ tier: 'enterprise' }));
+    const r = computeRefundEligibility(makePayment({ tier_granted: 'platinum' }), makeLicense({ tier: 'platinum' }));
     expect(r.eligible).toBe(false);
     expect(r.code).toBe('unknown_tier');
+  });
+
+  it('eligible: enterprise is a real tier and refunds like the rest', () => {
+    const r = computeRefundEligibility(makePayment({ tier_granted: 'enterprise' }), makeLicense({ tier: 'enterprise' }));
+    expect(r.eligible).toBe(true);
   });
 
   it('handles malformed metadata (treats as non-renewal)', () => {

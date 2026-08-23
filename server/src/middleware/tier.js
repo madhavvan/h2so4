@@ -36,8 +36,8 @@ const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
 // would say at the same instant. Two hand-maintained copies of this ladder
 // would drift, and both directions of drift are bad — a claim that grants
 // Auto-Type where the route 403s makes the feature look broken, and a claim
-// that denies where the route allows locks a paying Ultra customer out of
-// the thing they pay $159/mo for. One function, one truth.
+// that denies where the route allows locks a paying Ultra or Enterprise
+// customer out of the thing they pay for. One function, one truth.
 //
 // Returns either
 //   { ok: true,  license }            — allowed; `license` is what the
@@ -60,13 +60,17 @@ function evaluateTier(user, allowedTiers) {
   }
 
   // Admin bypass — same logic as the client-side admin short-circuit
-  // in services/licenseService.ts. Admins effectively get Max access.
+  // in services/licenseService.ts. Admins effectively get Enterprise access.
   const email = (user?.email || '').toLowerCase();
   if (ADMIN_EMAILS.includes(email)) {
     // Still return the license so downstream handlers have it; falls
-    // back to a synthetic Max placeholder if no license row exists
-    // (admin who never went through the normal signup flow).
-    return { ok: true, license: db.getLicenseByUserId(user.id) || { tier: 'max', status: 'active' } };
+    // back to a synthetic ENTERPRISE placeholder if no license row exists
+    // (admin who never went through the normal signup flow). It was 'max'
+    // — which silently denied admins the two gates above Max (Auto-Type
+    // was Ultra-only, and Enterprise is the top of the ladder since
+    // 2026-08). Admins are meant to bypass every gate, so the placeholder
+    // has to be the top tier, not the middle of the list.
+    return { ok: true, license: db.getLicenseByUserId(user.id) || { tier: 'enterprise', status: 'active' } };
   }
 
   const license = db.getLicenseByUserId(user.id);
@@ -128,7 +132,8 @@ function evaluateTier(user, allowedTiers) {
       },
     };
   }
-  // expires_at = -1 sentinel = "never expires" (recurring Pro/Max).
+  // expires_at = -1 sentinel = "never expires" — the subscription tiers
+  // (Ultra, Enterprise), legacy recurring Pro/Max, and every admin grant.
   if (license.expires_at > 0 && Date.now() > license.expires_at) {
     return {
       ok: false,

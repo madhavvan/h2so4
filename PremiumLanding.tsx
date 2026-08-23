@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import MinicaMark from './MinicaMark';
-import { pricingService, PricingTier, RegionPricing } from './services/pricingService';
+import { pricingService, PricingTier, RegionPricing, PLAN_GROUPS, groupOf } from './services/pricingService';
 import { UltraMark } from './UltraMark';
+import { EnterpriseMark } from './EnterpriseMark';
 import { BasicMark, ProMark, MaxMark } from './TierMarks';
 import { RefundPolicy } from './RefundPolicy';
 // Confirmed-present phosphor glyphs (same set SubscriptionGate imports).
@@ -25,6 +26,7 @@ const TIER_MARK: Partial<Record<PricingTier['id'], React.ComponentType<{ size?: 
   pro: ProMark,
   max: MaxMark,
   ultra: UltraMark,
+  enterprise: EnterpriseMark,
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -64,6 +66,18 @@ const TIER_MARK: Partial<Record<PricingTier['id'], React.ComponentType<{ size?: 
 //  in the dark theater), breathing aperture, 28 delicate motes, proscenium
 //  gate. At center: enormous, almost-invisible foil echo of the hero line
 //  that the slit dramatically illuminates as it passes — a quiet miracle.
+//
+//  Stage wash (2026-08): after the globe the page went dead-flat ink.
+//  Gold radial wash on .pl-root, warmer vignette, slightly louder grain,
+//  brighter --mut, and ledger rows as beveled instrument plates so Kit
+//  reads as the same theater — not a spec sheet on a black void.
+//
+//  Type lock (2026-08): the page was falling through to thin mixed faces.
+//  Newsreader is the only display voice (opsz + wght + ital locked per
+//  size — never opsz alone, which resets the other axes). Inter is the
+//  only UI voice, inherited from .pl-root, never forced onto <p> so a
+//  .pl-serif paragraph cannot be stolen back. One scale: display / h2 /
+//  h3 / lede / ui. No new families.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 interface PremiumLandingProps {
@@ -94,7 +108,7 @@ const hasFinePointer = () =>
 
 const CSS = `
 .pl-root{
-  --ink:#070706; --ink2:#0b0a08; --paper:#f2efe6; --mut:#9d968a; --faint:#645e54;
+  --ink:#070706; --ink2:#0b0a08; --paper:#f6f2e9; --mut:#c6beaf; --faint:#8a8377;
   --line:rgba(255,255,255,.07);
   --gold-1:#f6e4b0; --gold-2:#d9b874; --gold-3:#b58f45; --gold:#d3ac63;
   --gold-line:rgba(211,172,99,.24); --gold-glow:rgba(211,172,99,.16);
@@ -111,13 +125,29 @@ const CSS = `
   --pv-1:#d7c2ff; --pv-2:#a271ff; --pv-3:#6c3fd6; --pv:#b48dff;
   --pv-line:rgba(162,113,255,.32); --pv-glow:rgba(162,113,255,.22);
   position:fixed; inset:0; overflow-y:auto; overflow-x:hidden;
-  background:var(--ink); color:var(--paper);
+  background:
+    radial-gradient(90% 48% at 50% -10%, rgba(211,172,99,.135), transparent 58%),
+    radial-gradient(55% 36% at 88% 28%, rgba(180,140,70,.06), transparent 52%),
+    radial-gradient(50% 30% at 8% 70%, rgba(211,172,99,.045), transparent 48%),
+    var(--ink);
+  color:var(--paper);
   font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  font-optical-sizing:auto;
+  font-kerning:normal;
+  font-weight:460;
+  font-size:16.5px;
+  line-height:1.55;
+  font-feature-settings:"ss01" 1,"cv11" 1,"kern" 1,"liga" 1,"calt" 1;
   -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
-  letter-spacing:-0.011em;
-  /* Never fake a face: if a weight/style isn't loaded, fall to a real cut
-     instead of letting the browser shear or double-strike letterforms. */
+  text-rendering:optimizeLegibility;
+  letter-spacing:-0.012em;
   font-synthesis:none;
+}
+/* Inter only on chrome that sits inside a serif parent. Do NOT force it
+   onto p/li — that rule beat .pl-serif and mixed the faces. */
+.pl-root button,.pl-root summary,.pl-root input,.pl-root a{
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  font-optical-sizing:auto;
 }
 .pl-root *{box-sizing:border-box;}
 /* Bar-less scrolling — the landing reads as a cinematic surface, not a
@@ -127,11 +157,67 @@ const CSS = `
 .pl-root::-webkit-scrollbar{width:0;height:0;display:none;}
 .pl-root ::selection{background:rgba(211,172,99,.3);color:#fff;}
 .pl-root :focus-visible{outline:2px solid var(--gold-2);outline-offset:3px;border-radius:4px;}
-.pl-serif{font-family:'Newsreader','Tiempos Headline',ui-serif,Georgia,serif;font-optical-sizing:auto;}
-.pl-grain{position:fixed;inset:0;z-index:1;pointer-events:none;opacity:.045;mix-blend-mode:overlay;
+.pl-serif{font-family:'Newsreader','Tiempos Headline',ui-serif,Georgia,serif;
+  font-optical-sizing:none;font-weight:500;font-style:normal;font-kerning:normal;
+  font-feature-settings:"kern" 1,"liga" 1;
+  font-variation-settings:"opsz" 28,"wght" 500,"ital" 0;
+  letter-spacing:-0.02em;font-synthesis:none;}
+.pl-serif em,.pl-serif i{font-style:italic;font-weight:500;font-synthesis:none;
+  font-variation-settings:"opsz" 28,"wght" 500,"ital" 1;}
+.pl-display,.pl-root h1.pl-serif{
+  font-size:clamp(38px,5.1vw,66px);line-height:1.02;letter-spacing:-0.032em;
+  font-weight:520;text-wrap:balance;
+  font-variation-settings:"opsz" 72,"wght" 520,"ital" 0;}
+.pl-display em,.pl-display i,.pl-root h1.pl-serif em,.pl-root h1.pl-serif i{
+  font-style:italic;font-weight:520;font-synthesis:none;
+  font-variation-settings:"opsz" 72,"wght" 520,"ital" 1;}
+.pl-h2,.pl-root h2.pl-serif{
+  font-size:clamp(32px,4.15vw,52px);line-height:1.07;letter-spacing:-0.028em;
+  font-weight:500;text-wrap:balance;
+  font-variation-settings:"opsz" 52,"wght" 500,"ital" 0;}
+.pl-h2 em,.pl-root h2.pl-serif em,.pl-h2 i,.pl-root h2.pl-serif i{
+  font-style:italic;font-weight:500;font-synthesis:none;
+  font-variation-settings:"opsz" 52,"wght" 500,"ital" 1;}
+.pl-closing h2.pl-serif{
+  font-size:clamp(34px,4.6vw,60px);letter-spacing:-0.03em;
+  font-variation-settings:"opsz" 64,"wght" 500,"ital" 0;}
+.pl-closing h2.pl-serif em,.pl-closing h2.pl-serif i{
+  font-variation-settings:"opsz" 64,"wght" 500,"ital" 1;}
+.pl-step-copy h3.pl-serif{
+  font-size:clamp(22px,2.8vw,32px);line-height:1.16;letter-spacing:-0.02em;
+  font-weight:500;font-variation-settings:"opsz" 28,"wght" 500,"ital" 0;}
+.pl-price h3.pl-serif,.pl-price-pop h3.pl-serif{
+  font-size:20px;letter-spacing:-0.016em;
+  font-variation-settings:"opsz" 22,"wght" 500,"ital" 0;}
+.pl-ultra-band h3.pl-serif{
+  font-size:26px;letter-spacing:-0.018em;
+  font-variation-settings:"opsz" 28,"wght" 500,"ital" 0;}
+.pl-lede{
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  font-optical-sizing:auto;font-weight:460;
+  font-size:clamp(16.5px,1.35vw,18px);line-height:1.65;letter-spacing:-0.011em;
+  color:var(--mut);}
+.pl-wordmark{font-size:22px;font-weight:600;letter-spacing:-0.022em;color:var(--paper);
+  font-variation-settings:"opsz" 22,"wght" 600,"ital" 0;}
+.pl-price-num{font-size:42px;font-weight:500;letter-spacing:-0.024em;line-height:1;
+  font-variation-settings:"opsz" 48,"wght" 500,"ital" 0;}
+.pl-proof{font-size:20px;font-weight:500;letter-spacing:-0.018em;color:#c9c2b4;
+  font-variation-settings:"opsz" 20,"wght" 500,"ital" 0;}
+.pl-faq-q{font-size:20px;font-weight:500;letter-spacing:-0.018em;
+  font-variation-settings:"opsz" 24,"wght" 500,"ital" 0;}
+.pl-row-t{font-size:19px;font-weight:500;letter-spacing:-0.016em;
+  font-variation-settings:"opsz" 22,"wght" 500,"ital" 0;}
+.pl-model{font-size:17px;font-variation-settings:"opsz" 18,"wght" 500,"ital" 0;}
+.pl-say{font-size:18px;line-height:1.55;letter-spacing:-0.012em;
+  font-variation-settings:"opsz" 18,"wght" 500,"ital" 0;}
+.pl-say-sm{font-size:12px;line-height:1.5;
+  font-variation-settings:"opsz" 12,"wght" 500,"ital" 0;}
+.pl-grain{position:fixed;inset:0;z-index:1;pointer-events:none;opacity:.07;mix-blend-mode:overlay;
   background-image:url("${GRAIN}");background-size:140px 140px;}
 .pl-vignette{position:fixed;inset:0;z-index:1;pointer-events:none;
-  background:radial-gradient(120% 90% at 50% 8%, transparent 46%, rgba(0,0,0,.55) 100%);}
+  background:
+    radial-gradient(110% 80% at 50% 6%, rgba(211,172,99,.06), transparent 42%),
+    radial-gradient(120% 90% at 50% 8%, transparent 44%, rgba(0,0,0,.62) 100%);}
 .pl-lamp{position:fixed;left:0;top:0;width:640px;height:640px;border-radius:50%;
   pointer-events:none;z-index:3;opacity:0;mix-blend-mode:screen;will-change:transform,opacity;
   background:radial-gradient(closest-side, rgba(211,172,99,.5), rgba(211,172,99,.1) 44%, transparent 72%);}
@@ -152,7 +238,9 @@ const CSS = `
    without it. 92px = 78px bar + 14px of air; 74px = 60px bar + 14px. */
 .pl-root [id]{scroll-margin-top:92px;}
 @media (max-width:767px){ .pl-root [id]{scroll-margin-top:74px;} }
-.pl-eyebrow{font-size:11.5px;font-weight:600;letter-spacing:.34em;text-transform:uppercase;color:var(--gold);}
+.pl-eyebrow{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  font-optical-sizing:auto;font-size:11.5px;font-weight:600;letter-spacing:.34em;
+  text-transform:uppercase;color:var(--gold);}
 .pl-gold{background:linear-gradient(100deg,var(--gold-1),var(--gold-2) 52%,var(--gold-3));
   -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent;}
 .pl-foil{background-size:230% 100%;background-position:82% 0;}
@@ -168,7 +256,8 @@ const CSS = `
 @keyframes pl-blink{to{opacity:0;}}
 .pl-cta{position:relative;overflow:hidden;cursor:pointer;border:none;
   background:linear-gradient(100deg,var(--gold-1),var(--gold-2) 55%,var(--gold-3));
-  color:#231c0c;font-weight:700;
+  color:#231c0c;font-weight:650;letter-spacing:-0.014em;
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
   box-shadow:0 14px 40px -16px rgba(211,172,99,.7), inset 0 1px 0 rgba(255,255,255,.4);
   transition:transform .25s cubic-bezier(.2,.9,.3,1), box-shadow .3s, filter .3s;}
 .pl-cta:hover{transform:translateY(-2px);filter:brightness(1.05);box-shadow:0 22px 54px -18px rgba(211,172,99,.85), inset 0 1px 0 rgba(255,255,255,.5);}
@@ -281,7 +370,7 @@ const CSS = `
 .pl-hero{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.06fr);
   gap:clamp(30px,4.4vw,60px);align-items:center;min-height:min(80vh,720px);}
 .pl-hero-copy{max-width:560px;}
-.pl-hero-sub{max-width:470px;margin-top:26px;}
+.pl-hero-sub{max-width:490px;margin-top:26px;}
 .pl-hero-cta{display:flex;gap:24px;align-items:center;flex-wrap:wrap;justify-content:flex-start;margin:36px 0 16px;}
 .pl-hero-visual{position:relative;perspective:1400px;}
 .pl-stagelight{position:absolute;left:50%;top:47%;transform:translate(-50%,-50%);
@@ -448,6 +537,60 @@ const CSS = `
    Passes are compact supporting players. Ultra is the distinct cinematic band:
    a spotlighted object with its own material depth and hierarchy. */
 .pl-passes{display:grid;grid-template-columns:repeat(auto-fit,minmax(186px,1fr));gap:14px;align-items:stretch;}
+
+/* Plan tabs — Individual / Team.
+   A segmented control, not two links: the two groups are alternatives, and
+   a segmented control is the one form that says "pick one of these" without
+   a word of copy. Gold hairline, obsidian well, the active segment lifted
+   on a warm gradient so it reads as the sheet in front. Deliberately small
+   and centred under the heading — it introduces the price list, it does not
+   compete with it. */
+.pl-plantabs{
+  display:inline-flex;gap:4px;padding:4px;margin:0 auto 30px;
+  border:1px solid var(--gold-line);border-radius:999px;
+  background:rgba(10,9,8,.6);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.04);
+}
+.pl-plantab{
+  appearance:none;border:0;cursor:pointer;
+  padding:9px 22px;border-radius:999px;
+  font-size:13px;font-weight:600;letter-spacing:.02em;
+  color:var(--mut);background:transparent;
+  transition:color .28s ease, background .28s ease, box-shadow .28s ease;
+}
+.pl-plantab:hover{color:var(--paper);}
+.pl-plantab[aria-selected="true"]{
+  color:#231c0c;
+  background:linear-gradient(100deg,var(--gold-1),var(--gold-3));
+  box-shadow:0 10px 26px -14px rgba(211,172,99,.7);
+}
+.pl-plantab:focus-visible{outline:2px solid var(--gold);outline-offset:2px;}
+
+/* Enterprise band — same cinematic staging as the Ultra band, one step
+   deeper. NO violet: Ultra owns amethyst, and giving Enterprise a second
+   accent colour would make the top of the ladder read as Ultra's sibling
+   rather than its successor. It gets more of the same gold instead —
+   a heavier border, a warmer floor, a wider glow. */
+.pl-ent-band{
+  margin-top:18px;
+  background:linear-gradient(145deg,rgba(211,172,99,.10),rgba(10,9,8,.82));
+  border:1px solid rgba(211,172,99,.34);
+  border-radius:22px;
+  padding:30px 34px;
+  box-shadow:0 70px 160px -50px rgba(0,0,0,.95), 0 0 120px -34px var(--gold-glow), inset 0 1px 0 rgba(255,255,255,.05);
+  display:grid;grid-template-columns:340px 1fr;gap:36px;align-items:start;
+}
+.pl-ent-band h3.pl-serif{
+  font-size:28px;letter-spacing:-0.018em;
+  font-variation-settings:"opsz" 30,"wght" 500,"ital" 0;}
+@media (max-width:980px){
+  .pl-ent-band{grid-template-columns:1fr;gap:22px;padding:24px 24px;}
+}
+@media (max-width:640px){
+  .pl-ent-band{padding:20px 18px;border-radius:18px;}
+  .pl-ent-band ul{grid-template-columns:1fr !important;}
+  .pl-plantab{padding:8px 16px;font-size:12.5px;}
+}
 .pl-ultra-band{
   margin-top:18px;
   background:linear-gradient(145deg,rgba(211,172,99,.065),rgba(10,9,8,.75));
@@ -461,16 +604,31 @@ const CSS = `
   .pl-ultra-band{grid-template-columns:1fr;gap:22px;padding:22px 24px;}
 }
 .pl-num{font-size:64px;line-height:1;color:rgba(211,172,99,.16);font-weight:500;
+  font-variation-settings:"opsz" 72,"wght" 500,"ital" 0;
   transition:color 1.2s ease .2s, text-shadow 1.2s ease .2s;}
 .pl-reveal.pl-in .pl-num{color:rgba(211,172,99,.42);text-shadow:0 0 26px rgba(211,172,99,.18);}
-.pl-ledger{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));column-gap:64px;}
-.pl-row{display:flex;flex-direction:column;gap:8px;padding:22px 0;border-top:1px solid var(--line);}
+.pl-root #kit::before{
+  content:'';position:absolute;left:50%;top:0;width:min(920px,100%);height:280px;
+  transform:translateX(-50%);pointer-events:none;z-index:0;
+  background:radial-gradient(ellipse at 50% 0%, rgba(211,172,99,.09), transparent 68%);
+}
+.pl-root #kit > *{position:relative;z-index:1;}
+.pl-ledger{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));column-gap:18px;row-gap:12px;}
+.pl-row{display:flex;flex-direction:column;gap:8px;padding:20px 18px;border:1px solid var(--line);
+  border-radius:16px;
+  background:
+    linear-gradient(165deg,rgba(255,255,255,.035) 0%,transparent 42%),
+    linear-gradient(180deg,#110f0b 0%,#0a0907 100%);
+  box-shadow:inset 0 1px 0 rgba(246,228,176,.06), 0 18px 40px -28px rgba(0,0,0,.8);
+  transition:border-color .35s, transform .4s cubic-bezier(.2,.9,.3,1), box-shadow .4s;}
+.pl-row:hover{border-color:var(--gold-line);transform:translateY(-2px);
+  box-shadow:inset 0 1px 0 rgba(246,228,176,.1), 0 24px 50px -26px rgba(211,172,99,.22);}
 .pl-chip{font-size:9.5px;font-weight:700;letter-spacing:.16em;color:var(--gold);
   border:1px solid var(--gold-line);border-radius:999px;padding:3px 8px;text-transform:uppercase;flex-shrink:0;}
 .pl-faq{border-top:1px solid var(--line);}
 .pl-faq:last-of-type{border-bottom:1px solid var(--line);}
 .pl-faq summary{display:flex;align-items:baseline;justify-content:space-between;gap:22px;
-  padding:22px 2px;cursor:pointer;list-style:none;}
+  padding:22px 2px;cursor:pointer;list-style:none;transition:color .2s;}
 .pl-faq summary::-webkit-details-marker{display:none;}
 .pl-faq summary:hover .pl-plus{color:var(--gold-1);}
 .pl-plus{color:var(--gold);font-size:21px;line-height:1;flex-shrink:0;
@@ -573,7 +731,7 @@ const CSS = `
    line snippet. This is the same moment played out: the question
    arriving, the depth being read, the covering line landing while you
    are still drawing breath, the full answer continuing without a seam,
-   and — on Ultra — the code typing itself into the editor.
+   and — on Ultra and Enterprise — the code typing itself into the editor.
    Everything here is namespaced .pl-at-* and rides CSS/timers, never
    the React render loop; character streaming writes textContent
    directly through refs.
@@ -1015,7 +1173,8 @@ const CSS = `
   74%{opacity:1;}
   100%{transform:translate(-50%,190%);opacity:0;}}
 .pl-vow-line{display:block;font-weight:500;line-height:1.03;
-  letter-spacing:-0.032em;font-size:clamp(29px,5.6vw,74px);}
+  letter-spacing:-0.032em;font-size:clamp(29px,5.6vw,74px);
+  font-variation-settings:"opsz" 72,"wght" 500,"ital" 0;}
 /* The second line keeps the light. The first stays legible on purpose -
    the pair is the message, and a first line dimmed to decoration would
    throw half of it away. */
@@ -1454,6 +1613,7 @@ const CSS = `
   box-shadow:inset 0 1px 0 rgba(255,255,255,.5),0 3px 10px -3px rgba(211,172,99,.45);}
 .pl-pip-title{flex:1;min-width:0;}
 .pl-pip-title h4{font-family:'Newsreader',ui-serif,Georgia,serif;font-size:14px;font-weight:500;margin:0;color:#fff;letter-spacing:-.01em;
+  font-optical-sizing:none;font-variation-settings:"opsz" 14,"wght" 500,"ital" 0;
   text-shadow:0 1px 4px rgba(0,0,0,.5);}
 .pl-pip-title span{display:flex;align-items:center;gap:5px;font-size:11px;color:rgba(255,255,255,.56);
   text-shadow:0 1px 4px rgba(0,0,0,.5);}
@@ -1846,8 +2006,9 @@ const CSS = `
 .pl-orb-live .pl-glass-crescent,
 .pl-orb-live .pl-glass-rim,
 .pl-orb-live .pl-glass-inner,
-.pl-orb-live .pl-globe-shell { display: none !important; }
-.pl-orb-live .pl-globe-atmo { opacity: .28; filter: blur(3px); }
+.pl-orb-live .pl-globe-shell,
+.pl-orb-live .pl-globe-atmo,
+.pl-orb-live .pl-globe-caustic { display: none !important; }
 .pl-orb-live .pl-galaxy-sphere {
   background: transparent;
   box-shadow:
@@ -2203,7 +2364,7 @@ const CSS = `
 
 const Wordmark: React.FC<{ onClick?: () => void }> = ({ onClick }) => (
   <button onClick={onClick} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-    <span className="pl-serif" style={{ fontSize: 21, fontWeight: 600, letterSpacing: '-0.02em', color: 'var(--paper)' }}>
+    <span className="pl-serif pl-wordmark">
       minicaai<span style={{ color: 'var(--gold)' }}>.</span>
     </span>
   </button>
@@ -2257,7 +2418,7 @@ const ShareFrame: React.FC<{ overlay?: boolean; scan?: boolean }> = ({ overlay, 
         {overlay && (
           <div className="pl-mini">
             <div className="pl-gold" style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', marginBottom: 5 }}>You say</div>
-            <p className="pl-serif" style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--paper)', margin: 0 }}>
+            <p className="pl-serif pl-say-sm" style={{ color: 'var(--paper)', margin: 0 }}>
               Start with the trade-offs, then the design…<span className="pl-caret" style={{ height: '.8em' }} />
             </p>
           </div>
@@ -2357,8 +2518,9 @@ const FAQS = [
   { q: 'Is my interview audio stored anywhere?', a: 'No. Audio streams to the transcription engine, comes back as text, and is discarded. Every provider we use runs on paid API tiers whose terms exclude your data from training.' },
   { q: 'What do I need to run it?', a: 'Windows 10 or later, macOS 12 Monterey or later (native on Apple Silicon), or Linux (Ubuntu 22.04+, Fedora 38+). It works with any interview platform that plays audio through your computer.' },
   // Device counts mirror the server's per-tier limits (registerDevice in
-  // server/src/database.js: free/basic 2 · pro 3 · max 5 · ultra 10).
-  { q: 'Can I use one account on two machines?', a: 'Yes — every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra). Signing in past your allowance moves the seat off your oldest device, so you can switch machines any time — but seats can’t be farmed out.' },
+  // server/src/database.js: free/basic 2 · pro 3 · max 5 · ultra 10 ·
+  // enterprise 25).
+  { q: 'Can I use one account on two machines?', a: 'Yes — every plan includes a device allowance (2 devices on Free and Basic, 3 on Pro, 5 on Max, 10 on Ultra, 25 on Enterprise). Signing in past your allowance moves the seat off your oldest device, so you can switch machines any time — but seats can’t be farmed out.' },
   { q: 'What if it doesn’t work out?', a: 'There’s a 14-day window on your first purchase — under two hours of use gets a full refund. Cancel any time and keep access through the period you already paid for.' },
 ];
 
@@ -2423,22 +2585,28 @@ const PLATFORM_ICONS: {
 // tumble, milky-way band with INTEGER lon frequencies (no seam crease),
 // three star scales with diffraction spikes, drifting key lights, fresnel.
 // Palette: gold/obsidian for minicaai. CSS galaxy remains the no-WebGL fallback.
+const ORB_VERT = `
+attribute vec2 aPos;
+attribute vec2 aUV;
+varying vec2 vUV;
+void main(){
+  vUV = aUV;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+
 const ORB_FRAG = `
 precision highp float;
+#define DUAL_LAYER
+varying vec2 vUV;
 uniform vec2 uRes;
+uniform vec3 uBg;
+uniform vec3 uAnchor, uC0, uC1, uC2;
+uniform float uTime, uPhase, uAudio, uSpin, uArch, uLens;
+/* kept so older uniform writes never fail to link */
 uniform float uT;
-uniform float uSpin;
-uniform float uPhase;
-/* legacy uniform kept so old call sites don't break if re-linked */
 uniform float uDpr;
 
-/* x.ai AgentOrb hash — single sin hash is enough for their star field */
-float h1(float x){ return fract(sin(x*127.1)*43758.5453); }
-
-/* Palette: gold + soft violet (minicaai brand cast on deep space) */
-vec3 uC0(){ return vec3(0.83, 0.68, 0.39); } /* gold */
-vec3 uC1(){ return vec3(0.55, 0.48, 0.95); } /* violet */
-vec3 uC2(){ return vec3(0.96, 0.90, 0.72); } /* cream */
+float h1(float x){ return fract(sin(x * 127.1) * 43758.5453); }
 
 /* ── starfield: a real galaxy in a glass sphere (x.ai recipe) ──
    Tilted galactic band, dark dust lanes, three star scales, warm core.
@@ -2454,6 +2622,12 @@ vec4 starfield(vec3 n, float t){
   float gb = lat + (0.15 + 0.4*v1)*sin(lon*(1.0 + floor(v2*2.0)) + 1.3)
            + 0.12*sin(lon*3.0 + t*0.1);
   float band = exp(-gb*gb*(5.0 + 10.0*v3));
+  float at = uArch >= 0.0 ? uArch : floor(fract(uPhase * 9.73) * 4.0);
+  float isNeb = step(0.5, at) * (1.0 - step(1.5, at));
+  float isCore = step(1.5, at) * (1.0 - step(2.5, at));
+  float isDeep = step(2.5, at);
+  band = mix(band, max(band, 0.8), isNeb);
+  band *= 1.0 - 0.85 * isDeep;
 
   /* nebula wisps + dark dust lanes carved through the bright band */
   float n1 = sin(lon*2.0 + sin(lat*3.0 + t*0.25)*1.6 + t*0.15);
@@ -2462,13 +2636,11 @@ vec4 starfield(vec3 n, float t){
   float lane = pow(0.5 + 0.5*sin(lon*4.0 + lat*7.0 + sin(lon*2.0)*2.0), 3.0);
   float galaxy = clamp(band*neb*(1.0 - lane*(0.55 + 0.35*v2)), 0.0, 1.0);
 
-  /* dust color: cool silver-blue with a gold/violet brand cast */
-  vec3 hue = mix(mix(uC0(), uC1(), v1), mix(uC1(), uC2(), v3), 0.5 + 0.5*sin(lon + lat*2.0 - t*0.2));
+  vec3 hue = mix(mix(uC0, uC1, v1), mix(uC1, uC2, v3), 0.5 + 0.5*sin(lon + lat*2.0 - t*0.2));
   vec3 hueGrey = vec3(dot(hue, vec3(0.299, 0.587, 0.114)));
-  hue = clamp(hueGrey + (hue - hueGrey)*1.35, 0.0, 1.0);
-  vec3 dust = mix(vec3(0.72, 0.78, 0.92), hue, 0.42 + 0.25*v1);
-  /* slightly tighter dust so black void between arms stays deep */
-  vec3 col = dust*galaxy*0.58;
+  hue = clamp(hueGrey + (hue - hueGrey)*1.45, 0.0, 1.0);
+  vec3 dust = mix(vec3(0.72, 0.78, 0.92), hue, 0.45 + 0.3*v1 + 0.45*isNeb);
+  vec3 col = dust * galaxy * (0.6 + 0.9 * isNeb);
 
   /* faint shear lines — the galaxy visibly turns */
   float shear = sin(lon*13.0 + lat*4.0 - t*0.35)*sin(lon*5.0 + t*0.2);
@@ -2477,18 +2649,19 @@ vec4 starfield(vec3 n, float t){
   /* second arm for spiral depth */
   float gb2 = lat - (0.35 + 0.25*v2)*sin(lon*2.0 - 1.1) + 0.4;
   float arm = exp(-gb2*gb2*7.0)*neb;
-  col += mix(dust, uC1(), 0.35)*arm*0.15;
+  col += mix(dust, uC1, 0.35)*arm*0.20;
 
-  /* void: nearly pure black with only a whisper of indigo (deeper = more premium) */
-  vec3 voidGlow = mix(vec3(0.015, 0.012, 0.04), mix(uC0(), mix(uC1(), uC2(), v3), v1)*0.10, 0.45);
-  col += voidGlow*(0.28 + 0.12*sin(t*0.4 + lon))*(0.25 + 0.45*band);
+  vec3 voidGlow = mix(vec3(0.04, 0.03, 0.1), mix(uC0, mix(uC1, uC2, v3), v1)*0.22, 0.75);
+  col += voidGlow*(0.5 + 0.22*sin(t*0.4 + lon))*(0.4 + 0.6*band);
 
-  /* warm amber core deep in the band — keep bright so contrast pops */
-  col += vec3(1.0, 0.88, 0.68)*pow(band, 4.0)*pow(neb, 2.0)*0.42;
+  col += vec3(1.0, 0.88, 0.68)*pow(band, 4.0)*pow(neb, 2.0)*0.4;
+  float ca = v2 * 6.28318;
+  vec3 Cdir = normalize(vec3(cos(ca)*0.85, 0.6*(v3 - 0.5), sin(ca)*0.85));
+  float bulge = max(dot(n, Cdir), 0.0);
+  col += mix(vec3(1.0, 0.85, 0.6), uC2, 0.25)*(pow(bulge, 14.0)*1.6 + pow(bulge, 4.0)*0.5)*isCore;
 
-  /* saturated color pockets breathing in the dust */
   float pocket = pow(neb, 5.0)*band*(0.7 + 0.3*sin(t*0.6 + lon*3.0));
-  col += mix(uC2(), uC0(), fract(v1 + 0.5*sin(lon*2.0)))*pocket*0.55;
+  col += mix(uC2, uC0, fract(v1 + 0.5*sin(lon*2.0)))*pocket*(0.5 + 0.4*v2 + 0.8*isNeb);
 
   /* milky grain along the band */
   float detail = smoothstep(90.0, 200.0, uRes.y);
@@ -2518,7 +2691,7 @@ vec4 starfield(vec3 n, float t){
     float sizeJit = 0.35 + 1.8*hz*hz;
     float sharp = (s == 0 ? 260.0 : (s == 1 ? 700.0 : 1600.0))/sizeJit*resFac;
     float star = exp(-d*d*sharp)*keep*tw;
-    vec3 tint = mix(vec3(1.0), hx < 0.33 ? vec3(0.85, 0.9, 1.0) : (hx < 0.66 ? vec3(1.0, 0.95, 0.85) : mix(vec3(1.0), uC1(), 0.3)), 0.55);
+    vec3 tint = mix(vec3(1.0), hx < 0.33 ? vec3(0.85, 0.9, 1.0) : (hx < 0.66 ? vec3(1.0, 0.95, 0.85) : mix(vec3(1.0), uC1, 0.3)), 0.55);
     float bright = (s == 0 ? 1.9 : (s == 1 ? 1.0 : 0.55))*(0.55 + 0.7*sizeJit);
     float starFade = mix(s == 2 ? 0.18 : 0.5, 1.0, detail);
     col += tint*star*bright*starFade;
@@ -2559,71 +2732,85 @@ vec4 sphereAt(vec3 n, float spin, float t){
   return starfield(n, t);
 }
 
-void main(){
-  vec2 p = (gl_FragCoord.xy*2.0 - uRes)/min(uRes.x, uRes.y);
+vec3 shade(vec2 p){
   float r = length(p);
-  /* CSS clip-path cuts the circle; discard corners for cost */
-  if(r > 1.0){ gl_FragColor = vec4(0.0); return; }
-
-  float t = uT*0.8 + uPhase;
+  float t = uTime * 0.8 + uPhase;
   float rr = min(r, 0.9995);
-  float z = sqrt(1.0 - rr*rr);
+  float z = sqrt(1.0 - rr * rr);
   vec3 N = vec3(p.x, p.y, z);
   float fres = pow(1.0 - z, 2.4);
 
-  /* refracted back-wall sample — solid glass, not a painted shell */
   vec3 I = vec3(0.0, 0.0, -1.0);
   vec3 R = refract(I, N, 0.75);
-  float dHit = -2.0*dot(N, R);
-  vec3 B = normalize(N + R*dHit);
+  float dHit = -2.0 * dot(N, R);
+  vec3 B = normalize(N + R * dHit);
 
-  float sv = fract(uPhase*6.31);
-  float sw = fract(uPhase*2.17);
+  float sv = fract(uPhase * 6.31);
+  float sw = fract(uPhase * 2.17);
   float tWarp = t
-    + (0.9 + 1.3*sv)*sin(t*(0.09 + 0.07*sw))
-    + (0.5 + 0.8*sw)*sin(t*(0.21 + 0.09*sv) + 2.6);
-
+    + (0.9 + 1.3 * sv) * sin(t * (0.09 + 0.07 * sw))
+    + (0.5 + 0.8 * sw) * sin(t * (0.21 + 0.09 * sv) + 2.6);
   vec4 front = sphereAt(N, uSpin, tWarp);
-  vec4 back  = sphereAt(B, uSpin, tWarp*0.8 + 2.7);
+#ifdef DUAL_LAYER
+  vec4 back = sphereAt(B, uSpin, tWarp * 0.8 + 2.7);
+#else
+  vec4 back = vec4(0.0);
+#endif
 
-  /* deeper black glass body — void reads almost ink, rim still catches gold */
-  vec3 anchor = uC0();
-  vec3 voidCol = mix(anchor*0.02, anchor*0.22, fres);
-  vec3 col = mix(vec3(0.004, 0.004, 0.007), voidCol, 0.94 - 0.06*fres);
-
-  /* mix (not add): band REPLACES glass where it lives — x.ai's key trick.
-     Slightly lower back-wall echo so the interior stays blacker. */
+  vec3 voidCol = mix(uAnchor * 0.04, uAnchor * 0.35, fres);
+  vec3 col = mix(uBg, voidCol, 0.97 - 0.04 * fres);
   float fa = clamp(front.a, 0.0, 1.0);
   float ba = clamp(back.a, 0.0, 1.0);
-  col = mix(col, back.rgb, ba*0.10);
-  col = mix(col, front.rgb, fa*0.82);
+  col = mix(col, back.rgb, ba * 0.16);
+  col = mix(col, front.rgb, fa * 0.85);
 
-  /* soft terminator — a touch more contrast (darker shade side) */
-  vec3 LD = normalize(vec3(0.85*sin(t*0.42), 0.45*sin(t*0.26 + 1.2), 0.5));
-  float diffuse = 0.52 + 0.72*max(dot(N, LD), 0.0);
+  vec3 LD = normalize(vec3(0.85 * sin(t * 0.42), 0.45 * sin(t * 0.26 + 1.2), 0.5));
+  float diffuse = (0.62 + 0.65 * max(dot(N, LD), 0.0)) * (1.0 + 0.35 * uAudio);
   col *= diffuse;
+  vec3 voiceCol = mix(uC1, vec3(1.0, 0.97, 0.9), 0.45);
+  col += voiceCol * pow(1.0 - rr, 1.8) * uAudio * 0.5;
+  col += (uC1 * 0.7 + vec3(0.12)) * fres * uAudio * 0.65;
+  float counter = max(dot(N.xy, -LD.xy), 0.0) * fres;
+  col += mix(uC0, vec3(0.5, 0.6, 0.9), 0.5) * counter * 0.18;
 
-  /* counter-rim atmospheric glow */
-  float counter = max(dot(N.xy, -LD.xy), 0.0)*fres;
-  col += mix(uC0(), vec3(0.5, 0.6, 0.9), 0.5)*counter*0.16;
-
-  /* drifting key light + soft sheen + counter glint (product glass) */
-  vec3 L1 = normalize(vec3(-0.45 + 0.3*sin(t*0.34), 0.62 + 0.2*sin(t*0.27 + 1.7), 0.64));
-  float keyAmp = 0.5*(0.78 + 0.22*sin(t*0.45 + 2.2));
-  col += vec3(1.0)*pow(max(dot(N, L1), 0.0), 150.0)*keyAmp;
-  vec3 LS = normalize(vec3(sin(t*0.07)*0.9, 0.35 + 0.3*cos(t*0.05), 0.7));
-  col += vec3(1.0)*pow(max(dot(N, LS), 0.0), 7.0)*0.05;
-  vec3 L2 = normalize(vec3(0.52, -0.5 + 0.12*sin(t*0.09), 0.69));
-  col += vec3(1.0)*pow(max(dot(N, L2), 0.0), 140.0)*0.25;
-
-  /* fresnel: limb catches a touch of the band's color */
-  col = mix(col, front.rgb, fa*fres*0.3);
+  vec3 L1 = normalize(vec3(-0.45 + 0.3 * sin(t * 0.34), 0.62 + 0.2 * sin(t * 0.27 + 1.7), 0.64));
+  col += vec3(1.0) * pow(max(dot(N, L1), 0.0), 150.0) * (0.5 * (0.78 + 0.22 * sin(t * 0.45 + 2.2)));
+  vec3 LS = normalize(vec3(sin(t * 0.07) * 0.9, 0.35 + 0.3 * cos(t * 0.05), 0.7));
+  col += vec3(1.0) * pow(max(dot(N, LS), 0.0), 7.0) * 0.05;
+  vec3 L2 = normalize(vec3(0.52, -0.5 + 0.12 * sin(t * 0.09), 0.69));
+  col += vec3(1.0) * pow(max(dot(N, L2), 0.0), 140.0) * 0.25;
+  col = mix(col, front.rgb, fa * fres * 0.3);
   float limb = smoothstep(0.94, 1.0, rr);
-  col = mix(col, col*0.85, limb*0.4);
+  col = mix(col, col * 0.85, limb * 0.4);
+  return col;
+}
 
-  /* soft AA at the circle edge (CSS mask finishes the silhouette) */
-  float aa = smoothstep(1.0, 0.985, r);
-  gl_FragColor = vec4(col*aa, aa);
+void main(){
+  vec2 p = vUV * 2.0 - 1.0;
+  if (uLens > 0.0) {
+    float r = length(p);
+    float ex = exp(2.0 * 1.7724539 * (r - 0.9) / 0.1414214);
+    float fall = 0.5 + 0.5 * (ex - 1.0) / (ex + 1.0);
+    if (fall > 0.004) {
+      float swell = 1.0 + 0.16 * (0.6 * sin(uTime * 0.9 + uPhase)
+                                + 0.4 * sin(uTime * 1.7 + uPhase * 1.3));
+      float k = uLens * fall * swell;
+      float cR = 1.4 * (1.0 + 0.06 * sin(uTime * 1.3 + uPhase));
+      float cG = 1.2 * (1.0 + 0.06 * sin(uTime * 1.3 + uPhase + 2.1));
+      float cB = 1.0 * (1.0 + 0.06 * sin(uTime * 1.3 + uPhase + 4.2));
+      vec3 col = vec3(shade(p * (1.0 - k * cR)).r,
+                      shade(p * (1.0 - k * cG)).g,
+                      shade(p * (1.0 - k * cB)).b);
+      vec2 a2 = min(abs(p), 1.0);
+      float lobe = max(abs(a2.x * 0.766 + a2.y * 0.643), abs(a2.x * 0.766 - a2.y * 0.643));
+      float glow = 0.65 * pow(clamp((lobe - 0.0707) / 1.3435, 0.0, 1.0), 2.4) * fall;
+      glow += 1.02 * clamp(1.0 + (r - 1.0) / 0.15, 0.0, 1.0) * step(r, 1.0) * pow(lobe, 2.0);
+      col += vec3(0.25) * min(glow, 1.0);
+      gl_FragColor = vec4(col, 1.0);
+      return;
+    }
+  }
+  gl_FragColor = vec4(shade(p), 1.0);
 }`;
 
 // Same WebGL nebula orb on laptop AND phone. Mobile used to skip WebGL and
@@ -2657,7 +2844,7 @@ const NebulaOrbCanvas: React.FC = () => {
     // pre-empted more aggressively on iOS thermal/battery paths.
     const gl = cv.getContext('webgl', {
       alpha: true,
-      antialias: false,
+      antialias: true,
       premultipliedAlpha: true,
       preserveDrawingBuffer: false,
       powerPreference: isMobile ? 'default' : 'high-performance',
@@ -2674,48 +2861,62 @@ const NebulaOrbCanvas: React.FC = () => {
       }
       return sh;
     };
-    const vs = compile(gl.VERTEX_SHADER, 'attribute vec2 aP; void main(){ gl_Position = vec4(aP, 0.0, 1.0); }');
+    const vs = compile(gl.VERTEX_SHADER, ORB_VERT);
     const fs = compile(gl.FRAGMENT_SHADER, ORB_FRAG);
     if (!vs || !fs) return;
     const prog = gl.createProgram()!;
     gl.attachShader(prog, vs);
     gl.attachShader(prog, fs);
+    gl.bindAttribLocation(prog, 0, 'aPos');
+    gl.bindAttribLocation(prog, 1, 'aUV');
     gl.linkProgram(prog);
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
 
     gl.useProgram(prog);
     gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-    const aP = gl.getAttribLocation(prog, 'aP');
-    gl.enableVertexAttribArray(aP);
-    gl.vertexAttribPointer(aP, 2, gl.FLOAT, false, 0, 0);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1, -1, 0, 1,
+       1, -1, 1, 1,
+      -1,  1, 0, 0,
+       1,  1, 1, 0,
+    ]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
 
     const uRes = gl.getUniformLocation(prog, 'uRes');
+    const uTime = gl.getUniformLocation(prog, 'uTime');
     const uT = gl.getUniformLocation(prog, 'uT');
     const uSpin = gl.getUniformLocation(prog, 'uSpin');
     const uPhase = gl.getUniformLocation(prog, 'uPhase');
     const uDpr = gl.getUniformLocation(prog, 'uDpr');
+    const uLens = gl.getUniformLocation(prog, 'uLens');
+    const uAudio = gl.getUniformLocation(prog, 'uAudio');
+    const uArch = gl.getUniformLocation(prog, 'uArch');
+    const uBg = gl.getUniformLocation(prog, 'uBg');
+    const uAnchor = gl.getUniformLocation(prog, 'uAnchor');
+    const uC0 = gl.getUniformLocation(prog, 'uC0');
+    const uC1 = gl.getUniformLocation(prog, 'uC1');
+    const uC2 = gl.getUniformLocation(prog, 'uC2');
     gl.uniform1f(uPhase, 0.37);
+    gl.uniform1f(uAudio, 0.0);
+    gl.uniform1f(uArch, 0.0);
+    gl.uniform3f(uBg, 0.004, 0.004, 0.007);
+    gl.uniform3f(uAnchor, 0.83, 0.68, 0.39);
+    gl.uniform3f(uC0, 0.83, 0.68, 0.39);
+    gl.uniform3f(uC1, 0.55, 0.48, 0.95);
+    gl.uniform3f(uC2, 0.96, 0.90, 0.72);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.clearColor(0, 0, 0, 0);
 
-    // Match the CSS orb box (240×240 desktop; scaled on mobile via stage).
-    // Hard-coded 480px ignored the real on-screen size and could look soft
-    // or blank under heavy stage scaling.
-    //
-    // CRITICAL: always re-bind viewport + uRes/uDpr, not only when the buffer
-    // size changes. React 18 StrictMode (vite dev) mounts → cleans up → remounts
-    // on the same <canvas>. The first mount leaves width/height at e.g. 240; the
-    // second mount would skip the uniform writes, leaving uRes at (0,0). The
-    // fragment then does (gl_FragCoord*2 - uRes)/min(uRes) → div-by-zero →
-    // every pixel discarded → .pl-orb-live promotes over a pure black disc
-    // (CSS galaxy hidden). Production only mounts once, so live looked fine.
+    // Layout size (240 CSS) — NOT getBoundingClientRect, which includes the
+    // mobile stage scale(0.55) and would undersample the buffer.
     const syncSize = () => {
-      const r = cv.getBoundingClientRect();
-      const css = Math.max(120, Math.min(480, Math.round(Math.max(r.width, r.height) || 240)));
+      const css = Math.max(120, Math.round(cv.clientWidth || cv.parentElement?.clientWidth || 240));
       const dpr = Math.min(2, window.devicePixelRatio || 1);
-      const px = Math.max(180, Math.round(css * dpr));
+      const px = Math.min(1280, Math.max(240, Math.round(css * dpr)));
       if (cv.width !== px || cv.height !== px) {
         cv.width = px;
         cv.height = px;
@@ -2723,6 +2924,7 @@ const NebulaOrbCanvas: React.FC = () => {
       gl.viewport(0, 0, px, px);
       gl.uniform2f(uRes, px, px);
       gl.uniform1f(uDpr, dpr);
+      gl.uniform1f(uLens, css >= 48 ? 0.4 : 0.0);
     };
     syncSize();
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(syncSize) : null;
@@ -2770,10 +2972,12 @@ const NebulaOrbCanvas: React.FC = () => {
       const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
       last = now;
       spin += dt * (spinBase + spinWave * Math.sin(now * 0.0004));
-      gl.uniform1f(uT, (now - t0) / 1000 + 18);
+      const tSec = (now - t0) / 1000 + 18;
+      gl.uniform1f(uTime, tSec);
+      gl.uniform1f(uT, tSec);
       gl.uniform1f(uSpin, spin);
       gl.clear(gl.COLOR_BUFFER_BIT);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
       if (!live) {
         goodFrames += 1;
@@ -3003,7 +3207,7 @@ const SilkStreamCanvas: React.FC = () => {
 // Plays the real shape of a live answer, once the section scrolls into
 // view: the question arrives, the depth is read, the covering line lands
 // while you're still drawing breath, the full answer continues without a
-// seam, and on Ultra the code types itself into the editor.
+// seam, and on Ultra/Enterprise the code types itself into the editor.
 //
 // No engineering internals on screen — a candidate should read this and
 // understand what they'll EXPERIENCE, not how it's built.
@@ -3022,7 +3226,7 @@ const AT_CAPTIONS: { t: string; b: string }[] = [
   { b: 'It reads how deep the question is.', t: 'A throwaway question gets a quick answer. A hard one gets real thinking — chosen for you, every time.' },
   { b: 'You have something to say in under a second.', t: 'An opening line lands while you are still drawing breath, so you are never the person sitting in silence.' },
   { b: 'The full answer arrives underneath it.', t: 'It continues from where your opening left off — one thought, no seam, nothing to backtrack out of.' },
-  { b: 'On Ultra, it types the code for you.', t: 'Straight into the editor at a human pace, so what appears on the screen looks like you wrote it.' },
+  { b: 'On Ultra and Enterprise, it types the code for you.', t: 'Straight into the editor at a human pace, so what appears on the screen looks like you wrote it.' },
 ];
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -3412,7 +3616,7 @@ const AnswerTheater: React.FC = () => {
           <div className="pl-at-ed">
             <div className="pl-at-edhead">
               <span>your editor</span>
-              <span style={{ color: 'var(--gold)', letterSpacing: '.16em' }}>ULTRA · AUTO-TYPE</span>
+              <span style={{ color: 'var(--gold)', letterSpacing: '.16em' }}>ULTRA &amp; ENTERPRISE · AUTO-TYPE</span>
             </div>
             <div className="pl-at-code">
               <span className="pl-at-nums">{[1, 2, 3, 4, 5].map(n => <span key={n}>{n}</span>)}</span>
@@ -3858,13 +4062,27 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
   };
   const tiers: PricingTier[] = (pricing?.tiers as PricingTier[]) || [];
 
+  // ── Plan group tabs (2026-08) ────────────────────────────────────────
+  // Individual = Starter / Basic / Pro / Max / Ultra. Team = Enterprise,
+  // alone. Grouping comes off the tier itself (pricingService `group`), not
+  // a list hardcoded here, so this section can never disagree with the
+  // in-app pricing grid about which tab a plan belongs to.
+  const [planGroup, setPlanGroup] = useState<'individual' | 'team'>('individual');
+  const individualTiers = tiers.filter(t => groupOf(t) === 'individual');
+  const teamTiers = tiers.filter(t => groupOf(t) === 'team');
+  // Defensive: an older server / a region table without the Team plan must
+  // not leave the tab strip offering an empty tab. Nothing renders the Team
+  // tab if there is nothing in it.
+  const showTeamTab = teamTiers.length > 0;
+  const activeGroup: 'individual' | 'team' = showTeamTab ? planGroup : 'individual';
+
   const priceBlock = (t: PricingTier) => {
-    if (!t.price || t.price === 0) return <span className="pl-serif" style={{ fontSize: 40, fontWeight: 500 }}>Free</span>;
+    if (!t.price || t.price === 0) return <span className="pl-serif pl-price-num">Free</span>;
     const amount = pricingService.formatPrice(t.price, t.currencySymbol, t.currency);
     const suffix = t.period === 'month' ? '/mo' : t.period === 'year' ? '/yr' : '';
     return (
       <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-        <span className="pl-serif" style={{ fontSize: 42, fontWeight: 500, letterSpacing: '-0.02em' }}>{amount}</span>
+        <span className="pl-serif pl-price-num">{amount}</span>
         {suffix
           ? <span style={{ color: 'var(--mut)', fontSize: 15 }}>{suffix}</span>
           : <span style={{ color: 'var(--gold)', fontSize: 10.5, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.18em', border: '1px solid var(--gold-line)', borderRadius: 999, padding: '3px 9px' }}>one-time</span>}
@@ -3911,7 +4129,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
                 are hidden from AT because the second line re-renders once
                 per typed character — a screen reader following the live DOM
                 would announce 40 partial fragments. */}
-            <h1 className="pl-serif" style={{ fontWeight: 500, fontSize: 'clamp(37px, 4.4vw, 62px)', lineHeight: 1.02, letterSpacing: '-0.03em', margin: 0 }} data-pl-hero aria-label={`Every interview question, ${HERO_LINE}`}>
+            <h1 className="pl-serif pl-display" style={{ margin: 0 }} data-pl-hero aria-label={`Every interview question, ${HERO_LINE}`}>
               <span aria-hidden="true">
                 <span style={{ color: 'var(--paper)' }}>Every interview question,</span>
                 <br />
@@ -3921,7 +4139,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
                 </span>
               </span>
             </h1>
-            <p className="pl-hero-sub" style={{ fontSize: 'clamp(15px, 1.4vw, 17.5px)', lineHeight: 1.6, color: 'var(--mut)' }}>
+            <p className="pl-hero-sub pl-lede">
               minicaai listens to your live call and streams a perfect, personalized answer to your screen —
               <span style={{ color: 'var(--paper)' }}> invisible to everyone but you.</span>
             </p>
@@ -4002,7 +4220,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
                     <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.2em', textTransform: 'uppercase', marginBottom: 8 }} className="pl-gold">You say</div>
                     <div className="pl-hero-answer">
                       <span className="pl-hero-stamp">yours to say · 0.8s</span>
-                      <p className="pl-serif" style={{ fontSize: 18, lineHeight: 1.55, color: 'var(--paper)', letterSpacing: '-0.01em', margin: 0 }}>
+                      <p className="pl-serif pl-say" style={{ color: 'var(--paper)', margin: 0 }}>
                         {ANSWER}<span className="pl-caret" />
                       </p>
                     </div>
@@ -4041,12 +4259,12 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         <div className="pl-seam-halo" aria-hidden />
         <div style={{ position: 'relative', zIndex: 1, maxWidth: 760, margin: '0 auto 30px', textAlign: 'center' }}>
           <p className="pl-eyebrow" style={{ marginBottom: 16 }}>The silence problem</p>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(30px,4.4vw,50px)', lineHeight: 1.09, letterSpacing: '-0.022em', marginBottom: 16 }}>
+          <h2 className="pl-serif" style={{ marginBottom: 16 }}>
             The question lands.
             <br />
             Then you’re <span className="pl-gold pl-foil">alone with it.</span>
           </h2>
-          <p style={{ fontSize: 16, lineHeight: 1.62, color: 'var(--mut)', maxWidth: 620, margin: '0 auto' }}>
+          <p className="pl-lede" style={{ maxWidth: 620, margin: '0 auto' }}>
             Any model worth asking needs seconds to think about a hard question — and in a live
             interview, that pause is the thing that costs you the room. So we stopped making you
             wait for it. You get <span style={{ color: 'var(--pv-1)', fontWeight: 600 }}>a line to say in half a second</span>,
@@ -4068,7 +4286,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           {PROOF.map((c, i) => (
             <React.Fragment key={c}>
               {i > 0 && <span style={{ color: 'var(--gold)', opacity: 0.5 }}>·</span>}
-              <span className="pl-serif" style={{ fontSize: 19, color: '#b7b1a4' }}>{c}</span>
+              <span className="pl-serif pl-proof">{c}</span>
             </React.Fragment>
           ))}
         </div>
@@ -4080,10 +4298,10 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         <div className="pl-reveal pl-moment">
           <div>
             <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Invisible by design</div>
-            <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.025em', marginBottom: 20 }}>
+            <h2 className="pl-serif" style={{ marginBottom: 20 }}>
               They share the screen.<br /><span className="pl-gold pl-foil">They still can’t see it.</span>
             </h2>
-            <p style={{ fontSize: 16.5, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 460 }}>
+            <p className="pl-lede" style={{ maxWidth: 460 }}>
               minicaai runs in a content-protected window the interviewer cannot capture — on Zoom, Meet, or Teams, even mid screen-share. Your edge stays yours.
             </p>
           </div>
@@ -4110,7 +4328,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           <div className="pl-hide-sm" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {MODELS.map((m, i) => (
               <div key={m} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '13px 18px', borderRadius: 12, border: `1px solid ${i === 0 ? 'var(--gold-line)' : 'var(--line)'}`, background: i === 0 ? 'linear-gradient(90deg,rgba(211,172,99,.07),transparent)' : 'transparent' }}>
-                <span className="pl-serif" style={{ fontSize: 17, color: i === 0 ? 'var(--paper)' : 'var(--mut)' }}>{m}</span>
+                <span className="pl-serif pl-model" style={{ color: i === 0 ? 'var(--paper)' : 'var(--mut)' }}>{m}</span>
                 {i === 0
                   ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, fontSize: 11, color: 'var(--gold)', fontWeight: 600 }}><span className="pl-live" /> active</span>
                   : <span style={{ fontSize: 11, color: 'var(--faint)' }}>ready</span>}
@@ -4119,10 +4337,10 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           </div>
           <div style={{ order: -1 }}>
             <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Five minds, one earpiece</div>
-            <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.025em', marginBottom: 20 }}>
+            <h2 className="pl-serif" style={{ marginBottom: 20 }}>
               The right model<br />for <span className="pl-gold pl-foil">every question.</span>
             </h2>
-            <p style={{ fontSize: 16.5, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 460 }}>
+            <p className="pl-lede" style={{ maxWidth: 460 }}>
               Claude Sonnet 5 for reasoning, GPT-5.6 for range, Gemini 3.6 for speed, Grok and Groq when you need instant. Switch minds mid-interview — no one will know.
             </p>
           </div>
@@ -4133,12 +4351,12 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         {/* Moment 3 — Auto-Type */}
         <div className="pl-reveal pl-moment">
           <div>
-            <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Auto-Type · Ultra</div>
-            <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.025em', marginBottom: 20 }}>
+            <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Auto-Type · Ultra &amp; Enterprise</div>
+            <h2 className="pl-serif" style={{ marginBottom: 20 }}>
               It can even<br /><span className="pl-gold pl-foil">type it for you.</span>
             </h2>
-            <p style={{ fontSize: 16.5, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 460 }}>
-              On Ultra, the perfect answer lands straight into the box at a human cadence — hands-free, for take-homes and live coding alike.
+            <p className="pl-lede" style={{ maxWidth: 460 }}>
+              On Ultra and Enterprise, the perfect answer lands straight into the box at a human cadence — hands-free, for take-homes and live coding alike.
             </p>
             <p style={{ fontSize: 15, lineHeight: 1.65, color: 'var(--faint)', maxWidth: 460, marginTop: 16 }}>
               Watch the whole thing happen — the question arriving, the depth being read,
@@ -4291,12 +4509,12 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       <section className="pl-wrap pl-reveal" style={{ paddingTop: 86, paddingBottom: 18 }}>
         <div className="pl-reck">
           <div className="pl-eyebrow" style={{ marginBottom: 22 }}>What you actually get</div>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(26px,3.5vw,44px)', fontWeight: 500, lineHeight: 1.1, letterSpacing: '-0.025em', margin: 0 }}>
+          <h2 className="pl-serif" style={{ margin: 0 }}>
             <span className="pl-reck-l">We don&rsquo;t hand you a guess.</span>
             <span className="pl-reck-l"><em className="pl-gold" style={{ fontStyle: 'italic' }}>Every answer carries its reasoning.</em></span>
           </h2>
           <div className="pl-reck-rule" style={{ maxWidth: 300, marginTop: 24 }} aria-hidden />
-          <p style={{ fontSize: 16, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 470, marginLeft: 'auto', marginTop: 22 }}>
+          <p className="pl-lede" style={{ maxWidth: 470, marginLeft: 'auto', marginTop: 22 }}>
             Something you can defend when the follow-up question comes — not a confident sentence with nothing underneath it.
           </p>
         </div>
@@ -4306,10 +4524,10 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       <section id="kit" className="pl-wrap" style={{ paddingTop: 72, paddingBottom: 24 }}>
         <div className="pl-reveal" style={{ textAlign: 'center', marginBottom: 40, maxWidth: 640, marginLeft: 'auto', marginRight: 'auto' }}>
           <div className="pl-eyebrow" style={{ marginBottom: 18 }}>Beyond the answer</div>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, letterSpacing: '-0.025em', marginBottom: 14 }}>
+          <h2 className="pl-serif" style={{ marginBottom: 14 }}>
             Every detail, <span className="pl-gold pl-foil">already handled.</span>
           </h2>
-          <p style={{ fontSize: 16, lineHeight: 1.6, color: 'var(--mut)' }}>
+          <p className="pl-lede">
             The quiet systems around the big moment — all working before you notice you need them.
           </p>
         </div>
@@ -4317,7 +4535,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           {LEDGER.map((f) => (
             <div key={f.t} className="pl-row">
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <span className="pl-serif" style={{ fontSize: 19, fontWeight: 500, letterSpacing: '-0.015em' }}>{f.t}</span>
+                <span className="pl-serif pl-row-t">{f.t}</span>
                 {f.chip && <span className="pl-chip">{f.chip}</span>}
               </div>
               <p style={{ fontSize: 14.5, lineHeight: 1.6, color: 'var(--mut)' }}>{f.b}</p>
@@ -4330,7 +4548,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       <section className="pl-wrap" style={{ paddingTop: 72, paddingBottom: 40 }}>
         <div className="pl-reveal" style={{ textAlign: 'center', marginBottom: 12 }}>
           <div className="pl-eyebrow" style={{ marginBottom: 18 }}>How it works</div>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, letterSpacing: '-0.025em' }}>
+          <h2 className="pl-serif">
             Live help, three quiet steps.
           </h2>
         </div>
@@ -4340,8 +4558,8 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             <div className="pl-step-row">
               <span className="pl-serif pl-num">{s.n}</span>
               <div className="pl-step-copy">
-                <h3 className="pl-serif" style={{ fontSize: 'clamp(22px,3vw,32px)', fontWeight: 500, letterSpacing: '-0.02em' }}>{s.t}</h3>
-                <p style={{ fontSize: 16, lineHeight: 1.6, color: 'var(--mut)' }}>{s.b}</p>
+                <h3 className="pl-serif">{s.t}</h3>
+                <p className="pl-lede">{s.b}</p>
               </div>
               {/* Tiny live vignette per step — same mini-UI language as the
                   capture-test frames. Decorative; the copy carries the steps. */}
@@ -4404,10 +4622,10 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       <section id="popout" className="pl-wrap" style={{ paddingTop: 40, paddingBottom: 56 }}>
         <div className="pl-reveal" style={{ textAlign: 'center', marginBottom: 28, maxWidth: 660, marginLeft: 'auto', marginRight: 'auto' }}>
           <div className="pl-eyebrow" style={{ marginBottom: 18 }}>The pop-out</div>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, letterSpacing: '-0.025em', marginBottom: 14 }}>
+          <h2 className="pl-serif" style={{ marginBottom: 14 }}>
             This is what floats over your <span className="pl-gold pl-foil">interview — and your meetings.</span>
           </h2>
-          <p style={{ fontSize: 16, lineHeight: 1.6, color: 'var(--mut)' }}>
+          <p className="pl-lede">
             A small always-on-top window with the answer, in your voice. The systems answer is
             already there — keep scrolling and the coding round surfaces. Invisible when you share your screen.
           </p>
@@ -4529,7 +4747,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         <div className="pl-moment" style={{ alignItems: 'start', padding: 0 }}>
           <div className="pl-reveal">
             <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Discretion, engineered</div>
-            <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.025em', marginBottom: 20 }}>
+            <h2 className="pl-serif" style={{ marginBottom: 20 }}>
               What we <span className="pl-gold pl-foil">never keep.</span>
             </h2>
             {/* "built to forget — audio, screenshots, keystrokes" implied we
@@ -4538,7 +4756,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
                 (Auto-Type keeps its last 50 on the user's own disk). Say the
                 thing that is actually true and still strong: none of it
                 reaches us. */}
-            <p style={{ fontSize: 16.5, lineHeight: 1.65, color: 'var(--mut)', maxWidth: 440, marginBottom: 28 }}>
+            <p className="pl-lede" style={{ maxWidth: 440, marginBottom: 28 }}>
               A tool this private has to be private all the way down. Your audio goes straight to the transcription engine, your screen never leaves your machine, and we keep no recording of either.
             </p>
             <button className="pl-textlink" style={{ fontSize: 15 }} onClick={() => setView('docs')}>
@@ -4570,7 +4788,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           {PLATFORMS.map((p, i) => (
             <React.Fragment key={p}>
               {i > 0 && <span style={{ color: 'var(--gold)', opacity: 0.45 }}>·</span>}
-              <span className="pl-serif" style={{ fontSize: 17, color: 'var(--mut)' }}>{p}</span>
+              <span className="pl-serif pl-proof" style={{ color: 'var(--mut)' }}>{p}</span>
             </React.Fragment>
           ))}
         </div>
@@ -4593,7 +4811,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             <span className="pl-vow-line pl-vow-a">We don&rsquo;t want your money.</span>
             <span className="pl-vow-line pl-vow-b">We want you to get the job.</span>
           </h2>
-          <p style={{ fontSize: 16, lineHeight: 1.6, color: 'var(--mut)', maxWidth: 440, margin: '30px auto 0' }}>
+          <p className="pl-lede" style={{ maxWidth: 440, margin: '30px auto 0' }}>
             That is the whole business. The prices below keep it running.
           </p>
         </div>
@@ -4605,17 +4823,59 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       <section id="pricing" style={{ maxWidth: 1280, margin: '0 auto', padding: '80px 34px 40px', position: 'relative', zIndex: 2 }}>
         <div className="pl-reveal" style={{ textAlign: 'center', marginBottom: 44, maxWidth: 620, marginLeft: 'auto', marginRight: 'auto' }}>
           <div className="pl-eyebrow" style={{ marginBottom: 18 }}>Pricing</div>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, letterSpacing: '-0.025em', marginBottom: 16 }}>
-            Pay for the interview,<br /><span className="pl-gold pl-foil">not a subscription.</span>
-          </h2>
-          <p style={{ fontSize: 16, lineHeight: 1.6, color: 'var(--mut)' }}>
-            One-time passes for the interviews that matter — or go unlimited with Ultra.{pricing?.currency ? ` Prices in ${pricing.currency}.` : ''}
-          </p>
+          {activeGroup === 'team' ? (
+            <>
+              <h2 className="pl-serif" style={{ marginBottom: 16 }}>
+                One plan.<br /><span className="pl-gold pl-foil">No meter on it.</span>
+              </h2>
+              <p className="pl-lede">
+                Enterprise removes the clock entirely — unlimited interview time that never expires, every top model, Auto-Type for coding rounds.{pricing?.currency ? ` Prices in ${pricing.currency}.` : ''}
+              </p>
+            </>
+          ) : (
+            <>
+              <h2 className="pl-serif" style={{ marginBottom: 16 }}>
+                Pay for the interview,<br /><span className="pl-gold pl-foil">not a subscription.</span>
+              </h2>
+              <p className="pl-lede">
+                One-time passes for the interviews that matter — or take a monthly block of hours with Ultra.{pricing?.currency ? ` Prices in ${pricing.currency}.` : ''}
+              </p>
+            </>
+          )}
         </div>
+        {/* Tab strip. role="tablist" + aria-selected because this genuinely
+            IS a tabbed disclosure — a screen reader that reads it as two
+            loose buttons gives no hint that picking one replaces the other's
+            content. Hidden entirely when there is no Team plan to show. */}
+        {showTeamTab && (
+          <div className="pl-reveal" style={{ display: 'flex', justifyContent: 'center' }}>
+            <div className="pl-plantabs" role="tablist" aria-label="Plan type">
+              {PLAN_GROUPS.map(g => (
+                <button
+                  key={g.id}
+                  role="tab"
+                  id={`pl-plantab-${g.id}`}
+                  aria-selected={activeGroup === g.id}
+                  aria-controls={`pl-planpanel-${g.id}`}
+                  className="pl-plantab"
+                  onClick={() => setPlanGroup(g.id)}
+                >
+                  {g.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div
+          id="pl-planpanel-individual"
+          role="tabpanel"
+          aria-labelledby="pl-plantab-individual"
+          hidden={activeGroup !== 'individual'}
+        >
         <div className="pl-reveal" style={{ marginBottom: 6 }}>
           <div style={{ fontSize: 10, letterSpacing: '.18em', textTransform: 'uppercase', color: 'var(--gold)', marginBottom: 8 }}>One-time passes</div>
           <div className="pl-passes">
-            {tiers.filter(t => t.id !== 'ultra').map((t) => {
+            {individualTiers.filter(t => t.id !== 'ultra').map((t) => {
               const pop = !!t.popular;
               const Mark = TIER_MARK[t.id];
               return (
@@ -4630,7 +4890,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
                   <div style={{ marginBottom: 8, height: 24, display: 'flex', alignItems: 'center' }}>
                     {Mark && <Mark size={24} />}
                   </div>
-                  <h3 className="pl-serif" style={{ fontSize: 18, fontWeight: 500 }}>{t.name}</h3>
+                  <h3 className="pl-serif">{t.name}</h3>
                   {t.subtitle && <p style={{ fontSize: 11, color: 'var(--faint)', marginTop: 1 }}>{t.subtitle}</p>}
                   <div style={{ margin: '12px 0 10px' }}>{priceBlock(t)}</div>
                   <button
@@ -4657,16 +4917,21 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           </div>
         </div>
         {(() => {
-          const ultra = tiers.find(t => t.id === 'ultra');
+          const ultra = individualTiers.find(t => t.id === 'ultra');
           if (!ultra) return null;
           const Mark = TIER_MARK[ultra.id];
           return (
             <div className="pl-reveal">
-              <div style={{ fontSize: 10, letterSpacing: '.18em', textTransform: 'uppercase', color: 'var(--gold)', margin: '2px 0 6px' }}>Flagship — unlimited</div>
+              {/* Eyebrow was "Flagship — unlimited". Ultra stopped being
+                  unlimited on 2026-08-22 (9 hours a month; unlimited moved to
+                  Enterprise), and a label that oversells the plan directly
+                  above its own feature list is the kind of thing a customer
+                  finds out about at 0 seconds, mid-interview. */}
+              <div style={{ fontSize: 10, letterSpacing: '.18em', textTransform: 'uppercase', color: 'var(--gold)', margin: '2px 0 6px' }}>Flagship — monthly</div>
               <div className="pl-ultra-band">
                 <div>
                   {Mark && <div style={{ marginBottom: 6 }}><Mark size={38} /></div>}
-                  <h3 className="pl-serif" style={{ fontSize: 23, fontWeight: 500, letterSpacing: '-0.01em' }}>{ultra.name}</h3>
+                  <h3 className="pl-serif">{ultra.name}</h3>
                   {ultra.subtitle && <p style={{ fontSize: 11.5, color: 'var(--faint)', marginTop: 1 }}>{ultra.subtitle}</p>}
                   <div style={{ margin: '12px 0 14px' }}>{priceBlock(ultra)}</div>
                   <button
@@ -4692,6 +4957,59 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             </div>
           );
         })()}
+        </div>
+
+        {/* ── TEAM — Enterprise, alone ─────────────────────────
+            One plan on this tab by design: a team buying minicaai is not
+            choosing between sizes, it is deciding whether to remove the
+            meter. So there is nothing to compare against here — just the
+            plan, its price, and what it drops. Staged on the same band the
+            flagship uses so the two tabs feel like one price list, not two
+            pages. */}
+        <div
+          id="pl-planpanel-team"
+          role="tabpanel"
+          aria-labelledby="pl-plantab-team"
+          hidden={activeGroup !== 'team'}
+        >
+          {teamTiers.map((ent) => {
+            const Mark = TIER_MARK[ent.id];
+            return (
+              <div className="pl-reveal" key={ent.id}>
+                <div style={{ fontSize: 10, letterSpacing: '.18em', textTransform: 'uppercase', color: 'var(--gold)', margin: '2px 0 6px' }}>For teams — unlimited</div>
+                <div className="pl-ent-band">
+                  <div>
+                    {Mark && <div style={{ marginBottom: 6 }}><Mark size={42} /></div>}
+                    <h3 className="pl-serif">{ent.name}</h3>
+                    {ent.subtitle && <p style={{ fontSize: 11.5, color: 'var(--faint)', marginTop: 1 }}>{ent.subtitle}</p>}
+                    <div style={{ margin: '12px 0 14px' }}>{priceBlock(ent)}</div>
+                    <button
+                      onClick={() => handleTierSelect(ent)}
+                      disabled={isSubmitting}
+                      className="pl-cta"
+                      style={{ padding: '11px 26px', borderRadius: 999, fontSize: 13.5, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, opacity: isSubmitting ? 0.6 : 1 }}
+                    >
+                      {ent.cta || 'Get Enterprise'} <PhArrowRight size={14} weight="bold" />
+                    </button>
+                    <p style={{ fontSize: 11.5, color: 'var(--faint)', marginTop: 12, lineHeight: 1.5 }}>
+                      Billed monthly. Cancel any time — you keep access to the end of the cycle.
+                    </p>
+                  </div>
+                  <div style={{ paddingTop: 2 }}>
+                    <ul style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '5px 14px', margin: 0, padding: 0, listStyle: 'none' }}>
+                      {(ent.features || []).map((f, i) => (
+                        <li key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 7, fontSize: 12.5, color: '#d2ccbf' }}>
+                          <PhCheck size={13} weight="fill" color="var(--gold)" style={{ flexShrink: 0, marginTop: 1 }} />
+                          <span style={{ lineHeight: 1.4 }}>{f}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
         {/* ── The aside — a margin note, not a headline ────────
             Sits inside the pricing block because this is where the
             thought forms. Staged as an ANNOTATION: left-aligned,
@@ -4710,7 +5028,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             verdict on whether they belong here. Keep it that way. */}
         <div className="pl-reveal pl-note" style={{ margin: '54px 0 4px' }}>
           <span className="pl-note-rule" aria-hidden />
-          <span className="pl-note-l pl-serif" style={{ fontSize: 'clamp(17px,2vw,21px)', lineHeight: 1.5, fontWeight: 500, letterSpacing: '-0.015em', color: 'var(--paper)' }}>
+          <span className="pl-note-l pl-serif pl-row-t" style={{ lineHeight: 1.5, color: 'var(--paper)' }}>
             If this is more than you can spare right now, please tell us.
           </span>
           <span className="pl-note-l" style={{ fontSize: 14.5, lineHeight: 1.6, color: 'var(--mut)', marginTop: 10 }}>
@@ -4744,7 +5062,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
         <div className="pl-uw">
           <div>
             <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Our side of it</div>
-            <h2 className="pl-serif" style={{ fontSize: 'clamp(26px,3.4vw,44px)', fontWeight: 500, lineHeight: 1.1, letterSpacing: '-0.025em', margin: 0 }}>
+            <h2 className="pl-serif" style={{ margin: 0 }}>
               If our answers don&rsquo;t earn it,{' '}
               <span className="pl-return-back"><em className="pl-gold" style={{ fontStyle: 'italic' }}>you get the money back.</em></span>
             </h2>
@@ -4768,7 +5086,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
       <section id="faq" className="pl-wrap" style={{ paddingTop: 62, paddingBottom: 40 }}>
         <div className="pl-reveal" style={{ textAlign: 'center', marginBottom: 40 }}>
           <div className="pl-eyebrow" style={{ marginBottom: 18 }}>Questions</div>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(27px,3.6vw,44px)', fontWeight: 500, letterSpacing: '-0.025em' }}>
+          <h2 className="pl-serif">
             Asked. <span className="pl-gold pl-foil">Answered.</span>
           </h2>
         </div>
@@ -4776,7 +5094,7 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
           {FAQS.map((f) => (
             <details key={f.q} className="pl-faq">
               <summary>
-                <span className="pl-serif" style={{ fontSize: 19, fontWeight: 500, letterSpacing: '-0.015em' }}>{f.q}</span>
+                <span className="pl-serif pl-faq-q">{f.q}</span>
                 <span className="pl-plus" aria-hidden>+</span>
               </summary>
               <p className="pl-faq-a">{f.a}</p>
@@ -4797,11 +5115,11 @@ const PremiumLanding: React.FC<PremiumLandingProps> = ({ setView, pricing, handl
             <MinicaMark size={104} state="given" />
           </div>
           <div className="pl-eyebrow" style={{ marginBottom: 20 }}>Calm outside · lightning within</div>
-          <h2 className="pl-serif" style={{ fontSize: 'clamp(30px,4.2vw,56px)', fontWeight: 500, lineHeight: 1.04, letterSpacing: '-0.028em', marginBottom: 26 }}>
+          <h2 className="pl-serif" style={{ marginBottom: 26 }}>
             <span style={{ color: 'var(--paper)' }}>The offer is one</span><br />
             <em className="pl-gold pl-foil" style={{ fontStyle: 'italic' }}>great answer away.</em>
           </h2>
-          <p style={{ fontSize: 17.5, color: 'var(--mut)', maxWidth: 480, margin: '0 auto 36px' }}>
+          <p className="pl-lede" style={{ maxWidth: 480, margin: '0 auto 36px' }}>
             Be the most prepared person on the call. Start free — no card, no risk.
           </p>
           <Magnetic>

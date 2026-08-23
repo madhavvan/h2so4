@@ -1023,7 +1023,7 @@ export async function streamClaude(
     { messages, systemInstruction, enableWebSearch,
       ...(isAutoSolve
         ? { instantOpener: '', coverPolicy: 'suppress', coverShape: 'auto-solve', coverContext: '', coverVocabulary: '', recentTurns: '' }
-        : buildOpenerPayload(query, contextFiles, history)) },
+        : buildOpenerPayload(query, contextFiles, history, { provider: 'claude' })) },
     onToken,
     signal,
   );

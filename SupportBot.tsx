@@ -93,7 +93,7 @@ export interface SupportBotProps {
 // Must stay in sync with AI_CHAT_TIERS in server/src/routes/support.js.
 // 'ultra' was absent from both, so the top paid tier saw the Free scripted
 // FAQ instead of the AI chat its plan promises.
-const AI_CHAT_TIERS = new Set(['basic', 'pro', 'max', 'ultra']);
+const AI_CHAT_TIERS = new Set(['basic', 'pro', 'max', 'ultra', 'enterprise']);
 
 type ScriptedTopic = { id: string; q: string; a: string };
 type ScriptedCategory = { id: string; label: string; topics: ScriptedTopic[] };

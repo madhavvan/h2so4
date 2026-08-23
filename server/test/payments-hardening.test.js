@@ -120,8 +120,13 @@ describe('credit seeding — Razorpay one-time purchases', () => {
   });
 });
 
-describe('credit seeding — subscription lifecycle (ultra-only rule)', () => {
-  it('subscription.charged for ULTRA lands the -1 unlimited sentinel', async () => {
+describe('credit seeding — subscription lifecycle', () => {
+  // 2026-08: Ultra became a METERED 9-hour monthly plan and Enterprise took
+  // over "unlimited". The rule this block pins split in two at the same time
+  // (see webhooks.js): a paid BILLING CYCLE re-seeds a recurring tier's
+  // allowance; a mere lifecycle re-affirmation (updated/resumed/reactivate)
+  // must not, or cancel→reactivate would refill Ultra's 9 hours for free.
+  it('subscription.charged for ULTRA seeds the 9-hour cycle allowance', async () => {
     const u = makeUser('free');
     await webhooks.handleRazorpayEvent({
       event: 'subscription.charged',
@@ -133,8 +138,11 @@ describe('credit seeding — subscription lifecycle (ultra-only rule)', () => {
     });
     const lic = db.getLicenseByUserId(u.id);
     expect(lic.tier).toBe('ultra'); // plan_id reverse-lookup beat the stale notes
-    expect(lic.credits_remaining_seconds).toBe(-1);
-    expect(db.resolveTimeBucket(lic)).toEqual({ source: 'unlimited', remaining: -1 });
+    expect(lic.credits_remaining_seconds).toBe(9 * 3600);
+    // Metered, NOT unlimited — even though the row carries expires_at -1
+    // (the subscription has no end date). Conflating those two -1s is what
+    // would give away the $1199 plan for $159.
+    expect(db.resolveTimeBucket(lic)).toEqual({ source: 'credits', remaining: 9 * 3600 });
   });
 
   it('subscription.charged for a LEGACY pro sub never clobbers the migration-era -1 balance', async () => {
@@ -153,11 +161,42 @@ describe('credit seeding — subscription lifecycle (ultra-only rule)', () => {
     expect(db.resolveTimeBucket(lic).source).toBe('unlimited');
   });
 
-  it('creditsForLifecycleGrant passes fields only for ultra', () => {
-    expect(webhooks.creditsForLifecycleGrant(webhooks.grantConfigForTier('ultra')))
+  it('creditsForLifecycleGrant passes fields only for enterprise (constant sentinel)', () => {
+    expect(webhooks.creditsForLifecycleGrant(webhooks.grantConfigForTier('enterprise')))
       .toEqual({ credits_remaining_seconds: -1, credits_expire_at: -1 });
+    // Ultra is METERED now: a re-affirmation event must not touch its balance.
+    // This is the cancel→reactivate refill hole, closed.
+    expect(webhooks.creditsForLifecycleGrant(webhooks.grantConfigForTier('ultra'))).toEqual({});
     expect(webhooks.creditsForLifecycleGrant(webhooks.grantConfigForTier('pro'))).toEqual({});
     expect(webhooks.creditsForLifecycleGrant(webhooks.grantConfigForTier('max'))).toEqual({});
+  });
+
+  it('creditsForBillingCycle re-seeds every recurring tier — and only those', () => {
+    expect(webhooks.creditsForBillingCycle(webhooks.grantConfigForTier('ultra')))
+      .toEqual({ credits_remaining_seconds: 9 * 3600, credits_expire_at: 0 });
+    expect(webhooks.creditsForBillingCycle(webhooks.grantConfigForTier('enterprise')))
+      .toEqual({ credits_remaining_seconds: -1, credits_expire_at: -1 });
+    expect(webhooks.creditsForBillingCycle(webhooks.grantConfigForTier('pro'))).toEqual({});
+    expect(webhooks.creditsForBillingCycle(webhooks.grantConfigForTier('max'))).toEqual({});
+    expect(webhooks.creditsForBillingCycle(webhooks.grantConfigForTier('basic'))).toEqual({});
+  });
+
+  it('grantConfigForTier: ultra is metered, enterprise is unlimited', () => {
+    const ultra = webhooks.grantConfigForTier('ultra');
+    expect(ultra).toEqual({
+      tier: 'ultra', sessions_limit: -1, expires_at: -1,
+      credits_remaining_seconds: 9 * 3600, credits_expire_at: 0,
+    });
+    const ent = webhooks.grantConfigForTier('enterprise');
+    expect(ent).toEqual({
+      tier: 'enterprise', sessions_limit: -1, expires_at: -1,
+      credits_remaining_seconds: -1, credits_expire_at: -1,
+    });
+    // The two copies of this config (payments.js owns customer purchases,
+    // webhooks.js owns grant writes) are duplicated deliberately and drift
+    // silently, so they are compared directly rather than trusted.
+    expect(payments.grantConfigForTier('ultra')).toEqual(ultra);
+    expect(payments.grantConfigForTier('enterprise')).toEqual(ent);
   });
 
   it('Stripe checkout.session.completed still seeds credits (pinned control)', async () => {
@@ -471,11 +510,21 @@ describe('refund accounting — partial-refund correctness', () => {
 // ─── /upgrade-tier in-place guard tripwire (2026-07 model) ─────────────
 
 describe('upgrade-tier in-place swap guard', () => {
-  it('rejects non-ultra in-place targets when a provider is on file (source tripwire)', () => {
+  it('rejects non-recurring in-place targets when a provider is on file (source tripwire)', () => {
     const src = fs.readFileSync(path.join(__dirname_, '..', 'src', 'routes', 'payments.js'), 'utf8');
     // The guard must sit between provider detection and the upgrade calls:
-    // pro/max are one-time passes — a subscription can only swap to ULTRA.
-    expect(src).toMatch(/\(isRazorpay \|\| isStripe\) && targetTier !== 'ultra'/);
+    // pro/max are one-time passes — a subscription can only swap to another
+    // SUBSCRIPTION tier. The literal `!== 'ultra'` became wrong on 2026-08-22
+    // when Enterprise arrived: it would have refused every Ultra→Enterprise
+    // upgrade with "Enterprise is a one-time interview pass now".
+    expect(src).toMatch(/\(isRazorpay \|\| isStripe\) && !isRecurringTier\(targetTier\)/);
+  });
+
+  it('isRecurringTier covers exactly the subscription plans', () => {
+    // The predicate behind the guard above, the checkout `mode`, the Razorpay
+    // plan requirement and the recurring price-shape validation. Anything
+    // added here has to be a real monthly plan on both providers.
+    expect(payments.RECURRING_TIERS).toEqual(['ultra', 'enterprise']);
   });
 });
 

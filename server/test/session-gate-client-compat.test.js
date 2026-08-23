@@ -260,43 +260,55 @@ describe('the protocol threshold is reachable', () => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  THE LLM COVER IS HELD BACK TOO — AND THE LOCAL OPENER IS NOT.
+//  THE LLM COVER IS ARMED — AND THE HOLD THAT KEPT IT DORMANT IS GONE.
 //
-//  runCover is AWAITED before the main provider call, so when the client
-//  sends no local opener the model round-trip lands in front of the answer:
-//  measured from planCoverFor, 13 of 20 provider × shape combinations fire,
-//  costing +2000ms (gemini deep) to +4500ms (groq, xai deep). Before 4.0.19
-//  all of them were 0ms. If the grounding guard then rejects the cover, that
-//  time buys nothing at all — the cover is dropped and the answer starts
-//  late. That is the "sometimes getting late responses" report.
+//  This block used to assert the OPPOSITE: that LLM_COVER_MIN_CLIENT stayed
+//  strictly AHEAD of package.json "until its latency is measured against
+//  live traffic". That assertion is why the feature never shipped. Every
+//  release bumped the version, the hold was moved ahead to keep this test
+//  green (4.0.20 -> 4.0.21 -> 4.0.22 -> 4.0.23), and a test written to
+//  protect a temporary hold quietly became the thing enforcing it forever.
 //
-//  What is NOT held is step 1 of runCover: the opener the client composed
-//  locally. It costs one string lookup, it is the part users feel, and it
-//  must keep working while the LLM fallback is dormant. Pinned here because
-//  "held back" and "broken" look identical from the outside.
+//  The measurement it was waiting for never needed live traffic — the real
+//  questions and real resumes are in the app's own SQLite. Run offline
+//  against 24 real deferred questions on the real providers: cover TTFT
+//  median 1,119ms, total median 1,858ms, guard rejection 29.2% -> 12.5%
+//  once the guard stopped discarding terms of art. See
+//  test/cover-live-corpus.test.js and the note on LLM_COVER_MIN_CLIENT.
+//
+//  What the cover is worth, graded on all 1,730 real questions: the local
+//  opener speaks on 143. The remaining 1,587 got nothing at all, and on
+//  groq and xai 91.7% of those sit past the cover floor with an average
+//  predicted gap of 24.8s and 10.8s.
+//
+//  So this now pins the armed state, in both directions:
+//    · a build cut from this tree must be ABLE to get an LLM cover
+//    · the local opener must still short-circuit it at 0ms
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-describe('the LLM cover is dormant, the local opener is not', () => {
+describe('the LLM cover is armed, and the local opener still wins', () => {
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 
-  it('the LLM cover threshold is ahead of the shipped release', () => {
+  it('a client built from this tree can actually reach the LLM cover', () => {
+    // The same reachability rule as the protocol threshold above, applied to
+    // the cover: a threshold no shippable build can satisfy is a feature that
+    // is off, and "not enforcing" looks exactly like "working".
     expect(
-      versionRank(_test.LLM_COVER_MIN_CLIENT),
-      `the LLM cover (${_test.LLM_COVER_MIN_CLIENT}) must stay ahead of the shipped ` +
-        `release (${pkg.version}) until its latency is measured against live traffic`
-    ).toBeGreaterThan(versionRank(pkg.version));
+      versionRank(pkg.version),
+      `LLM_COVER_MIN_CLIENT is ${_test.LLM_COVER_MIN_CLIENT} but this tree builds ` +
+        `${pkg.version}. A build cut from here could never get an LLM cover, so every ` +
+        'question without a local opener would be answered in silence.'
+    ).toBeGreaterThanOrEqual(versionRank(_test.LLM_COVER_MIN_CLIENT));
   });
 
-  it('the current release gets NO model round-trip when it sends no opener', async () => {
-    const sent = [];
-    const sse = { send: (t) => sent.push(t), signal: undefined };
-    const req = {
-      user: { id: 'u1', email: 'user@example.invalid' },
-      headers: { 'x-app-version': pkg.version },
-      body: {}, // no instantOpener -> this is the path that used to cost seconds
-    };
-    const out = await _test.runCover({ sse, req, question: 'Design a rate limiter.', provider: 'groq' });
-    expect(out, 'a dormant cover must return the empty string, not stall').toBe('');
-    expect(sent, 'nothing may be streamed for a cover that did not run').toEqual([]);
+  it('is reachable by the oldest client that can use one, and no older', () => {
+    // 4.0.19 added coverContext/coverVocabulary. Anything older sends neither,
+    // so the model would be asked to open with nothing to stand on and the
+    // client could not render the result — that round-trip is pure dead air.
+    const at = (v) => _test.clientAtLeastLlmCover({ headers: { 'x-app-version': v } });
+    expect(at('4.0.19'), '4.0.19 is the first client that can use a cover').toBe(true);
+    expect(at(pkg.version), 'the shipping build must be able to use a cover').toBe(true);
+    expect(at('4.0.18'), 'a pre-coverContext client must not pay for a cover').toBe(false);
+    expect(at(undefined), 'no version header means an old client').toBe(false);
   });
 
   it('the locally-composed opener STILL fires for the current release', async () => {

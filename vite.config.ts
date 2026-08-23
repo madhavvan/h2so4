@@ -1,6 +1,6 @@
 import path from 'path';
 import { readFileSync } from 'node:fs';
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import svgr from 'vite-plugin-svgr';
 
@@ -12,8 +12,7 @@ const pkg = JSON.parse(
   readFileSync(path.resolve(__dirname, './package.json'), 'utf-8')
 );
 
-export default defineConfig(({ mode }) => {
-    const env = loadEnv(mode, '.', '');
+export default defineConfig(() => {
     return {
       base: './',
       server: {
@@ -30,8 +29,22 @@ export default defineConfig(({ mode }) => {
         svgr({ include: '**/*.svg?react' }),
       ],
       define: {
-        'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+        // No API key is defined here, and loadEnv is deliberately gone.
+        //
+        // This block used to map 'process.env.API_KEY' and
+        // 'process.env.GEMINI_API_KEY' onto env.GEMINI_API_KEY. Nothing in
+        // the renderer ever read either token, so nothing was inlined — but
+        // the first line of renderer code that did would have baked the live
+        // Gemini key into dist/, and dist/ ships to every installed client
+        // AND to minicaai.com. Logged as latent in
+        // docs/private/AUDIT-crownjewels-2026-08-02.md; removed 2026-08-19.
+        //
+        // Gemini is server-side only: server/src/routes/ai.js reads
+        // process.env.GEMINI_API_KEY per request, so the key lives in the
+        // Railway service env and nowhere near a bundle. The config now
+        // reads no .env at all, which makes the mistake unavailable rather
+        // than merely unmade. VITE_* still works — Vite exposes those
+        // through import.meta.env independently of loadEnv.
         __APP_VERSION__: JSON.stringify(pkg.version),
       },
       resolve: {

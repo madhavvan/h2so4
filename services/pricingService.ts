@@ -3,7 +3,7 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 export interface PricingTier {
-  id: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+  id: 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
   name: string;
   price: number;
   currency: string;
@@ -13,6 +13,26 @@ export interface PricingTier {
   popular?: boolean;
   cta: string;
   subtitle?: string; // e.g. "3 interviews · 14-day expiry"
+  // ── Plan group (2026-08) ────────────────────────────────────────────
+  // The pricing surfaces are split into two tabs: INDIVIDUAL (Starter,
+  // Basic, Pro, Max, Ultra — one person, one job hunt) and TEAM
+  // (Enterprise only). The group lives on the tier rather than in a
+  // hardcoded list at each render site because there are four of those
+  // sites (landing, in-app pricing grid, plan sheet, upgrade rows) and a
+  // fifth would otherwise be born every time a tier is added. Absent =
+  // 'individual', so nothing that predates the tabs has to be touched.
+  group?: 'individual' | 'team';
+}
+
+// Tabs, in display order. Exported so every pricing surface renders the
+// SAME two tabs with the same labels instead of re-inventing them.
+export const PLAN_GROUPS: Array<{ id: 'individual' | 'team'; label: string; blurb: string }> = [
+  { id: 'individual', label: 'Individual', blurb: 'Pay for the interview, not a subscription.' },
+  { id: 'team',       label: 'Team',       blurb: 'One plan, unlimited interviews, for teams that hire and prepare at scale.' },
+];
+
+export function groupOf(t: PricingTier): 'individual' | 'team' {
+  return t.group || 'individual';
 }
 
 export interface RegionPricing {
@@ -124,13 +144,41 @@ const BASE_FEATURES_MAX = [
   'Everything in Pro',
 ];
 
+// ── Ultra (2026-08) ─────────────────────────────────────────────────
+// Ultra was "unlimited" from 2026-07 until 2026-08-22, when it became a
+// METERED monthly plan: 9 hours of interview time per billing cycle,
+// re-seeded on every renewal. Unlimited moved up to Enterprise. The
+// number here is display copy for ONE truth that lives in three places
+// and must not drift:
+//   client  services/licenseService.ts  ULTRA_MONTHLY_SECONDS
+//   server  routes/payments.js          grantConfigForTier('ultra')
+//   server  routes/webhooks.js          grantConfigForTier('ultra')
+// Existing Ultra rows carrying the -1 credit sentinel stay unlimited
+// (grandfathered) until their next renewal re-seeds them — see the
+// isUnlimitedLicense note in licenseService.ts.
 const BASE_FEATURES_ULTRA = [
-  'Unlimited interviews, all five models',
+  '9 hours of interview time every month',
   'Auto-Type into any editor (HackerRank, CoderPad, LeetCode)',
+  'All five AI models — incl. Claude Sonnet 5',
   'Human-like typing rhythm & indent handling',
   'Train Model + full reasoning control',
-  'No copy-paste detection',
   'Priority support',
+];
+
+// ── Enterprise (2026-08) ────────────────────────────────────────────
+// The Team tab's only plan. Unlimited interview time that never expires,
+// every top model, and Auto-Type for coding rounds. Deliberately says
+// nothing about seats, SSO, or centralised billing — none of those are
+// built, and the landing page must not promise what checkout can't
+// deliver (the same rule the Razorpay/UPI footnote is under).
+const BASE_FEATURES_ENTERPRISE = [
+  'Unlimited interview time — no monthly cap',
+  'Every top model: Claude Sonnet 5 · GPT-5.6 · Gemini · Grok · Groq',
+  'Auto-Type for coding rounds (HackerRank, CoderPad, LeetCode)',
+  'Train Model + full reasoning-effort control',
+  'Pop-out stealth mode & Auto-Solve on every screen',
+  'Up to 25 devices on one account',
+  'Priority support, answered first',
 ];
 
 function roundPrice(price: number, code: string): number {
@@ -150,15 +198,19 @@ function roundPrice(price: number, code: string): number {
 // interview purchases; Ultra is the only monthly subscription. India prices are
 // the same value converted to INR (see the IN block below), not a discount.
 const USD_PRICES = {
-  basic: 30,     // one-time · one 30-min interview
-  pro: 50,       // one-time · one 1-hour interview
-  max: 89,       // one-time · three 1-hour interviews
-  ultra: 159,    // per month · unlimited + Auto-Type
+  basic: 30,        // one-time · one 30-min interview
+  pro: 50,          // one-time · one 1-hour interview
+  max: 89,          // one-time · three 1-hour interviews
+  ultra: 159,       // per month · 9 hours of interview time + Auto-Type
+  enterprise: 1199, // per month · unlimited, never expires (Team tab)
 } as const;
 
-// ── Mid-interview top-up — client mirror (2026-07) ──
+// ── Mid-interview top-up — client mirror (2026-07, extended 2026-08) ──
 // A flat +30-minute top-up ($25 / ₹2099) for every metered tier
-// (Basic/Pro/Max); Ultra is exempt (unlimited). Tier is preserved on the
+// (Basic/Pro/Max — and Ultra since 2026-08, when its 9-hour monthly
+// allowance replaced "unlimited"; a metered plan that can run dry needs a
+// way to keep going mid-interview). Enterprise is unlimited and exempt:
+// it never resolves a top-up price because it never runs out. Tier is preserved on the
 // grant. Unlimited repeats on the interview day. MUST stay in sync with
 // RENEWAL_USD_CENTS / RENEWAL_INR_PAISE in server/src/routes/payments.js
 // (the amount charged) and the flat +30-min grantTimeExtension in
@@ -171,10 +223,11 @@ export interface RenewalPricing {
   minutes: number;   // seconds / 60, for display copy
   label: string;     // "+30 min" / "+1 hour" — button-sized copy
 }
-const RENEWAL_BY_TIER: Record<'basic' | 'pro' | 'max', { seconds: number; usd: number; inr: number; label: string }> = {
+const RENEWAL_BY_TIER: Record<'basic' | 'pro' | 'max' | 'ultra', { seconds: number; usd: number; inr: number; label: string }> = {
   basic: { seconds: 30 * 60, usd: 25, inr: 2099, label: '+30 min' },
   pro:   { seconds: 30 * 60, usd: 25, inr: 2099, label: '+30 min' },
   max:   { seconds: 30 * 60, usd: 25, inr: 2099, label: '+30 min' },
+  ultra: { seconds: 30 * 60, usd: 25, inr: 2099, label: '+30 min' },
 };
 
 // ── Graduated top-up packs — 2026-07 ────────────────────────────────
@@ -274,7 +327,14 @@ class PricingService {
             id: 'ultra', name: 'Ultra', price: 12999,
             currency: 'INR', currencySymbol: '₹', period: 'month',
             features: BASE_FEATURES_ULTRA, cta: 'Go Ultra',
-            subtitle: 'Unlimited + Auto-Type',
+            subtitle: '9 hours a month · Auto-Type',
+          },
+          {
+            id: 'enterprise', name: 'Enterprise', price: 99999,
+            currency: 'INR', currencySymbol: '₹', period: 'month',
+            features: BASE_FEATURES_ENTERPRISE, cta: 'Get Enterprise',
+            subtitle: 'Unlimited · never expires',
+            group: 'team',
           },
         ],
       };
@@ -327,7 +387,14 @@ class PricingService {
             id: 'ultra', name: 'Ultra', price: USD_PRICES.ultra,
             currency: 'USD', currencySymbol: '$', period: 'month',
             features: BASE_FEATURES_ULTRA, cta: 'Go Ultra',
-            subtitle: 'Unlimited + Auto-Type',
+            subtitle: '9 hours a month · Auto-Type',
+          },
+          {
+            id: 'enterprise', name: 'Enterprise', price: USD_PRICES.enterprise,
+            currency: 'USD', currencySymbol: '$', period: 'month',
+            features: BASE_FEATURES_ENTERPRISE, cta: 'Get Enterprise',
+            subtitle: 'Unlimited · never expires',
+            group: 'team',
           },
         ],
       };
@@ -385,7 +452,14 @@ class PricingService {
           id: 'ultra', name: 'Ultra', price: USD_PRICES.ultra,
           currency: 'USD', currencySymbol: '$', period: 'month',
           features: BASE_FEATURES_ULTRA, cta: 'Go Ultra',
-          subtitle: 'Unlimited + Auto-Type',
+          subtitle: '9 hours a month · Auto-Type',
+        },
+        {
+          id: 'enterprise', name: 'Enterprise', price: USD_PRICES.enterprise,
+          currency: 'USD', currencySymbol: '$', period: 'month',
+          features: BASE_FEATURES_ENTERPRISE, cta: 'Get Enterprise',
+          subtitle: 'Unlimited · never expires',
+          group: 'team',
         },
       ],
     };
@@ -405,14 +479,15 @@ class PricingService {
   // +30 min · $25/₹2099 (RENEWAL_BY_TIER above — larger +1h/+3h packs are
   // the graduated EXTENSION_PACKS the user picks explicitly). Unknown
   // tiers (free/expired reactivating via a top-up) resolve to the Basic
-  // unit — mirrors the server's grantTimeExtension legacy behavior. Ultra
-  // never calls this (it is exempt from all top-up UI).
+  // unit — mirrors the server's grantTimeExtension legacy behavior.
+  // Enterprise never calls this (unlimited — exempt from all top-up UI);
+  // Ultra does, since 2026-08 made its 9-hour monthly allowance metered.
   //
   // India goes through Razorpay in INR. Everywhere else the server
   // creates a Stripe charge with `currency:'usd'` at the tier's usd_cents
   // (see payments.js RENEWAL_BY_TIER), so the UI must show USD to match.
   getRenewalPrice(countryCode: string, tier: string): RenewalPricing {
-    const cfg = RENEWAL_BY_TIER[tier as 'basic' | 'pro' | 'max'] || RENEWAL_BY_TIER.basic;
+    const cfg = RENEWAL_BY_TIER[tier as 'basic' | 'pro' | 'max' | 'ultra'] || RENEWAL_BY_TIER.basic;
     const cc = (countryCode || 'US').toUpperCase();
     // INR only while INR checkout is live (see INR_CHECKOUT_ENABLED) —
     // otherwise the top-up pill must show the USD amount Stripe charges.

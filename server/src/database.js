@@ -525,6 +525,39 @@ function getDB() {
     db.exec("UPDATE licenses SET credits_granted_seconds = credits_remaining_seconds WHERE credits_granted_seconds = 0 AND tier IN ('basic','pro','max') AND credits_remaining_seconds > 0");
   }
 
+  // ── Admin-grant marker (2026-08) ────────────────────────────────────
+  // Owner's rule: a plan an ADMIN activates never expires until an admin
+  // changes it. The sentinels alone cannot express that. An admin comp and a
+  // migration-era legacy Pro/Max subscriber look identical on the row —
+  // both carry expires_at = -1 and credits_remaining_seconds = -1 — and
+  // downgrading the legacy subscriber when their subscription really does
+  // end is CORRECT, while downgrading the comp is the bug. Something has to
+  // tell them apart, so it is written down explicitly rather than inferred.
+  //
+  // 0 = not an admin grant. > 0 = the ms timestamp of the grant. Only admin
+  // actions ever set or clear it (see routes/admin.js and recordCompPayment);
+  // provider webhooks and the cycle-end sweeper must never touch a row that
+  // carries it — enforced in updateLicenseOnPayment + transitionLicenseToFree
+  // below, which is where every downgrade in the system funnels through.
+  //
+  // Backfill is deliberately conservative: only rows that BOTH have a
+  // recorded admin-comp payment AND still carry the comp sentinels. A user
+  // who was comped long ago and has since churned or bought normally has
+  // moved off those sentinels and is left alone.
+  if (!licenseCols.find(c => c.name === 'admin_granted_at')) {
+    db.exec('ALTER TABLE licenses ADD COLUMN admin_granted_at INTEGER DEFAULT 0');
+    db.exec(`
+      UPDATE licenses SET admin_granted_at = activated_at
+      WHERE tier != 'free'
+        AND expires_at = -1
+        AND credits_remaining_seconds = -1
+        AND user_id IN (
+          SELECT user_id FROM payments
+          WHERE provider = 'admin-comp' AND status = 'completed'
+        )
+    `);
+  }
+
   // Defense-in-depth against the /verify-razorpay ↔ payment.captured race:
   // both paths grant the same payment if they both see "no row yet" between
   // their dedup check and their transaction. The in-transaction re-check
@@ -782,8 +815,24 @@ function verifyUserPassword(email, password) {
   return user;
 }
 
-function updateUserTier(userId, tier) {
+// updateUserTier(userId, tier, { adminOverride })
+//
+// NOTE this writes licenses.tier too, which makes it a SECOND door into a
+// downgrade — it does not go through updateLicenseOnPayment, so the guard
+// there does not cover it. Every terminal webhook calls this immediately
+// before that function, and it was this call that actually wiped the tier
+// off an admin-granted license when a stale subscription reported canceled.
+// Same rule, enforced here as well: only a deliberate admin action can move
+// an admin-granted plan to free.
+function updateUserTier(userId, tier, opts = {}) {
   const d = getDB();
+  if (tier === 'free' && !opts.adminOverride) {
+    const lic = d.prepare('SELECT tier, admin_granted_at FROM licenses WHERE user_id = ?').get(userId);
+    if (lic && (lic.admin_granted_at || 0) > 0) {
+      console.warn(`[license] REFUSED tier downgrade of an admin-granted plan — user=${userId} tier=${lic.tier} → free. Admin grants never expire.`);
+      return getUserById(userId);
+    }
+  }
   d.prepare('UPDATE users SET tier = ?, updated_at = ? WHERE id = ?').run(tier, Date.now(), userId);
   // Also update their license
   d.prepare('UPDATE licenses SET tier = ? WHERE user_id = ?').run(tier, userId);
@@ -1057,7 +1106,52 @@ function hashToInt(s) {
   return h;
 }
 
-function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_limit, credits_remaining_seconds, credits_expire_at }) {
+// ── Would this write take access AWAY? ───────────────────────────────────
+// A downgrade is either a drop to the free tier or a move into a status that
+// does not carry access (see services/subscriptionStates ACCESS_STATUSES:
+// active / canceling / past_due are the ones that do). Everything else —
+// expired, revoked, refunded, disputed, paused — is a revocation.
+function isAccessRemovingWrite(tier, status) {
+  const { hasAccess } = require('./services/subscriptionStates');
+  if (tier === 'free') return true;
+  if (status && !hasAccess(status)) return true;
+  return false;
+}
+
+// updateLicenseOnPayment(userId, { ..., admin_granted_at, admin_override })
+//
+// admin_granted_at — set to Date.now() by an admin grant, 0 to clear it.
+//                    Omit to leave the existing value alone.
+// admin_override   — true only from a deliberate ADMIN action. Required to
+//                    downgrade a license that carries an admin grant.
+function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_limit, credits_remaining_seconds, credits_expire_at, admin_granted_at, admin_override }) {
+  // ── ADMIN GRANTS NEVER EXPIRE (2026-08 owner rule) ──────────────────
+  // Proven hole this closes: a user who once had a real Stripe subscription
+  // and was LATER comped by an admin got wiped back to free/expired the
+  // moment that old subscription reported canceled — customer.subscription
+  // .updated(canceled) and .deleted both write tier='free', status='expired'
+  // unconditionally. Same for a Razorpay halt, a refund on an old charge, or
+  // a dispute. The comp had nothing to do with any of those events, and the
+  // person just lost the access an admin gave them.
+  //
+  // The check lives HERE rather than in each webhook because every one of
+  // those paths funnels through this function — one guard that cannot be
+  // forgotten the next time a lifecycle handler is added. Provider events
+  // that PRESERVE access (a renewal tick, a resume, a reactivate) still pass
+  // straight through; only access-removing writes are refused.
+  if (isAccessRemovingWrite(tier, status) && !admin_override) {
+    const existing = getDB()
+      .prepare('SELECT tier, admin_granted_at FROM licenses WHERE user_id = ?')
+      .get(userId);
+    if (existing && (existing.admin_granted_at || 0) > 0) {
+      console.warn(
+        `[license] REFUSED downgrade of an admin-granted plan — user=${userId} ` +
+        `tier=${existing.tier} → ${tier}/${status}. Admin grants never expire; ` +
+        `only an admin changing the plan removes one.`
+      );
+      return;
+    }
+  }
   // Status validation — refuse to persist an unknown status. Without this
   // a typo at a call site (e.g. 'cancling' or 'past-due') would silently
   // succeed and only manifest later as the renderer's license validity
@@ -1068,6 +1162,10 @@ function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_lim
 
   const sets = ['tier = ?', 'status = ?', 'expires_at = ?', 'sessions_limit = ?'];
   const args = [tier, status, expires_at, sessions_limit];
+  if (admin_granted_at !== undefined) {
+    sets.push('admin_granted_at = ?');
+    args.push(admin_granted_at);
+  }
   if (credits_remaining_seconds !== undefined) {
     sets.push('credits_remaining_seconds = ?');
     args.push(credits_remaining_seconds);
@@ -1105,9 +1203,17 @@ function updateLicenseOnPayment(userId, { tier, status, expires_at, sessions_lim
 // can fire the goodbye email exactly once.
 function transitionLicenseToFree(userId, opts = {}) {
   const d = getDB();
-  const cur = d.prepare('SELECT tier, status FROM licenses WHERE user_id = ?').get(userId);
+  const cur = d.prepare('SELECT tier, status, admin_granted_at FROM licenses WHERE user_id = ?').get(userId);
   if (!cur) return false;
   if (cur.tier === 'free' && cur.status !== 'canceling') return false;
+  // Admin grants never expire — same rule as updateLicenseOnPayment, and this
+  // is the OTHER door into a downgrade: the 5-minute cycle-end sweeper and
+  // the lapsed-plan repair inside /license/validate both come through here.
+  // opts.adminOverride is how an admin deliberately moves someone to free.
+  if ((cur.admin_granted_at || 0) > 0 && !opts.adminOverride) {
+    console.warn(`[license] REFUSED cycle-end transition of an admin-granted plan — user=${userId} tier=${cur.tier} (reason=${opts.reason || 'unknown'})`);
+    return false;
+  }
 
   const FREE_SESSIONS_LIMIT = 5;
   const FREE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
@@ -1265,6 +1371,7 @@ function registerDevice(userId, deviceId, deviceName, platform) {
     pro: getConfig('max_devices_pro', 3),
     max: getConfig('max_devices_max', 5),
     ultra: getConfig('max_devices_ultra', 10),
+    enterprise: getConfig('max_devices_enterprise', 25),
   };
   const maxDevices = tierDeviceLimits[user.tier] ?? tierDeviceLimits.free;
   const activeDevices = d.prepare('SELECT * FROM devices WHERE user_id = ? AND is_active = 1 ORDER BY last_seen_at ASC').all(userId);
@@ -2041,13 +2148,45 @@ function grantBasicRenewal(userId) {
 function grantTimeExtension(userId, seconds) {
   const license = getLicenseByUserId(userId);
   if (!license) return null;
-  if (license.sessions_limit === -1 || license.expires_at === -1
-      || (license.credits_remaining_seconds ?? 0) === -1) {
-    return license; // unlimited — nothing to top up
+  // Unlimited — nothing to top up. Uses the shared predicate rather than the
+  // old sentinel soup (`sessions_limit === -1 || expires_at === -1 || ...`),
+  // which was correct only while Ultra was unlimited: an Ultra row carries
+  // sessions_limit -1 AND expires_at -1, so a metered Ultra buying a top-up
+  // would have been charged and handed back an untouched license.
+  if (isUnlimitedLicenseRow(license)) {
+    return license;
   }
-  const tier = ['basic', 'pro', 'max'].includes(license.tier) ? license.tier : 'basic';
+  const tier = METERED_TIERS.includes(license.tier) ? license.tier : 'basic';
   const EXT_S = (typeof seconds === 'number' && seconds > 0) ? Math.floor(seconds) : 30 * 60; // graduated pack seconds, default +30 min
   const EXT_MS = EXT_S * 1000;
+
+  // ── Subscription-backed tiers extend the CLOCK ONLY (2026-08) ─────────
+  // A pass is a dated window, so topping one up moves its end date. A
+  // subscription is not: Ultra's expires_at is the -1 "no end date"
+  // sentinel and its sessions_limit is -1 (unlimited sessions). Running the
+  // pass arithmetic over those columns is destructive in three separate
+  // ways, all of which lock out a paying subscriber:
+  //   expires_at  -1 → now+30min  → the tier gate reads the subscription as
+  //                                 lapsed half an hour later;
+  //   sessions_limit -1 → 0       → canStartSession compares used < 0, false
+  //                                 forever;
+  //   credits_expire_at 0 → the stale-window test below drops the balance,
+  //                                 so a 9-hour Ultra who buys +30 min ends
+  //                                 up with 30 minutes total.
+  // So for these tiers we add seconds and touch nothing else.
+  if (RECURRING_TIERS.includes(license.tier)) {
+    const existing = Math.max(0, license.credits_remaining_seconds || 0);
+    const existingGranted = Math.max(0, license.credits_granted_seconds || 0);
+    getDB().prepare(`
+      UPDATE licenses SET
+        status = 'active',
+        credits_remaining_seconds = ?,
+        credits_granted_seconds = ?
+      WHERE user_id = ?
+    `).run(existing + EXT_S, existingGranted + EXT_S, userId);
+    return getLicenseByUserId(userId);
+  }
+
   const base = Math.max(Date.now(), license.expires_at || 0);
   const newExpiresAt = base + EXT_MS;
   // Stale credits past their window don't carry (the user couldn't have
@@ -2121,15 +2260,45 @@ const USAGE_HEARTBEAT_CAP_S = 90; // max chargeable seconds per settle
 //   ultra / -1 sentinels        → unlimited
 //   basic|pro|max               → credits (0 once past credits_expire_at)
 //   free                        → trial
+// ── Which tiers draw live time from the credit-seconds bucket ──────────
+// Ultra joined in 2026-08, when its 9-hour monthly allowance replaced
+// "unlimited". Enterprise is never here — it IS unlimited.
+const METERED_TIERS = ['basic', 'pro', 'max', 'ultra'];
+// The recurring (subscription) tiers: no calendar expiry of their own, and
+// their allowance is re-seeded by the paid-invoice webhook rather than by a
+// dated window.
+const RECURRING_TIERS = ['ultra', 'enterprise'];
+
+// ── THE unlimited predicate (2026-08) ──────────────────────────────────
+// Mirrors isUnlimitedLicense() in the client's services/licenseService.ts;
+// the two must agree or the client shows a meter the server doesn't enforce
+// (or worse, the reverse). Three ways to be unlimited:
+//   1. tier === 'enterprise'  — the unlimited plan, by definition.
+//   2. credits_remaining_seconds === -1 — the sentinel every admin grant and
+//      comp writes, and the balance legacy Ultra + migration-era Pro/Max
+//      subscribers still carry. This is what GRANDFATHERS a pre-2026-08
+//      Ultra subscriber: their row says -1, so they keep unlimited access
+//      until a renewal re-seeds them at 9 hours.
+//   3. The legacy window sentinels — kept ONLY for the pass tiers, which is
+//      where they have always been written. Ultra is deliberately excluded:
+//      an Ultra subscription legitimately carries expires_at = -1 ("this
+//      subscription has no end date"), and reading that as unlimited time
+//      would hand out the $1199 plan for $159.
+function isUnlimitedLicenseRow(license) {
+  if (!license) return false;
+  if (license.tier === 'enterprise') return true;
+  if ((license.credits_remaining_seconds ?? 0) === -1) return true;
+  if (license.tier === 'ultra') return false; // metered since 2026-08
+  if (['basic', 'pro', 'max'].includes(license.tier)) {
+    return license.expires_at === -1 || license.credits_expire_at === -1;
+  }
+  return false;
+}
+
 function resolveTimeBucket(license) {
   if (!license) return { source: 'none', remaining: 0 };
-  if (license.tier === 'ultra') return { source: 'unlimited', remaining: -1 };
-  if (['basic', 'pro', 'max'].includes(license.tier)) {
-    if ((license.credits_remaining_seconds ?? 0) === -1
-        || license.expires_at === -1
-        || license.credits_expire_at === -1) {
-      return { source: 'unlimited', remaining: -1 };
-    }
+  if (isUnlimitedLicenseRow(license)) return { source: 'unlimited', remaining: -1 };
+  if (METERED_TIERS.includes(license.tier)) {
     const expireAt = license.credits_expire_at || 0;
     if (expireAt > 0 && Date.now() > expireAt) return { source: 'credits', remaining: 0 };
     return { source: 'credits', remaining: Math.max(0, license.credits_remaining_seconds || 0) };
@@ -2151,11 +2320,7 @@ function resolveTimeBucket(license) {
 function readBucketRemaining(license, source) {
   if (!license) return 0;
   if (source === 'credits') {
-    if ((license.credits_remaining_seconds ?? 0) === -1
-        || license.expires_at === -1
-        || license.credits_expire_at === -1) {
-      return -1;
-    }
+    if (isUnlimitedLicenseRow(license)) return -1;
     const expireAt = license.credits_expire_at || 0;
     if (expireAt > 0 && Date.now() > expireAt) return 0;
     return Math.max(0, license.credits_remaining_seconds || 0);
@@ -2704,11 +2869,15 @@ function recordCompPayment(userId, tier, note) {
   const user = d.prepare('SELECT * FROM users WHERE id = ?').get(userId);
   if (!user) return null;
   // Comp grants are unlimited-until-revoked across every paid tier (2026-07).
+  // The -1 credit sentinel written below is the SAME thing Enterprise carries,
+  // so a comp of ANY tier gets Enterprise-equivalent time (2026-08 policy) and
+  // keeps it until an admin changes the plan — see isUnlimitedLicenseRow.
   const grantConfig = {
-    basic: { sessions_limit: -1, expires_at: -1 },
-    pro:   { sessions_limit: -1, expires_at: -1 },
-    max:   { sessions_limit: -1, expires_at: -1 },
-    ultra: { sessions_limit: -1, expires_at: -1 },
+    basic:      { sessions_limit: -1, expires_at: -1 },
+    pro:        { sessions_limit: -1, expires_at: -1 },
+    max:        { sessions_limit: -1, expires_at: -1 },
+    ultra:      { sessions_limit: -1, expires_at: -1 },
+    enterprise: { sessions_limit: -1, expires_at: -1 },
   }[tier];
   if (!grantConfig) return null;
   // Capture the inserted payment row id so the admin audit entry can
@@ -2718,8 +2887,10 @@ function recordCompPayment(userId, tier, note) {
   let paymentId = null;
   const tx = d.transaction(() => {
     d.prepare('UPDATE users SET tier = ?, updated_at = ? WHERE id = ?').run(tier, Date.now(), userId);
-    d.prepare('UPDATE licenses SET tier = ?, status = ?, expires_at = ?, sessions_limit = ?, credits_remaining_seconds = -1, credits_expire_at = -1 WHERE user_id = ?')
-      .run(tier, 'active', grantConfig.expires_at, grantConfig.sessions_limit, userId);
+    // admin_granted_at stamps this as an ADMIN grant, which makes it immune
+    // to every automatic downgrade path (see updateLicenseOnPayment).
+    d.prepare('UPDATE licenses SET tier = ?, status = ?, expires_at = ?, sessions_limit = ?, credits_remaining_seconds = -1, credits_expire_at = -1, admin_granted_at = ? WHERE user_id = ?')
+      .run(tier, 'active', grantConfig.expires_at, grantConfig.sessions_limit, Date.now(), userId);
     const info = d.prepare(`
       INSERT INTO payments (user_id, email, provider, provider_payment_id, provider_subscription_id, amount, currency, status, tier_granted, metadata, created_at)
       VALUES (?, ?, 'admin-comp', ?, NULL, 0, 'USD', 'completed', ?, ?, ?)

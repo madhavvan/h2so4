@@ -59,7 +59,7 @@ Two features read your screen, and both are worth stating plainly because they a
 | Feature | Plans | What is captured | Where it goes |
 |---|---|---|---|
 | **Auto-Solve** | every paid plan | A single still frame of your **whole display**, taken when you press the button — not a recording, and never without that press. Whatever else is on that display is in the frame | Sent with your prompt to the AI model for that one call. Not stored on our server |
-| **Auto-Type** | Ultra | A single still frame of the display your cursor is on, taken only when the app cannot read the code editor through the accessibility APIs it tries first | Uploaded to our server, which passes it straight to the AI model so it can read the editor, and does not keep it. A copy **is written to your own machine** under the app's data folder (`autotype-screenshots`), where the 50 most recent are kept so you can see what the assistant saw. Deleting the app's data folder removes them |
+| **Auto-Type** | Ultra & Enterprise | A single still frame of the display your cursor is on, taken only when the app cannot read the code editor through the accessibility APIs it tries first | Uploaded to our server, which passes it straight to the AI model so it can read the editor, and does not keep it. A copy **is written to your own machine** under the app's data folder (`autotype-screenshots`), where the 50 most recent are kept so you can see what the assistant saw. Deleting the app's data folder removes them |
 
 Neither feature records continuously, and neither runs on the free trial.
 

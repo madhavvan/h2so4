@@ -55,7 +55,7 @@ For a full data inventory and the legal basis under GDPR / India DPDP / CCPA, re
 
 - Sign-in supports email + password (bcrypt-hashed server-side) or Google OAuth.
 - After sign-in we issue a JWT that's stored in your app's local storage and used to authenticate every API call.
-- A license carries a per-plan device allowance (2 devices on Free/Basic, 3 on Pro, 5 on Max, 10 on Ultra). Each device is fingerprint-registered on sign-in; going past the allowance automatically deactivates the oldest device, so one person can move freely between their own machines but a seat can't be farmed out.
+- A license carries a per-plan device allowance (2 devices on Free/Basic, 3 on Pro, 5 on Max, 10 on Ultra, 25 on Enterprise). Each device is fingerprint-registered on sign-in; going past the allowance automatically deactivates the oldest device, so one person can move freely between their own machines but a seat can't be farmed out.
 - If you suspect your account is compromised, write to **support@minicaai.com** and we'll force-revoke active sessions.
 
 ## 6. How we handle audio

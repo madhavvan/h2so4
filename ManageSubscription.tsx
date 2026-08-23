@@ -26,12 +26,13 @@ import {
 } from 'lucide-react';
 import { WizardHat } from './WizardHat';
 import { UltraMark } from './UltraMark';
+import { EnterpriseMark } from './EnterpriseMark';
 // Precious-material marks for the pricing rows: Basic→bronze, Pro→platinum,
 // Max→gold — a value ladder that tops out at Ultra's amethyst gem. See
 // TierMarks.tsx. (The identity chips above keep their semantic Zap/Crown/
 // WizardHat marks on currentColor.)
 import { BasicMark, ProMark, MaxMark } from './TierMarks';
-import { licenseService, UserProfile, LicenseData } from './services/licenseService';
+import { licenseService, isUnlimitedLicense, UserProfile, LicenseData } from './services/licenseService';
 import { pricingService, getExtensionPacks } from './services/pricingService';
 import { backfillAllConversations, BackfillProgress } from './services/aiProxyService';
 import { RefundPolicy } from './RefundPolicy';
@@ -111,7 +112,7 @@ async function openRazorpayTopUpSheet(
 
 interface SubscriptionStatus {
   status: 'active' | 'canceling' | 'past_due' | 'trial' | 'expired' | 'revoked' | 'paused' | 'refunded' | 'disputed' | 'none';
-  tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra';
+  tier: 'free' | 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
   provider: 'stripe' | 'razorpay' | null;
   expires_at: number;
   sessions_used: number;
@@ -137,7 +138,7 @@ interface ManageSubscriptionProps {
   userLicense: LicenseData | null;
   // Triggers the existing upgrade flow (re-uses SubscriptionGate's checkout
   // path so we don't duplicate Razorpay/Stripe SDK plumbing).
-  onUpgradeRequested: (targetTier: 'basic' | 'pro' | 'max' | 'ultra') => void;
+  onUpgradeRequested: (targetTier: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise') => void;
   // Optional callback fired after the user successfully edits their
   // profile here (display name) so MainApp can keep its userProfile state
   // in sync without a separate fetch. licenseService already mirrors the
@@ -161,7 +162,7 @@ interface ManageSubscriptionProps {
   // browser to open. Without this, the button click felt unresponsive
   // — modal closed instantly with no feedback. Now button shows spinner
   // until the parent decides to close us, smoothly.
-  upgradePending?: 'basic' | 'pro' | 'max' | 'ultra' | null;
+  upgradePending?: 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise' | null;
   // Same pattern but for the plan-specific time top-up — separate flag so
   // the renewal spinner doesn't accidentally light up the upgrade rows.
   renewPending?: boolean;
@@ -210,12 +211,24 @@ const TIER_INFO: Record<string, {
     blurb: 'Three 1-hour interviews · all five models incl. Claude Sonnet 5 · Train Model. Extendable +30 min.',
   },
   ultra: {
-    // Amethyst flagship — the only unlimited, monthly-subscription tier.
+    // Amethyst flagship — a monthly subscription with a 9-hour allowance
+    // per billing cycle (metered since 2026-08-22; it was unlimited before
+    // that, and unlimited moved up to Enterprise).
     label: 'Ultra',
     color: 'text-violet-300',
     gradient: 'from-violet-600/45 to-fuchsia-700/40',
     icon: UltraMark,
-    blurb: 'Unlimited interviews · Auto-Type · all five models. The monthly flagship.',
+    blurb: '9 hours of interview time a month · Auto-Type · all five models. The monthly flagship.',
+  },
+  enterprise: {
+    // The Team plan and the top of the ladder. Deep gold rather than a sixth
+    // hue — Ultra owns amethyst, and a second accent colour up here would
+    // read as Ultra's sibling rather than its successor.
+    label: 'Enterprise',
+    color: 'text-yellow-200',
+    gradient: 'from-yellow-600/40 via-amber-600/40 to-yellow-800/40',
+    icon: EnterpriseMark,
+    blurb: 'Unlimited interview time that never expires · Auto-Type · all five models. Billed monthly.',
   },
 };
 
@@ -275,23 +288,29 @@ function formatTrialTime(seconds: number | undefined): string {
 // Plan comparison rows. Keep this short — long tables intimidate users
 // scanning for the right plan at decision time.
 // 2026-07 model. Basic/Pro/Max are one-time interviews (time-gated); Ultra is
-// the unlimited monthly subscription. Auto-Type is Ultra-only; Claude unlocks
-// at Pro.
+// the monthly subscriptions. Auto-Type is Ultra+; Claude unlocks at Pro.
+//
+// 2026-08: Ultra's 'Unlimited' rows became '9 h / month' and a sixth column
+// arrived. Enterprise is deliberately feature-IDENTICAL to Ultra — what
+// $1199/mo buys is the removal of the meter, not extra switches — so the only
+// rows where the two differ are the two time rows. A row that differed
+// elsewhere would be an Enterprise-only feature the pricing copy never
+// promised.
 const FEATURE_ROWS: Array<{ label: string; values: Record<string, string | boolean> }> = [
-  { label: 'Interview time',      values: { free: '10-min trial', basic: 'One 30-min',  pro: 'One 1-hour', max: 'Three 1-hour', ultra: 'Unlimited' } },
+  { label: 'Interview time',      values: { free: '10-min trial', basic: 'One 30-min',  pro: 'One 1-hour', max: 'Three 1-hour', ultra: '9 h / month', enterprise: 'Unlimited' } },
   // Flat +30-min top-up (2026-07). Currency-neutral here — the exact price
   // ($25 / ₹2099) renders on the charge surfaces via
   // pricingService.getRenewalPrice, which is region-aware.
-  { label: 'Extend on interview day', values: { free: false,      basic: '+30 min',     pro: '+30 min',    max: '+30 min',      ultra: 'Unlimited' } },
-  { label: 'AI models',           values: { free: '4 during trial', basic: '4 (no Claude)', pro: 'All 5',    max: 'All 5',        ultra: 'All 5' } },
-  { label: 'Pop-out window',      values: { free: false,          basic: true,          pro: true,         max: true,           ultra: true } },
-  { label: 'Auto-Solve (screen)', values: { free: false,          basic: true,          pro: true,         max: true,           ultra: true } },
-  { label: 'Train Model',         values: { free: false,          basic: false,         pro: false,        max: true,           ultra: true } },
-  { label: 'Auto-Type (typing)',  values: { free: false,          basic: false,         pro: false,        max: false,          ultra: true } },
-  { label: 'Context files',       values: { free: '1',            basic: 'Unlimited',   pro: 'Unlimited',  max: 'Unlimited',    ultra: 'Unlimited' } },
+  { label: 'Extend on interview day', values: { free: false,      basic: '+30 min',     pro: '+30 min',    max: '+30 min',      ultra: '+30 min',     enterprise: 'Not needed' } },
+  { label: 'AI models',           values: { free: '4 during trial', basic: '4 (no Claude)', pro: 'All 5',    max: 'All 5',        ultra: 'All 5',       enterprise: 'All 5' } },
+  { label: 'Pop-out window',      values: { free: false,          basic: true,          pro: true,         max: true,           ultra: true,          enterprise: true } },
+  { label: 'Auto-Solve (screen)', values: { free: false,          basic: true,          pro: true,         max: true,           ultra: true,          enterprise: true } },
+  { label: 'Train Model',         values: { free: false,          basic: false,         pro: false,        max: true,           ultra: true,          enterprise: true } },
+  { label: 'Auto-Type (typing)',  values: { free: false,          basic: false,         pro: false,        max: false,          ultra: true,          enterprise: true } },
+  { label: 'Context files',       values: { free: '1',            basic: 'Unlimited',   pro: 'Unlimited',  max: 'Unlimited',    ultra: 'Unlimited',   enterprise: 'Unlimited' } },
 ];
 
-const TIER_ORDER = ['free', 'basic', 'pro', 'max', 'ultra'] as const;
+const TIER_ORDER = ['free', 'basic', 'pro', 'max', 'ultra', 'enterprise'] as const;
 
 // ── Purchasable plans (2026-07 model) ──
 // Basic/Pro/Max are one-time interview buys; Ultra is the monthly subscription.
@@ -301,19 +320,29 @@ const TIER_ORDER = ['free', 'basic', 'pro', 'max', 'ultra'] as const;
 // Basic bronze → Pro platinum → Max gold → Ultra amethyst-gold gem. The marks
 // self-colour (they ignore the span tint below); `accent` now only drives the
 // row chrome — gold hairline for the metals, violet glow for the Ultra jewel.
-type BuyTier = 'basic' | 'pro' | 'max' | 'ultra';
+type BuyTier = 'basic' | 'pro' | 'max' | 'ultra' | 'enterprise';
 const PLAN_ROW_META: Record<BuyTier, { title: string; blurb: string; Icon: React.ComponentType<{ size?: number }>; accent: 'gold' | 'violet' }> = {
   basic: { title: 'Get Basic', Icon: BasicMark, accent: 'gold',   blurb: 'One 30-min interview · Gemini, GPT-5.6, Grok, Groq (no Claude)' },
   pro:   { title: 'Get Pro',   Icon: ProMark,   accent: 'gold',   blurb: 'One 1-hour interview · all 5 models incl. Claude Sonnet 5' },
   max:   { title: 'Get Max',   Icon: MaxMark,   accent: 'gold',   blurb: 'Three 1-hour interviews · all 5 models · Train Model' },
-  ultra: { title: 'Go Ultra',  Icon: UltraMark,  accent: 'violet', blurb: 'Unlimited interviews · Auto-Type · all 5 models · billed monthly' },
+  ultra: { title: 'Go Ultra',  Icon: UltraMark,  accent: 'violet', blurb: '9 hours a month · Auto-Type · all 5 models · billed monthly' },
+  // Enterprise keeps the GOLD accent, not a third colour: the violet hint is
+  // Ultra's signature, and reusing it here would blur the two subscriptions
+  // together on the one screen where a customer is choosing between them.
+  enterprise: { title: 'Get Enterprise', Icon: EnterpriseMark, accent: 'gold', blurb: 'Unlimited interview time that never expires · Auto-Type · billed monthly' },
 };
+// Only ever offers tiers ABOVE the current one. Ultra used to be a dead end
+// (its row was `[]`) because it was the top of the ladder; since 2026-08 an
+// Ultra subscriber who keeps exhausting their 9 hours has exactly one place
+// to go, and /upgrade-tier makes it a prorated in-place swap rather than a
+// second parallel subscription.
 const UPGRADE_TARGETS: Record<string, BuyTier[]> = {
-  free:  ['basic', 'pro', 'max', 'ultra'],
-  basic: ['pro', 'max', 'ultra'],
-  pro:   ['max', 'ultra'],
-  max:   ['ultra'],
-  ultra: [],
+  free:  ['basic', 'pro', 'max', 'ultra', 'enterprise'],
+  basic: ['pro', 'max', 'ultra', 'enterprise'],
+  pro:   ['max', 'ultra', 'enterprise'],
+  max:   ['ultra', 'enterprise'],
+  ultra: ['enterprise'],
+  enterprise: [],
 };
 
 // Themed purchase row — dark with a SLIGHT gold hairline; Basic is the plainest.
@@ -876,12 +905,25 @@ export function ManageSubscription({
   // from the last fetch. Prefer the more conservative (lower-rank) tier so a
   // downgrade is reflected before the in-flight refetch completes; otherwise
   // we'd show "Cancel subscription" on a tier the user no longer has.
-  const tierRank: Record<string, number> = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4 };
+  const tierRank: Record<string, number> = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4, enterprise: 5 };
   const subTier = sub?.tier;
   const licTier = userLicense?.tier;
   const tier = (subTier && licTier)
     ? ((tierRank[String(licTier).toLowerCase()] ?? 0) < (tierRank[String(subTier).toLowerCase()] ?? 0) ? licTier : subTier)
     : (subTier || licTier || 'free');
+  // The RECURRING plans. Every cancel / reactivate / renews-label surface
+  // below keys off this rather than a literal 'ultra' — that literal is
+  // exactly what left Ultra with an empty billing section back when Pro/Max
+  // were the only subscriptions, and it would do the same to Enterprise.
+  // Mirrors RECURRING_TIERS in server/src/routes/payments.js.
+  const SUBSCRIPTION_TIERS = ['ultra', 'enterprise'];
+  const onSubscriptionTier = SUBSCRIPTION_TIERS.includes(tier);
+  // A subscription that also carries a clock. True for Ultra on the 2026-08
+  // pricing; false for Enterprise (unlimited by definition) and for any
+  // license carrying the -1 sentinel — an admin comp, or a pre-2026-08 Ultra
+  // that has not yet been re-seeded by a renewal. isUnlimitedLicense is the
+  // shared predicate, so this can never disagree with the meter itself.
+  const meteredSubscription = onSubscriptionTier && !isUnlimitedLicense(userLicense);
   const status = sub?.status || userLicense?.status || 'none';
   const provider = sub?.provider;
   const expiresAt = sub?.expires_at ?? userLicense?.expires_at ?? 0;
@@ -899,7 +941,7 @@ export function ManageSubscription({
   // Never". These labels translate the sentinel into subscription truth.
   const renewsLabel = expiresAt > 0
     ? formatExpiry(expiresAt)
-    : (tier === 'ultra' ? 'Monthly — automatic on your billing date' : formatExpiry(expiresAt));
+    : (onSubscriptionTier ? 'Monthly — automatic on your billing date' : formatExpiry(expiresAt));
   const accessUntilLabel = expiresAt > 0
     ? formatExpiry(expiresAt)
     : 'the end of your current billing cycle';
@@ -913,15 +955,55 @@ export function ManageSubscription({
     || ['expired', 'refunded', 'revoked'].includes(status);
   // Subscription vs one-time pass (2026-07 model). The server computes this
   // from the payments ledger; when talking to an older server that doesn't
-  // send the field, fall back to "Ultra is the only subscription" — exactly
-  // the model the pricing shipped with, so the fallback can't over-offer
-  // cancel to pass holders.
-  const isRecurring = typeof sub?.is_recurring === 'boolean' ? sub.is_recurring : tier === 'ultra';
+  // send the field, fall back to "the subscription tiers are subscriptions"
+  // — so the fallback can't over-offer cancel to pass holders.
+  const isRecurring = typeof sub?.is_recurring === 'boolean' ? sub.is_recurring : onSubscriptionTier;
 
   // Free-on-trial: light up the hero strip with a countdown so the user
   // feels the 30-min taste-test clock running. Without this, a Free user
   // sees no signal that the picker badges they encounter are tied to a
   // wall-clock window.
+  // Top-up control, shared by the pass branch and the metered-subscription
+  // branch below. It was inlined inside the pass branch, which is why adding
+  // Ultra to the surface would otherwise have meant a second copy of the
+  // pack picker — and a second place for the "button names one pack, charges
+  // another" bug this block already carries a warning about.
+  const extendControl = (
+    <div className="sm:col-span-2">
+      {(() => {
+        const packs = getExtensionPacks(userProfile?.country_code || 'US');
+        // The charge button MUST name the pack that will actually be charged
+        // (handleExtendNow sends selectedExtPack) — the old label hardcoded
+        // the flat +30 min · $25 unit, so picking "+3 hours" showed "$25" on
+        // the button and charged $80.
+        const sel = packs.find(p => p.id === selectedExtPack) || packs[0];
+        return (
+          <>
+            <div className="flex gap-1 mb-2">
+              {packs.map(p => (
+                <button key={p.id} onClick={() => setSelectedExtPack(p.id)}
+                  className={"px-2 py-1 rounded text-[10px] font-bold border transition-all " + (selectedExtPack === p.id ? "bg-emerald-500/25 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20")}>
+                  {p.label + " · " + p.currencySymbol + p.price}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={handleExtendNow}
+              disabled={extendLoading}
+              className="w-full sm:w-auto px-4 py-2 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold hover:bg-emerald-500/25 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
+            >
+              {extendLoading ? <Loader2 size={13} className="animate-spin" /> : <Zap size={13} />}
+              {`Add ${sel.minutes} minutes · ${pricingService.formatPrice(sel.price, sel.currencySymbol, sel.currency)}`}
+            </button>
+          </>
+        );
+      })()}
+      <p className="text-[10px] text-white/40 mt-1.5">
+        One click on your card on file. Repeat as often as you need on your interview day.
+      </p>
+    </div>
+  );
+
   const trialActive = tier === 'free' && licenseService.isTrialActive(userLicense);
   const trialRemaining = trialActive ? licenseService.getTrialRemainingSeconds(userLicense) : 0;
 
@@ -1011,6 +1093,34 @@ export function ManageSubscription({
                     <div className="font-semibold text-white">Pick a plan to keep going</div>
                   </div>
                 </>
+              ) : meteredSubscription ? (
+                /* ── A metered SUBSCRIPTION (Ultra since 2026-08-22) ──
+                   It needs both halves: the renewal date, because it bills
+                   monthly, AND the clock, because it now has one. Before
+                   this branch existed Ultra fell to the subscription `else`
+                   below and showed only "Renews" — no balance, and no way to
+                   top up — on the exact screen a subscriber opens when they
+                   are running out. Enterprise and any -1 (admin comp /
+                   grandfathered) license are NOT metered and keep the plain
+                   subscription view. */
+                <>
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Time left this cycle</div>
+                    <div className="font-semibold text-white">{formatCredits(userLicense?.credits_remaining_seconds)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Renews</div>
+                    <div className="font-semibold text-white">{renewsLabel}</div>
+                  </div>
+                  {/* /50 not /45: index.css remaps the white-opacity scale for
+                      the light theme in fixed steps, and an unlisted step has
+                      no rule — the light-theme coverage test catches it as
+                      "invisible on cream". */}
+                  <div className="sm:col-span-2 text-[10.5px] text-white/50 -mt-1">
+                    Your allowance resets in full on each renewal — unused time doesn&rsquo;t roll over.
+                  </div>
+                  {!planLapsed && extendControl}
+                </>
               ) : ['basic', 'pro', 'max'].includes(tier) ? (
                 <>
                   <div>
@@ -1021,42 +1131,7 @@ export function ManageSubscription({
                     <div className="text-[10px] uppercase tracking-wider text-white/50 mb-0.5">Pass expires</div>
                     <div className="font-semibold text-white">{userLicense?.credits_expire_at ? formatExpiry(userLicense.credits_expire_at) : '—'}</div>
                   </div>
-                  {!planLapsed && (
-                  <div className="sm:col-span-2">
-                    {(() => {
-                      const packs = getExtensionPacks(userProfile?.country_code || 'US');
-                      // The charge button MUST name the pack that will
-                      // actually be charged (handleExtendNow sends
-                      // selectedExtPack) — the old label hardcoded the flat
-                      // +30 min · $25 unit, so picking "+3 hours" showed
-                      // "$25" on the button and charged $80.
-                      const sel = packs.find(p => p.id === selectedExtPack) || packs[0];
-                      return (
-                        <>
-                          <div className="flex gap-1 mb-2">
-                            {packs.map(p => (
-                              <button key={p.id} onClick={() => setSelectedExtPack(p.id)}
-                                className={"px-2 py-1 rounded text-[10px] font-bold border transition-all " + (selectedExtPack === p.id ? "bg-emerald-500/25 border-emerald-500/60 text-emerald-200" : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20")}>
-                                {p.label + " · " + p.currencySymbol + p.price}
-                              </button>
-                            ))}
-                          </div>
-                          <button
-                            onClick={handleExtendNow}
-                            disabled={extendLoading}
-                            className="w-full sm:w-auto px-4 py-2 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold hover:bg-emerald-500/25 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
-                          >
-                            {extendLoading ? <Loader2 size={13} className="animate-spin" /> : <Zap size={13} />}
-                            {`Add ${sel.minutes} minutes · ${pricingService.formatPrice(sel.price, sel.currencySymbol, sel.currency)}`}
-                          </button>
-                        </>
-                      );
-                    })()}
-                    <p className="text-[10px] text-white/40 mt-1.5">
-                      One click on your card on file. Repeat as often as you need on your interview day.
-                    </p>
-                  </div>
-                  )}
+                  {!planLapsed && extendControl}
                 </>
               ) : (
                 <>
@@ -1374,7 +1449,7 @@ export function ManageSubscription({
               Ultra) saw an EMPTY plan section — no way to change or cancel
               their plan from here. Provider-aware: real subs go through the
               cancel modal; admin grants (no provider) flip instantly. */}
-          {tier === 'ultra' && (
+          {onSubscriptionTier && (
             <>
               <button
                 onClick={() => {
@@ -1415,7 +1490,7 @@ export function ManageSubscription({
             the old pro/max-only gate left Ultra with a "Cancel Ultra"
             button whose confirm panel (below) never rendered — the
             flagship tier literally could not cancel or reactivate in-app. */}
-        {(tier === 'pro' || tier === 'max' || tier === 'ultra') && isPaidProvider && (
+        {(tier === 'pro' || tier === 'max' || onSubscriptionTier) && isPaidProvider && (
           <div className="space-y-3">
             <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500 dark:text-white/50">Billing</h4>
 
@@ -1550,7 +1625,7 @@ export function ManageSubscription({
                           </button>
                         </div>
                         <div className="text-[10.5px] text-amber-200/70 leading-relaxed">
-                          {tier === 'ultra'
+                          {onSubscriptionTier
                             ? 'Interviewing on and off? After cancelling you can also buy one-time passes (Basic $30 / Pro $50 / Max $89) whenever an interview comes up — no monthly bill.'
                             : 'One-time passes (Basic $30 / Pro $50 / Max $89) are available any time after your subscription ends — pay only when an interview comes up.'}
                         </div>
@@ -1573,12 +1648,16 @@ export function ManageSubscription({
                           missed. */}
                       <div className="text-[11px] font-bold uppercase tracking-wider text-white/60">What you'll lose at {accessUntilLabel}</div>
                       <ul className="text-[12px] text-white/80 space-y-1 ml-2 list-disc list-inside">
-                        {/* Gate-accurate under 2026-07 pricing (mirrors FEATURE_GATES).
-                            Renders for the subscription tiers — legacy Pro/Max subs
-                            and Ultra. Ultra alone loses Auto-Type + unlimited time. */}
-                        {tier === 'ultra' && <li>Unlimited interviews + Auto-Type</li>}
+                        {/* Gate-accurate (mirrors FEATURE_GATES). Renders for the
+                            subscription tiers — legacy Pro/Max subs, Ultra and
+                            Enterprise. The two subscriptions lose Auto-Type; what
+                            they lose in TIME differs, so the line says what each
+                            actually had rather than claiming "unlimited" for a
+                            plan that was metered at 9 hours. */}
+                        {tier === 'enterprise' && <li>Unlimited interview time + Auto-Type</li>}
+                        {tier === 'ultra' && <li>9 hours of interview time a month + Auto-Type</li>}
                         <li>Claude Sonnet 5 access</li>
-                        {(tier === 'max' || tier === 'ultra') && <li>Reasoning effort control + Train Model</li>}
+                        {(tier === 'max' || onSubscriptionTier) && <li>Reasoning effort control + Train Model</li>}
                         <li>Gemini, Groq, GPT, and Grok models</li>
                         <li>Auto-Solve (screen-capture problem solving)</li>
                         <li>Pop-out window (screen-share invisible)</li>

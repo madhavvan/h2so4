@@ -282,6 +282,16 @@ describe('client and server guards agree exactly', () => {
       const m = new RegExp(`const ${name} = new Set\\(\\[([\\s\\S]*?)\\]\\);`).exec(src);
       return new Set((m[1].match(/'[^']+'/g) || []).map((x) => x.slice(1, -1)));
     };
+    // GENERIC_ACRONYMS left this list on 2026-08-20, along with the list
+    // itself. It was ~150 hand-written acronyms whose only job was to keep
+    // the proper-noun check off a term of art, and it could only ever know
+    // the industries it had been written for: measured live on a telecom
+    // resume, "UE initiates attach by sending Attach Request to the MME"
+    // and "verify the tunnel integrity and TEID matching" were both
+    // REJECTED as invented companies, and both are textbook-correct.
+    // Widening it was not an option either - "UE" and "IBM" are the same
+    // shape, and only the CLAIM separates a term of art from a fabricated
+    // employer. That judgement now lives in coverVerdict; see routes/ai.js.
     for (const name of ['DISCOURSE', 'SENTENCE_OPENERS']) {
       const a = grab(tsSrc, name);
       const b = grab(jsSrc, name);

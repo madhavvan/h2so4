@@ -443,13 +443,13 @@ router.post('/session', authMiddleware, async (req, res) => {
 // guessing from a 403 that could equally mean "expired token" or "we're
 // down". Returning 403 to a Basic user here would throw that away.
 const ENTITLEMENT_CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-// Mirrors ULTRA_ONLY in routes/ai.js (the list behind /autotype-plan,
+// Mirrors AUTOTYPE_TIERS in routes/ai.js (the list behind /autotype-plan,
 // /autotype-agent and /autotype-vision). Written out as a literal rather
 // than imported because routes must not depend on other routes — ai.js
 // pulls in every model SDK, and requiring it from here to read one array
 // would drag all of that into this module's load path. The shared thing
 // that actually enforces the answer is evaluateTier, and that IS imported.
-const AUTO_TYPE_TIERS = ['ultra'];
+const AUTO_TYPE_TIERS = ['ultra', 'enterprise'];
 
 router.get('/entitlements', authMiddleware, (req, res) => {
   try {

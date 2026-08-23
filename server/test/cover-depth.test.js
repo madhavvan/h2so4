@@ -216,9 +216,16 @@ describe('the length budget reaches the model', () => {
     expect(userPrompt('q', 'other', '')).toContain('12-30 words');
   });
 
-  it('stays inside the prompt budget even with a whole resume attached', () => {
-    const huge = userPrompt('q?', 'other', 'x'.repeat(50_000), COVER_TIERS[2]);
-    expect(huge.length).toBeLessThan(10_000);
+  it('passes the background through whole — the budget is applied upstream', () => {
+    // Was `expect(huge.length).toBeLessThan(10_000)`, pinning a 9,000-char
+    // slice inside userPrompt. That slice cut a real 39,891-char upload at
+    // char 9,000 and lost the section that says "Used GMARS? No. Do not
+    // claim it", which the app then claimed out loud. The bound now lives
+    // once, at construction — COVER_SOURCE_MAX_CHARS in
+    // services/coverSource.ts — where over-budget input loses whole named
+    // sections and says so, instead of being cut mid-sentence silently.
+    const whole = 'x'.repeat(30_000);
+    expect(userPrompt('q?', 'other', whole, COVER_TIERS[2])).toContain(whole);
   });
 });
 

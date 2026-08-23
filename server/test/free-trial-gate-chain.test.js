@@ -117,10 +117,10 @@ beforeAll(() => {
 describe('tier constants — the trial contract itself', () => {
   it("TRIAL_MODELS includes 'free' (dropping it re-creates the live bug)", () => {
     expect(TRIAL_MODELS).toContain('free');
-    expect(TRIAL_MODELS).toEqual(['free', 'basic', 'pro', 'max', 'ultra']);
+    expect(TRIAL_MODELS).toEqual(['free', 'basic', 'pro', 'max', 'ultra', 'enterprise']);
   });
   it("CLAUDE_TIERS excludes 'free' and 'basic' (Claude is Pro+)", () => {
-    expect(CLAUDE_TIERS).toEqual(['pro', 'max', 'ultra']);
+    expect(CLAUDE_TIERS).toEqual(['pro', 'max', 'ultra', 'enterprise']);
     expect(CLAUDE_TIERS).not.toContain('free');
   });
 });
@@ -257,10 +257,34 @@ describe('paid tiers through the same chains (no collateral damage)', () => {
     expect(r.body.source).toBe('credits');
   });
 
-  it('US ultra → unlimited, claude chain passes with no time gate', async () => {
-    const { req } = freshSignup('ultra', 'US');
+  it('US enterprise → unlimited, claude chain passes with no time gate', async () => {
+    const { req } = freshSignup('enterprise', 'US');
     const r = await runChain(claudeChain(), req);
     expect(r.passed).toBe(true);
+  });
+
+  // 2026-08: Ultra is metered (9 h/cycle), so it goes through the time gate
+  // like any pass — with an allowance it passes, at zero it 402s. Before this
+  // change Ultra short-circuited to 'unlimited' and never reached either.
+  it('US ultra with allowance → claude chain passes on the credit bucket', async () => {
+    const { req } = freshSignup('ultra', 'US', {
+      credits_remaining_seconds: 9 * 60 * 60,
+      credits_expire_at: 0,
+      expires_at: -1,
+    });
+    const r = await runChain(claudeChain(), req);
+    expect(r.passed).toBe(true);
+  });
+
+  it('US ultra at 0 seconds → 402 no_time_remaining (source credits)', async () => {
+    const { req } = freshSignup('ultra', 'US', {
+      credits_remaining_seconds: 0,
+      credits_expire_at: 0,
+      expires_at: -1,
+    });
+    const r = await runChain(claudeChain(), req);
+    expect(r.status).toBe(402);
+    expect(r.body.source).toBe('credits');
   });
 });
 

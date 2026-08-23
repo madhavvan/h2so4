@@ -65,7 +65,7 @@ const CLIENT_MODELS_BY_TIER = {
 };
 
 const REASONING_EFFORT_VALUES = ['none', 'low', 'medium', 'high'];
-const VALID_TIERS = ['free', 'basic', 'pro', 'max', 'ultra'];
+const VALID_TIERS = ['free', 'basic', 'pro', 'max', 'ultra', 'enterprise'];
 
 // Lazy provider clients — only loaded when an admin actually calls a
 // refund / cancel / etc. Mirrors the lazy pattern in routes/admin.js.
@@ -720,7 +720,7 @@ const USER_SERVER_TOOLS = [
       properties: {
         target_tier: {
           type: 'string',
-          enum: ['free', 'basic', 'pro', 'max', 'ultra'],
+          enum: ['free', 'basic', 'pro', 'max', 'ultra', 'enterprise'],
           description: 'The tier the user is considering switching to.',
         },
       },
@@ -754,7 +754,8 @@ const USER_SERVER_TOOLS = [
           basic: { time: 'one 30-minute interview',                        models: ['Gemini','GPT','Grok','Groq'],    autoSolve: true,  autoType: false, popout: true,  reasoning: false, trainModel: false },
           pro:   { time: 'one 1-hour interview',                           models: ['Gemini','GPT','Grok','Groq','Claude'], autoSolve: true, autoType: false, popout: true, reasoning: false, trainModel: false },
           max:   { time: 'three 1-hour interviews',                        models: ['Gemini','GPT','Grok','Groq','Claude'], autoSolve: true, autoType: false, popout: true, reasoning: true,  trainModel: true },
-          ultra: { time: 'unlimited interviews',                           models: ['Gemini','GPT','Grok','Groq','Claude'], autoSolve: true, autoType: true,  popout: true, reasoning: true,  trainModel: true },
+          ultra: { time: '9 hours of interview time every month',          models: ['Gemini','GPT','Grok','Groq','Claude'], autoSolve: true, autoType: true,  popout: true, reasoning: true,  trainModel: true },
+          enterprise: { time: 'unlimited interview time that never expires', models: ['Gemini','GPT','Grok','Groq','Claude'], autoSolve: true, autoType: true, popout: true, reasoning: true, trainModel: true },
         };
         const cur = FEATURES[currentTier] || FEATURES.free;
         const tgt = FEATURES[target_tier] || FEATURES.free;
@@ -789,30 +790,36 @@ const USER_SERVER_TOOLS = [
         // Effective-date semantics under the 2026-07 model: Basic/Pro/Max
         // are ONE-TIME passes (a "switch" between them is a fresh pass
         // purchase charged today — the new pass's clock replaces what's
-        // left of the old one); Ultra is the only subscription (cancel =
-        // access until cycle end, then Free).
+        // left of the old one); Ultra and Enterprise are the subscriptions
+        // (cancel = access until cycle end, then Free).
         const cycleEnd = license.expires_at && license.expires_at > 0
           ? new Date(license.expires_at).toISOString().slice(0, 10)
           : 'the end of your current cycle';
+        const SUBSCRIPTION_TIERS = ['ultra', 'enterprise'];
+        const onSubscription = SUBSCRIPTION_TIERS.includes(currentTier);
+        const currentLabel = currentTier === 'enterprise' ? 'Enterprise' : 'Ultra';
         let effective;
-        if (target_tier === 'ultra') {
-          effective = 'immediate after checkout — Ultra is the monthly subscription, billed from today';
+        if (SUBSCRIPTION_TIERS.includes(target_tier)) {
+          const targetLabel = target_tier === 'enterprise' ? 'Enterprise' : 'Ultra';
+          effective = onSubscription
+            ? `immediate — your existing subscription is switched to ${targetLabel} in place, and the difference is prorated onto your next invoice`
+            : `immediate after checkout — ${targetLabel} is a monthly subscription, billed from today`;
         } else if (target_tier === 'free') {
-          effective = currentTier === 'ultra'
-            ? `cancel any time — you keep Ultra access until ${cycleEnd}, then drop to Free`
+          effective = onSubscription
+            ? `cancel any time — you keep ${currentLabel} access until ${cycleEnd}, then drop to Free`
             : 'your pass simply expires on its own — there is nothing to cancel and no ongoing billing';
-        } else if (currentTier === 'ultra') {
-          effective = `passes are one-time purchases — cancel Ultra first (access until ${cycleEnd}), then buy the ${target_tier} pass whenever the next interview comes up`;
+        } else if (onSubscription) {
+          effective = `passes are one-time purchases — cancel ${currentLabel} first (access until ${cycleEnd}), then buy the ${target_tier} pass whenever the next interview comes up`;
         } else {
           effective = `immediate after checkout — a fresh ${target_tier} pass is charged today and its full interview clock replaces whatever remains on your current pass`;
         }
 
         let suggested_alternative = null;
-        if (target_tier === 'free' && currentTier === 'ultra') {
+        if (target_tier === 'free' && onSubscription) {
           suggested_alternative = isStripe
             ? 'If cost is the concern, you could pause the subscription from the Stripe billing portal instead of canceling — or switch to one-time passes (Basic $30 / Pro $50 / Max $89) after the cycle ends and pay only when an interview comes up.'
             : 'After your cycle ends you can use one-time passes (Basic / Pro / Max) instead — pay only when an interview comes up, no monthly bill.';
-        } else if (isDowngrade && currentTier !== 'ultra' && target_tier !== 'free') {
+        } else if (isDowngrade && !onSubscription && target_tier !== 'free') {
           suggested_alternative = 'Heads up: buying a smaller pass replaces the time left on your current one. If you just need more minutes on the pass you already have, the +30 min / +1 h / +3 h extensions are usually the better deal.';
         }
 
@@ -1133,24 +1140,27 @@ const USER_SERVER_TOOLS = [
         // same file. Anything unresolvable falls back to the published
         // 2026-07 table, so a require failure degrades to stale-but-loud
         // rather than to a crash.
-        let usdCents = { basic: 3000, pro: 5000, max: 8900, ultra: 15900 };
+        let usdCents = { basic: 3000, pro: 5000, max: 8900, ultra: 15900, enterprise: 119900 };
         try {
           const canonical = require('../routes/payments')?._test?.EXPECTED_USD_CENTS;
-          if (canonical && ['basic', 'pro', 'max', 'ultra'].every(t => Number.isFinite(canonical[t]))) {
+          if (canonical && ['basic', 'pro', 'max', 'ultra', 'enterprise'].every(t => Number.isFinite(canonical[t]))) {
             usdCents = canonical;
           }
         } catch { /* keep the fallback table */ }
         const usd = t => "$" + (usdCents[t] / 100).toFixed(2).replace(/\.00$/, '');
 
-        // 2026-07 model, identical to the one preview_tier_change describes:
-        // Basic/Pro/Max are ONE-TIME interview passes, Ultra is the only
-        // subscription. The retired "monthly Pro / monthly Max" ladder is
-        // what made the two tools contradict each other.
+        // 2026-07 model + the 2026-08 change, identical to the one
+        // preview_tier_change describes: Basic/Pro/Max are ONE-TIME interview
+        // passes; Ultra is a METERED monthly subscription (9 hours per cycle,
+        // not unlimited — it was unlimited until 2026-08-22 and the bot
+        // telling a customer otherwise is exactly the contradiction this
+        // shared table exists to prevent); Enterprise is the unlimited plan.
         const PLAN = {
           basic: `${usd('basic')} one-time · one 30-minute interview`,
           pro:   `${usd('pro')} one-time · one 1-hour interview`,
           max:   `${usd('max')} one-time · three 1-hour interviews`,
-          ultra: `${usd('ultra')}/month · unlimited interviews + Auto-Type`,
+          ultra: `${usd('ultra')}/month · 9 hours of interview time + Auto-Type`,
+          enterprise: `${usd('enterprise')}/month · unlimited interview time, never expires`,
         };
 
         let recommended;
@@ -1168,15 +1178,20 @@ const USER_SERVER_TOOLS = [
           recommended = paidCount >= 3 ? 'max' : 'pro';
           reasoning = paidCount >= 3
             ? `You've paid ${paidCount} times. If your interviews come in clusters, Max (${PLAN.max}) is three 1-hour interviews for less than three Pro passes, and it adds Train Model plus reasoning-effort control.`
-            : `Pro (${PLAN.pro}) covers a full-hour interview and every model including Claude. Move up only if you have several interviews lined up (Max — ${PLAN.max}) or you want Auto-Type and unlimited time (Ultra — ${PLAN.ultra}).`;
+            : `Pro (${PLAN.pro}) covers a full-hour interview and every model including Claude. Move up only if you have several interviews lined up (Max — ${PLAN.max}) or you want Auto-Type and a monthly block of time (Ultra — ${PLAN.ultra}).`;
         } else if (currentTier === 'max') {
           recommended = paidCount >= 4 ? 'ultra' : 'max';
           reasoning = paidCount >= 4
-            ? `You've bought ${paidCount} passes. At that rate Ultra (${PLAN.ultra}) costs less than buying Max passes back to back, and it's the only plan with Auto-Type.`
-            : `Max (${PLAN.max}) already covers three 1-hour interviews with every model, Train Model and reasoning control. The only step up is Ultra (${PLAN.ultra}), which is worth it if you want Auto-Type or you're interviewing every week.`;
+            ? `You've bought ${paidCount} passes. At that rate Ultra (${PLAN.ultra}) costs less than buying Max passes back to back, and it's the cheapest plan with Auto-Type.`
+            : `Max (${PLAN.max}) already covers three 1-hour interviews with every model, Train Model and reasoning control. The step up is Ultra (${PLAN.ultra}), which is worth it if you want Auto-Type or you're interviewing every week.`;
+        } else if (currentTier === 'ultra') {
+          recommended = paidCount >= 6 ? 'enterprise' : 'ultra';
+          reasoning = paidCount >= 6
+            ? `You're on Ultra (${PLAN.ultra}) and you've paid ${paidCount} times. If you're regularly running past the 9 hours, Enterprise (${PLAN.enterprise}) removes the meter entirely — same models, same Auto-Type, no monthly cap. Otherwise the +30 min / +1 h / +3 h top-ups are the cheaper way to cover an occasional overrun.`
+            : `You're on Ultra (${PLAN.ultra}) — every model, Auto-Type, Train Model. If you run out mid-month the +30 min / +1 h / +3 h top-ups extend it; if you're consistently past 9 hours, Enterprise (${PLAN.enterprise}) drops the cap altogether.`;
         } else {
-          recommended = 'ultra';
-          reasoning = `You're on Ultra (${PLAN.ultra}) — unlimited interviews, every model, Auto-Type. There's nothing above it. If you stop interviewing for a while, cancel and come back on a one-time pass (Basic ${usd('basic')} / Pro ${usd('pro')} / Max ${usd('max')}) instead of paying monthly.`;
+          recommended = 'enterprise';
+          reasoning = `You're on Enterprise (${PLAN.enterprise}) — unlimited interview time, every model, Auto-Type. There's nothing above it. If your volume drops, Ultra (${PLAN.ultra}) or a one-time pass (Basic ${usd('basic')} / Pro ${usd('pro')} / Max ${usd('max')}) will cost you less.`;
         }
 
         return {

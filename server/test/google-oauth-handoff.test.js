@@ -141,8 +141,12 @@ async function consentUnder(sessionId) {
   const cb = await get(`/google/callback?code=fake-auth-code&state=${sessionId}`);
   expect(cb.status).toBe(200);
   // The deep link the success page hands to the OS on the machine where
-  // consent happened. This is the ONLY place the code appears.
-  const deepLink = cb.body.match(/interview-copilot:\/\/signin-complete\?session_id=[^&]+&code=([A-Z0-9]+)/);
+  // consent happened. It now lives in an <a href> rather than inside the
+  // script — the script used to build it by interpolating the OAuth `state`
+  // into a JS string literal, which was an injection once the script was
+  // given a CSP nonce (see google-callback-state-injection.test.js). In an
+  // HTML attribute the ampersand is written `&amp;`, hence the alternation.
+  const deepLink = cb.body.match(/interview-copilot:\/\/signin-complete\?session_id=[^&"]+&(?:amp;)?code=([A-Z0-9]+)/);
   const printed = cb.body.match(/([0-9A-Z]{5})-([0-9A-Z]{5})/);
   return {
     html: cb.body,

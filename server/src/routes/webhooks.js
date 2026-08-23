@@ -98,8 +98,14 @@ const stripe = createStripeClient();
 // version of this file still granted Pro/Max as `expires_at:-1` (unlimited) and
 // omitted 'ultra' entirely, so a real Ultra purchase recorded as "failed / no
 // tier" and Pro/Max buyers got unlimited time for a one-time price.
-const VALID_TIERS = ['basic', 'pro', 'max', 'ultra'];
+const VALID_TIERS = ['basic', 'pro', 'max', 'ultra', 'enterprise'];
 const INTERVIEW_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // window to USE a one-time interview
+// Ultra's per-cycle allowance (2026-08). Mirrors ULTRA_CYCLE_SECONDS in
+// routes/payments.js and ULTRA_MONTHLY_SECONDS in the client's
+// services/licenseService.ts.
+const ULTRA_CYCLE_SECONDS = 9 * 60 * 60;
+// The RECURRING (subscription) tiers, as opposed to the one-time passes.
+const RECURRING_TIERS = ['ultra', 'enterprise'];
 
 // Strict: returns null for unknown/missing. Every money-granting path uses
 // this — the prior version defaulted to 'pro', which silently upgraded a
@@ -113,8 +119,10 @@ function resolveTier(t) {
 //   Basic = one 30-min interview  (1 session, 1800s, 30-day window)
 //   Pro   = one 1-hour interview  (1 session, 3600s, 30-day window)
 //   Max   = three 1-hour interviews (3 sessions, 10800s, 30-day window)
-//   Ultra = unlimited monthly subscription (-1 sentinels; lifecycle managed by
-//           customer.subscription.updated/.deleted).
+//   Ultra = 9 hours per BILLING CYCLE (32,400s; metered since 2026-08-22,
+//           re-seeded by the paid-invoice / subscription.charged handlers;
+//           lifecycle managed by customer.subscription.updated/.deleted).
+//   Enterprise = unlimited, never expires (-1 sentinels; subscription).
 function grantConfigForTier(tier) {
   const now = Date.now();
   if (tier === 'basic') {
@@ -129,8 +137,15 @@ function grantConfigForTier(tier) {
     const exp = now + INTERVIEW_WINDOW_MS;
     return { tier: 'max', sessions_limit: 3, expires_at: exp, credits_remaining_seconds: 3 * 60 * 60, credits_expire_at: exp };
   }
-  // ultra — monthly subscription, unlimited.
-  return { tier: 'ultra', sessions_limit: -1, expires_at: -1, credits_remaining_seconds: -1, credits_expire_at: -1 };
+  if (tier === 'ultra') {
+    // Metered monthly subscription. expires_at:-1 says the SUBSCRIPTION has
+    // no end date — it is NOT a time sentinel (db.resolveTimeBucket must not
+    // read it as unlimited for ultra). credits_expire_at:0 = no calendar
+    // window; the next cycle replaces the balance. See payments.js.
+    return { tier: 'ultra', sessions_limit: -1, expires_at: -1, credits_remaining_seconds: ULTRA_CYCLE_SECONDS, credits_expire_at: 0 };
+  }
+  // enterprise — monthly subscription, unlimited and never expiring.
+  return { tier: 'enterprise', sessions_limit: -1, expires_at: -1, credits_remaining_seconds: -1, credits_expire_at: -1 };
 }
 
 // Reverse-lookup: given a Razorpay plan_id, return the tier it represents.
@@ -144,6 +159,7 @@ function tierForRazorpayPlan(planId) {
   // swap to Ultra every subsequent subscription.charged fell back to the
   // stale creation-time notes.tier and re-granted the OLD tier while
   // billing the Ultra price.
+  if (planId === process.env.RAZORPAY_PLAN_ID_ENTERPRISE) return 'enterprise';
   if (planId === process.env.RAZORPAY_PLAN_ID_ULTRA) return 'ultra';
   if (planId === process.env.RAZORPAY_PLAN_ID_MAX) return 'max';
   if (planId === process.env.RAZORPAY_PLAN_ID_PRO) return 'pro';
@@ -151,17 +167,41 @@ function tierForRazorpayPlan(planId) {
   return null;
 }
 
-// ── Credits policy for grant writes (2026-07) ───────────────────────────
+// ── Credits policy for grant writes (2026-07, split 2026-08) ────────────
 // One-time PURCHASES (checkout.session.completed non-renewal, Razorpay
 // payment.captured non-renewal, /verify-razorpay tier grants) seed the full
 // per-tier interview clock — a purchase starts a fresh plan window.
-// SUBSCRIPTION-LIFECYCLE events (charged/updated/resumed/reactivate) pass
-// credits ONLY for Ultra (the -1 unlimited sentinel): legacy Pro/Max
-// SUBSCRIBERS carry a migration-era -1 unlimited balance, and re-seeding
-// them from the 2026-07 one-time config would shrink an unlimited legacy
-// sub to a 1-hour clock on its next billing tick.
+//
+// Everything else splits into two rules, and the split is load-bearing money
+// logic. Until 2026-08 there was one rule ("pass credits only for Ultra"),
+// which was safe precisely BECAUSE Ultra's balance was the constant -1: you
+// can write -1 on top of -1 as many times as Stripe cares to fire an event
+// and nothing changes. The moment Ultra became a metered 9-hour allowance
+// that stopped being true, and the old rule became a refill exploit:
+// customer.subscription.updated fires on cancel AND on reactivate, so
+//   burn 9 h → cancel → reactivate → 9 h again, repeat forever
+// would have been a supported flow costing us nothing but our own money.
+// Same for pause/resume, and for any metadata edit Stripe echoes back.
+//
+// So:
+//   creditsForLifecycleGrant — for events that merely RE-AFFIRM a plan
+//     (updated / resumed / reactivate / dispute-won). Passes credits ONLY
+//     when the tier's balance is a constant sentinel, i.e. Enterprise's -1.
+//     Metered tiers are left strictly alone: their balance is whatever the
+//     user has actually spent down to. Legacy Pro/Max SUBSCRIBERS also carry
+//     a migration-era -1 that must never be clobbered by the one-time config.
+//   creditsForBillingCycle — for events that ARE a paid billing cycle
+//     (Stripe invoice.payment_succeeded with billing_reason=subscription_cycle,
+//     Razorpay subscription.charged). This is the ONLY thing that re-seeds a
+//     metered subscription, which is exactly what "9 hours a month" means.
 function creditsForLifecycleGrant(grant) {
-  return grant.tier === 'ultra'
+  return grant.tier === 'enterprise'
+    ? { credits_remaining_seconds: grant.credits_remaining_seconds, credits_expire_at: grant.credits_expire_at }
+    : {};
+}
+
+function creditsForBillingCycle(grant) {
+  return RECURRING_TIERS.includes(grant.tier)
     ? { credits_remaining_seconds: grant.credits_remaining_seconds, credits_expire_at: grant.credits_expire_at }
     : {};
 }
@@ -548,6 +588,35 @@ async function handleStripeEvent(event) {
           mode: 'subscription_cycle',
         },
       });
+      // ── Monthly allowance re-seed (2026-08) ──────────────────────────
+      // This handler used to ONLY record the payment: the tier is owned by
+      // customer.subscription.updated, and back when the only subscription
+      // was unlimited-Ultra there was no balance to reset. Now Ultra sells
+      // 9 hours PER CYCLE, so the paid renewal invoice is the event that
+      // has to put those 9 hours back — without this, an Ultra subscriber
+      // burns their first month and is billed $159/month forever for a
+      // plan that never refills.
+      //
+      // Deliberately scoped to the license's CURRENT tier rather than
+      // anything on the invoice: whatever the subscription is actually on
+      // right now is what got billed. Non-recurring tiers return {} from
+      // creditsForBillingCycle and are untouched, so a stray invoice on a
+      // legacy pass account can't reset a pass clock.
+      if (license && RECURRING_TIERS.includes(license.tier)) {
+        const grant = grantConfigForTier(license.tier);
+        const cycleCredits = creditsForBillingCycle(grant);
+        if (Object.keys(cycleCredits).length > 0) {
+          db.updateLicenseOnPayment(user.id, {
+            tier: license.tier,
+            status: 'active',
+            expires_at: grant.expires_at,
+            sessions_limit: grant.sessions_limit,
+            ...cycleCredits,
+          });
+          console.log('[WEBHOOK] Re-seeded', license.tier, 'cycle allowance for:', user.email,
+            '→', cycleCredits.credits_remaining_seconds, 'seconds');
+        }
+      }
       console.log('[WEBHOOK] Recurring charge recorded for:', user.email, 'amount:', invoice.amount_paid);
       return;
     }
@@ -832,7 +901,17 @@ async function handleStripeEvent(event) {
           metadata: { reason: 'subscription_deleted' },
         });
       })();
-      console.log('[WEBHOOK] User downgraded to free:', user.email);
+      // Report what ACTUALLY happened. The downgrade writes are refused for an
+      // admin-granted plan (db.updateUserTier / db.updateLicenseOnPayment log
+      // their own REFUSED line), and an operator reading "User downgraded to
+      // free" for an account that is still on Ultra would be chasing a ghost.
+      const afterCancel = db.getLicenseByUserId(user.id);
+      if (afterCancel && afterCancel.tier !== 'free') {
+        console.log('[WEBHOOK] subscription.deleted for', user.email,
+          '— plan PRESERVED at', afterCancel.tier, '(admin-granted; not downgraded)');
+      } else {
+        console.log('[WEBHOOK] User downgraded to free:', user.email);
+      }
       return;
     }
 
@@ -1325,10 +1404,11 @@ async function handleRazorpayEvent(body) {
           status: 'active',
           expires_at: grant.expires_at,
           sessions_limit: grant.sessions_limit,
-          // Ultra-only credits (see creditsForLifecycleGrant): first charge
-          // of an Ultra sub must land the -1 unlimited sentinel or the
-          // subscriber has a tier and 0 seconds.
-          ...creditsForLifecycleGrant(grant),
+          // A CHARGE is a billing cycle (see creditsForBillingCycle): the
+          // first charge of a sub must land its allowance or the subscriber
+          // has a tier and 0 seconds, and every later charge is the monthly
+          // re-seed that makes "9 hours a month" mean anything.
+          ...creditsForBillingCycle(grant),
         });
         // Legacy: prefix-marker in stripe_customer_id for provider detection
         // (still used by reads that haven't migrated to razorpay_subscription_id).
@@ -1822,5 +1902,7 @@ module.exports._test = {
   resolveTier,
   grantConfigForTier,
   creditsForLifecycleGrant,
+  creditsForBillingCycle,
+  RECURRING_TIERS,
   VALID_TIERS,
 };

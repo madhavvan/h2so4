@@ -122,17 +122,47 @@ describe('the prompt the cover model actually receives', () => {
     expect(p).not.toContain('CANDIDATE BACKGROUND');
   });
 
-  it('caps the background, but high enough to hold a whole resume', () => {
-    // The cap exists for the 1,500ms first-token deadline, not to save
-    // tokens — and it was originally 1,200, which cut a real resume off
-    // before its first employer. Measured after raising it: first token
-    // still 500-740ms on Groq llama-3.3-70b. So: generous enough for any
-    // resume, hard enough that a 50K document cannot blow the deadline.
+  it('does NOT cut the background — the budget lives where it is built', () => {
+    // ⚠️ THIS TEST USED TO ASSERT THE OPPOSITE, and the assertion was the
+    // bug. It pinned `bg.slice(0, 9000)` as "generous enough for any
+    // resume", which was true while the background WAS a resume.
+    //
+    // It is now the candidate's uploaded documents, verbatim. Measured on a
+    // real 39,891-char upload: the cut landed at char 9,000, and the section
+    // reading "Used GMARS? No. Do not claim it" sits at ~char 30,000 — so
+    // the app claimed GMARS out loud, three times across two live runs, on
+    // a document that forbids it in capitals.
+    //
+    // A cap in two places is a cap that will disagree, and this pair had
+    // already disagreed once before (client 9,000 vs this line still at
+    // 1,200, which sliced off every employer). The budget now lives in ONE
+    // place — COVER_SOURCE_MAX_CHARS in services/coverSource.ts — where it
+    // can drop whole named sections and log which, instead of cutting a
+    // sentence in half and telling nobody.
     const ABOUT_THEM = 'have you worked with Kafka?';
-    const huge = userPrompt(ABOUT_THEM, 'other', 'x'.repeat(50_000));
-    expect(huge.length).toBeLessThan(10_000);
-    const realistic = userPrompt(ABOUT_THEM, 'other', 'x'.repeat(7_300));  // a real resume
-    expect(realistic).toContain('x'.repeat(7_300));                        // uncut
+    const whole = 'x'.repeat(30_000);
+    expect(userPrompt(ABOUT_THEM, 'other', whole)).toContain(whole);
+    const realistic = userPrompt(ABOUT_THEM, 'other', 'x'.repeat(7_300));
+    expect(realistic).toContain('x'.repeat(7_300));
+  });
+
+  it('still gives a PROBLEM question no background at all', () => {
+    // The narrowing in userPrompt is to PROBLEM_CATEGORIES, not a removal.
+    // A model handed a résumé and "design exactly-once delivery" reaches for
+    // the résumé; that was measured live and the exclusion stands for
+    // exactly the categories it was proven on.
+    const p = userPrompt('how would you design exactly-once delivery?', 'system_design', RESUME);
+    expect(p).not.toContain('CANDIDATE BACKGROUND');
+  });
+
+  it('…but a CONCEPT question now gets it, because the documents answer it', () => {
+    // Measured: "minimum weight vs smallest net weight" is defined in the
+    // uploaded file. With the background excluded the cover got it backwards
+    // 0 times out of 3; with the same file present it matched the document's
+    // own wording. Excluding the material did not stop résumé recitation —
+    // it just made the model guess.
+    const p = userPrompt('what is the difference between OQ and PQ?', 'concept', RESUME);
+    expect(p).toContain('CANDIDATE BACKGROUND');
   });
 });
 
@@ -217,14 +247,34 @@ describe('question one is grounded, without waiting for extraction', () => {
     // project, skill line and metric in the WHOLE knowledge base, where the
     // old coverContext was a 9,000-char slice of a single file) and the
     // vocabulary the server needs to police a fallback model.
-    const sent = (PROXY_SRC.match(/buildOpenerPayload\(query, contextFiles, history\)/g) || []).length;
-    expect(sent).toBe(4);
-    expect(claude).toMatch(/buildOpenerPayload\(query, contextFiles, history\)/);
+    //
+    // ⚠️ EACH ROUTE NAMES ITSELF. The provider argument is not decoration:
+    // a prewarmed cover's LENGTH is chosen from that provider's predicted
+    // gap, and the store now refuses to hand a line written for one route
+    // to another (see cover-provider-fit.test.js). A route that omits its
+    // provider, or copies a neighbour's, silently reopens the defect where
+    // a 72-word groq holding line was spoken in front of a 1.5s OpenAI
+    // answer — so the four are asserted DISTINCT, not merely counted.
+    const named = (PROXY_SRC.match(
+      /buildOpenerPayload\(query, contextFiles, history, \{ provider: '(openai|gemini|xai|groq)' \}\)/g
+    ) || []);
+    expect(named.length).toBe(4);
+    expect(new Set(named).size, 'two routes sharing a provider is the cross-route bug').toBe(4);
+    expect(claude).toMatch(
+      /buildOpenerPayload\(query, contextFiles, history, \{ provider: 'claude' \}\)/
+    );
     // And the payload really does carry the background.
     const fn = /export function buildOpenerPayload[\s\S]*?\n}/.exec(PROXY_SRC)[0];
     expect(fn).toMatch(/ledgerDigest\(ledger\)/);
     expect(fn).toMatch(/ledgerVocabulary\(ledger\)/);
-    expect(fn).toMatch(/composeOpener\(ledger, query, recent\)/);
+    // The rail carries the MODEL's cover and nothing else (2026-08-22).
+    // composeOpener used to be called here and its sentence took precedence;
+    // it spoke extractor artifacts as fact ("Opened 6 May 2026" as an
+    // employer) and is no longer on the product path. What remains is the
+    // suppress verdict, which is about the transcript, not about composing.
+    expect(fn).not.toMatch(/composeOpener\(/);
+    expect(fn).toMatch(/isChallengeToPreviousAnswer\(query\)/);
+    expect(fn).toMatch(/takePrewarmedCover\(query,/);
     // Auto-Solve output is code typed into an editor — no spoken opener,
     // so no background needs to travel with it.
   });
@@ -394,10 +444,28 @@ describe('the cover chain cannot go quiet', () => {
 
   it('the routes actually pass the backstop key', () => {
     const ai = fs.readFileSync(path.resolve(process.cwd(), 'src', 'routes', 'ai.js'), 'utf8');
-    // Once, in runCover — which every stream route goes through, so the
-    // backstop now reaches five routes instead of the two that happened
-    // to have the line copied into them.
-    expect((ai.match(/anthropicKey: process\.env\.ANTHROPIC_API_KEY/g) || []).length).toBe(1);
+    // ⚠️ THE RULE IS "NOT COPIED INTO EVERY ROUTE", NOT "APPEARS ONCE".
+    //
+    // This asserted a count of exactly 1, which was the right shape when
+    // runCover was the only place a cover could be produced: the backstop
+    // reached five routes through one helper instead of the two that
+    // happened to have the line pasted in. There are now TWO cover entry
+    // points — runCover (in-line, on the answer path) and /cover/prewarm
+    // (written during the silence timer) — and both legitimately need the
+    // full chain. What must never come back is the key appearing inside a
+    // /stream/ handler, because that is the copy-paste this guards.
+    const entryPoints = ['async function runCover({', "router.post('/cover/prewarm'"];
+    for (const marker of entryPoints) {
+      const start = ai.indexOf(marker);
+      expect(start, `${marker} is missing`).toBeGreaterThan(-1);
+      const body = ai.slice(start, ai.indexOf('\n});', start) + 4);
+      expect(body, `${marker} must reach the paid backstop`).toMatch(/anthropicKey: process\.env\.ANTHROPIC_API_KEY/);
+      expect(body).toMatch(/groqKey: process\.env\.GROQ_API_KEY/);
+      expect(body).toMatch(/geminiKey: process\.env\.GEMINI_API_KEY/);
+    }
+    // Exactly the two entry points, and nothing else.
+    expect((ai.match(/anthropicKey: process\.env\.ANTHROPIC_API_KEY/g) || []).length).toBe(entryPoints.length);
+
     const helper = /async function runCover\(\{[\s\S]*?\n}/.exec(ai)[0];
     expect(helper).toMatch(/groqKey: process\.env\.GROQ_API_KEY/);
     expect(helper).toMatch(/geminiKey: process\.env\.GEMINI_API_KEY/);
