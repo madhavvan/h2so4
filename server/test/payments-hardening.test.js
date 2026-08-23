@@ -24,6 +24,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 process.env.DATABASE_PATH = ':memory:';
+// Ultra's 9-hour metering is behind ULTRA_METERED while un-updated desktop
+// clients are still in the field (see the kill-switch note in payments.js).
+// The assertions below describe the METERED product, so the flag is on here;
+// the OFF default is pinned in enterprise-plan.test.js.
+process.env.ULTRA_METERED = 'true';
 process.env.JWT_SECRET = 'test-secret-do-not-use-in-prod';
 // Dummy Razorpay creds so payments.js initializes its client — the routing
 // flag test needs a non-null client to prove flag-gating (not key-gating).

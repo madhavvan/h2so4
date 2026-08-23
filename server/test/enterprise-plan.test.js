@@ -34,6 +34,12 @@ import { createRequire } from 'module';
 process.env.DATABASE_PATH = ':memory:';
 process.env.JWT_SECRET = 'test-secret-do-not-use-in-prod';
 process.env.ADMIN_EMAILS = 'owner@minicaai.test';
+// Ultra's metering is behind a kill-switch while un-updated desktop clients
+// are still in the field (they read tier==='ultra' as unlimited, so metering
+// them server-side shows time in the app that the server will not honour).
+// This file tests the METERED product, so it turns the flag on; the OFF
+// default is pinned in its own block at the bottom.
+process.env.ULTRA_METERED = 'true';
 
 const require = createRequire(import.meta.url);
 const db = require('../src/database.js');
@@ -539,5 +545,64 @@ describe('the top-up affordance follows the LICENSE, not a tier list', () => {
     expect(unlimitedAt).toBeGreaterThan(-1);
     expect(tierAt).toBeGreaterThan(-1);
     expect(unlimitedAt).toBeLessThan(tierAt);
+  });
+});
+
+
+// ─── The shipping default ───────────────────────────────────────────────
+
+describe('with ULTRA_METERED unset, Ultra grants exactly what it did before', () => {
+  // The deploy-safety default. Server code can go to production ahead of a
+  // desktop release without any installed client discovering, mid-interview,
+  // that the unlimited plan it is showing has actually been counting down.
+  const withFlag = (value, fn) => {
+    const prev = process.env.ULTRA_METERED;
+    if (value === undefined) delete process.env.ULTRA_METERED;
+    else process.env.ULTRA_METERED = value;
+    try { return fn(); } finally {
+      if (prev === undefined) delete process.env.ULTRA_METERED;
+      else process.env.ULTRA_METERED = prev;
+    }
+  };
+
+  it('payments.js falls back to the -1 unlimited sentinel', () => {
+    withFlag(undefined, () => {
+      const g = payments.grantConfigForTier('ultra');
+      expect(g.credits_remaining_seconds).toBe(-1);
+      expect(g.credits_expire_at).toBe(-1);
+      expect(g.expires_at).toBe(-1);
+    });
+  });
+
+  it('webhooks.js agrees — the two copies must not diverge on the flag either', () => {
+    withFlag(undefined, () => {
+      const g = webhooks.grantConfigForTier('ultra');
+      expect(g.credits_remaining_seconds).toBe(-1);
+      expect(g.credits_expire_at).toBe(-1);
+    });
+  });
+
+  it('a grant written with the flag off reads as unlimited', () => {
+    withFlag(undefined, () => {
+      const g = payments.grantConfigForTier('ultra');
+      const u = makeUser('free');
+      db.updateUserTier(u.id, 'ultra');
+      db.updateLicenseOnPayment(u.id, { ...g, status: 'active' });
+      expect(db.resolveTimeBucket(lic(u.id)).source).toBe('unlimited');
+    });
+  });
+
+  it('ENTERPRISE is unaffected by the flag — it ships now', () => {
+    withFlag(undefined, () => {
+      const g = payments.grantConfigForTier('enterprise');
+      expect(g.tier).toBe('enterprise');
+      expect(g.credits_remaining_seconds).toBe(-1);
+    });
+  });
+
+  it('and turning it on meters again', () => {
+    withFlag('true', () => {
+      expect(payments.grantConfigForTier('ultra').credits_remaining_seconds).toBe(ULTRA_CYCLE);
+    });
   });
 });

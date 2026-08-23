@@ -88,6 +88,29 @@ const INTERVIEW_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 // Ultra's monthly allowance. Mirrored in webhooks.js grantConfigForTier and
 // in the client's services/licenseService.ts ULTRA_MONTHLY_SECONDS.
 const ULTRA_CYCLE_SECONDS = 9 * 60 * 60;
+
+// ── ULTRA METERING KILL-SWITCH (2026-08-22) ────────────────────────────
+// Ultra's 9-hour allowance is a SERVER-side change, and the desktop fleet
+// updates on its own schedule. A client older than this change still reads
+// `tier === 'ultra'` as unlimited (services/licenseService.ts before the
+// isUnlimitedLicense refactor), so if the server starts metering while that
+// client is installed, the app shows unlimited time while the server counts
+// down — and the subscriber discovers the difference as a 402 in the middle
+// of an interview. That is the exact client/server age skew that forced the
+// 2026-07-29 revert.
+//
+// So metering is OFF until turned on. With the flag unset, Ultra grants the
+// -1 unlimited sentinel exactly as it did before, which is what every
+// installed client already believes; Enterprise, the admin-grant permanence
+// work and the cover fixes are unaffected and ship immediately.
+//
+// TO TURN IT ON: ship a desktop release containing isUnlimitedLicense, wait
+// for the fleet, then set ULTRA_METERED=true on the server. Same flag-pair
+// discipline as RAZORPAY_ROUTING_ENABLED + INR_CHECKOUT_ENABLED.
+function ultraMeteringEnabled() {
+  return process.env.ULTRA_METERED === 'true';
+}
+
 function grantConfigForTier(tier) {
   const now = Date.now();
   if (tier === 'free') {
@@ -106,6 +129,11 @@ function grantConfigForTier(tier) {
     return { tier: 'max', sessions_limit: 3, expires_at: exp, credits_remaining_seconds: 3 * 60 * 60, credits_expire_at: exp };
   }
   if (tier === 'ultra') {
+    // Metering is flag-gated while older clients are still in the field —
+    // see ultraMeteringEnabled. Unset = the pre-2026-08 unlimited grant.
+    if (!ultraMeteringEnabled()) {
+      return { tier: 'ultra', sessions_limit: -1, expires_at: -1, credits_remaining_seconds: -1, credits_expire_at: -1 };
+    }
     // Monthly subscription, METERED: 9 hours per billing cycle.
     //   expires_at: -1        — the SUBSCRIPTION has no end date. This is not
     //                           a time sentinel; db.resolveTimeBucket must not
