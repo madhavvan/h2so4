@@ -930,6 +930,14 @@ function _prewarmPut(key, value) {
   }
   _prewarmCache.set(key, { ...value, at: Date.now() });
 }
+// Take a completed prewarm OUT of the cache. Consuming, not peeking: the
+// same sentence must never be spoken twice, and the client's own
+// takePrewarmedCover is consuming for exactly that reason.
+function _prewarmTake(key) {
+  const hit = _prewarmGet(key);
+  if (hit) _prewarmCache.delete(key);
+  return hit;
+}
 function _resetPrewarmCache() { _prewarmCache.clear(); }
 
 // ── ONE PREWARM IN FLIGHT PER USER, AND A DEAD CLIENT STOPS THE WORK ──
@@ -1611,6 +1619,37 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
     console.log(`[cover] ${provider} user=${req.user?.id} LOCAL shape=${req.body?.coverShape || '-'} `
       + `words=${local.split(/\s+/).filter(Boolean).length} cost=0ms model=none`);
     return local;
+  }
+
+  // ── 1b. A PREWARM THAT FINISHED LATE IS NOT A WASTED PREWARM ──
+  //
+  // The prewarm runs while the speaker is still talking, and the client
+  // only gets to use it if the HTTP response beats the ~1,050ms auto-send.
+  // Measured on a real 168 KB knowledge base, 12 distinct questions: 11 of
+  // 12 covers were PRODUCED and only 6 arrived in time. The other five had
+  // already been written, already passed the full grounding guard, and were
+  // then dropped on the floor — while this function went off and raced
+  // three providers from scratch, which is where "groq: produced nothing"
+  // comes from.
+  //
+  // The server still has them. _prewarmPut only ever stores a cover that
+  // cleared coverVerdict (a rejected one returns before the write), so
+  // there is nothing to re-check: this is the same text the client would
+  // have put on the instantOpener rail, arriving by a different door.
+  //
+  // Consuming, and keyed on the EXACT question — the prewarm fires against
+  // an in-progress transcript, so a hit means the sentence the speaker
+  // finished on is the one this cover was written for. A near-miss falls
+  // through to the live race exactly as before.
+  if (!req.headers['x-cover-disabled'] && req.body?.coverPolicy !== 'suppress') {
+    const warmed = _prewarmTake(_prewarmKey(req.user?.id || '-', provider, question));
+    if (warmed && warmed.cover) {
+      sse.send(warmed.cover);
+      sse.send(' ');
+      console.log(`[cover] ${provider} user=${req.user?.id} PREWARM-CLAIMED `
+        + `words=${warmed.cover.split(/\s+/).filter(Boolean).length} cost=0ms model=none`);
+      return warmed.cover;
+    }
   }
 
   // ── 2. An opener would make this moment worse ──
@@ -3503,4 +3542,10 @@ module.exports._test = {
   // two can never drift from each other or from the route mounts.
   ULTRA_ONLY: AUTOTYPE_TIERS,
   _resetPrefetchDedup,
+  _prewarmTake,
+  _prewarmKey,
+  _resetPrewarmCache,
+  // Exposed so the consuming-read contract can be tested for real rather
+  // than skipped — a test that quietly returns early proves nothing.
+  _prewarmPut,
 };
