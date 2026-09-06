@@ -59,6 +59,8 @@ class CreditTimerService {
   private displaySeconds = 0;
   private source: 'trial' | 'credits' | 'unlimited' | 'none' = 'none';
   private beatInFlight = false;
+  // Consecutive heartbeats refused with 401 — see heartbeat().
+  private unauthorizedBeats = 0;
   // Generation counter: stop() (or a newer start()) bumps it, so an
   // in-flight async start() that awakes after being superseded discards
   // itself instead of resurrecting a clock the caller already stopped.
@@ -349,6 +351,17 @@ class CreditTimerService {
         this.emit('stopped');
         return;
       }
+      // Three beats in a row refused as unauthenticated is a dead token, not
+      // a blip (a rotation lands within one beat). Report it so the user is
+      // told to sign in again, instead of a clock that quietly stops syncing.
+      if (resp.status === 401) {
+        this.unauthorizedBeats += 1;
+        if (this.unauthorizedBeats === 3) {
+          try { licenseService.noteAuthRejected('heartbeat'); } catch { /* best effort */ }
+        }
+        return;
+      }
+      this.unauthorizedBeats = 0;
       if (!resp.ok) return; // transient — keep counting locally, retry next beat
       const data = await resp.json();
       if (typeof data.remaining === 'number' && data.remaining !== -1) {

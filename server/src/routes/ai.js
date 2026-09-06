@@ -1083,6 +1083,10 @@ router.post('/cover/prewarm', async (req, res) => {
     const firstPromise = write('');
 
     const depth = await depthPromise;
+  // Same rule as runCover: nothing about them → no model is asked about them.
+  if (aboutThemWithoutEvidence(req, question)) {
+    return res.json({ cover: '', effort: null, reason: 'no-evidence' });
+  }
     if (ac.signal.aborted) {
       if (!res.writableEnded) res.json({ cover: '', effort: null, reason: 'superseded', ms: Date.now() - t0 });
       return;
@@ -1095,6 +1099,25 @@ router.post('/cover/prewarm', async (req, res) => {
       console.log(
         `[prewarm] tier user=${req.user?.id} started on "${provisional.plan.name}", `
         + `verdict "${depth || 'null'}" wanted "${plan.name}" — kept the running one`
+  // ── ONE PREWARM PER PAUSE IS ONE TOO MANY WHEN PAUSES ARE 150 ms APART ──
+  //
+  // The hook fires after a 150 ms transcript settle, and speech finals land
+  // 200–400 ms apart, so a fifteen-second question is four to six prewarms.
+  // Each is a full cover prompt (~4.6k tokens) plus a depth judgement on
+  // Groq, and an aborted stream has already spent its prompt tokens against
+  // the per-minute bucket. Six of those is more than the bucket, and a 429
+  // benches the cover for sixty seconds — precisely at the question.
+  //
+  // So a user may START a prewarm at most once per interval. A request
+  // inside the interval is answered "throttled" and costs nothing; the
+  // prewarm already running keeps running (it is not superseded), and if
+  // the question grows past what that one was written for, the client's
+  // divergence check declines it and the live race takes over as before.
+  const lastStart = _prewarmLastStartByUser.get(uid) || 0;
+  if (Date.now() - lastStart < _prewarmMinIntervalMs) {
+    return res.json({ cover: '', effort: null, reason: 'throttled', ms: 0 });
+  }
+  _prewarmLastStartByUser.set(uid, Date.now());
       );
     }
     // ── 2b. TWO ATTEMPTS IN PARALLEL, NOT ONE THEN ANOTHER ──
@@ -1715,6 +1738,16 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
   // sentence nobody needed — the feature must only ever ADD speed.
   if (!plan) return '';
 
+// Fewer characters than this and the "background" is a name or a header,
+// not evidence a sentence about the candidate can rest on.
+const MIN_EVIDENCE_CHARS = 200;
+function aboutThemWithoutEvidence(req, question) {
+  const { isExperientialQuestion, isBackgroundQuestion } = require('../services/coverAnswer');
+  const evidence = String(req.body?.coverContext || '').trim();
+  if (evidence.length >= MIN_EVIDENCE_CHARS) return false;
+  return isExperientialQuestion(question) || isBackgroundQuestion(question);
+}
+
   // ── HELD BACK UNTIL IT HAS BEEN CHECKED ──
   //
   // This used to be `onToken: (t) => sse.send(t)` — the model's words went
@@ -1765,6 +1798,21 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
     citationHolds, claimsOwnHistory,
   } = require('../services/groundingGuard');
 
+  // ── A QUESTION ABOUT THEM, WITH NOTHING ABOUT THEM, GETS NO COVER ──
+  //
+  // Production, 3.7 days: 12 LLM covers attempted, 5 rejected by the guard
+  // as fabrications — "My first job was as a junior software engineer at a
+  // small fintech startup", "In my work designing custom textiles…" — every
+  // one on a request that carried no evidence at all (no documents
+  // uploaded), for a question about the candidate. The prompt already says
+  // to speak about the subject instead; gpt-oss-20b at low effort ignored
+  // that ~40% of the time. The guard caught them all, and each catch cost
+  // 400–750 ms on the critical path and then silence. So the model is not
+  // asked: about-them + no evidence is a skip, at zero cost.
+  if (aboutThemWithoutEvidence(req, question)) {
+    console.log(`[cover] ${provider} user=${req.user?.id} SKIPPED shape=about-them-no-evidence — no documents to ground a personal answer in`);
+    return '';
+  }
   // ── WHO IS SPEAKING ──
   // Checked before anything else because it is the only failure here that
   // is not about the facts. A cover that says "the interviewer is asking
@@ -1824,7 +1872,8 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
   console.log(
     `[cover] ${provider} user=${req.user?.id} tier=${plan.name} cat=${category} `
     + `effort=${effort} gap~${gapMs}ms cover=${Date.now() - t0}ms `
-    + `words=${words} speech~${(words / SPOKEN_WORDS_PER_SEC).toFixed(1)}s`
+    + `words=${words} speech~${(words / SPOKEN_WORDS_PER_SEC).toFixed(1)}s `
+    + `text="${cover.replace(/\s+/g, ' ').slice(0, 160)}"`
   );
   return cover;
 }
@@ -1921,6 +1970,10 @@ function normalizeProviderError(err) {
   // A JSON body as the message is Gemini's ApiError — never render that at a
   // candidate mid-interview, whatever it says.
   if (raw.trim().startsWith('{')) return PROVIDER_DOWN_MESSAGE;
+  // The TEXT too. Rejected covers were always logged verbatim; accepted ones
+  // were a word count, so the only covers that could be audited from
+  // production were the ones nobody heard. Truncated: this is a log line,
+  // not a transcript.
   if (/timed out|connection error|econnreset|etimedout|socket hang up|had an error|internal error/i.test(raw)) {
     return PROVIDER_DOWN_MESSAGE;
   }
@@ -3618,3 +3671,4 @@ module.exports._test = {
   // than skipped — a test that quietly returns early proves nothing.
   _prewarmPut,
 };
+  _setPrewarmMinInterval,

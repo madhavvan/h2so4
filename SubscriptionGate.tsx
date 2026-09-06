@@ -8085,6 +8085,19 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
           // Validate with server (non-blocking for free, blocking for pro)
           if (licenseService.needsRevalidation(saved.license)) {
             const validated = await licenseService.validateWithServer();
+            // The server refused the saved token outright: it expired while
+            // the app was closed, or was revoked by a password change or an
+            // admin. validateWithServer hands back the cached licence on
+            // purpose (it also runs mid-interview), so at LAUNCH — the one
+            // moment nothing is running — this is where it is acted on.
+            // Rendering the signed-in UI over a dead token is what produced
+            // "every answer fails" reports with no sign-in prompt in sight.
+            if (licenseService.lastValidateStatus === 401) {
+              licenseService.logout();
+              setAuthError('Your session has expired. Please sign in again.');
+              setIsLoading(false);
+              return;
+            }
             if (validated && licenseService.isLicenseValid(validated)) {
               onAuthenticated(saved.user, validated);
               return;

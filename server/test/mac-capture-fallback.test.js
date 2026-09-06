@@ -94,7 +94,7 @@ describe('App.tsx — the notice reaches both windows', () => {
     expect(app).toContain('speechNotice: _rawSpeechNotice,');
     expect(app).toContain('speechNotice: rawSpeechNoticeRef.current,');
     expect(app).toContain('setRemoteSpeechNotice(data.speechNotice ?? null);');
-    expect(app).toMatch(/speechError, speechNotice, isMicStarting, isMicReconnecting, toggleAutoSend/);
+    expect(app).toMatch(/speechError, speechNotice, authRejected, isMicStarting, isMicReconnecting, toggleAutoSend/);
   });
 
   it('renders amber beside the mic, yields to a real error, and offers the settings button for the permission case', () => {

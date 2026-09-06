@@ -49,7 +49,7 @@ describe('the click is acknowledged at once', () => {
     expect(app).toMatch(/isStarting: rawIsStartingRef\.current,\s*\n\s*isReconnecting: rawIsReconnectingRef\.current,/);
     expect(app).toContain('setRemoteIsStarting(!!data.isStarting);');
     expect(app).toContain('setRemoteIsReconnecting(!!data.isReconnecting);');
-    expect(app).toMatch(/speechError, speechNotice, isMicStarting, isMicReconnecting, toggleAutoSend/); // sharedProps → ChatInterface
+    expect(app).toMatch(/speechError, speechNotice, authRejected, isMicStarting, isMicReconnecting, toggleAutoSend/); // sharedProps → ChatInterface
   });
 });
 

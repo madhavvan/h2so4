@@ -260,6 +260,14 @@ export async function proxyRequest(endpoint: string, body: any): Promise<string>
     if (peek?.error === SESSION_REQUIRED) throw sessionRequiredError();
   }
 
+  // A 401 on an answer means the token is dead. Still thrown as a plain
+  // error below (never a "log in" prompt mid-answer — see the note), but
+  // recorded so App can show ONE persistent sign-in bar instead of a fresh
+  // error on every question for the rest of the interview.
+  if (response.status === 401) {
+    try { licenseService.noteAuthRejected('stream'); } catch { /* best effort */ }
+  }
+
   if (!response.ok) {
     const err = await response.json().catch(() => ({ error: 'AI request failed' }));
     // Never tell the user to log in again — this runs during live interviews

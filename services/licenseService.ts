@@ -1090,9 +1090,35 @@ class LicenseService {
     }
   }
 
+  // ── A DEAD TOKEN MUST BE VISIBLE, EVEN THOUGH IT MUST NEVER LOG ANYONE OUT HERE ──
+  //
+  // Production audit, 2026-09-02: a client whose JWT had expired while the app
+  // was closed (or had been revoked by a password change / admin action) came
+  // back up, rendered the signed-in interview UI over the dead token, and then
+  // every call 401'd — 45 answers, the mic key, heartbeats every 20 s for 14
+  // minutes — with nothing on screen but generic errors. validateWithServer
+  // keeps its contract (it never degrades the cached licence, because it also
+  // runs mid-interview), but it now RECORDS the refusal, and the two places
+  // that can act on it do: the launch path in SubscriptionGate signs the user
+  // out cleanly, and App shows one persistent "sign in again" bar instead of
+  // an error per question.
+  /** HTTP status of the most recent /license/validate round-trip. null = none yet. */
+  lastValidateStatus: number | null = null;
+  /** When the server last refused this device's token outright (401). */
+  tokenRejectedAt: number | null = null;
+
+  noteAuthRejected(source: 'validate' | 'stream' | 'heartbeat'): void {
+    this.tokenRejectedAt = Date.now();
+    if (typeof window === 'undefined') return;
+    try {
+      window.dispatchEvent(new CustomEvent('minicaai-auth-rejected', { detail: { source } }));
+    } catch { /* CustomEvent unavailable */ }
+  }
+
   async validateWithServer(): Promise<LicenseData | null> {
     const { license, token } = this.loadAuth();
     if (!license || !token) return null;
+    this.lastValidateStatus = null;
 
     // license.device_id loaded from localStorage is always undefined —
     // the server's licenses table has no device_id column, so it's never
@@ -1124,7 +1150,12 @@ class LicenseService {
       // cannot pause an interviewer to re-authenticate.
       // Revalidation is best-effort: it can UPGRADE the cached state
       // (tier change, token rotation) but never DEGRADE it.
+      this.lastValidateStatus = response.status;
       if (!response.ok) {
+        // 401 alone means "this token is dead" (expired, revoked). 403/404
+        // are licence states the callers already interpret; 5xx and network
+        // failures are the server's problem, not the token's.
+        if (response.status === 401) this.noteAuthRejected('validate');
         return license;
       }
 

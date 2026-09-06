@@ -979,6 +979,7 @@ const ChatInterface = ({
     interimText,
     speechError,
     speechNotice,
+    authRejected,
     isMicStarting,
     isMicReconnecting,
     toggleAutoSend,
@@ -1972,6 +1973,18 @@ const ChatInterface = ({
                 <div className="absolute bottom-0 left-0 right-0 bg-transparent pt-4 pb-4 px-2 md:px-6 z-20">
                     <div className="max-w-3xl mx-auto flex flex-col gap-2">
                         
+                        {authRejected && (
+                            <div className="mx-auto bg-red-600/95 text-white px-3 py-1.5 rounded-full text-xs border border-red-400 flex items-center gap-2 shadow-lg backdrop-blur max-w-[680px]">
+                                <AlertTriangle size={10} /> <span>Your sign-in has expired. Answers and the mic will keep failing until you sign in again.</span>
+                                <button
+                                    type="button"
+                                    onClick={() => onLogout()}
+                                    className="ml-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-white text-red-700 hover:bg-red-50"
+                                >
+                                    Sign in again
+                                </button>
+                            </div>
+                        )}
                         {speechError && (
                             <div className="mx-auto bg-red-500/90 text-white px-3 py-1 rounded-full text-xs border border-red-400 flex items-center gap-2 shadow-lg backdrop-blur">
                                 <AlertTriangle size={10} /> {speechError}
@@ -7044,6 +7057,25 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   }, []);
 
   const gateRef = useRef(gate);
+
+  // ── ONE BAR FOR A DEAD TOKEN, NOT AN ERROR PER QUESTION ──
+  // licenseService.noteAuthRejected fires when /license/validate, an answer
+  // stream or three heartbeats in a row come back 401. Nothing here logs the
+  // user out on its own (that is the launch path's job, in SubscriptionGate);
+  // this only makes the state visible and offers the one action that fixes
+  // it. Cleared by any auth change (a fresh sign-in, or the sign-out itself).
+  const [authRejected, setAuthRejected] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onRejected = () => setAuthRejected(true);
+    const onChanged = () => setAuthRejected(false);
+    window.addEventListener('minicaai-auth-rejected', onRejected);
+    window.addEventListener('minicaai-auth-changed', onChanged);
+    return () => {
+      window.removeEventListener('minicaai-auth-rejected', onRejected);
+      window.removeEventListener('minicaai-auth-changed', onChanged);
+    };
+  }, []);
   useEffect(() => { rawIsListeningRef.current = _rawIsListening; }, [_rawIsListening]);
   useEffect(() => { isProcessingRef.current = isProcessing; }, [isProcessing]);
   useEffect(() => { interimTextRef.current = interimText; }, [interimText]);
@@ -8070,7 +8102,15 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
         let responseText = "";
 
         const streamers: Record<string, Function> = { groq: streamGroq, openai: streamOpenAI, xai: streamXAI, gemini: streamGemini, claude: streamClaude };
-        const gen = streamers[currentSettings.selectedModel] || streamGemini;
+        // Resolve the model the way executeSend does: route around a
+        // provider that is cooling after a refusal, never on the raw picker
+        // value. Regenerate used to re-hit the provider that had just failed
+        // — the same bug the send path fixed in 4.0.22 (delivery ledger).
+        const chosenModel = currentSettings.selectedModel as ModelKey;
+        const regenModel: ModelKey = isModelCooling(chosenModel)
+          ? (pickFallbackModel(chosenModel, gateRef.current?.allowedModels || [], isModelCooling) || chosenModel)
+          : chosenModel;
+        const gen = streamers[regenModel] || streamGemini;
         // Keep the interruption mirrors accurate for regenerated streams
         // too — an interviewer can cut into a regeneration just as well.
         streamingIdRef.current = pendingId;
@@ -8470,7 +8510,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
 
   const sharedProps = {
     messages, streamingMsg: effectiveStreamingMsg, settings, setSettings, isListening, isProcessing, inputText, setInputText, interimText,
-    speechError, speechNotice, isMicStarting, isMicReconnecting, toggleAutoSend, startListening, stopListening, handleManualSend, handleAutoSolve,
+    speechError, speechNotice, authRejected, isMicStarting, isMicReconnecting, toggleAutoSend, startListening, stopListening, handleManualSend, handleAutoSolve,
     handleClear, handleRegenerate, chatContainerRef, textareaRef, handleScroll,
     isPinned, newSinceUnpin, handleJumpToLatest, sidebarOpen,
     onOpenSettings: () => setShowSettings(true),

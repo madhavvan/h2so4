@@ -497,9 +497,29 @@ function _providerCooldowns() {
 // silence with the interviewer waiting. So the holding budget is
 // computed from the gap by the same arithmetic the whole feature rests
 // on: words = (gap - cover_ttft) × words_per_second.
+// ── THE OPENER IS SIZED TO ITS GAP TOO (2026-09-06) ──
+//
+// Production, 3.7 days of logs: every openai cover fired into a predicted
+// gap of 2.5–2.7 s and spoke 14–21 words — six to nine SECONDS of speech in
+// front of an answer that arrived in under three. The candidate is still on
+// the opener's first clause when the real answer paints under it, and the
+// answer then re-makes the point the opener just made. That is the "says
+// the same thing twice" complaint, on the in-request rail this time; the
+// prewarm rail already sizes its sub-floor line by arithmetic (see
+// planForPrewarm). The opener tier keeps its clocks and token budget; only
+// the WORDS follow the gap, with the same floor a person needs to say
+// anything at all.
+const OPENER_MIN_WORDS_FLOOR = 8;
+
 function planCover(gapMs) {
   if (!(gapMs > COVER_FLOOR_MS)) return null;
-  if (gapMs < BRIDGE_FROM_MS) return COVER_TIERS[0];
+  if (gapMs < BRIDGE_FROM_MS) {
+    const base = COVER_TIERS[0];
+    const needed = Math.ceil(((gapMs - COVER_TTFT_ALLOWANCE_MS) / 1000) * SPOKEN_WORDS_PER_SEC);
+    const minWords = clamp(needed, OPENER_MIN_WORDS_FLOOR, base.minWords);
+    const maxWords = clamp(Math.round(needed * 1.35), minWords + 4, base.maxWords);
+    return { ...base, minWords, maxWords };
+  }
   if (gapMs < HOLDING_FROM_MS) return COVER_TIERS[1];
 
   const base = COVER_TIERS[2];
@@ -1112,7 +1132,7 @@ const PROBLEM_CATEGORIES = new Set([
 
 const RECENT_TURNS_CHARS = 1_200;
 
-function userPrompt(question, category, candidateContext, plan, recentTurns) {
+function userPrompt(question, category, candidateContext, plan, recentTurns, profile) {
   const tier = plan || COVER_TIERS[0];
   // Shape first, topic second — see the EXPERIENTIAL_Q note.
   const hint = (isExperientialQuestion(question) || isBackgroundQuestion(question))
@@ -1184,7 +1204,30 @@ function userPrompt(question, category, candidateContext, plan, recentTurns) {
     // What protects the server from an absurd client is no longer a silent
     // slice: contextStore prices every expansion before allocating it and
     // refuses past MAX_RESOLVED_BYTES, and that refusal is visible.
-    bg ? `CANDIDATE BACKGROUND (true — use it, never go beyond it):\n${bg}\n` : '',
+    // ── WHAT IS ALREADY SETTLED, BEFORE ANY PASSAGE IS READ ──
+    //
+    // Derived once at upload time from the WHOLE document, every line
+    // checked against the text it came out of — see
+    // services/candidateProfile.js. Optional: when it is absent this
+    // block disappears and the prompt is byte-for-byte what it was.
+    //
+    // It goes in FRONT of the passages, and the label on the passages
+    // changes when it is present. That label mattered more than it looks:
+    // "CANDIDATE BACKGROUND (true — use it)" is honest about a résumé and
+    // false about an interview dossier, which also contains the topics
+    // they are STUDYING because they have never done them, and the
+    // company on the other side of the table. Measured, that produced "I
+    // have led the qualification of elemental impurity analyzers,
+    // including ICP-MS" from a document whose own table marks ICP-MS
+    // absent, and "during my time at <interviewer>" to that interviewer.
+    //
+    // This is not one more rule arguing with the evidence — two attempts
+    // took that route and the evidence won both times. It TYPES the
+    // evidence, which is work no prompt can do inside a 1,050ms window.
+    profile ? `WHAT IS ESTABLISHED ABOUT THIS PERSON — decided from their whole document.\nWhere this and the passages below disagree, THIS is right:\n${profile}\n` : '',
+    bg ? (profile
+      ? `PASSAGES from their documents matching this question. These are RAW: a\npassage may be their own history, a topic they are studying, or a\ndescription of the company interviewing them. Take DETAIL and wording\nfrom here; let the section above decide what is theirs to claim:\n${bg}\n`
+      : `CANDIDATE BACKGROUND (true — use it, never go beyond it):\n${bg}\n`) : '',
     // Before the question, because the question is often only meaningful
     // relative to it — and after the background, because the background is
     // what is TRUE while this is merely what was said.
@@ -1209,13 +1252,13 @@ function userPrompt(question, category, candidateContext, plan, recentTurns) {
 
 // ── Provider stream factories ── each returns an async iterable of
 // { text } chunks (Gemini) or is adapted to that shape (Groq).
-function geminiCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan, recentTurns) {
+function geminiCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan, recentTurns, profile) {
   return async () => {
     const { GoogleGenAI } = require('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
     return ai.models.generateContentStream({
       model: 'gemini-3.6-flash',
-      contents: [{ role: 'user', parts: [{ text: userPrompt(question, category, candidateContext, plan, recentTurns) }] }],
+      contents: [{ role: 'user', parts: [{ text: userPrompt(question, category, candidateContext, plan, recentTurns, profile) }] }],
       config: {
         systemInstruction: COVER_SYSTEM,
         thinkingConfig: { thinkingLevel: 'MINIMAL' },
@@ -1226,7 +1269,7 @@ function geminiCoverFactory(question, category, candidateContext, apiKey, abortS
   };
 }
 
-function groqCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan, recentTurns) {
+function groqCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan, recentTurns, profile) {
   return async () => {
     const Groq = require('groq-sdk');
     // maxRetries: 0 — see the note on the Anthropic client below.
@@ -1291,13 +1334,44 @@ function groqCoverFactory(question, category, candidateContext, apiKey, abortSig
     //
     // Length is not at risk from a generous number: createCoverEmitter caps
     // the cover at plan.maxWords on a sentence boundary.
-    const REASONING_TOKEN_ALLOWANCE = 96;
+    // ⚠️ 96 → 224, MEASURED 2026-08-23, AND THE OLD NUMBER WAS SILENTLY
+    // COSTING ABOUT A THIRD OF ALL COVERS.
+    //
+    // The distribution above ("26-81 tokens, median ~50") was real when it
+    // was taken and is no longer. Re-measured on this exact prompt with a
+    // cap generous enough that nothing could truncate, over ten questions:
+    //
+    //     reasoning tokens   min 22   median 81   p90 172   max 172
+    //     content   tokens   min 38   median 50   p90 108   max 108
+    //
+    // The opener tier therefore needs up to 280 tokens to finish a
+    // sentence, and it was being given 90 + 96 = 186. Three of ten
+    // completions ran past that — and truncation here is not a shorter
+    // cover, it is NO cover: the reasoning comes first, so a spike eats
+    // the entire budget and the model emits zero content tokens. Probed
+    // separately at the old cap, 6 of 28 calls returned completely empty
+    // and 4 more stopped after the CITE line, before a word was spoken.
+    // That is the "[cover] NO COVER — groq: produced nothing" line in the
+    // logs, and it is arithmetic, not rate limits or a slow provider.
+    //
+    // Costs nothing to raise. max_tokens is a ceiling, not a target: the
+    // model stops when it stops, unused headroom is never generated, and
+    // the emitter still caps the spoken text at plan.maxWords on a
+    // sentence boundary. It is added HERE rather than to plan.maxTokens
+    // for the reason the original note gives — plan.maxTokens also sizes
+    // generationWindowMs, the clock a provider may hold the main answer
+    // on, and inflating that would buy latency on the failure path.
+    //
+    // 224 = p90 reasoning (172) plus ~30% headroom, so it covers the tail
+    // this measurement saw without pretending the tail is the whole
+    // distribution. Pinned by cover-token-budget.test.js.
+    const REASONING_TOKEN_ALLOWANCE = 224;
     const stream = await groq.chat.completions.create({
       model: 'openai/gpt-oss-20b',
       reasoning_effort: 'low',
       messages: [
         { role: 'system', content: COVER_SYSTEM },
-        { role: 'user', content: userPrompt(question, category, candidateContext, plan, recentTurns) },
+        { role: 'user', content: userPrompt(question, category, candidateContext, plan, recentTurns, profile) },
       ],
       max_tokens: plan.maxTokens + REASONING_TOKEN_ALLOWANCE,
       temperature: 0.7,
@@ -1327,7 +1401,7 @@ function groqCoverFactory(question, category, candidateContext, apiKey, abortSig
 // other two are exhausted. A cover is ~80 output tokens; the insurance
 // costs a fraction of a cent and only bills when the free tiers are
 // already down.
-function anthropicCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan, recentTurns) {
+function anthropicCoverFactory(question, category, candidateContext, apiKey, abortSignal, plan, recentTurns, profile) {
   return async () => {
     const Anthropic = require('@anthropic-ai/sdk');
     // NO SDK RETRIES, and a hard timeout.
@@ -1343,7 +1417,7 @@ function anthropicCoverFactory(question, category, candidateContext, apiKey, abo
       model: 'claude-haiku-4-5',
       max_tokens: plan.maxTokens,
       system: COVER_SYSTEM,
-      messages: [{ role: 'user', content: userPrompt(question, category, candidateContext, plan, recentTurns) }],
+      messages: [{ role: 'user', content: userPrompt(question, category, candidateContext, plan, recentTurns, profile) }],
       stream: true,
     }, { signal: abortSignal });
     return (async function* () {
@@ -1701,6 +1775,10 @@ async function streamCoverAnswer({
   question,
   category,
   candidateContext,
+  // The typed upload-time profile (services/candidateProfile.js).
+  // Optional everywhere: an install that never builds one behaves
+  // exactly as this file did before it existed.
+  profile,
   recentTurns,
   geminiKey,
   groqKey,
@@ -1799,15 +1877,15 @@ async function streamCoverAnswer({
   // up FIRST on a day the free tiers are exhausted.
   const cooling = injectedCooling;
   if (!providers.length && groqKey) {
-    if (providerReady('groq')) { providers.push((sig) => groqCoverFactory(question, category, candidateContext, groqKey, sig, tier, recentTurns)()); names.push('groq'); } else cooling.push('groq');
+    if (providerReady('groq')) { providers.push((sig) => groqCoverFactory(question, category, candidateContext, groqKey, sig, tier, recentTurns, profile)()); names.push('groq'); } else cooling.push('groq');
   }
   if (geminiKey) {
-    if (providerReady('gemini')) { providers.push((sig) => geminiCoverFactory(question, category, candidateContext, geminiKey, sig, tier, recentTurns)()); names.push('gemini'); } else cooling.push('gemini');
+    if (providerReady('gemini')) { providers.push((sig) => geminiCoverFactory(question, category, candidateContext, geminiKey, sig, tier, recentTurns, profile)()); names.push('gemini'); } else cooling.push('gemini');
   }
   // Paid, and last in the ORDER — reached only when the free tiers are
   // slow, exhausted or down, which is exactly when it matters.
   if (anthropicKey) {
-    if (providerReady('haiku')) { providers.push((sig) => anthropicCoverFactory(question, category, candidateContext, anthropicKey, sig, tier, recentTurns)()); names.push('haiku'); } else cooling.push('haiku');
+    if (providerReady('haiku')) { providers.push((sig) => anthropicCoverFactory(question, category, candidateContext, anthropicKey, sig, tier, recentTurns, profile)()); names.push('haiku'); } else cooling.push('haiku');
   }
   if (providers.length === 0) {
     // Nothing to try. Return NOW rather than after the budget: the main
@@ -2004,6 +2082,10 @@ module.exports = {
   planForPrewarm,
   DEPTH_SYSTEM,
   PROBLEM_CATEGORIES,
+  // The two "is this about the candidate?" predicates, so the routes can
+  // refuse to ask a model about a person it has been shown nothing about.
+  isExperientialQuestion,
+  isBackgroundQuestion,
   COVER_TIERS,
   COVER_FLOOR_MS,
   SPOKEN_WORDS_PER_SEC,
