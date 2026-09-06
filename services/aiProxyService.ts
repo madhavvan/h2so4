@@ -4,6 +4,7 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 import { licenseService } from './licenseService';
+import { getDeepgramKeyCached } from './deepgramKey';
 import { Message, ContextFile } from '../types';
 import { offloadContext, repairContext } from './contextStore';
 import { retrieveEvidence, kbTextLength, RETRIEVAL_MIN_CHARS, warmIndex } from './kbRetrieval';
@@ -3190,56 +3191,10 @@ export async function backfillAllConversations(
   }
 }
 
+// The key fetch, its error mapping and — new in 2026-09 — its cache live in
+// services/deepgramKey.ts: a minted key is reused for its lifetime instead of
+// being fetched (and minted server-side) on every mic start and reconnect.
+// Kept as a thin alias so existing imports keep working.
 export async function getDeepgramKey(): Promise<string> {
-  const token = licenseService.getToken();
-  if (!token) throw new Error('You are not signed in. Please sign in and try again.');
-
-  const response = await fetch(`${API_BASE}/api/v1/ai/deepgram-key`, {
-    headers: { 'Authorization': `Bearer ${token}` },
-  });
-
-  if (!response.ok) {
-    // Pull the server's actual error body so the toast tells the user
-    // what's really wrong (instead of a generic "Failed to get Deepgram
-    // key" that hides every distinct failure mode behind one string).
-    // Server errors come back as { error, message, ... } per the
-    // express-error convention used across our routes; we keep both
-    // fields handy and pick whichever is more user-readable. The console
-    // line is for support-debug — it logs status + body so when a user
-    // shares a DevTools screenshot we can see exactly what hit them.
-    let serverErr = '';
-    let serverMsg = '';
-    try {
-      const body = await response.json();
-      serverErr = String(body?.error || '');
-      serverMsg = String(body?.message || '');
-    } catch { /* response had no JSON body */ }
-    console.error('[deepgram-key] HTTP', response.status, { serverErr, serverMsg });
-
-    if (response.status === 401) {
-      throw new Error('Your session has expired. Please sign out and sign back in to continue using voice mode.');
-    }
-    if (response.status === 403) {
-      // regionGate (server/src/middleware/regionGate.js) hard-blocks
-      // every AI route — including this one — for India-region users
-      // without an active paid subscription. The error body carries
-      // `error: "subscription_required"` + region + tier + status,
-      // which we surface verbatim so the user knows whether to upgrade,
-      // renew, or check their region setting.
-      if (serverErr === 'subscription_required') {
-        throw new Error(serverMsg || 'Voice mode requires an active paid subscription in your region.');
-      }
-      throw new Error(serverMsg || 'Voice mode is not available on this account.');
-    }
-    if (response.status === 503) {
-      throw new Error('Voice service is temporarily unavailable. Please try again in a few seconds.');
-    }
-    if (response.status === 429) {
-      throw new Error('Too many voice-mode start attempts. Wait a moment, then try again.');
-    }
-    // Catch-all — surface server message if present, fall back to status.
-    throw new Error(serverMsg || serverErr || `Voice service error (HTTP ${response.status}). Please try again.`);
-  }
-  const data = await response.json();
-  return data.key;
+  return getDeepgramKeyCached();
 }

@@ -229,6 +229,7 @@ const { hasAccess, isPlanLapsed } = require('../services/subscriptionStates');
 // how the two ends of a gate drift apart.
 const {
   participatesInProtocol, MIN_PROTOCOL_CLIENT, versionRank, CLIENT_VERSION_HEADER,
+  SESSION_GATE_MIN_CLIENT,
 } = require('../middleware/clientVersion');
 
 // Kept as a named constant because the tests and the app release both refer
@@ -283,7 +284,11 @@ const {
 // What is still missing is field time. Arm this in 4.0.23 once 4.0.22 has run
 // real traffic — "fixed and proven in a harness" and "proven in the field"
 // are different claims, and 15k interviews are downstream of the difference.
-const SESSION_GATE_MIN_CLIENT = '4.0.23';
+//
+// The constant itself lives in middleware/clientVersion.js (imported above)
+// since 2026-09, because the usage clock's full-gap settle cap has to arm on
+// the SAME release as this gate — a client that stops its own clock on sleep
+// is also the first one that can render a 428.
 
 // ⚠️ THE LLM COVER IS HELD BACK TOO — DORMANT (2026-08-08).
 //
@@ -3312,6 +3317,45 @@ let _deepgramMintDisabledReason = null;
 let _deepgramMintFallbackWarned = false;
 let _deepgramStrictBlockWarned = false;
 
+// ── Per-user key cache (2026-09) ──────────────────────────────────────
+// Every call used to mint: p50 623 ms / p90 908 ms / max 1.4 s of Deepgram
+// round trip in production, paid on every mic start AND every reconnect —
+// 21 mints for 7 interview starts in one week of logs. A minted key is good
+// for DEEPGRAM_KEY_TTL_SECONDS and Deepgram checks it only at the handshake,
+// so one key per user per window is all the product needs.
+//
+// Only keys with a comfortable remainder are re-served: an interview that
+// starts on a key with 75+ minutes left reaches its natural end before the
+// key does, and the client refreshes early anyway (services/deepgramKey.ts).
+// `?fresh=1` bypasses the cache — the client sends it when Deepgram rejected
+// the key it had. Master-key fallbacks are never cached: they carry no expiry
+// and are not per-user.
+const DEEPGRAM_KEY_MIN_REMAINING_S = 75 * 60;
+const DEEPGRAM_KEY_CACHE_MAX = 5000;
+const _deepgramKeyCache = new Map(); // userId → { key, expiresAt }
+function cachedDeepgramKeyFor(userId) {
+  if (!userId) return null;
+  const hit = _deepgramKeyCache.get(userId);
+  if (!hit) return null;
+  if (hit.expiresAt - Date.now() < DEEPGRAM_KEY_MIN_REMAINING_S * 1000) {
+    _deepgramKeyCache.delete(userId);
+    return null;
+  }
+  return hit;
+}
+function rememberDeepgramKey(userId, key, expiresAt) {
+  if (!userId) return;
+  if (_deepgramKeyCache.size >= DEEPGRAM_KEY_CACHE_MAX) {
+    const now = Date.now();
+    for (const [id, v] of _deepgramKeyCache) if (v.expiresAt <= now) _deepgramKeyCache.delete(id);
+    if (_deepgramKeyCache.size >= DEEPGRAM_KEY_CACHE_MAX) {
+      _deepgramKeyCache.delete(_deepgramKeyCache.keys().next().value); // oldest insertion
+    }
+  }
+  _deepgramKeyCache.set(userId, { key, expiresAt });
+}
+function _resetDeepgramKeyCache() { _deepgramKeyCache.clear(); }
+
 // Opt-in hard lockdown. When DEEPGRAM_STRICT_NO_MASTER is set, the server
 // NEVER hands the master DEEPGRAM_API_KEY to a client — if per-user minting
 // can't be done, voice transcription degrades (503) instead of leaking a
@@ -3338,7 +3382,10 @@ function fallbackToMasterKey(res, masterKey, reason) {
     _deepgramMintFallbackWarned = true;
     console.warn(`[deepgram] FALLING BACK TO MASTER KEY for the rest of this server process. Reason: ${reason}. Voice mode will keep working, but the master key is now reachable from the client (DevTools). Fix: grant keys:write scope to your Deepgram API key at https://console.deepgram.com/ → Settings → API Keys, OR set DEEPGRAM_PROJECT_ID to a project the key can mint into. Suppressing further fallback warnings this process.`);
   }
-  return res.json({ key: masterKey });
+  // expires_at: null tells the client this key has no expiry to refresh
+  // against (a master key is long-lived) — distinct from an older server
+  // that sends no field at all.
+  return res.json({ key: masterKey, expires_at: null });
 }
 
 // Both GET and POST are bound to the same handler. Older app builds
@@ -3370,6 +3417,16 @@ const deepgramKeyHandler = async (req, res) => {
   // failure (403 insufficient scope, etc.). Don't waste an API call.
   if (_deepgramMintDisabled) {
     return fallbackToMasterKey(res, masterKey, _deepgramMintDisabledReason);
+  }
+
+  // Cached per-user key — the common case after the first start of the day.
+  const cacheId = req.user?.id || null;
+  const freshRaw = req.query?.fresh;
+  const wantFresh = freshRaw === '1' || freshRaw === 'true' || freshRaw === true;
+  if (wantFresh && cacheId) _deepgramKeyCache.delete(cacheId);
+  const hit = wantFresh ? null : cachedDeepgramKeyFor(cacheId);
+  if (hit) {
+    return res.json({ key: hit.key, expires_at: hit.expiresAt, cached: true });
   }
 
   // Tag the key with user identity so the Deepgram dashboard's "Keys"
@@ -3431,7 +3488,11 @@ const deepgramKeyHandler = async (req, res) => {
       return fallbackToMasterKey(res, masterKey, 'mint response missing key field');
     }
 
-    res.json({ key: data.key });
+    // The client caches the key until shortly before this instant
+    // (services/deepgramKey.ts) and so does the map above.
+    const expiresAt = Date.now() + DEEPGRAM_KEY_TTL_SECONDS * 1000;
+    rememberDeepgramKey(cacheId, data.key, expiresAt);
+    res.json({ key: data.key, expires_at: expiresAt });
   } catch (e) {
     console.error('[deepgram] mint error:', e.message);
     // Network failure / DNS / TLS — transient. Serve master key so the user
@@ -3477,6 +3538,14 @@ module.exports.servingModels = {
 // extra properties on the router function are invisible to app.use().
 module.exports._test = {
   requireTimeRemaining,
+  // The Deepgram key route and its per-user cache, so the "one mint per user
+  // per window" contract is tested by calling the handler with a stubbed
+  // Deepgram, not by reading prose.
+  deepgramKeyHandler,
+  _deepgramKeyCache,
+  _resetDeepgramKeyCache,
+  DEEPGRAM_KEY_TTL_SECONDS,
+  DEEPGRAM_KEY_MIN_REMAINING_S,
   // The session gate, so its backward-compatibility contract can be tested
   // by CALLING it rather than by grepping this file for an implementation
   // shape. An earlier version of that test asserted the regex of an inline
