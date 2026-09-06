@@ -60,7 +60,22 @@ function isAdminEmail(email) {
 // USAGE_HEARTBEAT_CAP_S, which is deliberately NOT the liveness window any
 // more: see the long note on both constants in database.js. Using the
 // window here would bill a fifteen-minute laptop sleep as interview time.
-const { USAGE_STALE_AFTER_MS, USAGE_HEARTBEAT_CAP_S } = db;
+const { USAGE_STALE_AFTER_MS, USAGE_HEARTBEAT_CAP_S, USAGE_FULL_GAP_CAP_S } = db;
+const { clientAtLeast, SESSION_GATE_MIN_CLIENT } = require('../middleware/clientVersion');
+
+// ━━ Which cap does THIS caller get? ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// The 90-second ceiling exists because an old client that slept for
+// fourteen minutes would otherwise be billed fourteen minutes on wake. From
+// SESSION_GATE_MIN_CLIENT (4.0.23) the desktop app stops its own session on
+// suspend / screen lock and reopens it on wake, so for those clients a
+// silent gap on a still-open session IS interview time and is billed in
+// full, up to the liveness window. That is what closes the slow-beat
+// discount (a hand-modified client beating every fourteen minutes paid
+// ninety seconds each time). Absent or unparseable version header → the
+// old cap: the safe direction, the same one every gate here fails toward.
+function settleCapFor(req) {
+  return clientAtLeast(req, SESSION_GATE_MIN_CLIENT) ? USAGE_FULL_GAP_CAP_S : USAGE_HEARTBEAT_CAP_S;
+}
 // A /start this soon after the running one is the same client asking
 // twice (a re-mounted window, a retried request — or a loop trying to
 // rewind the clock): it RESUMES the live session instead of minting a
@@ -75,10 +90,10 @@ const USAGE_START_RESUME_MS = 10 * 1000;
 // grows by what the balance ACTUALLY gave up rather than by the nominal
 // ask, so an empty bucket can never inflate the usage ledger the refund
 // policy reads. Returns the seconds charged.
-function settleUsageSession(userId, sess, now) {
+function settleUsageSession(userId, sess, now, capS = USAGE_HEARTBEAT_CAP_S) {
   if (!sess || sess.source === 'unlimited') return 0;
   const owed = Math.max(0, Math.floor(
-    Math.min(now - sess.last_heartbeat_at, USAGE_HEARTBEAT_CAP_S * 1000) / 1000,
+    Math.min(now - sess.last_heartbeat_at, capS * 1000) / 1000,
   ));
   if (owed <= 0) return 0;
   const col = sess.source === 'credits' ? 'credits_remaining_seconds' : 'trial_remaining_seconds';
@@ -110,11 +125,11 @@ function settleUsageSession(userId, sess, now) {
 // Settle the one session the client named (/heartbeat, /stop). An
 // unknown, closed, or someone else's id settles nothing — the database
 // helper that runs next answers those with its own 410.
-function settleUsageSessionById(userId, sessionId, now) {
+function settleUsageSessionById(userId, sessionId, now, capS) {
   const sess = db.getDB().prepare(
     'SELECT * FROM usage_sessions WHERE id = ? AND user_id = ? AND ended_at IS NULL'
   ).get(sessionId, userId);
-  return settleUsageSession(userId, sess, now);
+  return settleUsageSession(userId, sess, now, capS);
 }
 
 // Settle EVERY session this account still has open and return the one a
@@ -125,7 +140,7 @@ function settleUsageSessionById(userId, sessionId, now) {
 // purpose: that keeps "there is never a moment with zero live sessions"
 // true, which is what stops a concurrent question being refused
 // mid-interview.
-function settleOpenUsageSessions(userId, now) {
+function settleOpenUsageSessions(userId, now, capS) {
   const open = db.getDB().prepare(`
     SELECT * FROM usage_sessions
     WHERE user_id = ? AND ended_at IS NULL
@@ -138,7 +153,7 @@ function settleOpenUsageSessions(userId, now) {
         && (now - sess.last_heartbeat_at) < USAGE_STALE_AFTER_MS) {
       resumable = sess;
     }
-    settleUsageSession(userId, sess, now);
+    settleUsageSession(userId, sess, now, capS);
   }
   return resumable;
 }
@@ -174,7 +189,7 @@ router.post('/start', authMiddleware, (req, res) => {
     // and threw its un-beaten seconds away, which made a /start loop an
     // unlimited free-time faucet.
     const now = Date.now();
-    const resumable = settleOpenUsageSessions(req.user.id, now);
+    const resumable = settleOpenUsageSessions(req.user.id, now, settleCapFor(req));
 
     // ── Repeat-/start guard ──
     // A second /start moments after the running one RESUMES that session
@@ -238,8 +253,9 @@ router.post('/heartbeat', authMiddleware, (req, res) => {
     // gap longer than the per-beat cap is charged for what it held), then
     // let the database helper charge the residual — ~0s — and run the
     // exhaustion / session-gone logic exactly as it always has.
-    const settled = settleUsageSessionById(req.user.id, sessionId, Date.now());
-    const result = db.heartbeatUsageSession(req.user.id, sessionId);
+    const capS = settleCapFor(req);
+    const settled = settleUsageSessionById(req.user.id, sessionId, Date.now(), capS);
+    const result = db.heartbeatUsageSession(req.user.id, sessionId, { capSeconds: capS });
     if (result?.error === 'no_session') {
       // Session was superseded (another device/window took over), swept
       // stale, or already exhausted. 410 tells the client to stop its
@@ -262,8 +278,9 @@ router.post('/stop', authMiddleware, (req, res) => {
     // Same server-clock settle as the heartbeat path, so a client that
     // stops after a long silent gap pays for the window it actually held
     // rather than the per-beat cap.
-    const settled = settleUsageSessionById(req.user.id, sessionId, Date.now());
-    const result = db.stopUsageSession(req.user.id, sessionId);
+    const capS = settleCapFor(req);
+    const settled = settleUsageSessionById(req.user.id, sessionId, Date.now(), capS);
+    const result = db.stopUsageSession(req.user.id, sessionId, { capSeconds: capS });
     if (result?.error === 'no_session') {
       // Already closed (exhausted beat, sweeper, supersede) — that's fine;
       // report the current balance so the client lands consistent.
@@ -325,7 +342,10 @@ router.get('/summary', authMiddleware, (req, res) => {
     // Metered: paid tiers anchor on the recorded grant (plan window total);
     // free anchors on FREE_TRIAL_SECONDS (single source of truth).
     // used = granted - remaining so the tube fills exactly with consumption.
-    const paid = ['basic', 'pro', 'max'].includes(license.tier);
+    // db.METERED_TIERS, not a local list: the copy that lived here never
+    // learned Ultra became metered, so a metered Ultra anchored on the
+    // 10-minute trial constant and its Usage card read "0 used" forever.
+    const paid = db.METERED_TIERS.includes(license.tier);
     const remaining = Math.max(0, bucket.remaining);
     const granted = paid
       ? Math.max(license.credits_granted_seconds || 0, remaining)

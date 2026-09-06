@@ -113,10 +113,37 @@ function participatesInProtocol(req) {
   return rank !== null && want !== null && rank >= want;
 }
 
+/**
+ * First client generation that can render the 428 session gate AND stops its
+ * own usage clock when the machine sleeps (creditTimerService power hooks).
+ * Both server behaviours that depend on it — routes/ai.js requireActiveSession
+ * and the full-gap settle cap in routes/usage.js — read this one constant so
+ * they arm on the same release. Held one release behind MIN_PROTOCOL_CLIENT
+ * on purpose (see the note on SESSION_GATE_MIN_CLIENT in routes/ai.js).
+ */
+const SESSION_GATE_MIN_CLIENT = '4.0.23';
+
+/**
+ * Is this caller at least `minVersion`? Reads req.clientRank when the
+ * middleware ran and the raw header otherwise, so a gate cannot be defeated
+ * by a missing mount. Unparseable / absent / bad threshold → false, i.e. the
+ * caller is treated as OLD — the direction every gate in this codebase fails.
+ */
+function clientAtLeast(req, minVersion) {
+  const want = versionRank(minVersion);
+  if (want === null) return false;
+  const rank = typeof req?.clientRank === 'number'
+    ? req.clientRank
+    : versionRank(req?.headers && req.headers[CLIENT_VERSION_HEADER]);
+  return rank !== null && rank >= want;
+}
+
 module.exports = {
   clientVersion,
   participatesInProtocol,
+  clientAtLeast,
   versionRank,
   CLIENT_VERSION_HEADER,
   MIN_PROTOCOL_CLIENT,
+  SESSION_GATE_MIN_CLIENT,
 };

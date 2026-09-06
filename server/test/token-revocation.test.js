@@ -79,11 +79,14 @@ describe('tokens_revoked_after — force logout', () => {
     // replacement session. Both land in the same whole second, so
     // iat*1000 === cutoff. A `<=` comparison would sign the user out of
     // the session the reset just handed them, on every password reset.
-    const now = Date.now();
-    revokedAfter = Math.floor(now / 1000) * 1000;
+    // Derive the cutoff from the token's OWN iat instead of a separate
+    // Date.now(): the two used to be read a few statements apart, and on a
+    // loaded CI runner a second boundary occasionally fell between them,
+    // failing the test for a reason that had nothing to do with revocation.
     const token = generateToken({ id: 'u1', email: 'a@b.com' });
     const decoded = require('jsonwebtoken').decode(token);
-    expect(decoded.iat * 1000).toBe(revokedAfter); // the boundary really is exercised
+    revokedAfter = decoded.iat * 1000; // same whole second as the token — the boundary is exercised
+    expect(decoded.iat * 1000).toBe(revokedAfter);
     expect(run(token).passed).toBe(true);
   });
 

@@ -499,6 +499,13 @@ async function handleStripeEvent(event) {
             sessions_limit: grant.sessions_limit,
             credits_remaining_seconds: grant.credits_remaining_seconds,
             credits_expire_at: grant.credits_expire_at,
+            // A REAL purchase supersedes any earlier admin comp. Without this
+            // the marker outlived the comp: a customer comped once, who later
+            // paid for Ultra and then cancelled, kept Ultra for free forever —
+            // customer.subscription.deleted was refused as "admin-granted".
+            // The marker exists to protect a comp from an OLD subscription's
+            // lifecycle, never to make a NEW paid plan irrevocable.
+            admin_granted_at: 0,
           });
         }
         // Save Stripe customer ID (even on renewal — may be the first
@@ -1597,6 +1604,7 @@ async function handleRazorpayEvent(body) {
             // paid, yet every usage/model gate said "time used up".
             credits_remaining_seconds: grant.credits_remaining_seconds,
             credits_expire_at: grant.credits_expire_at,
+            admin_granted_at: 0, // a real purchase supersedes any earlier admin comp
           });
         }
         // Never clobbers an existing Stripe `cus_…` marker — see

@@ -2056,16 +2056,50 @@ function grantCreditSessions(userId, n) {
   return getLicenseByUserId(userId);
 }
 
+// Admin "add interview minutes" — the time-model successor to
+// grantCreditSessions above, which only ever moved the legacy session count
+// and therefore changed nothing a metered customer could feel. A positive
+// delta goes through grantTimeExtension, i.e. lands exactly like a paid
+// extension pack: stacks onto a live pass, reopens a lapsed one as Basic,
+// adds seconds only on a subscription. A negative delta clamps the credit
+// bucket at zero and touches nothing else. Unlimited licences come back
+// untouched — there is nothing to add to.
+function adjustLicenseTimeSeconds(userId, deltaSeconds) {
+  const license = getLicenseByUserId(userId);
+  if (!license) return null;
+  const delta = Math.trunc(Number(deltaSeconds) || 0);
+  if (delta === 0) return license;
+  if (isUnlimitedLicenseRow(license)) return license;
+  if (delta > 0) return grantTimeExtension(userId, delta);
+  getDB().prepare(`
+    UPDATE licenses SET credits_remaining_seconds = MAX(0, COALESCE(credits_remaining_seconds, 0) - ?)
+    WHERE user_id = ?
+  `).run(-delta, userId);
+  return getLicenseByUserId(userId);
+}
+
 // Push the license expiry out by N days from whichever is later: now, or the
-// current expiry. -1 (never-expires, for Pro/Max) is preserved.
+// current expiry. -1 (never-expires — the subscriptions and every admin
+// grant) is preserved.
+//
+// The interview WINDOW moves with the plan. A pass's credits_expire_at is the
+// date its minutes stop being usable and is written equal to expires_at at
+// grant time; moving expires_at alone (the pre-2026-09 behaviour) left the
+// console saying "extended" while /usage/start kept answering 402, because
+// the minutes had already voided. Rows without a window (credits_expire_at
+// 0 — a metered subscription) keep it that way.
 function extendLicenseExpiry(userId, days) {
   const license = getLicenseByUserId(userId);
   if (!license) return null;
   if (license.expires_at === -1) return license;
-  const base = Math.max(Date.now(), license.expires_at);
-  const newExpiry = base + days * 24 * 60 * 60 * 1000;
-  getDB().prepare('UPDATE licenses SET expires_at = ? WHERE user_id = ?')
-    .run(newExpiry, userId);
+  const d = Number(days);
+  if (!Number.isFinite(d) || d === 0) return license;
+  const base = Math.max(Date.now(), license.expires_at || 0);
+  const newExpiry = base + d * 24 * 60 * 60 * 1000;
+  const hadWindow = (license.credits_expire_at || 0) > 0;
+  const newWindow = hadWindow ? newExpiry : (license.credits_expire_at || 0);
+  getDB().prepare('UPDATE licenses SET expires_at = ?, credits_expire_at = ? WHERE user_id = ?')
+    .run(newExpiry, newWindow, userId);
   return getLicenseByUserId(userId);
 }
 
@@ -2205,6 +2239,12 @@ function grantTimeExtension(userId, seconds) {
       credits_granted_seconds = ?
     WHERE user_id = ?
   `).run(tier, newExpiresAt, existing + EXT_S, newExpiresAt, existingGranted + EXT_S, userId);
+  // A free/expired account reactivated as Basic must read Basic on the users
+  // row too: the gates read the licence, but the admin dashboard badge and
+  // the JWT tier claim read users.tier, and they showed FREE for a customer
+  // who had just been given (or had just bought) interview time. Seen live
+  // on 2026-09-06 through the dashboard's "Add interview minutes".
+  getDB().prepare('UPDATE users SET tier = ?, updated_at = ? WHERE id = ? AND tier != ?').run(tier, Date.now(), userId, tier);
   return getLicenseByUserId(userId);
 }
 
@@ -2254,6 +2294,25 @@ const USAGE_STALE_AFTER_MS = 15 * 60 * 1000;
 // Keep at/above the client's HEARTBEAT_EVERY_MS (20s) with room for a few
 // missed beats, or ordinary jitter starts under-billing real sessions.
 const USAGE_HEARTBEAT_CAP_S = 90; // max chargeable seconds per settle
+
+// ── The cap for clients that stop their own clock on sleep (2026-09) ──
+// From 4.0.23 the desktop app closes its usage session the moment the
+// machine suspends or the screen locks and reopens it on wake
+// (creditTimerService power hooks), so for those clients a silent gap on a
+// still-open session is interview time — and a settle may bill the whole
+// gap, up to the liveness window. That closes the slow-beat discount the
+// note above left open, without billing anyone for a laptop that slept.
+// Older clients cannot make that promise and keep the 90-second ceiling.
+// routes/usage.js picks between the two per request (settleCapFor).
+const USAGE_FULL_GAP_CAP_S = USAGE_STALE_AFTER_MS / 1000;
+
+// Normalise a caller-supplied per-settle cap: a positive finite number of
+// seconds, never above the liveness window (anything past it is the
+// sweeper's business), defaulting to the conservative ceiling.
+function settleCapSeconds(capSeconds) {
+  if (!Number.isFinite(capSeconds) || capSeconds <= 0) return USAGE_HEARTBEAT_CAP_S;
+  return Math.min(Math.floor(capSeconds), USAGE_FULL_GAP_CAP_S);
+}
 
 // Which bucket does this license draw live-interview time from?
 // Mirrors the client's getLiveTimeBalance so both sides agree on semantics:
@@ -2442,9 +2501,10 @@ function startUsageSession(userId, deviceId, { unlimitedOverride = false } = {})
 // Heartbeat: charge elapsed-since-last-beat (clamped) and report the
 // authoritative remaining balance. Returns exhausted:true exactly once —
 // the beat that drains the bucket also closes the session.
-function heartbeatUsageSession(userId, sessionId) {
+function heartbeatUsageSession(userId, sessionId, { capSeconds } = {}) {
   const d = getDB();
   const now = Date.now();
+  const cap = settleCapSeconds(capSeconds);
   let result = null;
   const tx = d.transaction(() => {
     const sess = d.prepare(
@@ -2453,7 +2513,7 @@ function heartbeatUsageSession(userId, sessionId) {
     if (!sess) { result = { error: 'no_session' }; return; }
 
     const elapsed = Math.min(
-      USAGE_HEARTBEAT_CAP_S,
+      cap,
       Math.max(0, Math.floor((now - sess.last_heartbeat_at) / 1000)),
     );
 
@@ -2496,9 +2556,10 @@ function heartbeatUsageSession(userId, sessionId) {
 }
 
 // Clean stop: settle the final partial interval, close the session.
-function stopUsageSession(userId, sessionId) {
+function stopUsageSession(userId, sessionId, { capSeconds } = {}) {
   const d = getDB();
   const now = Date.now();
+  const cap = settleCapSeconds(capSeconds);
   let result = null;
   const tx = d.transaction(() => {
     const sess = d.prepare(
@@ -2507,7 +2568,7 @@ function stopUsageSession(userId, sessionId) {
     if (!sess) { result = { error: 'no_session' }; return; }
 
     const elapsed = sess.source === 'unlimited' ? 0 : Math.min(
-      USAGE_HEARTBEAT_CAP_S,
+      cap,
       Math.max(0, Math.floor((now - sess.last_heartbeat_at) / 1000)),
     );
     const remaining = sess.source === 'unlimited'
@@ -3293,7 +3354,10 @@ function getStats() {
 
   // Full per-tier user count — single GROUP BY scan instead of four COUNTs.
   const tierRows = d.prepare('SELECT tier, COUNT(*) as c FROM users GROUP BY tier').all();
-  const tiers = { free: 0, basic: 0, pro: 0, max: 0, ultra: 0 };
+  // Every sellable tier has a key here AND in the three maps below. Enterprise
+  // was missing from all four until 2026-09, so the $1199 plan's users and
+  // revenue were silently dropped from the admin tier cards.
+  const tiers = { free: 0, basic: 0, pro: 0, max: 0, ultra: 0, enterprise: 0 };
   for (const row of tierRows) {
     if (row.tier in tiers) tiers[row.tier] = row.c;
   }
@@ -3314,12 +3378,12 @@ function getStats() {
     WHERE status = 'completed' AND created_at > ?
     GROUP BY tier_granted, COALESCE(currency, 'USD')
   `).all(monthAgo);
-  const revenueByTier = { basic: 0, pro: 0, max: 0, ultra: 0 };
-  const paymentsByTier = { basic: 0, pro: 0, max: 0, ultra: 0 };
+  const revenueByTier = { basic: 0, pro: 0, max: 0, ultra: 0, enterprise: 0 };
+  const paymentsByTier = { basic: 0, pro: 0, max: 0, ultra: 0, enterprise: 0 };
   // { pro: { USD: 12900 }, ultra: { USD: 15900, INR: 1299900 } } — minor
   // units. The flat revenueByTier above adds cents to paise and is kept only
   // for older clients; anything rendering money reads this map.
-  const revenueByTierCurrency = { basic: {}, pro: {}, max: {}, ultra: {} };
+  const revenueByTierCurrency = { basic: {}, pro: {}, max: {}, ultra: {}, enterprise: {} };
   for (const row of revenueRows) {
     const t = row.tier_granted;
     if (!t || !(t in revenueByTier)) continue;
@@ -3337,7 +3401,7 @@ function getStats() {
   const signupRows = d.prepare(`
     SELECT tier, COUNT(*) as c FROM users WHERE created_at > ? GROUP BY tier
   `).all(monthAgo);
-  const signupsByTier = { free: 0, basic: 0, pro: 0, max: 0, ultra: 0 };
+  const signupsByTier = { free: 0, basic: 0, pro: 0, max: 0, ultra: 0, enterprise: 0 };
   for (const row of signupRows) {
     if (row.tier in signupsByTier) signupsByTier[row.tier] = row.c;
   }
@@ -3367,6 +3431,7 @@ function getStats() {
     basic_users: tiers.basic,
     max_users: tiers.max,
     ultra_users: tiers.ultra,
+    enterprise_users: tiers.enterprise,
     // Cross-currency minor-unit sum — legacy, not renderable as money.
     revenue_by_tier: revenueByTier,
     // Per-tier, per-currency minor units. This is what the dashboard renders.
@@ -3898,7 +3963,13 @@ module.exports = {
   // than its own copies. They were duplicated there under a "keep in sync"
   // comment, which is the arrangement that lets a window and a charge
   // ceiling drift apart silently.
-  USAGE_STALE_AFTER_MS, USAGE_HEARTBEAT_CAP_S,
+  USAGE_STALE_AFTER_MS, USAGE_HEARTBEAT_CAP_S, USAGE_FULL_GAP_CAP_S, settleCapSeconds,
+  // The tier lists the clock is defined over — exported so routes stop
+  // carrying their own copies (routes/usage.js /summary had one that never
+  // learned Ultra became metered).
+  METERED_TIERS, RECURRING_TIERS,
+  // Admin "add interview minutes" (time-model successor to grantCreditSessions)
+  adjustLicenseTimeSeconds,
   // Lifecycle emails (pass-expiry reminders etc.)
   markLifecycleEmailOnce, getExpiringPassLicenses,
   // Cycle-end downgrade (paid → free safety net)

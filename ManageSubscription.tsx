@@ -342,7 +342,10 @@ const UPGRADE_TARGETS: Record<string, BuyTier[]> = {
   pro:   ['max', 'ultra', 'enterprise'],
   max:   ['ultra', 'enterprise'],
   ultra: ['enterprise'],
-  enterprise: [],
+  // Enterprise → Ultra is the one DOWN-move offered: both are subscriptions,
+  // so /upgrade-tier swaps the item in place (prorated credit on the next
+  // invoice) instead of the cancel-then-repurchase dance a pass would need.
+  enterprise: ['ultra'],
 };
 
 // Themed purchase row — dark with a SLIGHT gold hairline; Basic is the plainest.
@@ -350,7 +353,7 @@ const UPGRADE_TARGETS: Record<string, BuyTier[]> = {
 // the RIGHT edge — a hint, not a violet row. Colors are inline hex so they
 // survive the html.dark blue/purple→gold remap in index.css and read on both
 // the light and dark surfaces. Icon color rides on the span's `color`.
-const UpgradeRow: React.FC<{ target: BuyTier; pending: boolean; disabled: boolean; onClick: () => void }> = ({ target, pending, disabled, onClick }) => {
+const UpgradeRow: React.FC<{ target: BuyTier; pending: boolean; disabled: boolean; onClick: () => void; titleOverride?: string }> = ({ target, pending, disabled, onClick, titleOverride }) => {
   const m = PLAN_ROW_META[target];
   const Icon = m.Icon;
   const isUltra = m.accent === 'violet';
@@ -376,7 +379,7 @@ const UpgradeRow: React.FC<{ target: BuyTier; pending: boolean; disabled: boolea
       <div className="flex items-center gap-3">
         <span style={{ color: fg, display: 'inline-flex' }}><Icon size={18} /></span>
         <div className="text-left">
-          <div className="font-semibold text-zinc-900 dark:text-white text-sm">{pending ? 'Preparing checkout…' : m.title}</div>
+          <div className="font-semibold text-zinc-900 dark:text-white text-sm">{pending ? 'Preparing checkout…' : (titleOverride || m.title)}</div>
           <div className="text-xs text-zinc-600 dark:text-white/60">{m.blurb}</div>
         </div>
       </div>
@@ -1306,6 +1309,11 @@ export function ManageSubscription({
               pending={upgradePending === t}
               disabled={upgradePending != null}
               onClick={() => onUpgradeRequested(t)}
+              // A move DOWN the ladder (Enterprise → Ultra) is a plan switch,
+              // not a "Go Ultra" purchase — say so on the row.
+              titleOverride={!planLapsed && TIER_ORDER.indexOf(t) < TIER_ORDER.indexOf(tier as typeof TIER_ORDER[number])
+                ? `Switch to ${TIER_INFO[t]?.label || t}`
+                : undefined}
             />
           ))}
 

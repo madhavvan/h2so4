@@ -260,7 +260,10 @@ function renderTierChangeEmail({ name, fromTier, toTier, provider, effectiveDate
   const safeProvider = String(provider || 'your card').replace(/</g, '&lt;');
   const safeDate = String(effectiveDate || 'now').replace(/</g, '&lt;');
 
-  const tierRank = { free: 0, basic: 1, pro: 2, max: 3 };
+  // Mirrors TIER_RANK in routes/payments.js. Ultra and Enterprise were
+  // missing, so an Ultra → Enterprise swap rendered as a "change" with
+  // "no feature change" copy, and Enterprise → Ultra never read as a downgrade.
+  const tierRank = { free: 0, basic: 1, pro: 2, max: 3, ultra: 4, enterprise: 5 };
   const direction = (tierRank[toTier] > tierRank[fromTier]) ? 'upgrade'
     : (tierRank[toTier] < tierRank[fromTier]) ? 'downgrade'
     : 'change';
@@ -369,7 +372,8 @@ function renderCancellationEmail({ name, tier, effectiveDate, manageUrl }) {
 // ("scheduled to cancel"); this one says "your access has ended,
 // here's what you keep and how to come back". Includes a one-click
 // "Buy Basic now" CTA because Basic is the easiest path back in
-// (one-time $25, no recurring commitment).
+// (one-time $30 · one 30-minute interview · 30-day window, no recurring
+// commitment — mirrors STRIPE_PRICE_DATA.basic in routes/payments.js).
 function renderAccessEndedEmail({ name, previousTier, buyBasicUrl, signInUrl }) {
   const safeName = (name || 'there').toString().replace(/</g, '&lt;');
   const safeTier = (previousTier || 'paid').toString().toUpperCase().replace(/</g, '&lt;');
@@ -383,12 +387,11 @@ function renderAccessEndedEmail({ name, previousTier, buyBasicUrl, signInUrl }) 
     '',
     `What you keep:`,
     `  - Your account, settings, custom instructions, and conversation history`,
-    `  - 5 free practice sessions per month with Gemini`,
     '',
-    `Easiest way back in: pick up Basic ($25 one-time, 3 sessions, 14-day window — no auto-renewal).`,
+    `Easiest way back in: pick up Basic ($30 one-time · one 30-minute interview · 30-day window — no auto-renewal).`,
     basicUrl,
     '',
-    `Or you can subscribe to Pro/Max again any time from Manage Subscription:`,
+    `Or pick any plan — Pro, Max, Ultra or Enterprise — from Manage Subscription:`,
     inUrl,
     '',
     '— The minicaai team',
@@ -406,18 +409,18 @@ function renderAccessEndedEmail({ name, previousTier, buyBasicUrl, signInUrl }) 
     <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:14px 18px;margin:18px 0">
       <div style="font-size:12px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">What you keep on Free</div>
       <ul style="font-size:13px;line-height:1.7;color:#d1d5db;margin:0;padding-left:18px">
-        <li>5 practice sessions per month</li>
-        <li>Gemini model access</li>
-        <li>Account, settings, custom instructions, history</li>
+        <li>Your account and settings</li>
+        <li>Custom instructions and uploaded context</li>
+        <li>Your full conversation history</li>
       </ul>
     </div>
-    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 8px">Easiest way back in is <strong style="color:#e5e7eb">Basic</strong> — $25 one-time, no auto-renewal, 3 sessions over 14 days:</p>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 8px">Easiest way back in is <strong style="color:#e5e7eb">Basic</strong> — $30 one-time, no auto-renewal, one 30-minute interview to use within 30 days:</p>
     <div style="margin:18px 0">
       <a href="${basicUrl}" style="display:inline-block;padding:12px 24px;border-radius:10px;background:linear-gradient(135deg,#10b981,#3b82f6);color:#fff;font-weight:700;font-size:14px;text-decoration:none">
-        Get Basic — $25
+        Get Basic — $30
       </a>
     </div>
-    <p style="font-size:13px;line-height:1.6;color:#9ca3af;margin:14px 0 24px">Or come back to <a href="${inUrl}" style="color:#60a5fa">Manage Subscription</a> any time to switch to Pro or Max.</p>
+    <p style="font-size:13px;line-height:1.6;color:#9ca3af;margin:14px 0 24px">Or come back to <a href="${inUrl}" style="color:#60a5fa">Manage Subscription</a> any time for Pro, Max, Ultra or Enterprise.</p>
     <div style="border-top:1px solid #1f2937;padding-top:16px;font-size:12px;color:#6b7280;line-height:1.6">
       Thanks for being a minicaai customer — we'd love to see you back.
     </div>

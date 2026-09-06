@@ -89,18 +89,13 @@ function getRazorpay() {
   return _razorpay;
 }
 
-// Mirrors handleChangeTier defaults in routes/admin.js. Duplicated here
-// rather than imported because admin.js doesn't export it — extracting
-// is a follow-up refactor.
-const DAY_MS = 24 * 60 * 60 * 1000;
-// Admin bot grants are UNLIMITED-until-revoked, same as routes/admin.js.
-const TIER_LICENSE_DEFAULTS = {
-  free:  { expires_at: () => Date.now() + 30 * DAY_MS, sessions_limit: 5 },
-  basic: { expires_at: () => -1, sessions_limit: -1 },
-  pro:   { expires_at: () => -1, sessions_limit: -1 },
-  max:   { expires_at: () => -1, sessions_limit: -1 },
-  ultra: { expires_at: () => -1, sessions_limit: -1 },
-};
+// The admin tier grant is ONE function shared with routes/admin.js
+// (services/adminGrants.js). This file used to carry its own copy of the
+// tier defaults and its own licence write, and the copy had drifted: the
+// bot moved a user to Pro with the credit columns untouched and no
+// admin-grant marker, so the "grant" evaporated on the next lifecycle event
+// for any old subscription while the dashboard's did not.
+const { applyAdminTierChange, PAID_TIERS: ADMIN_GRANT_PAID_TIERS } = require('./adminGrants');
 
 // ─── Step-up gate helper ──────────────────────────────────────────
 // Returns null when the caller has a fresh stepUp=true claim, or a
@@ -1661,12 +1656,12 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
   // Mirrors routes/admin.js handleChangeTier.
   {
     name: 'change_user_tier',
-    description: 'ADMIN-ONLY: Move ANOTHER user (not yourself) to a specified plan (free/basic/pro/max). Updates that user\'s license + tier in one transaction. DO NOT use this for the caller\'s own subscription — for that, use open_manage_subscription which opens the upgrade/downgrade UI. Required args: email (the target user\'s email, NOT optional), tier (target plan), confirmed (true after explicit user yes). Calling with empty args is always wrong.',
+    description: 'ADMIN-ONLY: Move ANOTHER user (not yourself) to a specified plan (free/basic/pro/max/ultra/enterprise). Same effect as the dashboard: any paid tier is granted as an admin comp — unlimited interview time that never expires until an admin changes the plan again; free clears the balance. DO NOT use this for the caller\'s own subscription — for that, use open_manage_subscription which opens the upgrade/downgrade UI. Required args: email (the target user\'s email, NOT optional), tier (target plan), confirmed (true after explicit user yes). Calling with empty args is always wrong.',
     parameters: {
       type: 'object',
       properties: {
         email: { type: 'string' },
-        tier: { type: 'string', enum: ['free', 'basic', 'pro', 'max'] },
+        tier: { type: 'string', enum: ['free', 'basic', 'pro', 'max', 'ultra', 'enterprise'] },
         confirmed: { type: 'boolean' },
       },
       required: ['email', 'tier', 'confirmed'],
@@ -1699,15 +1694,22 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
         if (!VALID_TIERS.includes(tier)) return { ok: false, reason: `Invalid tier ${tier}.` };
         const user = db.getUserByEmail(email);
         if (!user) return { ok: false, reason: `No user with email ${email}.` };
-        const previousTier = user.tier;
-        const defaults = TIER_LICENSE_DEFAULTS[tier];
-        db.updateUserTier(user.id, tier);
-        db.updateLicenseOnPayment(user.id, {
-          tier, status: 'active',
-          expires_at: defaults.expires_at(), sessions_limit: defaults.sessions_limit,
+        const change = applyAdminTierChange(user, tier);
+        if (!change.ok) return { ok: false, reason: change.error };
+        const { previousTier, paidGrant } = change;
+        botAudit(ctx, 'change-tier', user, {
+          from: previousTier,
+          to: tier,
+          credits: paidGrant ? 'enterprise-equivalent (unlimited, never expires)' : 'cleared',
         });
-        botAudit(ctx, 'change-tier', user, { from: previousTier, to: tier });
-        return { ok: true, message: `${email} moved from ${previousTier} to ${tier}.` };
+        return {
+          ok: true,
+          message: paidGrant
+            ? `${email} moved from ${previousTier} to ${tier} with unlimited interview time (never expires until an admin changes the plan).`
+            : `${email} moved from ${previousTier} to ${tier}.`,
+          credits: paidGrant ? 'unlimited' : 'none',
+          never_expires: paidGrant,
+        };
       } catch (e) { return { ok: false, reason: e.message }; }
     },
   },
@@ -1715,32 +1717,50 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
   // Mirrors POST /admin/users/grant-credits.
   {
     name: 'grant_credits',
-    description: 'Adjust a user\'s session/credit balance. Positive grants, negative revokes.',
+    description: 'Add (or, negative, remove) INTERVIEW MINUTES on a user\'s clock — the bucket a metered Basic/Pro/Max/Ultra customer actually draws from. Lands like a paid extension pack: stacks onto a live pass, reopens a lapsed pass as Basic, adds seconds only on a subscription; unlimited plans (Enterprise, admin comps) are left untouched. Pass `minutes`. The legacy `credits` field adjusts the old session count and does NOT add time.',
     parameters: {
       type: 'object',
       properties: {
         email: { type: 'string' },
-        credits: { type: 'integer', description: 'Non-zero, may be negative.' },
+        minutes: { type: 'integer', description: 'Interview minutes to add (positive) or remove (negative). Preferred.' },
+        credits: { type: 'integer', description: 'LEGACY session-count adjustment. Does not add interview time.' },
         confirmed: { type: 'boolean' },
       },
-      required: ['email', 'credits', 'confirmed'],
+      required: ['email', 'confirmed'],
     },
     destructive: true,
-    handler: async ({ email, credits, confirmed }, ctx) => {
+    handler: async ({ email, credits, minutes, confirmed }, ctx) => {
       if (!confirmed) return { ok: false, reason: 'Confirm credit adjustment first.' };
-      const gate = checkStepUp(ctx, 'grant_credits', { email, credits, confirmed });
+      const gate = checkStepUp(ctx, 'grant_credits', { email, credits, minutes, confirmed });
       if (gate) return gate;
       try {
-        const n = Number(credits);
-        if (!Number.isFinite(n) || n === 0) return { ok: false, reason: 'Credits must be non-zero.' };
         const user = db.getUserByEmail(email);
         if (!user) return { ok: false, reason: `No user with email ${email}.` };
+        if (minutes !== undefined && minutes !== null) {
+          const m = Number(minutes);
+          if (!Number.isFinite(m) || m === 0) return { ok: false, reason: 'Minutes must be non-zero.' };
+          const updated = db.adjustLicenseTimeSeconds(user.id, m * 60);
+          if (!updated) return { ok: false, reason: 'User has no license.' };
+          const bucket = db.resolveTimeBucket(updated);
+          botAudit(ctx, 'grant-credits', user, { minutes: m, remaining_after: bucket.remaining, tier_after: updated.tier });
+          if (bucket.source === 'unlimited') {
+            return { ok: true, message: `${email} already has unlimited interview time — nothing to add.`, remaining_seconds: -1 };
+          }
+          return {
+            ok: true,
+            message: `${m > 0 ? 'Added' : 'Removed'} ${Math.abs(m)} minute(s) for ${email}. ${Math.floor(bucket.remaining / 60)} min now available on ${updated.tier.toUpperCase()}.`,
+            remaining_seconds: bucket.remaining,
+            tier: updated.tier,
+          };
+        }
+        const n = Number(credits);
+        if (!Number.isFinite(n) || n === 0) return { ok: false, reason: 'Pass minutes (preferred) or a non-zero legacy credits count.' };
         const updated = db.grantCreditSessions(user.id, n);
         if (!updated) return { ok: false, reason: 'User has no license.' };
-        botAudit(ctx, 'grant-credits', user, { credits: n, new_limit: updated.sessions_limit });
+        botAudit(ctx, 'grant-credits', user, { credits: n, new_limit: updated.sessions_limit, legacy_session_count: true });
         return {
           ok: true,
-          message: `${n > 0 ? 'Granted' : 'Revoked'} ${Math.abs(n)} credit(s) for ${email}. New limit: ${updated.sessions_limit}.`,
+          message: `${n > 0 ? 'Granted' : 'Revoked'} ${Math.abs(n)} legacy session credit(s) for ${email}. New limit: ${updated.sessions_limit}. This did not add interview time — use minutes for that.`,
         };
       } catch (e) { return { ok: false, reason: e.message }; }
     },
@@ -1784,12 +1804,12 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
   // Mirrors POST /admin/users/:id/grant-comp.
   {
     name: 'grant_comp_subscription',
-    description: 'Grant a free comp at a paid tier (basic/pro/max) — for support make-goods, influencer comps, etc.',
+    description: 'Grant a free comp at a paid tier (basic/pro/max/ultra/enterprise) — for support make-goods, influencer comps, etc. Unlimited interview time that never expires until an admin changes the plan; a $0 admin-comp row is written to the ledger.',
     parameters: {
       type: 'object',
       properties: {
         email: { type: 'string' },
-        tier: { type: 'string', enum: ['basic', 'pro', 'max'] },
+        tier: { type: 'string', enum: ['basic', 'pro', 'max', 'ultra', 'enterprise'] },
         note: { type: 'string', description: 'Internal note for the audit trail.' },
         confirmed: { type: 'boolean' },
       },
@@ -1801,10 +1821,14 @@ const ADMIN_DESTRUCTIVE_TOOLS = [
       const gate = checkStepUp(ctx, 'grant_comp_subscription', { email, tier, note, confirmed });
       if (gate) return gate;
       try {
-        if (!['basic','pro','max'].includes(tier)) return { ok: false, reason: 'tier must be basic, pro, or max.' };
+        if (!ADMIN_GRANT_PAID_TIERS.includes(tier)) return { ok: false, reason: `tier must be one of ${ADMIN_GRANT_PAID_TIERS.join(', ')}.` };
         const user = db.getUserByEmail(email);
         if (!user) return { ok: false, reason: `No user with email ${email}.` };
+        // Same materialise-first rule as the dashboard route: recordCompPayment's
+        // licence UPDATE is a no-op for a user without a row and returns null.
+        if (!db.ensureLicenseForUser(user.id)) return { ok: false, reason: 'Could not create a license for this user.' };
         const result = db.recordCompPayment(user.id, tier, note || null);
+        if (!result) return { ok: false, reason: 'Comp grant failed — license not updated.' };
         botAudit(ctx, 'grant-comp', user, { tier, note: note || null, payment_id: result.payment_id });
         return { ok: true, message: `${email} granted ${tier} as a comp.`, ...result };
       } catch (e) { return { ok: false, reason: e.message }; }

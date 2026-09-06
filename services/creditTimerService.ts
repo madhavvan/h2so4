@@ -35,7 +35,7 @@
 
 import { licenseService, TIME_CONSTANTS } from './licenseService';
 
-type EventName = 'tick' | 'hour-boundary' | 'low-warning' | 'exhausted' | 'stopped' | 'started';
+type EventName = 'tick' | 'hour-boundary' | 'low-warning' | 'exhausted' | 'stopped' | 'started' | 'suspended' | 'resumed';
 type Listener = (payload: any) => void;
 
 const HEARTBEAT_EVERY_MS = 20 * 1000;
@@ -63,6 +63,22 @@ class CreditTimerService {
   // in-flight async start() that awakes after being superseded discards
   // itself instead of resurrecting a clock the caller already stopped.
   private startGen = 0;
+  // ── Power hooks (2026-09) ──
+  // The server bills a heartbeat gap in FULL for clients from 4.0.23 (it
+  // used to cap every settle at 90 s precisely because a laptop that slept
+  // for fourteen minutes would otherwise be billed fourteen minutes on wake).
+  // That promise is kept here: the moment the machine suspends or the screen
+  // locks we close the server session, and on wake we open a fresh one, so
+  // the time asleep is never interview time. `powerSuspended` remembers that
+  // WE paused the clock (not the user, not the server) so resume knows to
+  // restart it — and so App's "session dropped, reopen" listener, which only
+  // watches 'stopped', does not race us on the way down.
+  private powerSuspended = false;
+  private powerHooksInstalled = false;
+
+  constructor() {
+    this.installPowerHooks();
+  }
 
   on(event: EventName, cb: Listener): () => void {
     if (!this.listeners.has(event)) this.listeners.set(event, new Set());
@@ -121,7 +137,10 @@ class CreditTimerService {
       try {
         const resp = await fetch(`${licenseService.getApiBase()}/api/v1/usage/start`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          // X-App-Version: the server picks its per-settle billing cap by
+          // client generation (routes/usage.js settleCapFor) — a client that
+          // stops its own clock on sleep is billed a silent gap in full.
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}`, 'X-App-Version': licenseService.getAppVersion() },
           body: JSON.stringify({ device_id: await licenseService.getDeviceId() }),
         });
         if (gen !== this.startGen) {
@@ -199,6 +218,7 @@ class CreditTimerService {
   }
 
   stop(): void {
+    this.powerSuspended = false; // an explicit stop outranks a pending power resume
     this.startGen++; // invalidate any in-flight async start()
     const hadInterval = !!this.intervalId;
     if (this.intervalId) {
@@ -219,8 +239,11 @@ class CreditTimerService {
     if (!token) return;
     const call = () => fetch(`${licenseService.getApiBase()}/api/v1/usage/stop`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}`, 'X-App-Version': licenseService.getAppVersion() },
       body: JSON.stringify({ session_id: sessionId }),
+      // Let the request outlive a renderer that is being torn down (quit,
+      // sleep): the stop is what keeps a suspended gap off the bill.
+      keepalive: true,
     });
     try {
       const r = await call();
@@ -315,7 +338,7 @@ class CreditTimerService {
       if (!token) return;
       const resp = await fetch(`${licenseService.getApiBase()}/api/v1/usage/heartbeat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}`, 'X-App-Version': licenseService.getAppVersion() },
         body: JSON.stringify({ session_id: this.sessionId }),
       });
       if (resp.status === 410) {
@@ -351,6 +374,46 @@ class CreditTimerService {
       clearInterval(this.intervalId);
       this.intervalId = null;
     }
+  }
+
+  // ── Power hooks ──
+  // main.cjs relays powerMonitor suspend/resume (and screen lock/unlock) to
+  // every window over 'system:suspend' / 'system:resume'. Only the window
+  // that owns a session has anything to pause; in the popout both handlers
+  // are no-ops because it never starts one.
+  private installPowerHooks(): void {
+    if (this.powerHooksInstalled) return;
+    if (typeof window === 'undefined' || !window.electronAPI?.on) return;
+    this.powerHooksInstalled = true;
+    try {
+      window.electronAPI.on('system:suspend', () => this.onSystemSuspend());
+      window.electronAPI.on('system:resume', () => this.onSystemResume());
+    } catch (e) {
+      console.warn('[creditTimer] power hooks unavailable:', e);
+    }
+  }
+
+  private onSystemSuspend(): void {
+    if (!this.intervalId && !this.sessionId) return; // nothing running
+    this.powerSuspended = true;
+    const sid = this.sessionId;
+    this.sessionId = null;
+    this.stopLocalOnly();
+    // Settle NOW, before the network goes away with the machine. If this
+    // request is lost the server's stale sweeper still settles the row at
+    // its last beat; only a sleep shorter than the liveness window with a
+    // lost stop can bill the gap.
+    if (sid) void this.settleStop(sid);
+    this.emit('suspended');
+  }
+
+  private onSystemResume(): void {
+    if (!this.powerSuspended) return; // the user, or the server, stopped it — not us
+    this.powerSuspended = false;
+    this.emit('resumed');
+    // A fresh server session: the balance is server-authoritative, so nothing
+    // is lost by not "resuming" the old row — and the old row is closed.
+    void this.start();
   }
 }
 

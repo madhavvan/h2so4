@@ -57,25 +57,11 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
 // (Basic has no Claude, Pro/Max have no Auto-Type). What it no longer
 // decides for an admin grant is how much time they get: that is always
 // Enterprise's answer, which is "all of it".
-const DAY_MS = 24 * 60 * 60 * 1000;
-const TIER_LICENSE_DEFAULTS = {
-  free:       { expires_at: () => Date.now() + 30 * DAY_MS, sessions_limit: 5 },
-  basic:      { expires_at: () => -1, sessions_limit: -1 },
-  pro:        { expires_at: () => -1, sessions_limit: -1 },
-  max:        { expires_at: () => -1, sessions_limit: -1 },
-  ultra:      { expires_at: () => -1, sessions_limit: -1 },
-  enterprise: { expires_at: () => -1, sessions_limit: -1 },
-};
-const VALID_TIERS = Object.keys(TIER_LICENSE_DEFAULTS);
-
-// The credit grant an admin activation writes, for every paid tier. Pulled
-// out as a named constant so the policy is one thing you can read and one
-// thing you can change, rather than a pair of ternaries buried in a route.
-const ENTERPRISE_EQUIVALENT_CREDITS = {
-  credits_remaining_seconds: -1, // unlimited — same sentinel Enterprise carries
-  credits_expire_at: -1,         // never voids
-};
-const NO_CREDITS = { credits_remaining_seconds: 0, credits_expire_at: 0 };
+//
+// The tables and the licence write itself live in services/adminGrants.js
+// since 2026-09, shared with the support bot's change_user_tier tool — the
+// two consoles had drifted (the bot wrote no credits and no marker).
+const { VALID_TIERS, applyAdminTierChange } = require('../services/adminGrants');
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  STEP-UP REAUTH
@@ -391,43 +377,15 @@ function handleChangeTier(req, res) {
     const user = db.getUserByEmail(email);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const previousTier = user.tier;
-    const defaults = TIER_LICENSE_DEFAULTS[tier];
-
-    // Materialize a license row first. updateLicenseOnPayment is a bare
-    // UPDATE, so on a user without one it affected zero rows while this route
-    // still answered { success: true, tier } — the operator got a green toast
-    // and an ULTRA badge for a customer who had no license and was still
-    // gated out. Existing licenses are returned untouched.
-    const licenseRow = db.ensureLicenseForUser(user.id);
-    if (!licenseRow) {
-      return res.status(500).json({ error: 'Could not create a license for this user' });
+    // One shared write for both admin consoles — see services/adminGrants.js
+    // for the policy (paid tier = Enterprise-equivalent unlimited time with the
+    // admin-grant marker; free clears everything; adminOverride lets THIS
+    // deliberate action remove an admin-granted plan).
+    const change = applyAdminTierChange(user, tier);
+    if (!change.ok) {
+      return res.status(change.error.startsWith('tier must') ? 400 : 500).json({ error: change.error });
     }
-
-    // adminOverride: this route is the deliberate admin action that IS allowed
-    // to move an admin-granted plan down to free.
-    db.updateUserTier(user.id, tier, { adminOverride: true });
-    // Admin grant of ANY paid tier = Enterprise-equivalent credits, unlimited
-    // until an admin changes the plan (see TIER_LICENSE_DEFAULTS above).
-    // Downgrade to free clears the balance.
-    const paidGrant = tier !== 'free';
-    db.updateLicenseOnPayment(user.id, {
-      tier,
-      status: 'active',
-      expires_at: defaults.expires_at(),
-      sessions_limit: defaults.sessions_limit,
-      ...(paidGrant ? ENTERPRISE_EQUIVALENT_CREDITS : NO_CREDITS),
-      // Stamp (or clear) the admin-grant marker. While it is set, NO automatic
-      // path can take this plan away: not a provider webhook for some older
-      // subscription of theirs, not a refund or dispute on an old charge, not
-      // the cycle-end sweeper, not the lapsed-plan repair in /license/validate.
-      // Only an admin coming back through this route can. See
-      // db.updateLicenseOnPayment / db.transitionLicenseToFree.
-      admin_granted_at: paidGrant ? Date.now() : 0,
-      // …which also means THIS route has to be able to move someone down to
-      // free. It is the deliberate admin action the rule carves out for.
-      admin_override: true,
-    });
+    const { previousTier, paidGrant } = change;
 
     writeAudit(req, 'change-tier', user, {
       from: previousTier,
@@ -467,24 +425,66 @@ router.post('/users/downgrade', authMiddleware, adminOnly, stepUpOnly, (req, res
 
 // Mutates a user's session/credit balance — money-equivalent operation
 // (admin can grant unlimited paid time). Step-up required.
+//
+// Body: { email, minutes } — adds (or, negative, removes) interview time on
+// the bucket the customer actually draws from. Lands exactly like a paid
+// extension pack (db.adjustLicenseTimeSeconds → grantTimeExtension): stacks
+// onto a live pass, reopens a lapsed one as Basic, adds seconds only on a
+// subscription. { email, credits } is the LEGACY session-count adjustment and
+// is kept for old dashboards; under the time model it changes nothing a
+// metered customer can feel, and the response says so.
 router.post('/users/grant-credits', authMiddleware, adminOnly, stepUpOnly, (req, res) => {
   try {
-    const { email, credits } = req.body || {};
-    const n = Number(credits);
-    if (!email || !Number.isFinite(n) || n === 0) {
-      return res.status(400).json({ error: 'email + non-zero credits required' });
-    }
-
+    const { email, credits, minutes, seconds } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'email required' });
     const user = db.getUserByEmail(email);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
+    const deltaSeconds = seconds !== undefined
+      ? Number(seconds)
+      : (minutes !== undefined ? Number(minutes) * 60 : null);
+
+    if (deltaSeconds !== null) {
+      if (!Number.isFinite(deltaSeconds) || deltaSeconds === 0) {
+        return res.status(400).json({ error: 'email + non-zero minutes required' });
+      }
+      const before = db.getLicenseByUserId(user.id);
+      const updated = db.adjustLicenseTimeSeconds(user.id, deltaSeconds);
+      if (!updated) return res.status(404).json({ error: 'User has no license' });
+      const bucket = db.resolveTimeBucket(updated);
+      const unlimited = bucket.source === 'unlimited';
+      const mins = Math.abs(Math.round(deltaSeconds / 60));
+      writeAudit(req, 'grant-credits', user, {
+        minutes: Math.round(deltaSeconds / 60),
+        seconds: deltaSeconds,
+        remaining_before: before ? db.resolveTimeBucket(before).remaining : null,
+        remaining_after: bucket.remaining,
+        tier_after: updated.tier,
+        unlimited,
+      });
+      return res.json({
+        success: true,
+        message: unlimited
+          ? `${email} already has unlimited interview time — nothing to add.`
+          : `${deltaSeconds > 0 ? 'Added' : 'Removed'} ${mins} minute(s) of interview time for ${email} — ${Math.floor(bucket.remaining / 60)} min now available on ${updated.tier.toUpperCase()}.`,
+        license: updated,
+        remaining_seconds: bucket.remaining,
+        source: bucket.source,
+      });
+    }
+
+    // Legacy: session-count adjustment.
+    const n = Number(credits);
+    if (!Number.isFinite(n) || n === 0) {
+      return res.status(400).json({ error: 'email + non-zero minutes (or legacy credits) required' });
+    }
     const updated = db.grantCreditSessions(user.id, n);
     if (!updated) return res.status(404).json({ error: 'User has no license' });
 
-    writeAudit(req, 'grant-credits', user, { credits: n, new_limit: updated.sessions_limit });
+    writeAudit(req, 'grant-credits', user, { credits: n, new_limit: updated.sessions_limit, legacy_session_count: true });
     res.json({
       success: true,
-      message: `${n > 0 ? 'Granted' : 'Revoked'} ${Math.abs(n)} credit(s) for ${email}`,
+      message: `${n > 0 ? 'Granted' : 'Revoked'} ${Math.abs(n)} legacy session credit(s) for ${email}. This does not add interview time — send { minutes } to do that.`,
       license: updated,
     });
   } catch (err) {
@@ -509,10 +509,20 @@ router.post('/users/extend-expiry', authMiddleware, adminOnly, stepUpOnly, (req,
     const updated = db.extendLicenseExpiry(user.id, n);
     if (!updated) return res.status(404).json({ error: 'User has no license' });
 
-    writeAudit(req, 'extend-expiry', user, { days: n, new_expires_at: updated.expires_at });
+    // Moves the plan date AND the interview window together (see
+    // db.extendLicenseExpiry) — an "extension" that left the minutes voided
+    // was the console saying yes while /usage/start kept saying 402.
+    writeAudit(req, 'extend-expiry', user, {
+      days: n,
+      new_expires_at: updated.expires_at,
+      new_credits_expire_at: updated.credits_expire_at,
+    });
+    const never = updated.expires_at === -1;
     res.json({
       success: true,
-      message: `${n > 0 ? 'Added' : 'Removed'} ${Math.abs(n)} day(s) for ${email}`,
+      message: never
+        ? `${email} is on a plan that never expires — nothing to extend.`
+        : `${n > 0 ? 'Added' : 'Removed'} ${Math.abs(n)} day(s) for ${email} — plan and interview window now end ${new Date(updated.expires_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}.`,
       license: updated,
     });
   } catch (err) {

@@ -714,12 +714,37 @@ router.post('/upgrade-tier', authMiddleware, async (req, res) => {
         error: `You're already on the ${targetTier.toUpperCase()} plan.`,
       });
     }
-    if (currentTier !== 'pro' && currentTier !== 'max') {
-      return res.status(400).json({
-        error: 'In-place plan change is only available for Pro and Max subscribers. Use the regular checkout instead.',
-      });
+    // Only an account that HOLDS A SUBSCRIPTION has anything to swap in
+    // place: the recurring tiers (Ultra, Enterprise) and the legacy Pro/Max
+    // subscribers from before the passes. Until 2026-09 this read
+    // `pro || max` — precisely the two tiers that had stopped being
+    // subscriptions — so every Ultra → Enterprise request (the one upgrade
+    // the client actually offers) died here with a 400, and the checkout
+    // fallback further down opened a SECOND subscription instead.
+    const holdsSubscription = isRecurringTier(currentTier) || isSubscriptionBackedTier(req.user.id, currentTier);
+    if (!holdsSubscription) {
+      // A pass holder (or a free account) buying a plan is a plain new
+      // purchase — the same guards as /create-checkout, then the same
+      // checkout. Passes are one-time, so there is nothing to double-bill.
+      const passConflict = checkoutConflictFor(currentLicense, false, targetTier);
+      if (passConflict && passConflict.code !== 'upgrade_in_place') {
+        return res.status(passConflict.httpStatus).json({
+          error: passConflict.message,
+          code: passConflict.code,
+          suggested_action: passConflict.suggested_action,
+        });
+      }
+      const passCountry = db.getUserById(req.user.id)?.country_code || 'US';
+      if (getPaymentProvider(passCountry) === 'razorpay') {
+        return await createRazorpayCheckout(req, res, targetTier);
+      }
+      return await createStripeCheckout(req, res, targetTier);
     }
-    if (currentLicense.status !== 'active') {
+    // 'canceling' is allowed on purpose: the swap re-enables auto-renewal
+    // (cancel_at_period_end: false), which is what a customer who cancelled
+    // Ultra and then chose Enterprise means. past_due is not — a plan change
+    // never fixes a declined card; the Billing Hub points at the card.
+    if (currentLicense.status !== 'active' && currentLicense.status !== 'canceling') {
       return res.status(400).json({
         error: 'Your subscription is not currently active. Renew or restart it from the billing page.',
       });
@@ -798,19 +823,21 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
   // the user always has a path to Ultra. The client already handles a
   // checkout_url response from this route — it is the same fall-through the
   // no-provider-on-file case uses.
+  // The new subscription item: the configured recurring Price when one is set
+  // and validated, otherwise inline price_data on our own Product for the
+  // tier. This used to fall back to a FRESH Checkout Session when no Price
+  // env var was set — which is production's configuration — so the "in-place
+  // upgrade" quietly became a second parallel subscription while the first
+  // kept billing. An in-place swap that cannot price itself now fails
+  // closed (503) rather than double-billing.
   let newLineItem;
   try {
-    newLineItem = await resolveStripeSubscriptionPrice(stripe, targetTier);
+    newLineItem = await resolveStripeSubscriptionItem(stripe, targetTier);
   } catch (err) {
-    console.error(`[upgrade-tier] price lookup failed for tier=${targetTier}:`, err.message || err);
+    console.error(`[upgrade-tier] could not price an in-place ${targetTier} swap for ${user.email}:`, err.message || err);
     return res.status(503).json({
       error: 'Pricing service is temporarily unavailable. Please try again in a moment.',
     });
-  }
-  if (!newLineItem) {
-    const priceEnvName = STRIPE_PRICE_ENV[targetTier] || 'the tier Price env var';
-    console.warn(`[upgrade-tier] no usable Price for an in-place ${targetTier} swap (${priceEnvName}) — sending ${user.email} to a fresh checkout instead. Set ${priceEnvName} to a real recurring Price to restore the prorated upgrade.`);
-    return await createStripeCheckout(req, res, targetTier);
   }
 
   // Stripe customers can in theory have multiple active subscriptions.
@@ -875,8 +902,12 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
     expires_at: grant.expires_at,
     sessions_limit: grant.sessions_limit,
     ...creditsForPlanChange(grant),
+    // A paid plan change is the customer's own money on the line: from here
+    // the subscription's lifecycle governs the row, not an older admin comp.
+    admin_granted_at: 0,
   });
   const license = db.getLicenseByUserId(user.id);
+  const isDowngrade = (TIER_RANK[targetTier] ?? 0) < (TIER_RANK[currentTier] ?? 0);
 
   // Audit trail — every tier change writes a row so compliance/support
   // can answer "when did this user go Pro → Max + who initiated it".
@@ -913,8 +944,77 @@ async function upgradeStripeSubscription(req, res, { user, currentTier, targetTi
     effective_date_label: 'now',
     proration: 'next_invoice',
     license: license ? { ...license, last_validated: Date.now() } : null,
-    message: `Plan changed to ${targetTier.toUpperCase()}. The prorated difference will appear on your next invoice.`,
+    message: isDowngrade
+      ? `Plan changed to ${targetTier.toUpperCase()}. The prorated credit for the rest of this cycle will appear on your next invoice.`
+      : `Plan changed to ${targetTier.toUpperCase()}. The prorated difference will appear on your next invoice.`,
   });
+}
+
+// ── Pricing an in-place subscription swap without a configured Price ──────
+// Stripe's subscription-item update accepts inline `price_data`, but unlike a
+// Checkout Session it needs a real Product id (no product_data). We keep one
+// Product per tier, tagged metadata.minicaai_tier, found by search or created
+// on first use and remembered in the config table so the swap costs one
+// Stripe call after the first.
+async function ensureStripeProductForTier(stripeClient, tier) {
+  const data = STRIPE_PRICE_DATA[tier];
+  if (!data) {
+    const err = new Error(`No price_data default for tier=${tier}`);
+    err.code = 'NO_PRICE_DATA';
+    throw err;
+  }
+  const cacheKey = `stripe_product_${tier}`;
+  const cached = db.getConfig(cacheKey, null);
+  if (cached) {
+    try {
+      const existing = await stripeClient.products.retrieve(String(cached));
+      if (existing && existing.id && existing.active !== false) return existing.id;
+    } catch (err) {
+      console.warn(`[upgrade-tier] cached Stripe product ${cached} for ${tier} is unusable (${err.message}) — re-resolving`);
+    }
+  }
+  let productId = null;
+  try {
+    const found = await stripeClient.products.search({
+      query: `active:'true' AND metadata['minicaai_tier']:'${tier}'`,
+      limit: 1,
+    });
+    productId = found?.data?.[0]?.id || null;
+  } catch (err) {
+    console.warn(`[upgrade-tier] products.search failed for ${tier}: ${err.message} — creating`);
+  }
+  if (!productId) {
+    const created = await stripeClient.products.create({
+      name: data.product_data.name,
+      description: data.product_data.description,
+      metadata: { minicaai_tier: tier },
+    });
+    productId = created.id;
+  }
+  try { db.setConfig(cacheKey, productId); } catch (cfgErr) {
+    console.warn('[upgrade-tier] could not cache Stripe product id:', cfgErr.message);
+  }
+  return productId;
+}
+
+async function resolveStripeSubscriptionItem(stripeClient, tier) {
+  const configured = await resolveStripeSubscriptionPrice(stripeClient, tier);
+  if (configured) return configured;
+  const data = STRIPE_PRICE_DATA[tier];
+  if (!data || !data.recurring) {
+    const err = new Error(`${tier} is not a recurring tier — nothing to swap a subscription to`);
+    err.code = 'NO_PRICE_DATA';
+    throw err;
+  }
+  const product = await ensureStripeProductForTier(stripeClient, tier);
+  return {
+    price_data: {
+      currency: data.currency,
+      product,
+      unit_amount: data.unit_amount,
+      recurring: data.recurring,
+    },
+  };
 }
 
 async function upgradeRazorpaySubscription(req, res, { user, currentTier, targetTier }) {
@@ -989,6 +1089,7 @@ async function upgradeRazorpaySubscription(req, res, { user, currentTier, target
       expires_at: grant.expires_at,
       sessions_limit: grant.sessions_limit,
       ...creditsForPlanChange(grant),
+      admin_granted_at: 0, // a paid plan change supersedes any older admin comp
     });
   }
   const license = db.getLicenseByUserId(user.id);
@@ -2269,6 +2370,7 @@ router.post('/verify-razorpay', authMiddleware, async (req, res) => {
             // start an interview.
             credits_remaining_seconds: grant.credits_remaining_seconds,
             credits_expire_at: grant.credits_expire_at,
+            admin_granted_at: 0, // a real purchase supersedes any earlier admin comp
           });
         }
 
@@ -2458,6 +2560,9 @@ router.post('/verify-stripe', authMiddleware, async (req, res) => {
           sessions_limit: grant.sessions_limit,
           credits_remaining_seconds: grant.credits_remaining_seconds,
           credits_expire_at: grant.credits_expire_at,
+          // A real purchase supersedes any earlier admin comp: the paid plan's
+          // own lifecycle (cancel, refund, dispute) must be able to end it.
+          admin_granted_at: 0,
         });
       }
 

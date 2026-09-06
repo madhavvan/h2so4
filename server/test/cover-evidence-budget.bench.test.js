@@ -69,7 +69,14 @@ const CASES = [
 
 const SIZES = [2_500, 3_500, 4_500, 5_500, 7_000, 9_000];
 
-const files = [{ id: 'kb', name: 'kb.md', type: 'custom', content: fs.readFileSync(DOC, 'utf8') }];
+// Read the knowledge-base document only when the sweep actually runs. This
+// used to execute unconditionally at module load, so on any machine without
+// that absolute Windows path (every CI runner) the whole file failed to
+// collect — `main` had been red since 2026-08-23 for exactly this line while
+// the sweep it belongs to was skipped anyway.
+const files = RUN
+  ? [{ id: 'kb', name: 'kb.md', type: 'custom', content: fs.readFileSync(DOC, 'utf8') }]
+  : [];
 
 async function cover(question, coverContext, token) {
   const t0 = Date.now();
