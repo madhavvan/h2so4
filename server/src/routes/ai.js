@@ -966,6 +966,11 @@ function _resetPrewarmCache() { _prewarmCache.clear(); }
 // session is single-owner by design (see requireActiveSession), so two
 // simultaneous interviews on one account is already not a supported state.
 const _prewarmInFlightByUser = new Map();
+// When each user last STARTED a prewarm — see the throttle in the route.
+const _prewarmLastStartByUser = new Map();
+const PREWARM_MIN_INTERVAL_MS = 2500;
+let _prewarmMinIntervalMs = PREWARM_MIN_INTERVAL_MS;
+function _setPrewarmMinInterval(ms) { _prewarmMinIntervalMs = Number.isFinite(ms) ? ms : PREWARM_MIN_INTERVAL_MS; _prewarmLastStartByUser.clear(); }
 
 router.post('/cover/prewarm', async (req, res) => {
   const t0 = Date.now();
