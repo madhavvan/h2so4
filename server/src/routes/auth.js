@@ -423,10 +423,29 @@ router.post('/google', async (req, res) => {
 
 // In-memory store for pending Google auth sessions (TTL: 5 min)
 const pendingGoogleSessions = new Map();
+// ── Redeemed sessions, remembered briefly ──
+// The success page keeps the typed code on screen until the app has actually
+// collected the token, and it learns that from /google/handoff-status. A
+// redeemed session is deleted from pendingGoogleSessions (single-use), so
+// without this the page could not tell "the app has it" from "this expired"
+// — and would tell a user whose sign-in had timed out that they were signed
+// in. Ten minutes outlives the 5-minute pending TTL with room to spare.
+const redeemedGoogleSessions = new Map();
+const REDEEMED_TTL_MS = 10 * 60 * 1000;
+function noteRedeemed(id) {
+  if (redeemedGoogleSessions.size >= 5000) {
+    const oldest = redeemedGoogleSessions.keys().next().value;
+    if (oldest !== undefined) redeemedGoogleSessions.delete(oldest);
+  }
+  redeemedGoogleSessions.set(id, Date.now());
+}
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of pendingGoogleSessions) {
     if (now - session.created_at > 5 * 60 * 1000) pendingGoogleSessions.delete(id);
+  }
+  for (const [id, at] of redeemedGoogleSessions) {
+    if (now - at > REDEEMED_TTL_MS) redeemedGoogleSessions.delete(id);
   }
 }, 60 * 1000);
 
@@ -695,10 +714,18 @@ router.get('/google/start', (req, res) => {
   // else falls back to US at consumption time.
   const rawCountry = String(req.query.country_code || '').toUpperCase();
   const countryCode = /^[A-Z]{2}$/.test(rawCountry) ? rawCountry : null;
+  // `lp` is the port of the app's loopback listener (4.0.23+) — see THE
+  // LOOPBACK HAND-OFF in /google/callback. Strictly an unprivileged port
+  // number; anything else is ignored and the flow behaves as it always has.
+  const rawLp = String(req.query.lp || '');
+  const loopbackPort = /^\d{4,5}$/.test(rawLp) && Number(rawLp) >= 1024 && Number(rawLp) <= 65535
+    ? Number(rawLp)
+    : null;
   pendingGoogleSessions.set(session_id, {
     created_at: Date.now(),
     status: 'pending',
     country_code: countryCode,
+    loopback_port: loopbackPort,
   });
 
   // Build the Google OAuth URL
@@ -912,6 +939,10 @@ router.get('/google/callback', async (req, res) => {
     // have known, which is exactly why the binding has to happen here and
     // not at start time. Only the hash is retained.
     const handoffCode = mintHandoffCode();
+    // Read before the entry is replaced below: the port the app registered
+    // at /google/start lives on the pending entry, and the success entry
+    // that follows is built fresh.
+    const loopbackPort = pendingGoogleSessions.get(session_id)?.loopback_port || null;
 
     // Store the result for polling
     pendingGoogleSessions.set(session_id, {
@@ -919,6 +950,7 @@ router.get('/google/callback', async (req, res) => {
       status: 'success',
       handoff_hash: hashHandoffCode(handoffCode),
       handoff_attempts: 0,
+      loopback_port: loopbackPort,
       // Consulted only on the legacy no-code path (GOOGLE_POLL_REQUIRE_CODE
       // =false). The consenting browser and the app that polls run on the
       // same machine in every legitimate sign-in. Now {family, prefix}, so
@@ -957,7 +989,32 @@ router.get('/google/callback', async (req, res) => {
     const safeSessionId = encodeURIComponent(String(session_id));
     const safeHandoff = encodeURIComponent(handoffCode);
     const displayCode = formatHandoffCode(handoffCode);
-
+    // ── THE LOOPBACK HAND-OFF (clients from 4.0.23) ──
+    //
+    // The deep link and the printed code each assume something about the
+    // machine: that the OS routes interview-copilot:// to the app (4.0.22 on
+    // macOS shipped without CFBundleURLTypes, so it never did), or that a
+    // human will carry ten characters across two windows. Neither held, and
+    // every sign-in from a legacy client depended instead on the browser and
+    // the app leaving the network through the same /24 — which a VPN with
+    // more than one exit breaks on a coin flip. Measured 2026-09-06: eight
+    // consents in three minutes for one account, three sign-ins.
+    //
+    // The app now opens an HTTP listener on 127.0.0.1 for the duration of a
+    // sign-in and registers its port at /google/start. This page hands the
+    // code to it directly: a fetch to the loopback address, which only the
+    // machine running this browser can reach — the same property the deep
+    // link relies on, without the OS registration. The attacker in the
+    // takeover scenario is on another machine; a fetch to THEIR port on the
+    // VICTIM's 127.0.0.1 goes nowhere. Browsers exempt loopback from
+    // mixed-content blocking, so an https page may call it.
+    //
+    // Nothing here is required. No port → no fetch, and the printed code
+    // stays the fallback for everyone.
+    const loopbackOrigin = loopbackPort ? `http://127.0.0.1:${loopbackPort}` : '';
+    const loopbackHref = loopbackOrigin
+      ? `${loopbackOrigin}/google-handoff?session_id=${safeSessionId}&amp;code=${safeHandoff}`
+      : '';
     // ── CSP: this page's inline script was never running ──
     // helmet() (index.js:71) ships `script-src 'self'` on every response,
     // which blocks an un-nonced inline <script>. This page's ENTIRE handoff
@@ -971,48 +1028,100 @@ router.get('/google/callback', async (req, res) => {
     // Scope a CSP to THIS response with a one-time nonce instead of
     // loosening the global helmet policy — this page is the only one in the
     // service that needs to run script, and it needs to run exactly its own.
+    // connect-src covers the two calls the script makes: the status poll on
+    // this origin, and — only when the app registered one — its loopback port.
     res.locals.authOutcome = 'callback:success:' + (isNewUser ? 'new_user' : 'returning_user');
     const cspNonce = crypto.randomBytes(16).toString('base64');
     res.setHeader(
       'Content-Security-Policy',
       `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${cspNonce}'; ` +
+      `connect-src 'self'${loopbackOrigin ? ' ' + loopbackOrigin : ''}; ` +
       `base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
     );
-    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signed in</title></head><body style="background:#050507;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center;max-width:420px;padding:32px 20px"><div style="width:56px;height:56px;border-radius:14px;background:linear-gradient(135deg,#10b981,#3b82f6);display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:24px;color:#fff">✓</div><h2 style="color:#e5e7eb;margin:0 0 6px;font-weight:600;font-size:18px">Signed in</h2><p style="color:#9ca3af;margin:0;font-size:13px">Returning to Interview Copilot…</p><p style="margin:16px 0 0"><a id="open-app" href="interview-copilot://signin-complete?session_id=${safeSessionId}&amp;code=${safeHandoff}" style="color:#60a5fa;font-size:13px;text-decoration:none;border:1px solid rgba(96,165,250,0.4);border-radius:999px;padding:7px 16px;display:inline-block">Open Interview Copilot</a></p><div id="fallback-box" style="margin:22px 0 0"><p style="color:#9ca3af;margin:0 0 10px;font-size:12px">Still waiting? Enter this code in the app:</p><div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:22px;letter-spacing:2px;color:#e5e7eb;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px 16px;display:inline-block">${displayCode}</div><p style="color:#6b7280;margin:12px 0 0;font-size:11px">It expires in 5 minutes and works once. You can close this tab after signing in.</p></div></div><script nonce="${cspNonce}">
+    res.setHeader('Cache-Control', 'no-store');
+    // ── THE PAGE NO LONGER CLOSES ITSELF ON A TIMER ──
+    // It used to call window.close() 1.2 s after landing, on the theory that
+    // the deep link had already handed the code over. When the deep link
+    // could not fire, that timer destroyed the only copy of the code the
+    // app was — at that very moment — asking the user to type. The page now
+    // asks /google/handoff-status whether the app has collected the token
+    // and closes only then; until then the code stays on screen, and after
+    // a couple of seconds it becomes the headline rather than a footnote.
+    res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signed in</title></head><body style="background:#050507;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center;max-width:420px;padding:32px 20px"><div id="mark" style="width:56px;height:56px;border-radius:14px;background:linear-gradient(135deg,#10b981,#3b82f6);display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:24px;color:#fff">✓</div><h2 id="headline" style="color:#e5e7eb;margin:0 0 6px;font-weight:600;font-size:18px">Signed in</h2><p id="sub" style="color:#9ca3af;margin:0;font-size:13px">Returning to Interview Copilot…</p><p id="open-row" style="margin:16px 0 0"><a id="open-app" href="interview-copilot://signin-complete?session_id=${safeSessionId}&amp;code=${safeHandoff}" style="color:#60a5fa;font-size:13px;text-decoration:none;border:1px solid rgba(96,165,250,0.4);border-radius:999px;padding:7px 16px;display:inline-block">Open Interview Copilot</a></p><div id="fallback-box" style="margin:22px 0 0"><p id="fallback-lead" style="color:#9ca3af;margin:0 0 10px;font-size:12px">Still waiting? Enter this code in the app:</p><div id="code" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:22px;letter-spacing:2px;color:#e5e7eb;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px 16px;display:inline-block">${displayCode}</div><p id="fallback-note" style="color:#6b7280;margin:12px 0 0;font-size:11px">It expires in 5 minutes and works once. Keep this tab open until the app shows you signed in.</p></div><a id="status-url" href="/api/v1/auth/google/handoff-status?session_id=${safeSessionId}" hidden></a>${loopbackHref ? `<a id="loopback-url" href="${loopbackHref}" hidden></a>` : ''}<script nonce="${cspNonce}">
 (function(){
-  // Hand off to the desktop app via the custom protocol. Browsers will
-  // close (or blank) this tab automatically when the OS protocol
-  // handler claims the navigation. If the OS doesn't recognize the
-  // protocol (older install, sandboxed browser), the redirect is a
-  // no-op and the code block below becomes the way in.
-  //
-  // The code rides the deep link so the normal path stays invisible:
-  // the OS routes it to the app on THIS machine, which is precisely the
-  // property that makes it safe — an attacker holding session_id is on
-  // some other machine and never receives it.
-  // NOTHING SERVER-SIDE IS INTERPOLATED INTO THIS SCRIPT ANY MORE.
+  // NOTHING SERVER-SIDE IS INTERPOLATED INTO THIS SCRIPT.
   // It used to build the deep link by substituting safeSessionId into a
   // single-quoted JS string. encodeURIComponent does NOT escape a single
   // quote (it is an unreserved character, verified), so an attacker-chosen
   // OAuth state closed that string literal and ran arbitrary JS under this
-  // page's own nonce. The URL is now read back off the anchor's href at
+  // page's own nonce. Every URL is now read back off an anchor's href at
   // runtime: encodeURIComponent DOES escape the double quote as %22, so a
   // double-quoted HTML attribute cannot be broken out of.
-  var a = document.getElementById('open-app');
-  var url = a ? a.getAttribute('href') : '';
-  try { if (url) window.location.href = url; } catch (e) { /* CSP or sandbox */ }
-  setTimeout(function(){
-    // Chromium refuses window.close() unless the tab was script-opened OR
-    // its history length is 1. Measured: a pure 302 chain (returning user,
-    // already consented) lands at length 1 and the tab DOES close itself;
-    // one click on Google's account picker makes it 2 and the close is
-    // refused — and nothing this page does afterwards can undo that
-    // (location.replace and history.replaceState were both tested and both
-    // leave it at 2). That is why /google/start no longer forces
-    // prompt=select_account. When it can't close, the code below is
-    // already on screen, so the tab is a dead end for nobody.
-    try { window.close(); } catch (e) {}
-  }, 1200);
+  var byId = function (id) { return document.getElementById(id); };
+  var text = function (id, s) { var el = byId(id); if (el) el.textContent = s; };
+  var hide = function (id) { var el = byId(id); if (el) el.style.display = 'none'; };
+  var href = function (id) { var el = byId(id); return el ? (el.getAttribute('href') || '') : ''; };
+  var appUrl = href('open-app');
+  var loopbackUrl = href('loopback-url');
+  var statusUrl = href('status-url');
+  // 1. The app on this machine, through its loopback listener (4.0.23+).
+  if (loopbackUrl) {
+    try { fetch(loopbackUrl, { mode: 'no-cors', cache: 'no-store', keepalive: true }).catch(function () {}); } catch (e) {}
+  }
+  // 2. The OS protocol handler. Browsers close (or blank) this tab when the
+  //    OS claims the navigation; if nothing is registered it is a no-op.
+  try { if (appUrl) window.location.href = appUrl; } catch (e) {}
+  // 3. Never close while the code may still be needed. When either hand-off
+  //    above worked the app collects the token within a second or two; if it
+  //    has not by then, the code becomes the headline and stays until it does.
+  var startedAt = Date.now();
+  var settled = false;
+  var revealTimer = setTimeout(function () {
+    if (settled) return;
+    text('headline', 'One more step');
+    text('sub', 'Enter this code in Interview Copilot to finish signing in.');
+    hide('fallback-lead');
+  }, 2500);
+  function finish(state) {
+    if (settled) return;
+    settled = true;
+    clearTimeout(revealTimer);
+    if (state === 'redeemed') {
+      text('headline', 'Signed in');
+      text('sub', 'You can close this tab.');
+      hide('fallback-box');
+      hide('open-row');
+      // Chromium refuses a scripted close unless the tab was script-opened OR
+      // its history length is 1. A pure 302 chain (returning user, already
+      // consented) lands at length 1 and the tab closes itself; one click
+      // on Google's account picker makes it 2 and the close is refused —
+      // which is why /google/start no longer forces prompt=select_account,
+      // and why the line above tells the user the tab may be closed.
+      try { window.close(); } catch (e) {}
+      return;
+    }
+    var mark = byId('mark');
+    if (mark) { mark.textContent = '!'; mark.style.background = '#7f1d1d'; }
+    text('headline', 'This sign-in link has expired');
+    text('sub', 'Go back to Interview Copilot and start Google sign-in again.');
+    hide('fallback-box');
+    hide('open-row');
+  }
+  function tick() {
+    if (settled) return;
+    if (Date.now() - startedAt > 6 * 60 * 1000) { finish('gone'); return; }
+    if (!statusUrl) return;
+    fetch(statusUrl, { cache: 'no-store', credentials: 'omit' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var s = j && j.state;
+        if (s === 'redeemed') finish('redeemed');
+        else if (s === 'gone' || s === 'error') finish('gone');
+        else setTimeout(tick, 2000);
+      })
+      .catch(function () { setTimeout(tick, 4000); });
+  }
+  setTimeout(tick, 700);
 })();
 </script></body></html>`);
 
@@ -1024,6 +1133,52 @@ router.get('/google/callback', async (req, res) => {
     res.locals.authOutcome = 'callback:exception:' + String((err && err.message) || 'unknown').slice(0, 60).replace(/\s+/g, '_');
     res.send('<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#f87171">Something went wrong</h2><p style="color:#9ca3af">Please close this window and try again.</p></div></body></html>');
   }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  /google/handoff-status — what the "Signed in" page waits on
+//
+//  The success page used to close itself 1.2 s after landing. Measured in
+//  production (2026-09-06): a user on a VPN whose browser and app left
+//  through different exits polled `awaiting_code:address_different_network`
+//  73 times in a minute — the app was asking for the code, and the only
+//  place the code had ever existed was a tab that had already closed. Eight
+//  consents in three minutes, three sign-ins, and those three succeeded only
+//  because both connections happened to share a /24 that time.
+//
+//  So the page now asks THIS endpoint whether the app has collected the
+//  token, and closes only then. It answers with a state and nothing else:
+//    pending   consent not finished (the page is never shown in this state)
+//    ready     token minted, not yet collected — keep the code on screen
+//    redeemed  the app has it — the tab can go
+//    gone      expired, restarted, or never existed — say so, do not say
+//              "signed in"
+//  Holding a session_id already lets a caller learn all of this from
+//  /google/poll, so nothing new is exposed here; the token itself is never
+//  in this response.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+router.get('/google/handoff-status', (req, res) => {
+  const { session_id } = req.query;
+  if (typeof session_id !== 'string' || !/^[A-Za-z0-9_-]{21,64}$/.test(session_id)) {
+    res.locals.authOutcome = 'handoff_status:invalid_session_id';
+    return res.status(400).json({ error: 'Invalid session_id' });
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  if (redeemedGoogleSessions.has(session_id)) {
+    res.locals.authOutcome = 'handoff_status:redeemed';
+    return res.json({ state: 'redeemed' });
+  }
+  const session = pendingGoogleSessions.get(session_id);
+  if (!session) {
+    res.locals.authOutcome = 'handoff_status:gone';
+    return res.json({ state: 'gone' });
+  }
+  const state = session.status === 'success' ? 'ready' : session.status === 'error' ? 'error' : 'pending';
+  // The page asks every couple of seconds for as long as the code is on
+  // screen; the waiting states are not worth a log line each.
+  if (state === 'ready' || state === 'pending') res.locals.authQuiet = true;
+  res.locals.authOutcome = `handoff_status:${state}`;
+  return res.json({ state });
 });
 
 // Step 3: Client polls this endpoint to get the auth result
@@ -1107,12 +1262,24 @@ router.get('/google/poll', (req, res) => {
             'different-network': `consent and poll came from different networks. THIS is the shape of a remote account-takeover attempt.`,
             'unknown': `could not parse one or both addresses.`,
           }[verdict];
-          console.warn(
-            `[google/poll] awaiting_code reason=address_${verdict.replace('-', '_')} ` +
-            `consent=${shownConsent} poll=${shownPoll} email=${session.data?.user?.email || 'unknown'} — ${why}`
-          );
-          res.locals.authOutcome = `awaiting_code:address_${verdict.replace('-', '_')}`;
-          return res.json({ status: 'awaiting_code', reason: `address_${verdict.replace('-', '_')}` });
+          const reasonKey = `address_${verdict.replace('-', '_')}`;
+          // Once per session per reason. The app polls every two seconds for
+          // up to five minutes while the user reads the code off the browser
+          // page, and one verdict repeated 150 times is how a real takeover
+          // attempt would hide in plain sight. The access log stays quiet on
+          // the repeats for the same reason; the first one is logged in full.
+          if (!session.awaiting_logged) session.awaiting_logged = new Set();
+          if (session.awaiting_logged.has(reasonKey)) {
+            res.locals.authQuiet = true;
+          } else {
+            session.awaiting_logged.add(reasonKey);
+            console.warn(
+              `[google/poll] awaiting_code reason=${reasonKey} ` +
+              `consent=${shownConsent} poll=${shownPoll} email=${session.data?.user?.email || 'unknown'} — ${why}`
+            );
+          }
+          res.locals.authOutcome = `awaiting_code:${reasonKey}`;
+          return res.json({ status: 'awaiting_code', reason: reasonKey });
         }
         console.warn(`[google/poll] LEGACY code-less redemption allowed for ${session.data?.user?.email || 'unknown'} at ${shownPoll} — no handoff code was presented, and the address check is what let it through. See REQUIRE_HANDOFF_CODE for when this path can be closed.`);
         res.locals.authOutcome = 'success:legacy_address_match';
@@ -1121,6 +1288,7 @@ router.get('/google/poll', (req, res) => {
 
     // Clean up after successful retrieval. Single-use by construction.
     pendingGoogleSessions.delete(session_id);
+    noteRedeemed(session_id);
     if (!res.locals.authOutcome) res.locals.authOutcome = 'success:handoff_code_verified';
     return res.json({ status: 'success', ...session.data });
   }

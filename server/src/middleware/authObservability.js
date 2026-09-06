@@ -135,6 +135,10 @@ function authAccessLog(req, res, next) {
     try {
       const ms = Date.now() - started;
       const status = res.statusCode;
+      // A handler may mark a request as a known repeat — the Nth identical
+      // "still waiting" poll of one sign-in — and those are logged only when
+      // something went wrong. The first of a kind is always logged in full.
+      if (res.locals?.authQuiet && status < 400) return;
       const outcome = sanitizeForLog(res.locals?.authOutcome || (status >= 400 ? 'unhandled_error' : 'ok')).slice(0, 120);
       const line =
         `[auth] ${sanitizeForLog(req.method)} ${safePath(req)} ${status} ${ms}ms ` +
