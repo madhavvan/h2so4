@@ -35,7 +35,7 @@ const geoRoutes = require('./routes/geo');
 const supportEscalation = require('./services/supportEscalation');
 // Semver compare — extracted to utils/version.js so unit tests can hit
 // it without booting Express. Used by /version + /license/validate.
-const { compareVersions } = require('./utils/version');
+const { compareVersions, latestForClient } = require('./utils/version');
 // Parses X-App-Version once per request; gates read req.clientAtLeast().
 const { clientVersion } = require('./middleware/clientVersion');
 
@@ -596,11 +596,17 @@ refreshVersionCache();
 app.get('/api/v1/app-version', (req, res) => {
   const latest = getLatestVersion();
   const clientVersion = req.query.v || '0.0.0';
-  const isOutdated = compareVersions(clientVersion, latest.version) < 0;
+  // A client can legitimately be AHEAD of what this cache knows: the GitHub
+  // fetch is cached for 15 minutes and falls back to a literal on a cold
+  // start, and a release reaches the fleet faster than either. Never tell
+  // such a client that an older build is "latest" — nothing good is built on
+  // that sentence. Its own version is reported back until the cache catches up.
+  const latestVersion = latestForClient(latest.version, clientVersion);
+  const isOutdated = compareVersions(clientVersion, latestVersion) < 0;
   const mustUpdate = compareVersions(clientVersion, latest.minVersion) < 0;
 
   res.json({
-    latest: latest.version,
+    latest: latestVersion,
     current: clientVersion,
     isOutdated,
     mustUpdate,

@@ -11,7 +11,14 @@
 ;     installed DisplayVersion (written by the stock installer to
 ;     SHELL_CONTEXT UNINSTALL_REGISTRY_KEY); if it is NEWER than this
 ;     installer's ${VERSION}, a silent run ABORTS (silent downgrades are
-;     always a bug, never an intent) and an interactive run must confirm.
+;     always a bug, never an intent) and an interactive run tells the user
+;     the app is already installed, opens the installed copy and leaves.
+;     It used to ASK "install the older version anyway?" — a question no
+;     customer can answer well, put to exactly the people re-running an
+;     old download because something went wrong (reported 2026-09-06).
+;     There is no downgrade path here any more: the installed app checks
+;     for updates on launch, so "already installed" also means it stays
+;     aligned with the latest release without the user doing anything.
 ;     The guard runs FIRST so an aborted downgrade never kills the app.
 ;
 ;  2. FILE-LOCK-SAFE KILL. Clients on v4.0.7/v4.0.8 run this installer
@@ -47,7 +54,12 @@
   StrCmp $R5 "1" 0 icGuardDone
   IfSilent 0 +2
     Quit
-  MessageBox MB_YESNO|MB_ICONEXCLAMATION "The installed version ($R6) is newer than this installer (${VERSION}).$\r$\nInstall the older version anyway?" /SD IDNO IDYES icGuardDone
+  ; Interactive: never offer a downgrade. Say the app is already current
+  ; (no version numbers — they are noise to a customer), open the installed
+  ; copy so the double-click still "does something", and exit.
+  MessageBox MB_OK|MB_ICONINFORMATION "Interview Copilot is already installed and up to date.$\r$\nOpening the installed app now." /SD IDOK
+  IfFileExists "$LOCALAPPDATA\Programs\interview-copilot-ai\Interview Copilot.exe" 0 +2
+    Exec '"$LOCALAPPDATA\Programs\interview-copilot-ai\Interview Copilot.exe"'
   Quit
   icGuardDone:
 

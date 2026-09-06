@@ -26,4 +26,27 @@ function compareVersions(a, b) {
   return 0;
 }
 
-module.exports = { compareVersions };
+/**
+ * The "latest" version to REPORT to a client, given what the release cache
+ * knows and what the client says it is running.
+ *
+ * The cache can lag the fleet: it is refreshed from GitHub every 15 minutes
+ * and starts from a literal on a cold boot, while auto-update reaches a
+ * machine within minutes of publish. In that window a client asks "am I
+ * outdated?" while running a version the cache has not heard of — and the
+ * honest answer is "no", not "the latest is the older one". Reporting the
+ * cache's older number is what a downgrade offer would be built on, and
+ * nothing good is built on it. So: never report a latest BELOW a well-formed
+ * client version; a client that is ahead is told its own version is latest
+ * until the cache catches up. Malformed or missing client versions ("0.0.0",
+ * "dev", "") never win — they are exactly the callers that must be told the
+ * real latest.
+ */
+function latestForClient(latestKnown, clientVersion) {
+  const known = String(latestKnown || '');
+  const client = String(clientVersion || '').trim();
+  if (!/^v?\d+\.\d+\.\d+$/.test(client)) return known;
+  return compareVersions(client, known) > 0 ? client.replace(/^v/i, '') : known;
+}
+
+module.exports = { compareVersions, latestForClient };
