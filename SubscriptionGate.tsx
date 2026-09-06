@@ -1619,7 +1619,9 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
     // user out. Include from→to in the body so the admin can double-check.
     setConfirmDialog({
       title: `Change tier for ${email}?`,
-      body: `Move ${email} from ${String(fromTier).toUpperCase()} → ${tier.toUpperCase()}. This resets sessions_limit and expires_at to the new tier's defaults. A step-up password prompt will appear.`,
+      body: tier === 'free'
+        ? `Move ${email} from ${String(fromTier).toUpperCase()} → FREE. This clears their interview time and removes any admin grant. A step-up password prompt will appear.`
+        : `Move ${email} from ${String(fromTier).toUpperCase()} → ${tier.toUpperCase()} as an admin grant: unlimited interview time that never expires until you change the plan again (features follow the named tier). A step-up password prompt will appear.`,
       confirmLabel: `Move to ${tier.toUpperCase()}`,
       danger: tier === 'free',
       onConfirm: async () => {
@@ -1633,10 +1635,14 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
     });
   };
 
+  // Adds interview MINUTES on the bucket the customer actually draws from
+  // (server: db.adjustLicenseTimeSeconds — lands like a paid extension pack).
+  // This used to send `credits`, a legacy session count that changed nothing
+  // a metered customer could feel.
   const handleGrantCredits = async (email: string) => {
     const n = parseInt(panelCredits, 10);
-    if (!Number.isFinite(n) || n === 0) return showMsg('Enter non-zero credits', 'error');
-    const data = await callMutation('/api/v1/admin/users/grant-credits', { email, credits: n }, `${n > 0 ? 'Granted' : 'Revoked'} ${Math.abs(n)} credit(s)`);
+    if (!Number.isFinite(n) || n === 0) return showMsg('Enter non-zero minutes', 'error');
+    const data = await callMutation('/api/v1/admin/users/grant-credits', { email, minutes: n }, `${n > 0 ? 'Added' : 'Removed'} ${Math.abs(n)} minute(s) of interview time`);
     if (!data) return;
     setPanelCredits('');
     if (data.license && searchResult?.user.email === email) {
@@ -2224,14 +2230,14 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                   </div>
                 </div>
 
-                {/* Tier distribution — 5 cards (Ultra included). The grid is
-                    md:grid-cols-5 so Ultra doesn't wrap onto a lonely row. */}
+                {/* Tier distribution — six cards, one per sellable tier (Enterprise
+                    included since 2026-09). lg:grid-cols-6 keeps them on one row. */}
                 <div>
                   <div className="flex items-center justify-between mb-3">
                     <h2 className="text-xs text-gray-500 uppercase tracking-widest font-semibold">Tier Distribution</h2>
                     <p className="text-[10px] text-gray-600">{stats?.total_users ?? 0} total users</p>
                   </div>
-                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
                     {TIERS.map(tier => {
                       const th = TIER_THEME[tier];
                       const Icon = th.Icon;
@@ -2328,11 +2334,11 @@ export const AdminDashboard = ({ onBack, currentUser }: { onBack: () => void; cu
                         </div>
 
                         <div className="p-3 rounded-xl border border-white/10 bg-black/30">
-                          <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-2">Grant credits (+/−)</label>
+                          <label className="text-[10px] text-gray-500 uppercase tracking-wider font-semibold block mb-2">Add interview minutes (+/−)</label>
                           <div className="flex gap-2">
-                            <input type="number" value={panelCredits} onChange={e => setPanelCredits(e.target.value)} placeholder="e.g. 10" className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-xs focus:outline-none focus:border-emerald-500/50" />
+                            <input type="number" value={panelCredits} onChange={e => setPanelCredits(e.target.value)} placeholder="e.g. 30" className="flex-1 px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.1] text-white text-xs focus:outline-none focus:border-emerald-500/50" />
                             <button onClick={() => handleGrantCredits(u.email)} disabled={!!panelBusy} className="px-3 py-2 rounded-lg bg-emerald-500/20 text-emerald-300 text-xs font-semibold hover:bg-emerald-500/30 border border-emerald-500/30 disabled:opacity-40 transition-all">
-                              Grant
+                              Add
                             </button>
                           </div>
                         </div>
@@ -9049,6 +9055,8 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setGoogleCodeInvalid(false);
     googleHandoffCodeRef.current = null;
     googleSessionIdRef.current = null;
+    // The loopback listener lives exactly as long as one sign-in attempt.
+    try { void (window as any).electronAPI?.invoke?.('auth:google-loopback-stop'); } catch { /* none running */ }
   }, [googleSubmitting]);
 
   // `opts` is optional because this is also wired straight to onClick, where
@@ -9065,6 +9073,19 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     setGoogleCodeInput('');
     setGoogleCodeInvalid(false);
     googleHandoffCodeRef.current = null;
+
+    // ── Loopback hand-off (electron/main.cjs, THE LOOPBACK HAND-OFF) ──
+    // The "Signed in" page hands the code to a listener on 127.0.0.1 that
+    // only this machine can reach, so the sign-in completes without the OS
+    // protocol handler and without the typed code — the two steps production
+    // showed failing on a VPN. Best effort: no port, no parameter, and the
+    // flow is exactly what it was.
+    let loopbackPort = 0;
+    try {
+      const r = await (window as any).electronAPI?.invoke?.('auth:google-loopback-start');
+      if (r && Number.isInteger(r.port) && r.port > 0) loopbackPort = r.port;
+    } catch { /* no listener — the deep link and the typed code still work */ }
+    const loopbackParam = loopbackPort ? `&lp=${loopbackPort}` : '';
 
     const sessionId = crypto.randomUUID();
     googleSessionIdRef.current = sessionId;
@@ -9090,7 +9111,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
     // history length 2, which is what stops the tab closing itself. The
     // chooser is opt-in instead, and THIS is the only thing that opts in.
     const switchAccountParam = wantsAccountPicker ? '&switch_account=1' : '';
-    const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}${geoCountry}${switchAccountParam}`;
+    const authUrl = `${serverUrl}/api/v1/auth/google/start?session_id=${sessionId}${geoCountry}${switchAccountParam}${loopbackParam}`;
 
     // Open Google sign-in in system browser. We MUST await + catch here —
     // the original fire-and-forget pattern silently swallowed shell errors
@@ -9377,7 +9398,7 @@ const SubscriptionGateInner: React.FC<SubscriptionGateProps> = ({ onAuthenticate
             style={{ background: 'var(--cream)', border: '1px solid var(--cream-line)', color: 'var(--ink-muted)' }}
           >
             <div className="text-[12px] mb-2" style={{ color: 'var(--ink)' }}>
-              Almost there — enter the code shown in your browser.
+              Almost there. The browser tab that says “Signed in” shows a 10-character code — type it here.
             </div>
             <div className="flex items-center gap-2">
               <input

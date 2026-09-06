@@ -38,6 +38,7 @@ import { Tutorial, shouldShowTutorial, markTutorialCompleted, clearTutorialCompl
 import { DownloadGuide } from './DownloadGuide';
 import { ManageSubscription } from './ManageSubscription';
 import { licenseService, UserProfile, LicenseData, TIME_CONSTANTS, fetchUsageSummary, UsageSummary } from './services/licenseService';
+import { prefetchDeepgramKey } from './services/deepgramKey';
 import { creditTimerService } from './services/creditTimerService';
 import { pricingService, getExtensionPacks } from './services/pricingService';
 import './pip-styles.css';
@@ -104,7 +105,7 @@ async function captureScreenBase64ForOCR(): Promise<string | null> {
   if (!isElectron) return null;
   let tempStream: MediaStream | null = null;
   try {
-    const sources = await electronIPC.invoke('get-desktop-sources');
+    const sources = await electronIPC.invoke('get-desktop-sources', { screenOnly: true, thumbnails: false });
     if (!sources || sources.length === 0) return null;
     const screenSource = sources.find((s: any) =>
       s.name === 'Entire Screen' || s.name === 'Screen 1' || s.name.toLowerCase().includes('screen')
@@ -975,11 +976,14 @@ const ChatInterface = ({
     isProcessing, 
     inputText, 
     setInputText, 
-    interimText, 
-    speechError, 
-    toggleAutoSend, 
-    startListening, 
-    stopListening, 
+    interimText,
+    speechError,
+    speechNotice,
+    isMicStarting,
+    isMicReconnecting,
+    toggleAutoSend,
+    startListening,
+    stopListening,
     handleManualSend, 
     handleAutoSolve,
     handleClear,
@@ -1625,16 +1629,28 @@ const ChatInterface = ({
 
                         <button
                             onClick={isListening ? stopListening : startListening}
-                            className={`pip-toggle ${isListening ? 'active-green' : ''}`}
+                            disabled={isMicStarting}
+                            className={`pip-toggle ${isListening ? 'active-green' : isMicStarting ? 'active-gold' : ''}`}
                             title={!inElectron ? "Share the meeting tab's audio — never your mic" : undefined}
                         >
-                            {isListening ? <Mic size={10} /> : <MicOff size={10} />}
-                            {isListening ? 'LIVE' : (!inElectron ? 'LISTEN' : 'MIC OFF')}
+                            {isMicStarting
+                              ? <Loader2 size={10} className="animate-spin" />
+                              : isListening ? <Mic size={10} /> : <MicOff size={10} />}
+                            {isMicStarting
+                              ? 'STARTING…'
+                              : isListening
+                                ? (isMicReconnecting ? 'RECONNECTING…' : 'LIVE')
+                                : (!inElectron ? 'LISTEN' : 'MIC OFF')}
                         </button>
 
                         {speechError && (
                             <span style={{ fontSize: '9px', color: '#ef4444', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                 {speechError}
+                            </span>
+                        )}
+                        {!speechError && speechNotice && (
+                            <span title={speechNotice} style={{ fontSize: '9px', color: '#f59e0b', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {speechNotice}
                             </span>
                         )}
 
@@ -1961,6 +1977,20 @@ const ChatInterface = ({
                                 <AlertTriangle size={10} /> {speechError}
                             </div>
                         )}
+                        {!speechError && speechNotice && (
+                            <div className="mx-auto bg-amber-500/90 text-black px-3 py-1 rounded-full text-xs border border-amber-300 flex items-center gap-2 shadow-lg backdrop-blur max-w-[640px]">
+                                <AlertTriangle size={10} /> <span>{speechNotice}</span>
+                                {isElectron && /screen recording/i.test(speechNotice) && (
+                                    <button
+                                        type="button"
+                                        onClick={() => { try { void (window as any).electronAPI?.invoke?.('open-screen-recording-settings'); } catch { /* not on macOS */ } }}
+                                        className="ml-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-black/80 text-white hover:bg-black"
+                                    >
+                                        Open settings
+                                    </button>
+                                )}
+                            </div>
+                        )}
 
                         <div className="composer-shell relative flex flex-col mx-2 rounded-[1.5rem] transition-all duration-300">
 
@@ -1980,15 +2010,24 @@ const ChatInterface = ({
 
                                     <button
                                         onClick={isListening ? stopListening : startListening}
+                                        disabled={isMicStarting}
                                         className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] md:text-xs font-bold transition-all ${
                                             isListening
                                             ? 'bg-emerald-500/20 text-emerald-400'
+                                            : isMicStarting
+                                            ? 'bg-amber-500/20 text-amber-400'
                                             : 'bg-white/[0.04] text-gray-400 hover:bg-white/[0.07]'
                                         }`}
                                         title={!isElectron ? "Share the meeting tab's audio — we never capture your mic" : undefined}
                                     >
-                                        {isListening ? <Mic size={12} /> : <MicOff size={12} />}
-                                        {isListening ? 'ON' : 'OFF'}
+                                        {isMicStarting
+                                          ? <Loader2 size={12} className="animate-spin" />
+                                          : isListening ? <Mic size={12} /> : <MicOff size={12} />}
+                                        {isMicStarting
+                                          ? 'STARTING…'
+                                          : isListening
+                                            ? (isMicReconnecting ? 'RECONNECTING…' : 'ON')
+                                            : 'OFF'}
                                     </button>
                                     {!isElectron && (
                                         <span className="text-[9px] md:text-[10px] text-gray-500 max-w-[140px] md:max-w-[220px] leading-tight" title="Privacy">
@@ -6836,10 +6875,21 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   // Pop-out is a thin UI client: it relays actions to main and receives state via IPC.
   const isPopoutThinClient = isElectron && isPopoutMode;
 
-  const { isListening: _rawIsListening, error: _rawSpeechError, startListening: _rawStartListening, stopListening: _rawStopListening, stream } = useSpeechRecognition({
+  const { isListening: _rawIsListening, isStarting: _rawIsStarting, isReconnecting: _rawIsReconnecting, error: _rawSpeechError, notice: _rawSpeechNotice, startListening: _rawStartListening, stopListening: _rawStopListening, stream } = useSpeechRecognition({
     onResult: isPopoutThinClient ? () => {} : handleSpeechResult,
     onError: (err) => console.error("Speech Error:", err),
   });
+
+  // ── Warm the Deepgram key before the first click ──
+  // The server mints keys (600–1400 ms in production) and the hook used to
+  // fetch one only when the mic was clicked, in series with everything else.
+  // Fetch it now, once, for its whole lifetime (services/deepgramKey.ts);
+  // the click then pays for the capture and the socket only. Main window
+  // only — the popout never opens a socket.
+  useEffect(() => {
+    if (isPopoutThinClient) return;
+    prefetchDeepgramKey();
+  }, [isPopoutThinClient]);
 
   // ── Speculative cache warming during transcription ──
   // As inputText / interimText updates (from speech OR typing), fire
@@ -6935,6 +6985,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const [remoteIsListening, setRemoteIsListening] = useState(false);
   const [remoteIsProcessing, setRemoteIsProcessing] = useState(false);
   const [remoteSpeechError, setRemoteSpeechError] = useState<string | null>(null);
+  const [remoteSpeechNotice, setRemoteSpeechNotice] = useState<string | null>(null);
+  const [remoteIsStarting, setRemoteIsStarting] = useState(false);
+  const [remoteIsReconnecting, setRemoteIsReconnecting] = useState(false);
 
   // Pop-out: shadow credit-timer state — main is authoritative, popout mirrors
   // so it can render the hour-boundary / low-warning / exhausted modals while
@@ -6953,6 +7006,15 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   // Expose unified state — pop-out reads from remote, main reads from local
   const isListening = isPopoutThinClient ? remoteIsListening : _rawIsListening;
   const speechError = isPopoutThinClient ? remoteSpeechError : _rawSpeechError;
+  // Microphone-only mode and its reason — the mic is ON when this is set, so
+  // it renders amber beside the button, never as the red error bar.
+  const speechNotice = isPopoutThinClient ? remoteSpeechNotice : _rawSpeechNotice;
+  // The mic button's two in-between states: the click has landed and the
+  // socket is not open yet (STARTING…), and a live session is re-establishing
+  // its socket (RECONNECTING…, button stays ON). Mirrored to the popout like
+  // isListening.
+  const isMicStarting = isPopoutThinClient ? remoteIsStarting : _rawIsStarting;
+  const isMicReconnecting = isPopoutThinClient ? remoteIsReconnecting : _rawIsReconnecting;
 
   useEffect(() => {
       streamRef.current = stream;
@@ -6966,6 +7028,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
   const isProcessingRef = useRef(isProcessing);
   const interimTextRef = useRef(interimText);
   const rawSpeechErrorRef = useRef(_rawSpeechError);
+  const rawSpeechNoticeRef = useRef(_rawSpeechNotice);
+  const rawIsStartingRef = useRef(_rawIsStarting);
+  const rawIsReconnectingRef = useRef(_rawIsReconnecting);
   // ── Provider cooldown (see PROVIDER_COOLDOWN_MS) ──
   // model -> epoch ms until which that provider is benched. A ref, not
   // state: nothing renders off it, and a re-render per 429 during a live
@@ -6995,6 +7060,9 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     electronIPC.send('session-active', { active: !!_rawIsListening });
   }, [_rawIsListening]);
   useEffect(() => { rawSpeechErrorRef.current = _rawSpeechError; }, [_rawSpeechError]);
+  useEffect(() => { rawSpeechNoticeRef.current = _rawSpeechNotice; }, [_rawSpeechNotice]);
+  useEffect(() => { rawIsStartingRef.current = _rawIsStarting; }, [_rawIsStarting]);
+  useEffect(() => { rawIsReconnectingRef.current = _rawIsReconnecting; }, [_rawIsReconnecting]);
   useEffect(() => { gateRef.current = gate; }, [gate]);
 
   // Credit-timer refs — populated below once `creditTimer` is defined. Used by
@@ -7037,14 +7105,17 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     electronIPC.send('relay-to-popout', {
       type: 'state-sync',
       isListening: _rawIsListening,
+      isStarting: _rawIsStarting,
+      isReconnecting: _rawIsReconnecting,
       isProcessing,
       interimText,
       inputText,
       autoSend: settings.autoSend,
       speechError: _rawSpeechError,
+      speechNotice: _rawSpeechNotice,
       selectedModel: settings.selectedModel,
     });
-  }, [_rawIsListening, isProcessing, interimText, inputText, settings.autoSend, _rawSpeechError, settings.selectedModel]);
+  }, [_rawIsListening, _rawIsStarting, _rawIsReconnecting, isProcessing, interimText, inputText, settings.autoSend, _rawSpeechError, _rawSpeechNotice, settings.selectedModel]);
 
   // ══ Main window → phone ═══════════════════════════════════════════
   //
@@ -7381,10 +7452,13 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
     const handler = (data: any) => {
       if (data?.type === 'state-sync') {
         setRemoteIsListening(data.isListening);
+        setRemoteIsStarting(!!data.isStarting);
+        setRemoteIsReconnecting(!!data.isReconnecting);
         setRemoteIsProcessing(data.isProcessing);
         setInterimText(data.interimText ?? '');
         setInputText(data.inputText ?? '');
         setRemoteSpeechError(data.speechError ?? null);
+        setRemoteSpeechNotice(data.speechNotice ?? null);
         setIsProcessing(data.isProcessing);
         // Echo-confirmation for a user's in-flight model pick. If main has
         // caught up and sent back the model we were waiting for, drop the
@@ -7721,7 +7795,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
 
       if (isElectron) {
         // Fresh one-shot capture in Electron
-        const sources = await electronIPC.invoke('get-desktop-sources');
+        const sources = await electronIPC.invoke('get-desktop-sources', { screenOnly: true, thumbnails: false });
         if (!sources || sources.length === 0) return null;
 
         const screenSource = sources.find((s: any) =>
@@ -7876,11 +7950,14 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
           electronIPC.send('relay-to-popout', {
             type: 'state-sync',
             isListening: rawIsListeningRef.current,
+            isStarting: rawIsStartingRef.current,
+            isReconnecting: rawIsReconnectingRef.current,
             isProcessing: isProcessingRef.current,
             interimText: interimTextRef.current,
             inputText: inputTextRef.current,
             autoSend: settingsRef.current.autoSend,
             speechError: rawSpeechErrorRef.current,
+            speechNotice: rawSpeechNoticeRef.current,
             selectedModel: settingsRef.current.selectedModel,
           });
           // Piggy-back the current credit-timer state so the popout can render
@@ -8393,7 +8470,7 @@ function MainApp({ userProfile, userLicense, onLogout, setUserProfile, setUserLi
 
   const sharedProps = {
     messages, streamingMsg: effectiveStreamingMsg, settings, setSettings, isListening, isProcessing, inputText, setInputText, interimText,
-    speechError, toggleAutoSend, startListening, stopListening, handleManualSend, handleAutoSolve,
+    speechError, speechNotice, isMicStarting, isMicReconnecting, toggleAutoSend, startListening, stopListening, handleManualSend, handleAutoSolve,
     handleClear, handleRegenerate, chatContainerRef, textareaRef, handleScroll,
     isPinned, newSinceUnpin, handleJumpToLatest, sidebarOpen,
     onOpenSettings: () => setShowSettings(true),

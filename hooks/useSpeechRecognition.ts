@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { getDeepgramKey } from '../services/aiProxyService';
+import { getDeepgramKeyCached, invalidateDeepgramKey } from '../services/deepgramKey';
 
 interface SpeechResult {
   final: string;
@@ -9,63 +9,182 @@ interface SpeechResult {
 interface UseSpeechRecognitionProps {
   onResult: (result: SpeechResult) => void;
   onError?: (error: string) => void;
+  /** Listening started, but in a reduced mode (microphone only) — and why. */
+  onNotice?: (notice: string) => void;
 }
 
 // Detect Electron via the contextBridge surface (window.electronAPI is set
 // by electron/preload.cjs). The old `process.versions.electron` check no
 // longer works under contextIsolation:true + nodeIntegration:false.
 const isElectron = typeof window !== 'undefined' && !!window.electronAPI?.isElectron;
+// Windows is the one platform where Electron can hand the renderer OS
+// loopback audio through getDisplayMedia (main.cjs
+// setDisplayMediaRequestHandler answers with audio: 'loopback').
+const isWindows = typeof navigator !== 'undefined'
+  && (/^Win/i.test(navigator.platform || '') || /Windows/i.test(navigator.userAgent || ''));
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  WHY THE MIC TOOK 4-5 SECONDS TO SHOW ON (2026-09-05), and what changed
+//
+//  startListening ran five steps strictly one after another and the button
+//  only changed when the LAST one finished: fetch a key (the server minted a
+//  brand-new Deepgram key every time — p50 623 ms, p90 908 ms server-side in
+//  production, plus the round trip), ask Electron for every desktop source
+//  WITH a 150×150 thumbnail of every open window (230 ms on a 4-window
+//  desktop, seconds on an interviewee's), open a desktop capture that also
+//  pulled a 1080p video track the mic never uses, connect the Deepgram
+//  socket, then paint. On stop the key was thrown away; on every reconnect
+//  another was minted — 21 mints for 7 interview starts in one week of logs.
+//
+//  Now: the button shows STARTING… on the click itself (isStarting); the key
+//  and the capture are fetched in parallel; the key is cached for its
+//  lifetime and prefetched when the interview screen mounts
+//  (services/deepgramKey.ts); the source lookup is screen-only with no
+//  thumbnails (6–8 ms measured); on Windows the capture is one getDisplayMedia
+//  call answered by main.cjs with OS loopback audio, and the unused video
+//  track is stopped immediately (verified: loopback audio keeps flowing);
+//  reconnects retry at once with the cached key and keep the button ON with a
+//  "reconnecting" hint instead of flipping it OFF.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+interface CaptureResult {
+  stream: MediaStream;
+  audioStream: MediaStream;
+  /** Set when listening started in a reduced mode the user should know about. */
+  notice?: string;
+}
+
+// ── MICROPHONE-ONLY FALLBACK ──
+// Used when meeting-audio capture is unavailable in Electron: the permission
+// is off, the platform offers no system-audio track (macOS without a virtual
+// audio device), or desktopCapturer simply failed. Through the mic the
+// interviewer is still heard as long as they play through speakers, which
+// is strictly better than a red error over an OFF button. The notice says
+// what happened and, for the permission case, exactly what to turn on.
+async function micOnlyCapture(cause: any): Promise<CaptureResult> {
+  const raw = String(cause?.message || cause || 'meeting audio capture failed');
+  const why = raw.replace(/^Error invoking remote method '[^']+': /, '').replace(/\.$/, '');
+  console.warn('[mic] meeting-audio capture unavailable — listening through the microphone only:', why);
+  let mic: MediaStream;
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: false,
+    });
+  } catch (micErr: any) {
+    throw new Error(`${why} — and the microphone could not be opened either (${micErr?.message || micErr}).`);
+  }
+  if (mic.getAudioTracks().length === 0) {
+    mic.getTracks().forEach(t => { try { t.stop(); } catch { /* already ended */ } });
+    throw new Error(`${why} — and the microphone produced no audio track.`);
+  }
+  const permission = /screen recording/i.test(why);
+  const notice = permission
+    ? 'Microphone only — meeting audio needs Screen Recording permission. Turn it on in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen the app.'
+    : `Microphone only — meeting audio capture is unavailable (${why.slice(0, 140)}). The interviewer is heard through your speakers.`;
+  return { stream: mic, audioStream: mic, notice };
+}
 
 /**
  * Get audio stream — handles both Browser (getDisplayMedia) and Electron (desktopCapturer)
  */
-async function getAudioStream(): Promise<{ stream: MediaStream; audioStream: MediaStream }> {
+async function getAudioStream(): Promise<CaptureResult> {
   if (isElectron) {
     // ── ELECTRON PATH ──
-    // desktopCapturer is only available in main process (Electron 17+).
-    // Reach it through the contextBridge surface — see electron/preload.cjs.
     if (!window.electronAPI) {
       throw new Error('Electron API not available');
     }
-    const sources = await window.electronAPI.invoke<any[]>('get-desktop-sources');
 
-    if (!sources || sources.length === 0) {
-      throw new Error('No capture sources found');
+    // ── Fast path (Windows): one call, answered by main.cjs with the screen
+    //    source plus OS loopback audio. No thumbnail of every open window, no
+    //    source-id round trip, and the desktop VIDEO track — which the mic
+    //    never uses (screenshots re-acquire their own one-shot stream) — is
+    //    stopped at once so nothing paints desktop frames for the whole
+    //    interview. Measured 2026-09-05: 160–210 ms end to end, against
+    //    230 ms (sources) + 280 ms (capture) for the path below.
+    if (isWindows && navigator.mediaDevices?.getDisplayMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+          audio: true,
+          video: { frameRate: { ideal: 1, max: 2 } },
+        });
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length > 0) {
+          // Verified with a standalone probe (2026-09-05): the loopback audio
+          // track stays live and keeps delivering after the video track stops.
+          stream.getVideoTracks().forEach(v => { try { v.stop(); } catch { /* already ended */ } });
+          return { stream, audioStream: new MediaStream(audioTracks) };
+        }
+        stream.getTracks().forEach(t => t.stop());
+        console.warn('[mic] loopback capture returned no audio — falling back to desktop capture');
+      } catch (e: any) {
+        console.warn('[mic] loopback capture unavailable — falling back to desktop capture:', e?.message || e);
+      }
     }
 
-    // Try to find "Entire Screen" first, fall back to first source
-    const screenSource = sources.find((s: any) =>
-      s.name === 'Entire Screen' || s.name === 'Screen 1' || s.name.toLowerCase().includes('screen')
-    ) || sources[0];
+    // ── Legacy path (macOS, or the Windows fallback) ──
+    // desktopCapturer is only available in main process (Electron 17+).
+    // Reach it through the contextBridge surface — see electron/preload.cjs.
+    // Screen only, no thumbnails: we pick "Entire Screen" by name anyway, and
+    // thumbnails of every open window were the expensive part.
+    //
+    // ── AND IF IT FAILS, THE MIC STILL STARTS ──
+    // Field report 2026-09-06, macOS: "Capture Error: Error invoking remote
+    // method 'get-desktop-sources': Failed to get sources" — Screen Recording
+    // was off for the app, so this call threw, the throw reached
+    // startListening, and the button stayed OFF. A user who could not hear
+    // the interviewer THROUGH THE APP was left unable to hear them at all.
+    // Any failure below — no permission, no sources, no system-audio track
+    // (the normal case on macOS without a virtual audio device) — now falls
+    // back to the microphone, and the reason is surfaced as a notice, not
+    // an error: the mic is ON, and the user is told what would make it
+    // better.
+    try {
+      const sources = await window.electronAPI.invoke<any[]>('get-desktop-sources', { screenOnly: true, thumbnails: false });
 
-    // In Electron, we use getUserMedia with chromeMediaSource constraints
-    // This captures system audio on Windows. macOS has limitations (see notes below).
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        mandatory: {
-          chromeMediaSource: 'desktop',
-          chromeMediaSourceId: screenSource.id,
-        }
-      } as any,
-      video: {
-        mandatory: {
-          chromeMediaSource: 'desktop',
-          chromeMediaSourceId: screenSource.id,
-          maxWidth: 1920,
-          maxHeight: 1080,
-          maxFrameRate: 5, // Low FPS since we only need occasional screenshots
-        }
-      } as any,
-    });
+      if (!sources || sources.length === 0) {
+        throw new Error('No capture sources found');
+      }
 
-    const audioTracks = stream.getAudioTracks();
-    if (audioTracks.length === 0) {
-      stream.getTracks().forEach(t => t.stop());
-      throw new Error('No system audio detected. On macOS you may need a virtual audio driver (e.g. BlackHole).');
+      // Try to find "Entire Screen" first, fall back to first source
+      const screenSource = sources.find((s: any) =>
+        s.name === 'Entire Screen' || s.name === 'Screen 1' || s.name.toLowerCase().includes('screen')
+      ) || sources[0];
+
+      // In Electron, we use getUserMedia with chromeMediaSource constraints.
+      // This captures system audio on Windows. macOS has limitations (see notes below).
+      // ⚠️ The video constraint is REQUIRED on this API: asking for desktop audio
+      // alone terminates the renderer (Chromium bad-message 263, reproduced
+      // 2026-09-05). That is why the Windows fast path above exists.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: screenSource.id,
+          }
+        } as any,
+        video: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: screenSource.id,
+            maxWidth: 1920,
+            maxHeight: 1080,
+            maxFrameRate: 5, // Low FPS since we only need occasional screenshots
+          }
+        } as any,
+      });
+
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        stream.getTracks().forEach(t => t.stop());
+        throw new Error('No system audio detected. On macOS you may need a virtual audio driver (e.g. BlackHole).');
+      }
+
+      const audioStream = new MediaStream(audioTracks);
+      return { stream, audioStream };
+    } catch (captureErr: any) {
+      return micOnlyCapture(captureErr);
     }
-
-    const audioStream = new MediaStream(audioTracks);
-    return { stream, audioStream };
 
   } else {
     // ── BROWSER PATH ──
@@ -92,8 +211,19 @@ async function getAudioStream(): Promise<{ stream: MediaStream; audioStream: Med
 export const useSpeechRecognition = ({
   onResult,
   onError,
+  onNotice,
 }: UseSpeechRecognitionProps) => {
   const [isListening, setIsListening] = useState(false);
+  // A reduced listening mode the user should know about (microphone only,
+  // and why). Distinct from `error`: the mic is ON when this is set.
+  const [notice, setNotice] = useState<string | null>(null);
+  // True from the click until the Deepgram socket opens (or the start fails).
+  // The button renders STARTING… on it — the user sees the click land.
+  const [isStarting, setIsStarting] = useState(false);
+  // True while a live session's socket is being re-established. isListening
+  // stays true meanwhile: the user's intent is ON, and flipping the button
+  // OFF for a one-second Deepgram idle close read as "the mic died".
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -109,7 +239,7 @@ export const useSpeechRecognition = ({
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intentionalStopRef = useRef(false); // true when user clicks stop
-  const deepgramKeyRef = useRef<string | null>(null); // Cache key for reconnects
+  const startingRef = useRef(false); // a start is in flight (dedupe double-clicks / IPC echoes)
   // ── Recovery state (mid-interview resilience) ──
   // reacquiring: a fresh-stream re-acquire is in flight (dedupe).
   // fastFailStreak: consecutive connects that closed without ever
@@ -126,7 +256,11 @@ export const useSpeechRecognition = ({
 
   const stopListening = useCallback(() => {
     intentionalStopRef.current = true;
+    startingRef.current = false;
     setIsListening(false);
+    setIsStarting(false);
+    setIsReconnecting(false);
+    setNotice(null);
 
     // Clear keepalive interval
     if (keepaliveIntervalRef.current) {
@@ -140,7 +274,9 @@ export const useSpeechRecognition = ({
       reconnectTimerRef.current = null;
     }
     reconnectAttemptsRef.current = 0;
-    deepgramKeyRef.current = null; // Clear cached key so next start gets fresh one
+    // The Deepgram key is NOT dropped here: it is good for its whole
+    // lifetime (services/deepgramKey.ts), and re-fetching it on every
+    // restart was one of the seconds the user waited.
     // Reset recovery state so a later start() isn't blocked or biased by a
     // previous session's fast-fail streak / in-flight re-acquire flag.
     reacquiringRef.current = false;
@@ -231,7 +367,10 @@ export const useSpeechRecognition = ({
 
       console.log('Deepgram Connected', reconnectAttemptsRef.current > 0 ? `(reconnect #${reconnectAttemptsRef.current})` : '');
       reconnectAttemptsRef.current = 0; // reset on successful connect
+      startingRef.current = false;
       setIsListening(true);
+      setIsStarting(false);
+      setIsReconnecting(false);
       setError(null);
 
       // ── KEEPALIVE: Send ping every 8 seconds to prevent timeout during silence ──
@@ -309,7 +448,6 @@ export const useSpeechRecognition = ({
       if (socketRef.current !== socket) return;
 
       console.log('Deepgram Closed', event.code, event.reason);
-      setIsListening(false);
 
       // Clear keepalive on close
       if (keepaliveIntervalRef.current) {
@@ -317,20 +455,36 @@ export const useSpeechRecognition = ({
         keepaliveIntervalRef.current = null;
       }
 
-      if (intentionalStopRef.current) return; // user stopped — nothing to recover
+      if (intentionalStopRef.current) {
+        // user stopped — nothing to recover
+        setIsListening(false);
+        setIsStarting(false);
+        setIsReconnecting(false);
+        return;
+      }
+
+      // A close before ANY data is the signature of a rejected key (1008
+      // policy close, 4xxx application codes) or a config problem. Whatever
+      // the reason, that key is not reused — the next connect fetches fresh.
+      const fastFail = !gotDataRef.current;
+      if (fastFail || event.code === 1008 || (event.code >= 4000 && event.code < 5000)) {
+        invalidateDeepgramKey();
+      }
 
       // ── Auth/config storm-breaker (#7) ──
-      // A socket that closes WITHOUT ever delivering data is a "fast-fail":
-      // almost always a bad/expired key, quota, or a policy close (1008 /
-      // Deepgram 4xxx). A few in a row means reconnecting won't help — stop
-      // and surface a clear error instead of hammering every ≤5s forever.
-      if (gotDataRef.current) {
-        fastFailStreakRef.current = 0;
-      } else {
+      // A few fast-fails in a row means reconnecting won't help — stop and
+      // surface a clear error instead of hammering forever.
+      if (fastFail) {
         fastFailStreakRef.current += 1;
+      } else {
+        fastFailStreakRef.current = 0;
       }
       if (fastFailStreakRef.current >= 5) {
         console.error('[mic] giving up after repeated fast-fail closes (auth/config?) code=', event.code);
+        startingRef.current = false;
+        setIsListening(false);
+        setIsStarting(false);
+        setIsReconnecting(false);
         setError('Voice service could not stay connected. Please stop and start the mic again.');
         return;
       }
@@ -346,6 +500,7 @@ export const useSpeechRecognition = ({
       if (!audioLive) {
         if (isElectron && recoverRef.current) {
           console.warn('[mic] audio track dead on close — re-acquiring stream');
+          setIsReconnecting(true);
           recoverRef.current();
         } else {
           console.warn('[mic] capture ended (share stopped) — stopping');
@@ -354,26 +509,29 @@ export const useSpeechRecognition = ({
         return;
       }
 
-      // ── Normal reconnect with the still-live stream ──
+      // ── Reconnect WITHOUT flipping the button off ──
+      // The first retry is immediate: most drops are a Deepgram idle close
+      // or a WiFi handover, and a second of backoff was a second of the
+      // interview unheard. Then 1 s, 2 s, 4 s, capped at 5 s. The key is
+      // the cached one unless this close just invalidated it.
       reconnectAttemptsRef.current += 1;
-      // Quick reconnect: 1s, then 2s, then cap at 5s for fast recovery
-      const delay = Math.min(1000 * Math.pow(2, Math.min(reconnectAttemptsRef.current - 1, 2)), 5000);
-      console.log(`Deepgram auto-reconnect #${reconnectAttemptsRef.current} in ${delay}ms`);
-      setError(`Reconnecting...`);
+      const n = reconnectAttemptsRef.current;
+      const delay = n <= 1 ? 0 : Math.min(1000 * Math.pow(2, n - 2), 5000);
+      console.log(`Deepgram auto-reconnect #${n} in ${delay}ms`);
+      setIsReconnecting(true);
+      setError('Reconnecting…');
 
       reconnectTimerRef.current = setTimeout(async () => {
-        if (!intentionalStopRef.current && audioStreamRef.current) {
-          // Get fresh Deepgram key for reconnect (keys may expire)
-          let keyToUse = cleanKey;
-          try {
-            keyToUse = await getDeepgramKey();
-            deepgramKeyRef.current = keyToUse;
-          } catch (e) {
-            console.error('Failed to refresh Deepgram key:', e);
-            // Continue with old key
-          }
-          connectDeepgram(audioStreamRef.current, keyToUse);
+        if (intentionalStopRef.current || !audioStreamRef.current) return;
+        let keyToUse = cleanKey;
+        try {
+          keyToUse = await getDeepgramKeyCached({ force: fastFail });
+        } catch (e) {
+          console.error('Failed to refresh Deepgram key:', e);
+          // Continue with the old key
         }
+        if (intentionalStopRef.current || !audioStreamRef.current) return;
+        connectDeepgram(audioStreamRef.current, keyToUse);
       }, delay);
     };
 
@@ -395,7 +553,8 @@ export const useSpeechRecognition = ({
   // Audio-track loss triggers recovery (#4).
   const wireTracks = useCallback((stream: MediaStream, audioStream: MediaStream) => {
     const vTracks = stream.getVideoTracks();
-    if (vTracks.length > 0) {
+    // The Windows fast path stops its video track on purpose — nothing to wire.
+    if (vTracks.length > 0 && vTracks[0].readyState === 'live') {
       vTracks[0].onended = () => {
         // Keep the mic alive. captureScreenshot re-acquires its own
         // one-shot video in Electron, so no persistent video track is
@@ -409,6 +568,7 @@ export const useSpeechRecognition = ({
         if (isElectron && recoverRef.current) {
           // System-audio loopback re-acquires with no prompt on desktop.
           console.warn('[mic] audio track ended — re-acquiring stream');
+          setIsReconnecting(true);
           recoverRef.current();
         } else {
           // Browser: no separate mic — a dead audio track means the user
@@ -430,12 +590,14 @@ export const useSpeechRecognition = ({
   const reacquireStream = useCallback(async () => {
     if (intentionalStopRef.current || reacquiringRef.current) return;
     reacquiringRef.current = true;
-    setError('Reconnecting...');
+    setIsReconnecting(true);
+    setError('Reconnecting…');
     try {
       // Drop the dead stream's tracks before re-acquiring.
       audioStreamRef.current?.getTracks().forEach(t => { try { t.stop(); } catch {} });
       streamRef.current?.getTracks().forEach(t => { try { t.stop(); } catch {} });
-      const { stream, audioStream } = await getAudioStream();
+      const { stream, audioStream, notice: reNotice } = await getAudioStream();
+      setNotice(reNotice || null);
       if (intentionalStopRef.current) {
         stream.getTracks().forEach(t => { try { t.stop(); } catch {} });
         return;
@@ -444,15 +606,21 @@ export const useSpeechRecognition = ({
       setCurrentStream(stream);
       audioStreamRef.current = audioStream;
       wireTracks(stream, audioStream);
-      let keyToUse = deepgramKeyRef.current || '';
+      let keyToUse = '';
       try {
-        keyToUse = await getDeepgramKey();
-        deepgramKeyRef.current = keyToUse;
-      } catch { /* keep old key */ }
-      if (!keyToUse) { setError('Voice service unavailable. Please restart the mic.'); return; }
+        keyToUse = await getDeepgramKeyCached();
+      } catch { /* reported below */ }
+      if (!keyToUse) {
+        setIsListening(false);
+        setIsReconnecting(false);
+        setError('Voice service unavailable. Please restart the mic.');
+        return;
+      }
       connectDeepgram(audioStream, keyToUse);
     } catch (e: any) {
       console.error('[mic] re-acquire failed:', e?.message || e);
+      setIsListening(false);
+      setIsReconnecting(false);
       setError('Lost the microphone and could not recover. Please stop and start again.');
     } finally {
       reacquiringRef.current = false;
@@ -464,42 +632,70 @@ export const useSpeechRecognition = ({
   useEffect(() => { recoverRef.current = reacquireStream; }, [reacquireStream]);
 
   const startListening = useCallback(async () => {
+    // Already starting, or already live — a double click / IPC echo must not
+    // open a second capture or a second socket.
+    if (startingRef.current) return;
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) return;
+
     setError(null);
     intentionalStopRef.current = false;
     reconnectAttemptsRef.current = 0;
+    startingRef.current = true;
+    setIsStarting(true);
 
     try {
-      // 1. Fetch Deepgram key from server (or use cached)
-      let cleanKey = deepgramKeyRef.current;
-      if (!cleanKey) {
-        cleanKey = await getDeepgramKey();
-        deepgramKeyRef.current = cleanKey;
+      // The key round trip and the capture share nothing, so they run at the
+      // same time. allSettled, because a capture that succeeded while the key
+      // failed must be released, not leaked.
+      const [keyResult, captureResult] = await Promise.allSettled([getDeepgramKeyCached(), getAudioStream()]);
+
+      if (intentionalStopRef.current) {
+        // The user hit stop while we were starting — release what we got.
+        if (captureResult.status === 'fulfilled') {
+          captureResult.value.stream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+        }
+        return;
       }
-      if (!cleanKey) {
-        const msg = "Could not get Deepgram key. Please try again.";
+      if (captureResult.status === 'rejected') throw captureResult.reason;
+      const { stream, audioStream, notice: captureNotice } = captureResult.value;
+      // A reduced mode is not an error: the mic is about to be ON. Tell the
+      // user what they are getting, and keep the red error bar for failures.
+      setNotice(captureNotice || null);
+      if (captureNotice) onNotice?.(captureNotice);
+
+      if (keyResult.status === 'rejected' || !keyResult.value) {
+        stream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+        const msg = keyResult.status === 'rejected'
+          ? String((keyResult.reason && keyResult.reason.message) || 'Could not get Deepgram key. Please try again.')
+          : 'Could not get Deepgram key. Please try again.';
         setError(msg);
         onError?.(msg);
         return;
       }
 
-      // 2. Get audio stream (handles both Browser and Electron)
-      const { stream, audioStream } = await getAudioStream();
-
       streamRef.current = stream;
       setCurrentStream(stream);
       audioStreamRef.current = audioStream;
 
-      // 3. Wire failure handlers (video decoupled from audio; audio loss
-      //    recovers) then connect to Deepgram.
+      // Wire failure handlers (video decoupled from audio; audio loss
+      // recovers) then connect to Deepgram. isStarting clears in onopen.
       wireTracks(stream, audioStream);
-      connectDeepgram(audioStream, cleanKey);
+      connectDeepgram(audioStream, keyResult.value);
 
     } catch (err: any) {
       console.error("Capture Error:", err);
-      if (err.name !== 'NotAllowedError') {
-        const msg = `Capture Error: ${err.message || 'Could not start audio capture'}`;
+      if (err?.name !== 'NotAllowedError') {
+        const msg = `Capture Error: ${err?.message || 'Could not start audio capture'}`;
         setError(msg);
         onError?.(msg);
+      }
+    } finally {
+      // Nothing connecting → the start is over (failed or abandoned). While a
+      // socket is CONNECTING the button keeps saying STARTING… until onopen.
+      const s = socketRef.current;
+      if (!s || s.readyState === WebSocket.CLOSED || s.readyState === WebSocket.CLOSING) {
+        startingRef.current = false;
+        setIsStarting(false);
       }
     }
   }, [onResult, onError, stopListening, connectDeepgram, wireTracks]);
@@ -525,5 +721,5 @@ export const useSpeechRecognition = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return { isListening, error, startListening, stopListening, stream: currentStream };
+  return { isListening, isStarting, isReconnecting, error, notice, startListening, stopListening, stream: currentStream };
 };

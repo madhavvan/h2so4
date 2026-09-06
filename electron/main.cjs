@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage, dialog, shell, globalShortcut, Notification, crashReporter, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, session, desktopCapturer, Tray, Menu, nativeImage, dialog, shell, globalShortcut, Notification, crashReporter, powerSaveBlocker, powerMonitor } = require('electron');
 
 // ── Display-sleep blocker (live-interview mic reliability) ──
 // While a session is active the user is often still (listening to the
@@ -288,9 +288,17 @@ function receiveProtocolUrl(rawUrl) {
     return;
   }
 
+  acceptGoogleHandoff(sessionId, code, 'protocol');
+}
+
+// One door for a hand-off, whichever way it arrived — the OS protocol
+// handler above or the loopback listener (see THE LOOPBACK HAND-OFF near
+// the IPC handlers). Buffers for a renderer that is not up yet and
+// broadcasts to the ones that are.
+function acceptGoogleHandoff(sessionId, code, via) {
   pendingGoogleHandoff = { sessionId, code, receivedAt: Date.now() };
   // Never log the code itself — it is a bearer credential for a session.
-  try { electronLog.info('[protocol] google handoff received for session', sessionId.slice(0, 8) + '…'); } catch {}
+  try { electronLog.info(`[${via}] google handoff received for session`, String(sessionId).slice(0, 8) + '…'); } catch {}
 
   for (const win of [mainWindow, popoutWindow]) {
     if (win && !win.isDestroyed()) {
@@ -1005,19 +1013,26 @@ function createMainWindow() {
     // code still untyped. Waiting for a real focus first means we only let go
     // once the user has genuinely had the window, then left it.
     let hasBeenFocused = false;
+    // Drop the pin WITHOUT letting Electron flip the process type: a plain
+    // setVisibleOnAllWorkspaces(false) calls app.dock.show() internally,
+    // which turned this app back into a Dock app and threw the pop-out off
+    // whatever full-screen Space the user was in (see syncMacDockIcon). The
+    // policy owner decides whether the Dock icon may come back.
+    const dropSpacesPin = (why) => {
+      if (!thisWindow || thisWindow.isDestroyed()) return;
+      try { thisWindow.setVisibleOnAllWorkspaces(false, { skipTransformProcessType: true }); } catch { /* best effort */ }
+      _macMainWindowSpacesPinned = false;
+      syncMacDockIcon(why);
+    };
     const releaseSpacesPin = () => {
       if (!hasBeenFocused) return;
-      if (!thisWindow || thisWindow.isDestroyed()) return;
-      try { thisWindow.setVisibleOnAllWorkspaces(false); } catch { /* best effort */ }
+      dropSpacesPin('main-window-blur');
     };
     thisWindow.on('focus', () => { hasBeenFocused = true; });
     thisWindow.on('blur', releaseSpacesPin);
     // 'hide' is unconditional: the window is gone from the screen either way,
     // so there is nothing left to keep pinned to a Space.
-    thisWindow.on('hide', () => {
-      if (!thisWindow || thisWindow.isDestroyed()) return;
-      try { thisWindow.setVisibleOnAllWorkspaces(false); } catch { /* best effort */ }
-    });
+    thisWindow.on('hide', () => dropSpacesPin('main-window-hide'));
   }
 
   // Load the full app
@@ -1060,6 +1075,85 @@ function createMainWindow() {
 // ───────────────────────────────────────────────
 let alwaysOnTopInterval = null;
 
+// ── macOS: ONE owner for the Dock icon / activation policy ──
+//
+// Background, verified against Electron 41's native_window_mac.mm and
+// browser_mac.mm (2026-09-05):
+//   • Since macOS 10.14 a normal Dock application's windows may NOT float
+//     over ANOTHER app's full-screen Space. Electron therefore makes
+//     win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+//     call app.dock.hide() (TransformProcessType → UIElement) unless
+//     { skipTransformProcessType: true } is passed, and makes
+//     setVisibleOnAllWorkspaces(false) call app.dock.show() (→ Foreground).
+//   • Browser::DockHide() silently does NOTHING when called within 1 s of a
+//     DockShow(). DockShow() on an active app activates the Dock, waits 1 s,
+//     transforms, waits 1 s more and re-activates this app IgnoringOtherApps.
+//     Electron's own docs describe the transform as "hide the window and
+//     dock for a short time every time it is called".
+//
+// Before this section existed, four unrelated code paths drove that
+// transform: the popout's 2-second re-assert (hide), the main window's
+// blur/hide handlers releasing their post-sign-in Spaces pin (show), and
+// the session-active handler (hide, then show at session end). Every
+// "show" demoted the app to a Dock app, which threw the popout OFF the
+// full-screen Zoom / Chrome Space the user was working in; the next tick's
+// "hide" was then ignored for a second and blinked the window when it
+// finally landed. Mac users saw exactly what they reported: the pop-out
+// will not stay on top of a full-screen app. Windows never had any of this:
+// a full-screen window there is just a big borderless window on the same
+// desktop, and HWND_TOPMOST beats it.
+//
+// Now every setVisibleOnAllWorkspaces call passes skipTransformProcessType
+// and the activation policy is decided HERE, from state, in one place. The
+// Dock icon is hidden while ANY of these holds and shown otherwise:
+//   1. a live interview session (the original stealth requirement: the
+//      Dock icon and the Cmd+Tab entry sit outside setContentProtection);
+//   2. the pop-out is open (it must be able to float over the user's
+//      full-screen Zoom / Meet / Teams / browser assessment at any moment,
+//      which the 10.14 rule allows only for a Dock-less app);
+//   3. the main window is pinned to all Spaces after a browser sign-in
+//      (focus-main-window), so it can surface over a full-screen Safari.
+// Nothing else may call app.dock.hide()/show() — test/popout-mac-fullscreen
+// pins that.
+let sessionActive = false;              // flipped by the 'session-active' IPC below
+let _macMainWindowSpacesPinned = false; // set/cleared by focus-main-window + its release
+let _macDockWantHidden = false;
+let _macDockRecheckTimer = null;
+
+function applyMacDockPolicy(wantHidden, tag) {
+  let visible = null;
+  try { visible = app.dock.isVisible(); } catch { /* unknown; apply anyway */ }
+  // Never call show() on an already-Regular app: DockShow's activation dance
+  // (activate the Dock, then this app IgnoringOtherApps) is user-visible.
+  if (visible !== null && visible === !wantHidden) return false;
+  try {
+    if (wantHidden) app.dock.hide(); else app.dock.show();
+    electronLog.info(`[dock] ${wantHidden ? 'hide' : 'show'} (${tag})`);
+    return true;
+  } catch (e) {
+    electronLog.warn(`[dock] ${wantHidden ? 'hide' : 'show'} failed (${tag}):`, e && e.message);
+    return false;
+  }
+}
+
+function syncMacDockIcon(reason) {
+  if (process.platform !== 'darwin' || !app.dock) return;
+  const popoutOpen = !!(popoutWindow && !popoutWindow.isDestroyed());
+  const wantHidden = sessionActive || popoutOpen || _macMainWindowSpacesPinned;
+  _macDockWantHidden = wantHidden;
+  applyMacDockPolicy(wantHidden, `${reason || 'sync'}; session=${sessionActive} popout=${popoutOpen} mainPinned=${_macMainWindowSpacesPinned}`);
+  // Electron ignores a hide that lands within 1 s of a show, and a show on an
+  // active app only completes ~2 s later. Re-check once the dust settles and
+  // apply again if the OS disagrees with the policy. One pending re-check at
+  // a time, so a flapping caller cannot stack timers.
+  if (_macDockRecheckTimer) clearTimeout(_macDockRecheckTimer);
+  _macDockRecheckTimer = setTimeout(() => {
+    _macDockRecheckTimer = null;
+    applyMacDockPolicy(_macDockWantHidden, 'settle re-check');
+  }, 2500);
+  if (_macDockRecheckTimer.unref) _macDockRecheckTimer.unref();
+}
+
 function enforceAlwaysOnTop() {
   if (popoutWindow && !popoutWindow.isDestroyed()) {
     // 'screen-saver' is the HIGHEST level — above all apps, even fullscreen
@@ -1074,24 +1168,25 @@ function enforceAlwaysOnTop() {
     // window relations) gets corrected within the next event tick.
     popoutWindow.setSkipTaskbar(true);
     // ── macOS: re-assert Spaces behavior AFTER setAlwaysOnTop ──
-    // Floating above ANOTHER app's fullscreen on macOS needs TWO things:
-    // a high window LEVEL ('screen-saver', set above) AND a collection
+    // Floating above ANOTHER app's fullscreen on macOS needs three things:
+    // a high window LEVEL ('screen-saver', set above), a collection
     // BEHAVIOR that lets the window join the fullscreen Space
-    // (canJoinAllSpaces + fullScreenAuxiliary, set via
-    // setVisibleOnAllWorkspaces). The catch: setAlwaysOnTop() RESETS the
-    // collection behavior, so a one-shot call at popout-creation gets
-    // clobbered the instant this re-assert first runs — and again on every
-    // 2s tick / blur / focus / move / resize. Re-applying it HERE, right
-    // after the level, keeps the two in lock-step so the popout reliably
-    // floats over fullscreen apps (Zoom/Meet/Teams, a fullscreen browser
-    // assessment) and follows the user across Spaces. Order matters:
-    // workspaces MUST come after the level. Gated to darwin for explicit
-    // intent (the API is a no-op on Windows; Spaces is a Mac construct).
-    // Wrapped so a transient Cocoa error can never crash the always-on-top
-    // safety net that the rest of the app's stealth depends on.
+    // (canJoinAllSpaces + fullScreenAuxiliary), and a Dock-less process
+    // (see syncMacDockIcon). The popout is created as type:'panel'
+    // (createPopoutWindow), and Electron's ElectronNSPanel ORs both
+    // behavior flags into EVERY setCollectionBehavior call, so nothing can
+    // strip them again. This call is belt-and-braces for the level reset
+    // the constructor comment describes, and it MUST carry
+    // skipTransformProcessType: without it Electron toggles the process
+    // type (app.dock.hide()) from inside this 2-second tick, which is the
+    // flip-flop that kept the popout off full-screen apps on Mac. Order
+    // still matters: workspaces after the level. Gated to darwin for
+    // explicit intent (the API is a no-op on Windows; Spaces is a Mac
+    // construct). Wrapped so a transient Cocoa error can never crash the
+    // always-on-top safety net that the rest of the app's stealth depends on.
     if (process.platform === 'darwin') {
       try {
-        popoutWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+        popoutWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
       } catch (e) {
         electronLog.warn('[popout] setVisibleOnAllWorkspaces failed:', e && e.message);
       }
@@ -1138,6 +1233,23 @@ function createPopoutWindow(options = {}) {
   const popY = wa.y + Math.round((wa.height - popH) / 2);
 
   popoutWindow = new BrowserWindow({
+    // ── macOS: an NSPanel, not an NSWindow ──
+    // Electron's `panel` type is its documented way to "float on top of
+    // full-screened apps": ElectronNSPanel forces
+    // NSWindowStyleMaskNonactivatingPanel into the style mask and ORs
+    // CanJoinAllSpaces | FullScreenAuxiliary into EVERY collection-behavior
+    // write, so neither setAlwaysOnTop nor a Spaces switch can take the
+    // full-screen permission away again (the failure mode Electron issue
+    // #36364 describes for plain windows, whose only workaround is a manual
+    // drag that a non-focusable window cannot receive). Non-activating also
+    // means show()/focus()/clicks never activate this app (Electron skips
+    // activateIgnoringOtherApps for panels), which is the real macOS
+    // counterpart of WS_EX_NOACTIVATE below: before this, every click on the
+    // pop-out activated Interview Copilot, and macOS answers an activation
+    // by switching Spaces away from the user's full-screen assessment and
+    // blurring its tab. Not applied on Windows/Linux, where `type` means
+    // something else.
+    ...(process.platform === 'darwin' ? { type: 'panel' } : {}),
     width: popW,
     height: popH,
     x: popX,
@@ -1212,16 +1324,20 @@ function createPopoutWindow(options = {}) {
   // The popout must (a) follow the user across Spaces — a Mission Control /
   // 4-finger swipe during an interview must not strand it on the Space it
   // was opened in — and (b) sit above a fullscreen Zoom/Meet/Teams call or
-  // a fullscreen browser-based assessment. Both come from
-  // setVisibleOnAllWorkspaces(true,{visibleOnFullScreen:true}). It is NOT
-  // called here as a one-shot anymore: setAlwaysOnTop() resets that
-  // collection behavior, so it has to be re-applied AFTER every
-  // setAlwaysOnTop. That now lives inside enforceAlwaysOnTop() (called
-  // immediately below, and on the 2s interval + window events), which
-  // applies the window level and the Spaces/fullscreen behavior together
-  // in the correct order. No-op on Windows/Linux.
+  // a fullscreen browser-based assessment. Three things deliver that, and
+  // all three are now in place before the window is ever shown:
+  //   1. type:'panel' (constructor above) pins canJoinAllSpaces +
+  //      fullScreenAuxiliary permanently and makes the window non-activating;
+  //   2. the app is a Dock-less (UIElement) process while the popout is open,
+  //      because since macOS 10.14 only such an app may float over another
+  //      app's full-screen Space (syncMacDockIcon, called right here);
+  //   3. enforceAlwaysOnTop() keeps the 'screen-saver' level and re-asserts
+  //      the Spaces behavior after it, on the 2 s interval + window events,
+  //      WITHOUT touching the process type again.
+  // No-op on Windows/Linux.
+  syncMacDockIcon('popout-open');
 
-  // Set highest always-on-top level immediately (also applies the macOS
+  // Set highest always-on-top level immediately (also re-applies the macOS
   // Spaces + visibleOnFullScreen behavior described above).
   enforceAlwaysOnTop();
 
@@ -1263,7 +1379,15 @@ function createPopoutWindow(options = {}) {
   }, 2000);
 
   popoutWindow.once('ready-to-show', () => {
-    popoutWindow.show();
+    // macOS: show() on a plain BrowserWindow calls
+    // [NSApp activateIgnoringOtherApps:YES] (Electron source), which pulled
+    // Interview Copilot to the front and the user OUT of their full-screen
+    // Space the moment the pop-out appeared. A panel's show() no longer
+    // activates, and showInactive() (orderFrontRegardless) states the intent
+    // explicitly: appear on top, take nothing. Windows keeps show() — with
+    // WS_EX_NOACTIVATE it already showed without activating.
+    if (process.platform === 'darwin') popoutWindow.showInactive();
+    else popoutWindow.show();
     enforceAlwaysOnTop();
   });
 
@@ -1285,6 +1409,9 @@ function createPopoutWindow(options = {}) {
       alwaysOnTopInterval = null;
     }
     popoutWindow = null;
+    // macOS: the Dock icon may come back now — unless a session is live or
+    // the main window is still pinned to all Spaces (policy owner decides).
+    syncMacDockIcon('popout-closed');
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('popout-closed');
     }
@@ -1313,14 +1440,146 @@ ipcMain.handle('auth:consume-google-handoff', () => {
   return { sessionId: handoff.sessionId, code: handoff.code };
 });
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  THE LOOPBACK HAND-OFF — the code reaches the app without the OS's help
+//
+//  interview-copilot:// depends on a registration this app cannot always
+//  get: 4.0.22 shipped on macOS without CFBundleURLTypes, a translocated
+//  (run-from-Downloads) app is refused by macOS, and a sandboxed install on
+//  Windows may not own the scheme. When it fails, the browser page prints a
+//  code for the human — and production showed on 2026-09-06 how often that
+//  step is where a sign-in dies: one account, eight consents in three
+//  minutes, three sign-ins.
+//
+//  RFC 8252's answer for native apps is a loopback listener. The app binds
+//  127.0.0.1 on an ephemeral port for the life of one sign-in, tells the
+//  server the port (`lp=` on /google/start), and the "Signed in" page hands
+//  the code straight to it with a fetch. Only this machine can reach its
+//  own 127.0.0.1, which is the property the deep link was relying on —
+//  minus the registry.
+//
+//  Bound to 127.0.0.1 only, one route, GET only, closed on the first
+//  hand-off or after six minutes (the server's session TTL plus slack). An
+//  attacker who knows the port learns nothing by calling it: it accepts a
+//  session_id and a code and forwards them to the renderer, which presents
+//  them to the server — where a wrong pair is refused, as always.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const LOOPBACK_HANDOFF_TTL_MS = 6 * 60 * 1000;
+let googleLoopback = null;   // { server, port, timer }
+
+function stopGoogleLoopback(reason) {
+  const lb = googleLoopback;
+  googleLoopback = null;
+  if (!lb) return;
+  try { clearTimeout(lb.timer); } catch {}
+  try { lb.server.close(); } catch {}
+  try { electronLog.info(`[loopback] closed (${reason}) port=${lb.port}`); } catch {}
+}
+
+ipcMain.handle('auth:google-loopback-start', async () => {
+  stopGoogleLoopback('restart');
+  try {
+    const http = require('http');
+    const server = http.createServer((req, res) => {
+      let url;
+      try { url = new URL(req.url || '/', 'http://127.0.0.1'); } catch { url = null; }
+      // Only the one route, only GET.
+      if (!url || req.method !== 'GET' || url.pathname !== '/google-handoff') {
+        res.writeHead(404, { 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+      const sessionId = url.searchParams.get('session_id') || '';
+      const code = url.searchParams.get('code') || '';
+      // Same shapes the server enforces; anything else is not a hand-off.
+      const shaped = /^[A-Za-z0-9_-]{21,64}$/.test(sessionId) && /^[0-9A-Za-z-]{10,12}$/.test(code);
+      res.writeHead(shaped ? 204 : 400, {
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end();
+      if (!shaped) return;
+      acceptGoogleHandoff(sessionId, code, 'loopback');
+      // The first hand-off ends the listener; the session is single-use anyway.
+      setTimeout(() => stopGoogleLoopback('handoff received'), 250);
+    });
+    server.on('error', (e) => { try { electronLog.warn('[loopback] server error:', e && e.message); } catch {} });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+    });
+    const port = server.address().port;
+    const timer = setTimeout(() => stopGoogleLoopback('ttl'), LOOPBACK_HANDOFF_TTL_MS);
+    googleLoopback = { server, port, timer };
+    try { electronLog.info(`[loopback] listening on 127.0.0.1:${port} for one sign-in`); } catch {}
+    return { port };
+  } catch (e) {
+    try { electronLog.warn('[loopback] could not start — the deep link and the typed code remain:', e && e.message); } catch {}
+    return { port: 0 };
+  }
+});
+
+ipcMain.handle('auth:google-loopback-stop', () => { stopGoogleLoopback('renderer'); return true; });
+
 // Desktop capturer — renderer can't access this directly in Electron 17+
-ipcMain.handle('get-desktop-sources', async () => {
-  const sources = await desktopCapturer.getSources({
-    types: ['window', 'screen'],
-    thumbnailSize: { width: 150, height: 150 }
-  });
+//
+// The mic and the one-shot screenshot only ever pick "Entire Screen", so they
+// ask for { screenOnly: true, thumbnails: false }: 6–8 ms measured, against
+// 230+ ms for a 150×150 thumbnail of EVERY open window on a four-window
+// desktop — and that cost grows with each window an interviewee has open
+// (Electron's own docs: a zero thumbnail size "will save the processing time
+// required for capturing the content of each window and screen"). With no
+// opts the old shape is returned for any caller that still wants it.
+ipcMain.handle('get-desktop-sources', async (_event, opts) => {
+  const screenOnly = !!(opts && opts.screenOnly);
+  const thumbnails = !(opts && opts.thumbnails === false);
+  // ── macOS: say WHY before Chromium says "Failed to get sources" ──
+  // desktopCapturer.getSources rejects with exactly that string when Screen
+  // Recording is off for this app. Field report 2026-09-06: "Capture Error:
+  // Error invoking remote method 'get-desktop-sources': Failed to get
+  // sources", and the mic left OFF. The permission state is readable up
+  // front, so the renderer gets a sentence a person can act on — and a
+  // phrase ("Screen Recording") it keys its microphone-only fallback on,
+  // because an IPC error crosses to the renderer as its message alone.
+  if (process.platform === 'darwin') {
+    let status = 'unknown';
+    try { status = require('electron').systemPreferences.getMediaAccessStatus('screen'); } catch { /* older Electron */ }
+    if (status === 'denied' || status === 'restricted') {
+      const err = new Error(`Screen Recording permission is ${status} for Interview Copilot. Open System Settings → Privacy & Security → Screen & System Audio Recording, turn on Interview Copilot, then quit and reopen the app.`);
+      err.code = 'SCREEN_RECORDING_DENIED';
+      throw err;
+    }
+  }
+  let sources;
+  try {
+    sources = await desktopCapturer.getSources({
+      types: screenOnly ? ['screen'] : ['window', 'screen'],
+      thumbnailSize: thumbnails ? { width: 150, height: 150 } : { width: 0, height: 0 },
+    });
+  } catch (e) {
+    const why = String((e && e.message) || e).replace(/\.$/, '');
+    const hint = process.platform === 'darwin'
+      ? ' On macOS this means Screen Recording permission is off for Interview Copilot (System Settings → Privacy & Security → Screen & System Audio Recording), or the app is running from the disk image or Downloads instead of Applications.'
+      : '';
+    const err = new Error(`${why}.${hint}`);
+    err.code = 'DESKTOP_SOURCES_UNAVAILABLE';
+    throw err;
+  }
   // Return serializable data (thumbnails are NativeImage, can't be sent directly)
   return sources.map(s => ({ id: s.id, name: s.name }));
+});
+
+// The one-click route to the pane the error above names. macOS only; the
+// renderer shows the button only when the notice is about that permission.
+ipcMain.handle('open-screen-recording-settings', async () => {
+  if (process.platform !== 'darwin') return false;
+  try {
+    await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+    return true;
+  } catch (e) {
+    try { electronLog.warn('[permissions] could not open Screen Recording settings:', e && e.message); } catch {}
+    return false;
+  }
 });
 
 // Robust external-URL opener — tries multiple OS-level launch paths and
@@ -1726,7 +1985,15 @@ ipcMain.on('focus-main-window', () => {
     let spacesOk = null;
     let focusOk = null;
     if (process.platform === 'darwin') {
-      try { mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); spacesOk = true; }
+      // The Spaces pin below only takes effect while this app is NOT a Dock
+      // app (macOS 10.14+ rule; see syncMacDockIcon). Electron used to do
+      // that implicitly inside setVisibleOnAllWorkspaces, and the implicit
+      // show() on release knocked the pop-out off full-screen Spaces. The
+      // policy owner hides the Dock for the pin; the call itself must not
+      // touch the process type.
+      _macMainWindowSpacesPinned = true;
+      syncMacDockIcon('main-window-spaces-pin');
+      try { mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true }); spacesOk = true; }
       catch (e) { spacesOk = false; try { electronLog.warn('[focus] setVisibleOnAllWorkspaces failed:', e && e.message); } catch {} }
       try { app.focus({ steal: true }); focusOk = true; }
       catch (e) { focusOk = false; try { electronLog.warn('[focus] app.focus({steal:true}) failed:', e && e.message); } catch {} }
@@ -1786,7 +2053,8 @@ ipcMain.on('relay-to-main', (_event, data) => {
 // renderer is the source of truth — `isListening` flipping there
 // drives this. If the renderer crashes mid-session the tray stays
 // hidden, which is a safer failure mode than the inverse.
-let sessionActive = false;
+// (`sessionActive` itself is declared next to syncMacDockIcon in the
+// pop-out section above: the macOS Dock-icon policy reads it.)
 // Periodic tray-menu refresh handle. Tracked at module scope so we can
 // clear it from session-active (which destroys the tray) and from each
 // createTray() call (which would otherwise stack a new interval on every
@@ -1822,12 +2090,10 @@ ipcMain.on('session-active', (_event, payload) => {
     // screen-share, but it does nothing for the Dock — that's a
     // separate OS-level surface. Hiding the Dock icon closes the only
     // remaining "Interview Copilot is running" leak on Mac. The Dock
-    // icon comes back when the session ends (below).
-    if (process.platform === 'darwin' && app.dock) {
-      try { app.dock.hide(); } catch (e) {
-        electronLog.warn('[dock] hide failed:', e && e.message);
-      }
-    }
+    // icon comes back when the session ends (below) — unless the pop-out
+    // is still open, which needs the Dock hidden for its own reason (see
+    // syncMacDockIcon; it is the only place allowed to touch app.dock).
+    syncMacDockIcon('session-start');
   } else {
     // Session ended — let the display sleep normally again.
     stopDisplaySleepBlocker();
@@ -1838,16 +2104,12 @@ ipcMain.on('session-active', (_event, payload) => {
       }
     }
     // ── macOS: restore the Dock icon at session end ──
-    // Symmetric to the hide above. Belt-and-suspenders: app.dock.show()
-    // is also called when the user explicitly quits or when the tray
-    // is rebuilt below — but doing it here keeps the dock state tied
-    // to the same lifecycle event the tray uses, so rebooting Dock +
-    // tray together stays consistent.
-    if (process.platform === 'darwin' && app.dock) {
-      try { app.dock.show(); } catch (e) {
-        electronLog.warn('[dock] show failed:', e && e.message);
-      }
-    }
+    // Symmetric to the hide above, via the policy owner: the icon returns
+    // only when nothing else needs the app Dock-less (pop-out closed, main
+    // window not pinned to all Spaces). Calling app.dock.show() directly
+    // here is what used to knock an open pop-out off the user's
+    // full-screen Space at the end of every session.
+    syncMacDockIcon('session-end');
   }
 });
 
@@ -8277,6 +8539,29 @@ app.whenReady().then(() => {
   // server-side route changes are actually exercised.
   resolveDevApiBase();
 
+  // ── Power events → renderer (2026-09) ──────────────────────────────
+  // The interview clock is billed against the SERVER clock, and from this
+  // client generation the server settles a heartbeat gap in full (it used to
+  // cap every settle at 90 s because a laptop that slept fourteen minutes
+  // would otherwise be billed fourteen minutes on wake). The renderer keeps
+  // that promise: creditTimerService closes its usage session on
+  // 'system:suspend' and reopens it on 'system:resume', so time asleep is
+  // never interview time. Screen lock counts as "walked away" for the same
+  // reason. Fan out to every window; only the main window owns a session.
+  const broadcastPower = (channel) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      try { if (!win.isDestroyed()) win.webContents.send(channel); } catch { /* window mid-teardown */ }
+    }
+  };
+  try {
+    powerMonitor.on('suspend', () => { electronLog.info('[power] suspend → pausing usage clock'); broadcastPower('system:suspend'); });
+    powerMonitor.on('resume', () => { electronLog.info('[power] resume → reopening usage clock'); broadcastPower('system:resume'); });
+    powerMonitor.on('lock-screen', () => { electronLog.info('[power] lock-screen → pausing usage clock'); broadcastPower('system:suspend'); });
+    powerMonitor.on('unlock-screen', () => { electronLog.info('[power] unlock-screen → reopening usage clock'); broadcastPower('system:resume'); });
+  } catch (e) {
+    electronLog.warn('[power] powerMonitor unavailable:', e && e.message);
+  }
+
   // AppUserModelId — without this, Windows toast notifications either
   // show under "electron.app.Interview Copilot" or fail to display at
   // all. Must match the appId in package.json's electron-builder config
@@ -8310,14 +8595,16 @@ app.whenReady().then(() => {
     'clipboard-read',
     'clipboard-sanitized-write',
   ]);
-  function isAppOrigin(webContents) {
-    if (!webContents || webContents.isDestroyed()) return false;
-    const url = webContents.getURL();
+  function isAppUrl(url) {
     if (!url) return false;
     if (isDev) {
       return url.startsWith('http://localhost:3005') || url.startsWith('http://127.0.0.1:3005');
     }
     return url.startsWith('file://');
+  }
+  function isAppOrigin(webContents) {
+    if (!webContents || webContents.isDestroyed()) return false;
+    return isAppUrl(webContents.getURL());
   }
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
     if (!ALLOWED_PERMISSIONS.has(permission)) {
@@ -8334,6 +8621,40 @@ app.whenReady().then(() => {
     if (!ALLOWED_PERMISSIONS.has(permission)) return false;
     return isAppOrigin(webContents);
   });
+
+  // ── getDisplayMedia → the screen plus OS loopback audio (2026-09) ─────
+  // The mic's fast path (hooks/useSpeechRecognition.ts getAudioStream). The
+  // renderer asks getDisplayMedia({ audio: true, video }) and this answers
+  // with the primary screen and, on Windows, the system's loopback audio —
+  // one call instead of "list every desktop source with a thumbnail, send
+  // the ids over IPC, open a desktop capture with the id". No picker is
+  // shown: the app captures the interview's system audio, never a choice
+  // the user has to make mid-call. Loopback audio is Windows-only in
+  // Electron; elsewhere the grant carries video only, the renderer sees no
+  // audio track and falls back to its legacy capture path.
+  try {
+    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+      const frameUrl = request && request.frame && !request.frame.isDestroyed?.() ? request.frame.url : null;
+      if (!isAppUrl(frameUrl)) {
+        electronLog.warn(`[display-media] denied — non-app frame: ${frameUrl}`);
+        return callback({});
+      }
+      desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } })
+        .then((sources) => {
+          const screen = sources[0];
+          if (!screen) return callback({});
+          const grant = { video: screen };
+          if (request.audioRequested && process.platform === 'win32') grant.audio = 'loopback';
+          callback(grant);
+        })
+        .catch((err) => {
+          electronLog.warn('[display-media] getSources failed:', err && err.message);
+          callback({});
+        });
+    }, { useSystemPicker: false });
+  } catch (e) {
+    electronLog.warn('[display-media] handler unavailable:', e && e.message);
+  }
 
   // Pre-warm the Windows UIA bridge so the first Auto-Type doesn't pay the
   // 300ms–2s PowerShell + `Add-Type System.Windows.Automation` cold start.

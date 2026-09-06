@@ -80,6 +80,13 @@ const INVOKE_CHANNELS = new Set([
   // once. Covers the cold start, where the protocol URL reaches main
   // before any renderer exists to hear the broadcast.
   'auth:consume-google-handoff',
+  // The loopback hand-off listener (main.cjs, THE LOOPBACK HAND-OFF): one
+  // per sign-in attempt, started before the browser opens, stopped when the
+  // attempt ends either way.
+  'auth:google-loopback-start',
+  'auth:google-loopback-stop',
+  // macOS: open the Screen Recording pane the microphone-only notice names.
+  'open-screen-recording-settings',
   // Local SQLite (Electron-side conversation/session/message DB)
   'db:claim-orphan-sessions',
   'db:get-active-session',
@@ -118,6 +125,10 @@ const RECEIVE_CHANNELS = new Set([
   'update-status',
   // Window-hidden-to-tray notification (drives first-time tray toast)
   'app-hidden-to-tray',
+  // Power events relayed from powerMonitor (main.cjs whenReady) — the usage
+  // clock pauses on suspend / screen lock and reopens on wake.
+  'system:suspend',
+  'system:resume',
   // In-app update-on-close prompt (replaces native dialog.showMessageBox)
   'show-update-prompt',
   // Main → renderer deeplink: admin tapped a support notification.

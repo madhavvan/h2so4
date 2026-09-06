@@ -40,11 +40,17 @@ The status should switch to **LIVE** in red. If it doesn't, refresh the browser 
 
 **On macOS specifically**, you also need OS-level permission. Open **System Settings → Privacy & Security → Screen & System Audio Recording**, toggle **Interview Copilot** on, then **quit and restart the app**. The grant doesn't take effect until restart.
 
+**"Capture Error: Error invoking remote method 'get-desktop-sources': Failed to get sources"** (macOS) means exactly that permission is off, or the app was launched from the disk image or Downloads folder instead of from Applications. Move the app to **Applications**, grant Screen & System Audio Recording as above, then quit and reopen it. From version 4.0.23 the mic still starts in **microphone-only** mode when meeting-audio capture is unavailable (you'll see an amber note under the mic button instead of a red error), and the note offers a button that opens the right System Settings pane.
+
+**On macOS, without a virtual audio device** the app hears the interviewer through your microphone as they play through your speakers. That works with speakers; with headphones it does not, because the sound never reaches the mic. To capture meeting audio directly, install a virtual audio driver such as BlackHole and route your meeting app's output through it.
+
 ## 2. The pop-out window is missing or off-screen
 
 Click the **External link** icon in the top bar again. The pop-out will re-spawn at the center of your current display. (Sometimes the window state from a previous monitor leaves it positioned where you can't see it — re-opening forces a fresh center position.)
 
 If it still doesn't appear, close the entire app from your system tray ("Quit"), then re-open. The pop-out preferences are reset on next launch.
+
+**On macOS, a note about the Dock icon.** The pop-out is built as a floating panel so it can stay on top of a full-screen Zoom, Meet, Teams or browser window and follow you across Spaces. macOS only allows that for an app without a Dock icon, so while the pop-out is open the Interview Copilot icon leaves the Dock on purpose. The app is still running: use the menu-bar icon or **⌘+Alt+Space** to bring the main window back. The Dock icon returns when you close the pop-out and no interview session is live.
 
 ## 3. Auto-Solve doesn't capture the screen
 
@@ -72,6 +78,8 @@ If you see "Invalid credentials" or "Your session has expired":
 2. If you forgot your password, click **Forgot password** on the sign-in screen. A reset link will be emailed within 5 minutes.
 3. If you signed up with Google, make sure you're using the same Google account. The license is bound to the email, not the provider — so switching from email/password to Google with a different email creates a different account.
 4. If you used to sign in fine and suddenly can't, check whether your machine's clock is correct. JWT tokens are time-sensitive; a clock that's >5 minutes off causes immediate sign-in failure.
+
+**Google sign-in asks for a code.** After you pick your Google account, the browser tab says **Signed in** and, if the app hasn't picked the sign-in up within a couple of seconds, shows a 10-character code (like `7K3QF-M9W2A`). Type that code into the app where it says **Almost there** and press **Continue**. This happens when the browser and the app reach our servers from different addresses, which is normal on a VPN or a dual-stack network; the code proves the sign-in is yours. Keep the browser tab open until the app shows you signed in. The code expires after 5 minutes; if it does, start Google sign-in again from the app.
 
 If none of these work, email **support@minicaai.com** with the account email and we'll look at the login logs.
 
