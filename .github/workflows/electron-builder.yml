@@ -41,6 +41,23 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      # ── Backfill a published release from a manual run ──
+      # 2026-09-06, v4.0.23: the macOS matrix job failed on GitHub's new
+      # macos-26 image before signing (see the matrix note), after the
+      # release was already published with Windows + Linux attached. A
+      # `release` event re-fire would run the workflow file AT THE TAG, i.e.
+      # the broken one. Naming the tag here lets a dispatch run — which uses
+      # the workflow on main — build the missing platform and attach its
+      # assets to the existing release instead of uploading nothing.
+      release_tag:
+        description: 'Existing release tag to attach built assets to (e.g. v4.0.23). Empty = build only.'
+        required: false
+        default: ''
+      only:
+        description: 'Build one platform only: mac or linux. Empty = every dispatch-buildable entry.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -136,7 +153,17 @@ jobs:
           - os: windows-latest
             platform: --win
             buildOnDispatch: false
-          - os: macos-latest
+          # ⚠️ PINNED, NOT macos-latest. On 2026-09-06 `macos-latest` had
+          # become the macos-26 image (20260831.0337.3) and electron-builder
+          # 26.8.1's certificate import died before signing:
+          #   security set-key-partition-list … → "SecKeychainUnlock: The
+          #   user name or passphrase you entered is not correct."
+          # on the temporary keychain it had just created with that password.
+          # Same secrets, same config, same electron-builder that built
+          # v4.0.22 four weeks earlier on the previous image. macOS 15 is the
+          # image that is known to work; move this on purpose, with a test
+          # build, not by letting the label drift.
+          - os: macos-15
             platform: --mac
             buildOnDispatch: true
           - os: ubuntu-latest
@@ -165,12 +192,18 @@ jobs:
         # Mac and Linux are the platforms CI handles. If we ever wire
         # the Azure secrets into GitHub repo secrets, flip Windows'
         # buildOnDispatch to true to re-enable CI rebuilds for it.
+        # A dispatch may also name ONE platform (`only: mac|linux`) so a
+        # backfill of the platform that failed does not rebuild the others.
         run: |
-          if [ "${{ matrix.buildOnDispatch }}" = "true" ]; then
-            echo "go=1" >> $GITHUB_OUTPUT
-          else
+          only="${{ github.event.inputs.only }}"
+          if [ "${{ matrix.buildOnDispatch }}" != "true" ]; then
             echo "go=0" >> $GITHUB_OUTPUT
             echo "::notice::Skipping ${{ matrix.os }} — locally-signed builds aren't rebuilt by CI."
+          elif [ -n "$only" ] && [ "--$only" != "${{ matrix.platform }}" ]; then
+            echo "go=0" >> $GITHUB_OUTPUT
+            echo "::notice::Skipping ${{ matrix.os }} — this run asked for '$only' only."
+          else
+            echo "go=1" >> $GITHUB_OUTPUT
           fi
         shell: bash
 
@@ -255,8 +288,11 @@ jobs:
       # (h2so4) — it is the LEGACY feed, still read by <=v4.0.9 installs.
       - name: Upload additional files to the source-repo release (legacy feed)
         uses: softprops/action-gh-release@v2
-        if: steps.gate.outputs.go == '1' && github.event_name == 'release'
+        # On a release event the action finds the release from the event; a
+        # dispatch that names release_tag attaches to that existing release.
+        if: steps.gate.outputs.go == '1' && (github.event_name == 'release' || github.event.inputs.release_tag != '')
         with:
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.release_tag }}
           files: |
             dist-electron/*.yml
             dist-electron/*.exe
@@ -284,11 +320,11 @@ jobs:
       # proves the feed is actually serving before you call a release done.
       - name: Mirror artifacts to the update-feed repo (what users update from)
         uses: softprops/action-gh-release@v2
-        if: steps.gate.outputs.go == '1' && github.event_name == 'release' && env.FEED_TOKEN != ''
+        if: steps.gate.outputs.go == '1' && (github.event_name == 'release' || github.event.inputs.release_tag != '') && env.FEED_TOKEN != ''
         with:
           repository: madhavvan/interviewcopilot-releases
           token: ${{ secrets.RELEASES_REPO_TOKEN }}
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.release_tag }}
           fail_on_unmatched_files: false
           files: |
             dist-electron/*.yml
