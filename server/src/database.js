@@ -2958,7 +2958,11 @@ function recordCompPayment(userId, tier, note) {
     `).run(
       userId,
       user.email,
-      `comp_${userId}_${Date.now()}`,
+      // Unique per grant, not per millisecond: two comps for one user in the
+      // same ms (the bot's in-place Ultra<->Enterprise swap, a double click)
+      // used to collide on UNIQUE(provider, provider_payment_id) and fail the
+      // second grant after the licence row had already been updated.
+      `comp_${userId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       tier,
       JSON.stringify({ mode: 'admin_comp', note: note || null }),
       Date.now(),

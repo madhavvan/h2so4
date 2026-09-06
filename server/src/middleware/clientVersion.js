@@ -114,14 +114,31 @@ function participatesInProtocol(req) {
 }
 
 /**
- * First client generation that can render the 428 session gate AND stops its
- * own usage clock when the machine sleeps (creditTimerService power hooks).
- * Both server behaviours that depend on it — routes/ai.js requireActiveSession
- * and the full-gap settle cap in routes/usage.js — read this one constant so
- * they arm on the same release. Held one release behind MIN_PROTOCOL_CLIENT
- * on purpose (see the note on SESSION_GATE_MIN_CLIENT in routes/ai.js).
+ * First client generation the 428 session gate is ENFORCED for. Held one
+ * release AHEAD of the shipping build on purpose (session-gate-client-compat
+ * pins that), and moved ahead again on every cut until the gate is armed
+ * deliberately — see the note on SESSION_GATE_MIN_CLIENT in routes/ai.js.
+ *
+ * 2026-09-06: 4.0.23 shipped as an urgent fix (Google sign-in, macOS
+ * capture). Arming a paywall gate for the first time inside that same build
+ * was not the moment, so the hold moved 4.0.23 → 4.0.24. Arm it on purpose,
+ * in a release whose only job is to arm it.
  */
-const SESSION_GATE_MIN_CLIENT = '4.0.23';
+const SESSION_GATE_MIN_CLIENT = '4.0.24';
+
+/**
+ * First client generation that stops its own usage clock when the machine
+ * sleeps or the screen locks (creditTimerService power hooks, shipped in
+ * 4.0.23). From here the full-gap settle cap in routes/usage.js applies: a
+ * silent gap on a still-open session is interview time and is billed up to
+ * the liveness window, because a client that sleeps closes its session first.
+ *
+ * Deliberately NOT the session-gate constant. The two used to be one value
+ * "so they arm on the same release", which meant a release could not ship
+ * the billing half without also arming the gate — and vice versa. They are
+ * separate facts about a client and move separately.
+ */
+const USAGE_FULL_GAP_MIN_CLIENT = '4.0.23';
 
 /**
  * Is this caller at least `minVersion`? Reads req.clientRank when the
@@ -146,4 +163,5 @@ module.exports = {
   CLIENT_VERSION_HEADER,
   MIN_PROTOCOL_CLIENT,
   SESSION_GATE_MIN_CLIENT,
+  USAGE_FULL_GAP_MIN_CLIENT,
 };

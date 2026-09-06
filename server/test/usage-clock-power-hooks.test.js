@@ -89,16 +89,20 @@ describe('usage clock power hooks — server contract', () => {
   it('routes/usage.js settles start, heartbeat and stop with the per-client cap, keyed on the SAME constant as the session gate', () => {
     const src = codeLines(read('server/src/routes/usage.js'));
     expect(src).toMatch(/require\('\.\.\/middleware\/clientVersion'\)/);
-    expect(src).toMatch(/function settleCapFor\(req\) \{\s*return clientAtLeast\(req, SESSION_GATE_MIN_CLIENT\) \? USAGE_FULL_GAP_CAP_S : USAGE_HEARTBEAT_CAP_S;/);
+    expect(src).toMatch(/function settleCapFor\(req\) \{\s*return clientAtLeast\(req, USAGE_FULL_GAP_MIN_CLIENT\) \? USAGE_FULL_GAP_CAP_S : USAGE_HEARTBEAT_CAP_S;/);
     expect(src.match(/settleCapFor\(req\)/g)).toHaveLength(4); // definition + start + heartbeat + stop
     expect(src).toContain('db.heartbeatUsageSession(req.user.id, sessionId, { capSeconds: capS })');
     expect(src).toContain('db.stopUsageSession(req.user.id, sessionId, { capSeconds: capS })');
     expect(src).toContain('settleOpenUsageSessions(req.user.id, now, settleCapFor(req))');
   });
 
-  it('SESSION_GATE_MIN_CLIENT has one home; ai.js imports it rather than declaring its own', () => {
+  it('the thresholds have one home; ai.js imports the gate rather than declaring its own', () => {
     const cv = require('../src/middleware/clientVersion.js');
-    expect(cv.SESSION_GATE_MIN_CLIENT).toBe('4.0.23');
+    // The power hooks shipped in 4.0.23, so full-gap billing starts there —
+    // and it is NOT tied to the session gate, which is held ahead of the
+    // shipping build until it is armed on purpose.
+    expect(cv.USAGE_FULL_GAP_MIN_CLIENT).toBe('4.0.23');
+    expect(cv.versionRank(cv.SESSION_GATE_MIN_CLIENT)).toBeGreaterThan(cv.versionRank(cv.USAGE_FULL_GAP_MIN_CLIENT));
     expect(typeof cv.clientAtLeast).toBe('function');
     const ai = codeLines(read('server/src/routes/ai.js'));
     expect(ai).not.toMatch(/const SESSION_GATE_MIN_CLIENT\s*=/);

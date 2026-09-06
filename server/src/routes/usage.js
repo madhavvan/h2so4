@@ -61,20 +61,21 @@ function isAdminEmail(email) {
 // more: see the long note on both constants in database.js. Using the
 // window here would bill a fifteen-minute laptop sleep as interview time.
 const { USAGE_STALE_AFTER_MS, USAGE_HEARTBEAT_CAP_S, USAGE_FULL_GAP_CAP_S } = db;
-const { clientAtLeast, SESSION_GATE_MIN_CLIENT } = require('../middleware/clientVersion');
+const { clientAtLeast, USAGE_FULL_GAP_MIN_CLIENT } = require('../middleware/clientVersion');
 
 // ━━ Which cap does THIS caller get? ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // The 90-second ceiling exists because an old client that slept for
 // fourteen minutes would otherwise be billed fourteen minutes on wake. From
-// SESSION_GATE_MIN_CLIENT (4.0.23) the desktop app stops its own session on
-// suspend / screen lock and reopens it on wake, so for those clients a
+// USAGE_FULL_GAP_MIN_CLIENT (4.0.23) the desktop app stops its own session
+// on suspend / screen lock and reopens it on wake, so for those clients a
 // silent gap on a still-open session IS interview time and is billed in
 // full, up to the liveness window. That is what closes the slow-beat
 // discount (a hand-modified client beating every fourteen minutes paid
 // ninety seconds each time). Absent or unparseable version header → the
 // old cap: the safe direction, the same one every gate here fails toward.
+// (Its own constant, not the session gate's — see clientVersion.js.)
 function settleCapFor(req) {
-  return clientAtLeast(req, SESSION_GATE_MIN_CLIENT) ? USAGE_FULL_GAP_CAP_S : USAGE_HEARTBEAT_CAP_S;
+  return clientAtLeast(req, USAGE_FULL_GAP_MIN_CLIENT) ? USAGE_FULL_GAP_CAP_S : USAGE_HEARTBEAT_CAP_S;
 }
 // A /start this soon after the running one is the same client asking
 // twice (a re-mounted window, a retried request — or a loop trying to

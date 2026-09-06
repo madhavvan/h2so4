@@ -38,6 +38,7 @@ for (const k of [
 
 const require = createRequire(import.meta.url);
 
+const { SESSION_GATE_MIN_CLIENT } = require('../src/middleware/clientVersion.js');
 // ─── Fake Stripe ─────────────────────────────────────────────────────────
 // A recording fake with just enough state for the routes under test. Every
 // call is appended to `calls` so a test can assert WHAT was sent to Stripe,
@@ -834,8 +835,8 @@ describe('4 · usage metering', () => {
     const sid = start.body.session_id;
     ageHeartbeat(sid, db.USAGE_STALE_AFTER_MS + 60_000);
     expect(db.hasLiveUsageSession(u.id)).toBe(false);
-    // The dormant session gate would refuse a 4.0.23 client here…
-    const gated = await call('/api/v1/ai/chat/openai', { method: 'POST', token: t, headers: { 'x-app-version': '4.0.23' }, body: { messages: [{ role: 'user', content: 'hi' }] } });
+    // The dormant session gate would refuse a client at its threshold here…
+    const gated = await call('/api/v1/ai/chat/openai', { method: 'POST', token: t, headers: { 'x-app-version': SESSION_GATE_MIN_CLIENT }, body: { messages: [{ role: 'user', content: 'hi' }] } });
     expect(gated.status).toBe(428);
     expect(gated.body.error).toBe('session_required');
     // …and lets a 4.0.22 client through (no key configured → 503 = every gate passed).
@@ -849,12 +850,12 @@ describe('4 · usage metering', () => {
     expect(lic(u).credits_remaining_seconds).toBe(3600); // nothing billed for the gap
   });
 
-  it('a live metered session satisfies the session gate for a 4.0.23 client', async () => {
+  it('a live metered session satisfies the session gate for a client at its threshold', async () => {
     const u = mkUser('meter_live_gate');
     await buy(u, 'pro');
     const t = tokenFor(u);
     await call('/api/v1/usage/start', { method: 'POST', token: t });
-    const res = await call('/api/v1/ai/chat/openai', { method: 'POST', token: t, headers: { 'x-app-version': '4.0.23' }, body: { messages: [{ role: 'user', content: 'hi' }] } });
+    const res = await call('/api/v1/ai/chat/openai', { method: 'POST', token: t, headers: { 'x-app-version': SESSION_GATE_MIN_CLIENT }, body: { messages: [{ role: 'user', content: 'hi' }] } });
     expect(res.status).toBe(503);
     expect(res.body.error).toBe('OpenAI not configured');
   });
