@@ -122,9 +122,10 @@ function participatesInProtocol(req) {
  * 2026-09-06: 4.0.23 shipped as an urgent fix (Google sign-in, macOS
  * capture). Arming a paywall gate for the first time inside that same build
  * was not the moment, so the hold moved 4.0.23 → 4.0.24. Arm it on purpose,
- * in a release whose only job is to arm it.
+ * in a release whose only job is to arm it. (4.0.24 shipped the same evening
+ * as an urgent fix release; the hold moved on again, 4.0.24 -> 4.0.25.)
  */
-const SESSION_GATE_MIN_CLIENT = '4.0.24';
+const SESSION_GATE_MIN_CLIENT = '4.0.25';
 
 /**
  * First client generation that stops its own usage clock when the machine

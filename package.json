@@ -1,7 +1,7 @@
 {
   "name": "interview-copilot-ai",
   "private": true,
-  "version": "4.0.23",
+  "version": "4.0.24",
   "description": "AI-powered real-time interview assistant",
   "author": {
     "name": "Interview Copilot",
