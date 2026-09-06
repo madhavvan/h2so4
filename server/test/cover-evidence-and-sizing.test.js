@@ -93,17 +93,25 @@ describe('a question about them, with nothing about them, is not asked', () => {
 });
 
 describe('the prewarm rail has a ceiling per user', () => {
-  it('a second prewarm inside the interval is answered "throttled" and starts nothing', () => {
+  it('a prewarm inside the interval is HELD until it ends; an aborted hold starts nothing', () => {
     expect(ai).toContain('const PREWARM_MIN_INTERVAL_MS = 2500;');
-    const prewarm = ai.slice(ai.indexOf("router.post('/cover/prewarm'"), ai.indexOf("router.post('/cover/prewarm'") + 5000);
-    const throttleAt = prewarm.indexOf("return res.json({ cover: '', effort: null, reason: 'throttled', ms: 0 });");
-    expect(throttleAt).toBeGreaterThan(-1);
-    // Cached hits are served before the throttle (free), and the throttle
-    // decides before the previous in-flight prewarm would be aborted.
-    expect(throttleAt).toBeGreaterThan(prewarm.indexOf('const cached = _prewarmGet(key);'));
-    expect(throttleAt).toBeLessThan(prewarm.indexOf('_prewarmInFlightByUser.get(uid)'));
-    expect(prewarm).toContain('_prewarmLastStartByUser.set(uid, Date.now());');
-    // Tests that fire prewarms back to back can turn it off.
+    const prewarm = ai.slice(ai.indexOf("router.post('/cover/prewarm'"), ai.indexOf("router.post('/cover/prewarm'") + 6000);
+    const holdAt = prewarm.indexOf('const hold = _prewarmMinIntervalMs - (Date.now() - lastStart);');
+    expect(holdAt).toBeGreaterThan(-1);
+    // Cached hits are served before the hold (free)…
+    expect(holdAt).toBeGreaterThan(prewarm.indexOf('const cached = _prewarmGet(key);'));
+    // …the abort wiring exists before the hold, so a client that moves on
+    // ends the wait without anything being spent…
+    expect(holdAt).toBeGreaterThan(prewarm.indexOf("res.on('close', () => { if (!res.writableEnded) ac.abort(); });"));
+    expect(prewarm).toContain('await new Promise((resolve) => setTimeout(resolve, hold));');
+    expect(prewarm).toContain("reason: 'superseded', ms: Date.now() - t0 });");
+    // …and only a request that outlives the hold starts work and supersedes the previous one.
+    const startAt = prewarm.indexOf('_prewarmLastStartByUser.set(uid, Date.now());');
+    expect(startAt).toBeGreaterThan(holdAt);
+    expect(startAt).toBeLessThan(prewarm.indexOf('_prewarmInFlightByUser.get(uid)'));
+    // Nothing is refused outright any more.
+    expect(prewarm).not.toContain("reason: 'throttled'");
+    // Tests that fire prewarms back to back can turn the interval off.
     expect(ai).toContain('function _setPrewarmMinInterval(ms)');
   });
 });

@@ -1018,13 +1018,32 @@ router.post('/cover/prewarm', async (req, res) => {
   // prewarm already running keeps running (it is not superseded), and if
   // the question grows past what that one was written for, the client's
   // divergence check declines it and the live race takes over as before.
-  const lastStart = _prewarmLastStartByUser.get(uid) || 0;
-  if (Date.now() - lastStart < _prewarmMinIntervalMs) {
-    return res.json({ cover: '', effort: null, reason: 'throttled', ms: 0 });
-  }
-  _prewarmLastStartByUser.set(uid, Date.now());
   const ac = new AbortController();
   res.on('close', () => { if (!res.writableEnded) ac.abort(); });
+  // ── HELD, NOT REFUSED (2026-09-06, first 4.0.23 session in production) ──
+  //
+  // The first version answered "throttled" at once. Measured live within the
+  // hour: 43 prewarm calls for 3 answers, and a pattern the refusal makes
+  // worse — the client aborts its OWN in-flight prewarm the moment the
+  // transcript moves ("client gone" in the NO COVER lines), and the request
+  // that replaces it was being refused. In a fast burst that leaves the
+  // final, complete question with nothing running: the interval passes with
+  // no prewarm for the words that actually get sent.
+  //
+  // So a request inside the interval WAITS for the interval to end. If the
+  // transcript moves on meanwhile the client aborts it (nothing spent); the
+  // last request of the burst outlives the hold and is the one that starts.
+  // Same ceiling on Groq spend, but the spend lands on the newest words.
+  const lastStart = _prewarmLastStartByUser.get(uid) || 0;
+  const hold = _prewarmMinIntervalMs - (Date.now() - lastStart);
+  if (hold > 0) {
+    await new Promise((resolve) => setTimeout(resolve, hold));
+    if (ac.signal.aborted) {
+      if (!res.writableEnded) res.json({ cover: '', effort: null, reason: 'superseded', ms: Date.now() - t0 });
+      return;
+    }
+  }
+  _prewarmLastStartByUser.set(uid, Date.now());
   const prev = _prewarmInFlightByUser.get(uid);
   if (prev) { try { prev.abort(); } catch { /* already done */ } }
   _prewarmInFlightByUser.set(uid, ac);
