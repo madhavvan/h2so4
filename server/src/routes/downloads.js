@@ -44,6 +44,16 @@
 //  `npm run release:verify` walks the real anonymous HTTP steps against
 //  both targets and fails if either cannot serve.
 //
+//  ── AS OF 2026-09-06: POINTED AT THE RELEASES REPO ──
+//  The condition above is met: interviewcopilot-releases carries every
+//  release since 4.0.17 with all four artifacts plus the three channel
+//  files (v4.0.25 checked anonymously before this flip). This constant and
+//  GITHUB_RELEASES_URL now read the repo that stays public, so h2so4 can be
+//  made private without touching the server again. When that happens,
+//  scripts/verify-release-feed.mjs must stop expecting anonymous reads
+//  from h2so4, and <=4.0.9 installs (already below MIN_PROTOCOL_CLIENT,
+//  so already told to download a new build) lose their updater feed.
+//
 //  Routes are explicit (one handler per platform) instead of /:platform
 //  with a lookup table — this keeps the router from swallowing every
 //  unmatched root path, which would shadow the 404 handler in index.js.
@@ -52,7 +62,7 @@
 const express = require('express');
 const router = express.Router();
 
-const REPO = 'madhavvan/h2so4';
+const REPO = 'madhavvan/interviewcopilot-releases';
 
 // Artifact filenames must match the patterns in package.json's
 // build.{win,mac,linux}.artifactName — keep them in sync.

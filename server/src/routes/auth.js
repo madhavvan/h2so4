@@ -9,6 +9,8 @@ const { clearLoginAttempts } = require('../middleware/rateLimiters');
 // return early. See middleware/authObservability.js for why this exists.
 const { authAccessLog } = require('../middleware/authObservability');
 const db = require('../database');
+const { checkEmailDeliverable } = require('../services/emailValidity');
+const { sendWelcomeMail, verifyUnsubscribeToken } = require('../services/marketingMail');
 
 const router = express.Router();
 
@@ -81,6 +83,15 @@ router.post('/signup', async (req, res) => {
     if (!isValidEmail(email)) {
       return res.status(400).json({ error: 'Invalid email format' });
     }
+    // Reachability (services/emailValidity.js): a one-letter slip on a
+    // consumer domain gets the correction back, a domain with no mail
+    // records is refused, and DNS trouble on our side fails open. Signup
+    // only — login and forgot-password are untouched.
+    const reach = await checkEmailDeliverable(email);
+    if (!reach.ok) {
+      res.locals.authOutcome = `signup:unreachable_email:${reach.reason}`;
+      return res.status(400).json({ error: reach.message, ...(reach.suggestion ? { suggestion: reach.suggestion } : {}) });
+    }
     if (!isStrongPassword(password)) {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
@@ -126,6 +137,9 @@ router.post('/signup', async (req, res) => {
       sessions_limit: isDev ? -1 : 5,
     });
 
+    // Welcome mail — fire and forget; a mail outage never fails a signup.
+    sendWelcomeMail({ user, req, via: 'signup' });
+
     // Register device if provided. `registerDevice` never rejects — it
     // auto-deactivates the oldest device when the tier limit is full. The
     // old `if (deviceResult.error)` branch was dead code.
@@ -160,6 +174,30 @@ router.post('/signup', async (req, res) => {
     console.error('Signup error:', err);
     res.status(500).json({ error: 'Signup failed. Please try again.' });
   }
+});
+
+// ── Marketing unsubscribe ──
+// The signed link in the welcome mail (and every promotional mail after
+// it). GET, so it works from any mail client; the token is an HMAC of the
+// user id under JWT_SECRET (services/marketingMail.js) — stateless, no
+// expiry. Only marketing mail is affected; receipts, password resets and
+// security notices still go out.
+router.get('/unsubscribe', (req, res) => {
+  const u = typeof req.query.u === 'string' ? req.query.u : '';
+  const t = typeof req.query.t === 'string' ? req.query.t : '';
+  const page = (title, body, color) => `<html><body style="background:#050507;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center;max-width:380px;padding:0 20px"><h2 style="color:${color}">${title}</h2><p style="color:#9ca3af;font-size:13px">${body}</p></div></body></html>`;
+  if (!u || !verifyUnsubscribeToken(u, t)) {
+    res.locals.authOutcome = 'unsubscribe:bad_token';
+    return res.status(400).send(page("This link isn't valid", 'Use the unsubscribe link from a mail we sent you, or write to support@minicaai.com and we will do it for you.', '#f87171'));
+  }
+  const changed = db.setMarketingOptOut(u, true);
+  if (!changed) {
+    res.locals.authOutcome = 'unsubscribe:no_such_user';
+    return res.status(404).send(page('No such account', 'This account no longer exists, so there is nothing to unsubscribe.', '#f87171'));
+  }
+  res.locals.authOutcome = 'unsubscribe:ok';
+  console.log(`[unsubscribe] user=${u} marketing_opt_out=1`);
+  return res.send(page("You're unsubscribed", "No more product updates or offers from minicaai. You'll still get receipts, password resets and security notices for your account.", '#34d399'));
 });
 
 // ── Login ──
@@ -353,6 +391,7 @@ router.post('/google', async (req, res) => {
           expires_at: isDev ? -1 : now + (30 * 24 * 60 * 60 * 1000),
           sessions_limit: isDev ? -1 : 5,
         });
+        sendWelcomeMail({ user, req, via: 'google' });
       }
     }
 
@@ -905,6 +944,7 @@ router.get('/google/callback', async (req, res) => {
           expires_at: isDev ? -1 : now + (30 * 24 * 60 * 60 * 1000),
           sessions_limit: isDev ? -1 : 5,
         });
+        sendWelcomeMail({ user, req, via: 'google-callback' });
       }
     }
 

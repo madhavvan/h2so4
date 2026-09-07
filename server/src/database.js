@@ -464,6 +464,15 @@ function getDB() {
     db.exec("UPDATE users SET razorpay_subscription_id = SUBSTR(stripe_customer_id, 5) WHERE stripe_customer_id LIKE 'rzp_%'");
   }
 
+  // Marketing consent (2026-09-06). Every account may receive product
+  // updates and offers until it opts out through the signed unsubscribe
+  // link in the welcome mail (routes/auth.js GET /unsubscribe, built by
+  // services/marketingMail.js). Transactional mail — receipts, password
+  // resets, security notices — is never gated by this column.
+  if (!userCols.find(c => c.name === 'marketing_opt_out')) {
+    db.exec('ALTER TABLE users ADD COLUMN marketing_opt_out INTEGER DEFAULT 0');
+  }
+
   // Coarse OS label per device — used by AdminDashboard to show whether a
   // user is on Mac/Windows/Linux without needing to parse the raw UA on the
   // client side. Captured by the client at signup/login/validate via
@@ -800,6 +809,21 @@ function getUserByEmail(email) {
 function getUserById(id) {
   const d = getDB();
   return d.prepare('SELECT * FROM users WHERE id = ?').get(id) || null;
+}
+
+/** Marketing opt-out (the unsubscribe link). True when a row changed. */
+function setMarketingOptOut(userId, optOut) {
+  const d = getDB();
+  const r = d.prepare('UPDATE users SET marketing_opt_out = ?, updated_at = ? WHERE id = ?').run(optOut ? 1 : 0, Date.now(), userId);
+  return r.changes > 0;
+}
+
+/** Everyone a promotional mail may go to: not opted out (the default), not banned. */
+function getMarketingRecipients() {
+  const d = getDB();
+  return d.prepare(
+    'SELECT id, email, name, tier, country_code, created_at FROM users WHERE COALESCE(marketing_opt_out, 0) = 0 AND COALESCE(is_banned, 0) = 0 ORDER BY created_at ASC'
+  ).all();
 }
 
 function verifyUserPassword(email, password) {
@@ -3951,6 +3975,7 @@ module.exports = {
   createUser, getUserByEmail, getUserById, getUserByGoogleId, linkGoogleAccount, verifyUserPassword,
   updateUserTier, updateUserPassword, banUser, unbanUser, getAllUsers, getUserCount, getProUserCount, getActiveToday,
   updateUserProfile, deleteUser, getUserDataExport,
+  setMarketingOptOut, getMarketingRecipients,
   // Password reset
   createPasswordResetToken, getPasswordResetToken, getRawPasswordResetToken, consumePasswordResetToken, cleanupExpiredResetTokens,
   invalidatePendingResetTokensForUser, applyPasswordReset,

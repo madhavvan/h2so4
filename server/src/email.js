@@ -596,4 +596,61 @@ function renderPurchaseReceiptEmail({ name, tier, isTopUp, amount, currency, man
   };
 }
 
-module.exports = { sendMail, renderPasswordResetEmail, renderPaymentFailedEmail, renderTierChangeEmail, renderCancellationEmail, renderAccessEndedEmail, renderGoogleLinkedEmail, renderPassExpiryEmail, renderPurchaseReceiptEmail };
+// ── Welcome (account creation) ─────────────────────────────
+// Sent by services/marketingMail.js on every new account — password signup
+// and both Google new-user paths. It is the first mail a user gets, so it
+// also states the consent basis for later product updates and offers and
+// carries the signed unsubscribe link. Claims are deliberately generic:
+// trial minutes differ by region (India is paid-only), so the mail sends the
+// user to the app for their plan rather than promising minutes here.
+function renderWelcomeEmail({ name, signInUrl, unsubscribeUrl }) {
+  const safeName = (name || 'there').toString().replace(/</g, '&lt;');
+  const site = signInUrl || 'https://minicaai.com';
+
+  const text = [
+    `Hi ${safeName},`,
+    '',
+    'Your minicaai account is ready. Three things to do before your first real interview:',
+    '',
+    `1. Install the desktop app for Windows, Mac or Linux: ${site}`,
+    '2. Sign in with this email address — your plan and any trial time are shown in the app.',
+    '3. Run one practice session so the audio capture and the pop-out window feel familiar before it counts.',
+    '',
+    'Questions? Reply to this mail or write to support@minicaai.com — a person reads it.',
+    '',
+    '— The minicaai team',
+    '',
+    "You'll occasionally hear from us about product updates and offers. Unsubscribe any time:",
+    unsubscribeUrl,
+  ].join('\n');
+
+  const html = `<!doctype html>
+<html><body style="margin:0;padding:0;background:#050507;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e5e7eb">
+  <div style="max-width:560px;margin:0 auto;padding:40px 24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:32px">
+      <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:inline-block"></div>
+      <div style="font-weight:700;font-size:18px;color:#fff">minicaai</div>
+    </div>
+    <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 16px">Welcome, ${safeName}</h1>
+    <p style="font-size:14px;line-height:1.6;color:#9ca3af;margin:0 0 20px">
+      Your account is ready. Three things to do before your first real interview:
+    </p>
+    <ol style="font-size:14px;line-height:1.7;color:#d1d5db;margin:0 0 24px;padding-left:20px">
+      <li style="margin-bottom:8px">Install the desktop app for Windows, Mac or Linux from <a href="${site}" style="color:#60a5fa">${site.replace(/^https?:\/\//, '')}</a>.</li>
+      <li style="margin-bottom:8px">Sign in with this email address — your plan and any trial time are shown in the app.</li>
+      <li>Run one practice session so the audio capture and the pop-out window feel familiar before it counts.</li>
+    </ol>
+    <a href="${site}" style="display:inline-block;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:12px 22px;border-radius:8px">Get the app</a>
+    <p style="font-size:13px;line-height:1.6;color:#9ca3af;margin:28px 0 0">
+      Questions? Reply to this mail or write to <a href="mailto:support@minicaai.com" style="color:#60a5fa">support@minicaai.com</a> — a person reads it.
+    </p>
+    <div style="border-top:1px solid #1f2937;margin-top:32px;padding-top:16px;font-size:12px;color:#6b7280;line-height:1.6">
+      You're receiving this because an account was just created with your email address. You'll occasionally hear from us about product updates and offers — <a href="${unsubscribeUrl}" style="color:#9ca3af">unsubscribe</a> any time. Receipts, password resets and security notices are unaffected.
+    </div>
+  </div>
+</body></html>`;
+
+  return { subject: 'Welcome to minicaai — your account is ready', html, text };
+}
+
+module.exports = { sendMail, renderWelcomeEmail, renderPasswordResetEmail, renderPaymentFailedEmail, renderTierChangeEmail, renderCancellationEmail, renderAccessEndedEmail, renderGoogleLinkedEmail, renderPassExpiryEmail, renderPurchaseReceiptEmail };

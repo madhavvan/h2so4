@@ -29,7 +29,10 @@
 // endpoint silently served FALLBACK_VERSION to every client for three
 // weeks. server/test/release-feed-config.test.js pins the three copies of
 // "which repo" together so they cannot drift apart again.
-const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/h2so4/releases/latest';
+// 2026-09-06: moved to the releases-only repo (the one that stays public
+// when h2so4 goes private). Its v4.0.25 release carried all artifacts and
+// channel files when checked anonymously; downloads.js REPO moved with it.
+const GITHUB_RELEASES_URL = 'https://api.github.com/repos/madhavvan/interviewcopilot-releases/releases/latest';
 const VERSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 // Offline fallback ONLY — the GitHub Releases fetch above is the live

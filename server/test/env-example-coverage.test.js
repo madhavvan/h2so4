@@ -39,6 +39,9 @@ const PLATFORM_INJECTED = new Set([
   'RAILWAY_SERVICE_ID',
   // Standard Node/PaaS conventions, documented by their own ecosystems.
   'NODE_ENV',
+  // Set by the vitest runner itself. src/services/emailValidity.js reads it
+  // to keep signup DNS lookups off under test; never an operator setting.
+  'VITEST',
   'PORT',
 ]);
 
