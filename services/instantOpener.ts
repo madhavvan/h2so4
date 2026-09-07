@@ -47,7 +47,9 @@ import {
 
 export type OpenerShape =
   | 'entity-yes' | 'entity-no' | 'platforms' | 'project' | 'background'
-  | 'topic' | 'meta' | 'unknown';
+  | 'topic' | 'meta' | 'unknown'
+  // 2026-09-06 widening — see the WIDENING note above composeOpener.
+  | 'greeting' | 'dates' | 'current' | 'certs';
 
 export type OpenerDecision =
   /** Say exactly this, now. Grounded by construction. */
@@ -130,6 +132,10 @@ const PROJECTS_PLURAL = [
   // "list ur projects" — terse and typed, which is how the desktop user
   // asks rather than speaks.
   /^(?:list|name|show)\b[^?]{0,20}\bprojects\b/i,
+  // "can you explain about your projects?" — measured deferring in the real
+  // corpus because none of the verbs above is "explain". Plural only: the
+  // singular is the favourite-project shape (PROJECT), checked first.
+  /\b(?:explain|talk|tell|go\s+over|run\s+(?:me\s+)?through|walk\s+(?:me\s+)?through|describe|discuss)\b[^?]{0,20}\byour\s+(?:\w+\s+){0,2}projects\b/i,
 ];
 
 // "where have you worked?", "which companies?" — the list of employers is
@@ -222,6 +228,156 @@ const PROJECT = [
 ];
 
 // "have you worked at X", "do you know X", "what about X", "who is X"
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  WIDENING (2026-09-06) — the shapes below were measured deferring on the
+//  real question corpus while every fact they need sat in the ledger. The
+//  rule for every one of them is unchanged: TRUE from parsed facts or say
+//  nothing — a live model may still cover a defer, and silence beats a
+//  wrong opener. (See _opener-defer-analysis in the session notes: 14.0%
+//  coverage; 434 distinct about-them questions deferred, most of them
+//  process questions that genuinely need the model.)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// A bare greeting — the WHOLE utterance, anchored both ends, so "how are
+// you handling schema drift?" can never match. Needs no ledger: nothing in
+// the reply is a fact about the candidate. Without this, "how are you doing
+// today?" on a slow route earned a 40-word HOLDING cover.
+// Filler an interviewer puts in front of a greeting. Up to three of them.
+const GREETING_LEAD = String.raw`^\W*(?:(?:hi|hey+|hello|hiya|so|okay|ok|alright|well|and|good\s+(?:morning|afternoon|evening))\W+){0,3}`;
+const HOW_ARE_YOU = new RegExp(GREETING_LEAD + String.raw`(?:how\s+are\s+you(?:\s+doing)?(?:\s+today|\s+this\s+(?:morning|afternoon|evening))?|how(?:'s|\s+is)\s+it\s+going(?:\s+today)?|how\s+have\s+you\s+been|how\s+are\s+things)\W*$`, 'i');
+const NICE_TO_MEET = new RegExp(GREETING_LEAD + String.raw`(?:it'?s\s+)?(?:a\s+)?(?:good|great|nice|lovely|pleasure)\s+to\s+(?:meet|see)\s+you(?:\s+too)?\W*$`, 'i');
+const HOW_ARE_YOU_FORMS = [
+  'Doing well, thanks — good to meet you.',
+  "I'm good, thank you — glad to be here.",
+  'Doing well, thanks. Ready when you are.',
+];
+const NICE_TO_MEET_FORMS = [
+  'Likewise — good to meet you too.',
+  'Nice to meet you too — thanks for having me.',
+];
+// A greeting is a short utterance. Past this length the last sentence is
+// a pleasantry tacked onto a real question, and the question wins.
+const GREETING_MAX_CHARS = 120;
+
+// What they are doing NOW. Present-tense "where do you work" is answered
+// with the current role; the past-tense list ("where have you worked") is
+// WHERE_WORKED, checked after this.
+const CURRENT_ROLE = [
+  // All anchored: they are tested against the question's LAST SENTENCE with
+  // the filler stripped (focusOf), never against the whole transcript.
+  // Measured on the corpus, the unanchored versions answered "why are you
+  // looking to leave your current role at Cook Medical?" with the job title,
+  // and a scenario prompt ending "…What do you do?" with "Currently at
+  // Evonik" — a non-sequitur nothing downstream can repair.
+  /^(?:what|which)(?:'s|\s+is|\s+was)?\s+(?:your\s+)?(?:current|present)\s+(?:role|position|title|job|company|employer|organi[sz]ation|work\s+status|employment\s+status)\b/i,
+  /^what(?:'s|\s+is)\s+your\s+(?:current\s+)?(?:work|employment|job)\s+status\b/i,
+  // "What do you do?" alone closes half the scenario questions in the
+  // corpus; only the for-a-living form is a status question.
+  /^what\s+do\s+you\s+do\s+(?:for\s+(?:a\s+)?living|currently|now|these\s+days|right\s+now|at\s+the\s+moment|professionally|for\s+work)\b/i,
+  /^where\s+(?:are|do)\s+you\s+(?:currently\s+|now\s+)?work(?:ing)?(?:\s+(?:now|currently|these\s+days|at\s+the\s+moment|right\s+now|at\s+present))?\W*$/i,
+  // The adverb is required: "are you working on the ingestion side?" is
+  // not a question about employment status.
+  /^(?:are|were)\s+you\s+(?:currently|still|presently)\s+(?:working|employed)\b/i,
+  /^are\s+you\s+(?:working|employed)\s+(?:right\s+now|now|currently|at\s+the\s+moment|anywhere|somewhere|these\s+days)\W*$/i,
+  /^who\s+(?:are\s+you|do\s+you)\s+(?:currently\s+)?work(?:ing)?\s+(?:for|with|at)\s*(?:now|currently|these\s+days)?\W*$/i,
+  /^(?:tell\s+me\s+about|describe|walk\s+me\s+through)\s+your\s+(?:current|present)\s+(?:role|position|job)\b/i,
+];
+const CURRENT_FORMS = [
+  (role: string, org: string, since: string) => `Currently ${role} at ${org}${since ? `, ${since}` : ''}.`,
+  (role: string, org: string, since: string) => `Right now I'm ${role} at ${org}${since ? ` — ${since}` : ''}.`,
+  (role: string, org: string, since: string) => `${role} at ${org}${since ? `, ${since}` : ''} — that's the current one.`,
+];
+const CURRENT_NO_ROLE_FORMS = [
+  (org: string, since: string) => `Currently at ${org}${since ? `, ${since}` : ''}.`,
+  (org: string, since: string) => `Right now it's ${org}${since ? ` — ${since}` : ''}.`,
+];
+// When the most recent role has an END date the candidate is between jobs,
+// and "Currently … from 2024 to 2025" contradicts itself (measured: three
+// corpus résumés). What is true is "most recently".
+const RECENT_FORMS = [
+  (role: string, org: string, when: string) => `Most recently ${role} at ${org}${when ? `, ${when}` : ''}.`,
+  (role: string, org: string, when: string) => `The latest was ${role} at ${org}${when ? ` — ${when}` : ''}.`,
+];
+const RECENT_NO_ROLE_FORMS = [
+  (org: string, when: string) => `Most recently at ${org}${when ? `, ${when}` : ''}.`,
+];
+
+// Dates and durations. "How many years" is deliberately answered with the
+// TIMELINE, not a total: the earliest employer in a résumé is often an
+// internship or a first job in another field, and "ten years" summed from
+// 2016 when the candidate's own summary says "4+ years" is the kind of
+// overclaim that gets probed. The dates are true; the arithmetic is the
+// interviewer's (and the full answer's).
+const DATES = [
+  // The question is ABOUT dates: "the dates when you worked", "from when to
+  // when", "which years were you at…". A bare "when" is not enough — "when
+  // you worked at Apollo, how did you handle…" is a process question.
+  /\b(?:dates?|timeline|from\s+when|which\s+years?|what\s+years?|what\s+period)\b[^?]{0,40}\b(?:work(?:ed|ing)?|employ(?:ed|ment)?|join(?:ed)?|start(?:ed)?|companies|roles?|jobs?|positions?|there)\b/i,
+  /\b(?:work(?:ed|ing)?|employ(?:ed)?|been\s+(?:at|there|with))\b[^?]{0,30}\b(?:from\s+when|dates?|which\s+years?|what\s+years?)\b/i,
+  // Question-initial "when did you join / leave / start working" only:
+  // "when did you start USING Airflow?" is a tool question and falls through.
+  /^\W*(?:(?:so|and|okay|ok|alright|now|um)\W+)?when\s+did\s+you\s+(?:join|leave|start\s+(?:working|there|at\b|your\s+(?:career|current|first))|begin\s+(?:working|there|at\b|your\s+career))/i,
+  /^\W*(?:(?:so|and|okay|ok|alright|now|um)\W+)?how\s+long\s+(?:have\s+you\s+been|were\s+you|did\s+you\s+(?:work|stay))\s+(?:working|employed|there|at\b|with\s+(?:the\s+)?(?:company|them|your\s+current)|in\s+(?:the\s+)?(?:industry|field|workforce|this\s+space|data|engineering|tech)|professionally|overall|in\s+total)/i,
+  /\bhow\s+many\s+years\b/i,
+  /\byears?\s+of\s+experience\b/i,
+  /\bhow\s+much\s+experience\b/i,
+];
+const DATES_FORMS = [
+  (timeline: string) => `${timeline}.`,
+  (timeline: string) => `Sure — ${timeline}.`,
+  (timeline: string) => `So — ${timeline}.`,
+];
+const ONE_ORG_DATES_FORMS = [
+  (org: string, when: string) => `${org} — ${when}.`,
+  (org: string, when: string) => `That was ${org}, ${when}.`,
+];
+
+// Certifications. Spoken only when the ledger parsed at least one; absence
+// from the documents is never evidence of absence, so with none parsed this
+// defers rather than saying no.
+const CERTS = [
+  /\b(?:any|what|which|your|hold|have|got|do\s+you\s+have)\b[^?]{0,25}\bcertif(?:ication|ied|icate)s?\b/i,
+  /\bare\s+you\s+certified\b/i,
+  /\bcertifications?\W*$/i,
+];
+const CERTS_FORMS = [
+  (list: string) => `Yes — ${list}.`,
+  (list: string) => `${list}, yes.`,
+  (list: string) => `I do — ${list}.`,
+];
+
+/**
+ * The employment timeline as a person would say it, most recent first:
+ * "Kestrelby Pharma since 2023 and Aldermoor Sciences from 2021 to 2023".
+ * Only employers whose dates parsed; capped like listOrgs.
+ */
+/** The last sentence of a multi-sentence turn — where the question is. */
+function lastSentence(q: string): string {
+  const parts = q.split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : q;
+}
+
+/** The last sentence with the interviewer's filler stripped off the front. */
+function focusOf(q: string): string {
+  return lastSentence(q)
+    .replace(/^(?:\W*(?:so|okay|ok|and|um|uh|yeah|right|well|alright|now|then|great|excellent|perfect|cool|sure|thanks|thank\s+you)\b[,.\s]*)+/i, '')
+    .replace(/^\W+/, '')
+    .trim();
+}
+
+function timelineOf(ledger: Ledger): string {
+  const items = ledger.employers
+    .map((e) => ({ subject: e.subject, when: tenure(e.when) }))
+    .filter((x) => x.when)
+    .slice(0, LIST_ORGS_MAX)
+    .map((x) => `${x.subject} ${x.when}`);
+  if (items.length === 0) return '';
+  // No "before that": document order is usually but not always
+  // chronological (a 2025 internship listed under a 2024–2025 job, in the
+  // corpus). Each item carries its own dates, so the list claims no order.
+  return listOrgs(items);
+}
+
 const ENTITY_SYNTAX = [
   // The optional pronoun is load-bearing: "were you at Deloitte?" puts
   // "you" between the verb and the preposition, and without it that
@@ -572,7 +728,13 @@ function roleOf(f: Fact): string {
   const d = String(f.detail || '');
   const dash = d.indexOf(' — ');
   const role = (dash === -1 ? d : d.slice(0, dash)).replace(/\s+/g, ' ').trim();
-  return role.replace(/\s*\(Intern\)\s*/i, ' intern').trim();
+  // Markdown emphasis and stray dashes from a badly converted document are
+  // never speakable: a real résumé produced "— **CQV LEAD**" here.
+  return role
+    .replace(/\s*\(Intern\)\s*/i, ' intern')
+    .replace(/[*_`#]+/g, '')
+    .replace(/^[\s—–\-:|]+|[\s—–\-:|]+$/g, '')
+    .trim();
 }
 
 /**
@@ -1079,6 +1241,14 @@ export function composeOpener(
 
   // Without a knowledge base there are no facts to compose from, and
   // guessing is the thing this file exists to stop.
+  // A greeting is answered before the knowledge-base check: the reply
+  // contains no fact about the candidate, so it needs no documents, and a
+  // slow route would otherwise spend a holding cover on "how are you?".
+  if (q.length <= GREETING_MAX_CHARS) {
+    const tail = lastSentence(q);
+    if (NICE_TO_MEET.test(tail)) return { kind: 'speak', text: pick(NICE_TO_MEET_FORMS, hash(q)), shape: 'greeting' };
+    if (HOW_ARE_YOU.test(tail)) return { kind: 'speak', text: pick(HOW_ARE_YOU_FORMS, hash(q)), shape: 'greeting' };
+  }
   if (!ledger || ledger.charCount === 0) {
     return { kind: 'defer', shape: 'unknown', why: 'no knowledge base' };
   }
@@ -1113,6 +1283,13 @@ export function composeOpener(
   // ── 1. A named organisation ──
   const known = namedKnownOrg(ledger, q);
   const unknownInQ = known ? questionNamesTheUnknown(ledger, q, known.subject) : [];
+  // "When did you join Aldermoor?" / "how long were you at Kestrelby?" — a
+  // dates question about ONE known employer is answered with its dates, not
+  // with the yes branch's "yeah, I was there".
+  if (known && known.kind === 'employer' && !unknownInQ.length && anyMatch(DATES, q)) {
+    const when = tenure(known.when);
+    if (when) return emit(pick(ONE_ORG_DATES_FORMS, seed)(known.subject, when), 'dates');
+  }
   if (known && known.kind === 'employer' && asksWhetherKnownOrg(q) && !unknownInQ.length) {
     const role = roleOf(known);
     const when = spokenDates(known.when);
@@ -1144,7 +1321,15 @@ export function composeOpener(
   const candidate = candidateEntity(q);
   if (candidate) {
     const inLedger = findOrganisation(ledger, candidate);
-    if (!inLedger) {
+    // A capitalised TOOL is not an employer to deny. "Have you worked with
+    // Kafka?" reached this branch — Kafka is in the documents, so the
+    // haystack check deferred it — before the have-you-used shapes below
+    // ever ran: the canonical question this rail exists for, handed to a
+    // model. Measured on the real corpus ("Have you worked with Kafka?",
+    // "…where you worked with Python?"). If the ledger knows the name as a
+    // technology, skip the denial machinery and let the tool shapes answer.
+    const namesATool = candidate.split(/\s+/).some((w) => isSpeakableTech(ledger, w.toLowerCase()));
+    if (!inLedger && !namesATool) {
       // ── 0. THE QUESTION ALSO NAMED A PLACE THEY DID WORK ──
       //
       // "Did you work at Merck's New Jersey site?" reaches here with
@@ -1275,6 +1460,38 @@ export function composeOpener(
   }
 
   // ── 2. Background / introduce yourself ──
+  // A question that names a technology the ledger knows is about the tool,
+  // whatever else it says: "how long have you been working with Kafka?" is
+  // not a request for the employment timeline, and "what is your current
+  // work on Snowflake?" is not a request for the job title.
+  const mentionsTool = q.split(/[^A-Za-z0-9+#.]+/).some((w) => isSpeakableTech(ledger, w));
+
+  // ── Current role (present tense) ──
+  if (!mentionsTool && anyMatch(CURRENT_ROLE, focusOf(q))) {
+    const cur = currentRole(ledger);
+    if (cur) {
+      const role = roleOf(cur);
+      const when = tenure(cur.when);
+      // Only an open-ended tenure ("since 2023") is "currently".
+      const ongoing = /^since\b/.test(when);
+      const text = ongoing
+        ? (role ? pick(CURRENT_FORMS, seed)(role, cur.subject, when) : pick(CURRENT_NO_ROLE_FORMS, seed)(cur.subject, when))
+        : (role ? pick(RECENT_FORMS, seed)(role, cur.subject, when) : pick(RECENT_NO_ROLE_FORMS, seed)(cur.subject, when));
+      return emit(text, 'current');
+    }
+  }
+
+  // ── Dates, durations, years ──
+  if (anyMatch(DATES, q) && !mentionsTool && ledger.employers.length) {
+    const timeline = timelineOf(ledger);
+    if (timeline) return emit(pick(DATES_FORMS, seed)(timeline), 'dates');
+  }
+
+  // ── Certifications ──
+  if (anyMatch(CERTS, q) && ledger.certifications.length) {
+    return emit(pick(CERTS_FORMS, seed)(listOrgs(ledger.certifications.map((c) => c.subject), 3)), 'certs');
+  }
+
   if (anyMatch(BACKGROUND, q)) {
     const cur = currentRole(ledger);
     if (cur) {
