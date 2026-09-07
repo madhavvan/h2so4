@@ -524,8 +524,16 @@ function planCover(gapMs) {
 
   const base = COVER_TIERS[2];
   const needed = Math.ceil(((gapMs - COVER_TTFT_ALLOWANCE_MS) / 1000) * SPOKEN_WORDS_PER_SEC);
-  const minWords = clamp(needed, base.minWords, HOLDING_MAX_WORDS - 30);
-  const maxWords = clamp(Math.round(needed * 1.35), minWords + 25, HOLDING_MAX_WORDS);
+  // Over-provide so the candidate never runs dry (cover-depth's "cover
+  // outlasts the wait"), but MODESTLY. The old floor of base.minWords (60)
+  // planned 60-85 words for a 13-17s gap — 26-37s of speech, a monologue the
+  // candidate is still reciting long after the real answer has painted, and
+  // every point it makes is one the continuation then has to avoid. Measured
+  // live 2026-09-06: 51/66/78-word covers against 14-16s gaps. Sized to the
+  // gap with ~12% headroom instead — the same arithmetic the opener tier now
+  // uses — and minWords still fills more than the wait across this whole band.
+  const minWords = clamp(Math.round(needed * 1.12), 30, HOLDING_MAX_WORDS - 20);
+  const maxWords = clamp(Math.round(needed * 1.4), minWords + 15, HOLDING_MAX_WORDS);
   return {
     ...base,
     minWords,
@@ -1181,6 +1189,15 @@ function userPrompt(question, category, candidateContext, plan, recentTurns, pro
   const aboutThem = isExperientialQuestion(question)
     || isBackgroundQuestion(question)
     || !PROBLEM_CATEGORIES.has(category);
+  // ⚠️ NO CHARACTER FLOOR HERE, ON PURPOSE. A thin background is where the
+  // fast model invents a biography, so a length threshold looks tempting —
+  // but the real coverContext is the candidate's own ledger digest, which is
+  // legitimately short for a junior or a one-line résumé, and dropping it
+  // would answer a real person from thin air. (The test fixtures are 16-95
+  // chars deliberately.) Invention is handled where it can be judged, not
+  // guessed: routes/ai.js skips an about-them question with no evidence
+  // before any model runs, and salvages a rejected self-claim into a topic
+  // sentence after. See aboutThemWithoutEvidence and the SALVAGE block there.
   const bg = aboutThem ? String(candidateContext || '').trim() : '';
   const recent = String(recentTurns || '').trim().slice(-RECENT_TURNS_CHARS);
   return [

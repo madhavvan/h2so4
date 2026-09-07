@@ -463,8 +463,14 @@ describe('the cover chain cannot go quiet', () => {
       expect(body).toMatch(/groqKey: process\.env\.GROQ_API_KEY/);
       expect(body).toMatch(/geminiKey: process\.env\.GEMINI_API_KEY/);
     }
-    // Exactly the two entry points, and nothing else.
-    expect((ai.match(/anthropicKey: process\.env\.ANTHROPIC_API_KEY/g) || []).length).toBe(entryPoints.length);
+    // runCover now produces up to TWICE — the cover, and a topic salvage
+    // when a self-claim is rejected on a holding-tier gap (see the SALVAGE
+    // block) — so the key legitimately appears three times: runCover ×2 and
+    // /cover/prewarm ×1. The guard that matters is the per-entry-point check
+    // above (each reaches the backstop) plus the helper check below; the
+    // total must never exceed those three, which is what would flag the key
+    // being pasted into a /stream/ or /chat/ handler.
+    expect((ai.match(/anthropicKey: process\.env\.ANTHROPIC_API_KEY/g) || []).length).toBe(entryPoints.length + 1);
 
     const helper = /async function runCover\(\{[\s\S]*?\n}/.exec(ai)[0];
     expect(helper).toMatch(/groqKey: process\.env\.GROQ_API_KEY/);

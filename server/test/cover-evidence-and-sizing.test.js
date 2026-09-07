@@ -59,10 +59,28 @@ describe('the opener is sized to its gap', () => {
     expect(planCover(3999).minWords).toBe(9);
   });
 
-  it('below the floor there is still no cover, and the bridge/holding tiers are untouched', () => {
+  it('below the floor there is still no cover, and the bridge tier is untouched', () => {
     expect(planCover(COVER_FLOOR_MS)).toBeNull();
     expect(planCover(6000)).toBe(COVER_TIERS[1]);
     expect(planCover(20000).name).toBe('holding');
+  });
+
+  it('the holding tier is sized to its gap, not floored into a monologue', () => {
+    // Field report 2026-09-06: a 14-16s gap produced 51-78-word covers,
+    // 22-34s of speech — the candidate still reciting long after the answer
+    // painted. Now sized to the gap: still over-provides (never runs dry),
+    // but no monologue.
+    const sec = (w) => w / SPOKEN_WORDS_PER_SEC;
+    for (const gap of [13000, 16000, 20000, 50000]) {
+      const p = planCover(gap);
+      expect(p.name).toBe('holding');
+      // Over-provision invariant survives: minWords fills more than the wait.
+      expect(sec(p.minWords), `${gap}ms`).toBeGreaterThan((gap - 300) / 1000);
+      // But no longer 2-3x the gap: the low end of the band is the fix.
+      if (gap <= 16000) expect(sec(p.maxWords), `${gap}ms ceiling`).toBeLessThan((gap / 1000) * 1.7);
+      // The big gap gets MORE than the old fixed ceiling, because 50s needs it.
+      if (gap === 50000) expect(p.minWords).toBeGreaterThan(110);
+    }
   });
 });
 
@@ -119,5 +137,27 @@ describe('the prewarm rail has a ceiling per user', () => {
 describe('accepted covers are auditable', () => {
   it('the accepted-cover log line carries the spoken text, truncated', () => {
     expect(ai).toContain('+ `text="${cover.replace(/\\s+/g, \' \').slice(0, 160)}"`');
+  });
+});
+
+describe('a rejected self-claim is salvaged into a topic sentence, not silence', () => {
+  const run = ai.slice(ai.indexOf('async function runCover('));
+  const rejectBlock = run.slice(run.indexOf('const verdict = coverVerdict('), run.indexOf('sse.send(held);'));
+
+  it('only on a holding-tier gap, only for a self-claim rejection, only if the client is still there', () => {
+    expect(rejectBlock).toContain("const selfClaimReject = /uncitedClaim|confabulatedCitation|deniedOwnHistory/.test(verdict);");
+    expect(rejectBlock).toContain("if (selfClaimReject && plan.name === 'holding' && !sse.signal.aborted) {");
+  });
+
+  it('retries WITHOUT the background so the model answers the subject, and re-checks with the same guard', () => {
+    // candidateContext '' is what steers COVER_SYSTEM to a topic answer.
+    expect(rejectBlock).toMatch(/candidateContext: '',\s*\/\/ no background/);
+    expect(rejectBlock).toContain('if (topic && !coverVerdict({ cover: topic, citation: \'\', shown, vocabulary: vocab, allowed })) {');
+    expect(rejectBlock).toContain('SALVAGED-TOPIC');
+    // Falls through to the original silence when the salvage cannot ground
+    // either: the topic branch returns inside the if, and the reject block
+    // still ends with a bare return.
+    expect(rejectBlock).toContain("return topic;");
+    expect(rejectBlock).toContain("return '';");
   });
 });

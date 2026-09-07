@@ -1882,6 +1882,48 @@ async function runCover({ sse, req, question, provider, effort = 'none', webSear
       + `${verdict} after ${Date.now() - t0}ms — dropped rather than spoken. `
       + `cite="${String(citation).slice(0, 80)}" text="${cover.slice(0, 120)}"`
     );
+    // ── SILENCE IS THE FEAR; A TOPIC SENTENCE IS NOT ──
+    //
+    // A rejected self-claim used to be dead air. Measured live 2026-09-06,
+    // every discarded live cover was an invented biography ("My first job was
+    // at a small fintech startup", "In my work designing custom textiles…") on
+    // a HOLDING-tier gap — grok/groq, 13-50s to first token. On those routes
+    // there is ample budget to try once more WITHOUT the background, which
+    // steers COVER_SYSTEM to answer the SUBJECT of the question (CITE: NONE),
+    // so the candidate speaks a true, generic opener instead of sitting
+    // silent while a fabrication is thrown away. Re-checked by the same guard;
+    // if it still claims a history (it should not, with no background), we
+    // fall through to the original silence. Not attempted on the fast tiers:
+    // the answer is ~1-2s behind there, and a retry would cost more than the
+    // silence it saves.
+    const selfClaimReject = /uncitedClaim|confabulatedCitation|deniedOwnHistory/.test(verdict);
+    if (selfClaimReject && plan.name === 'holding' && !sse.signal.aborted) {
+      let salvaged = '';
+      const topic = await streamCoverAnswer({
+        question,
+        category,
+        candidateContext: '',        // no background → answer the subject, not the self
+        recentTurns: typeof req.body?.recentTurns === 'string' ? req.body.recentTurns : '',
+        plan,
+        groqKey: process.env.GROQ_API_KEY,
+        geminiKey: process.env.GEMINI_API_KEY,
+        anthropicKey: process.env.ANTHROPIC_API_KEY,
+        onToken: (t) => { salvaged += t; },
+        onMeta: () => {},
+        signal: sse.signal,
+      });
+      // A topic answer must not smuggle in a history either. Same guard.
+      if (topic && !coverVerdict({ cover: topic, citation: '', shown, vocabulary: vocab, allowed })) {
+        sse.send(topic);
+        sse.send(' ');
+        console.log(
+          `[cover] ${provider} user=${req.user?.id} SALVAGED-TOPIC tier=${plan.name} `
+          + `gap~${gapMs}ms words=${topic.split(/\s+/).filter(Boolean).length} `
+          + `— spoke the subject instead of a rejected self-claim. text="${topic.replace(/\s+/g, ' ').slice(0, 160)}"`
+        );
+        return topic;
+      }
+    }
     return '';
   }
 
